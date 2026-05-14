@@ -23,6 +23,7 @@ import {
   SideGallery,
   SideSettings,
 } from "@/components/components";
+import { MenuBar } from "@/components/MenuBar";
 import { ChatSidebar } from "@/features/chat/chat-sidebar";
 import {
   DockWorkspace,
@@ -49,7 +50,7 @@ import { seedGalleryFolders } from "@/mocks/seedGalleryFolders";
 import { seedMessages } from "@/mocks/seedMessages";
 import type { DockState } from "@/lib/types";
 import { db, seedIfEmpty, toGenerationRow } from "@/lib/db";
-import { COMMANDS, getCommandById, type CommandContext } from "@/lib/commands";
+import { COMMANDS, getCommandById, fmtKbd, type CommandContext } from "@/lib/commands";
 import { useCommandKeybindings } from "@/lib/keybindings";
 
 // ─── Types ────────────────────────────────────────────────────
@@ -166,15 +167,6 @@ function CommandPalette({ open, onClose, ctx }: { open: boolean; onClose: () => 
     });
     return [...m.entries()];
   }, [filtered]);
-
-  // Format keybinding tokens into a display string (e.g. ["Cmd","K"] → "⌘K").
-  const fmtKbd = (tokens: string[] | undefined): string => {
-    if (!tokens || tokens.length === 0) return "";
-    const map: Record<string, string> = {
-      Cmd: "⌘", Ctrl: "⌃", Alt: "⌥", Shift: "⇧", Enter: "↵", Tab: "⇥", Space: "␣",
-    };
-    return tokens.map(t => map[t] ?? t).join("");
-  };
 
   const onKey = (e: React.KeyboardEvent) => {
     if (e.key === "Escape") { e.preventDefault(); onClose(); return; }
@@ -636,6 +628,7 @@ export function RootLayout() {
             onSettings={() => getCommandById("open-settings")?.run(cmdCtx)}
             sideCollapsed={sideCollapsed}
             onToggleSide={() => setSideCollapsed(c => !c)}
+            menu={<MenuBar ctx={cmdCtx}/>}
           />
           <div className="main">
             <Rail view={view} setView={navigateTo}/>

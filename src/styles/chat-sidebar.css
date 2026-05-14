@@ -292,3 +292,15 @@
   background: rgba(255,255,255,0.06);
   margin: 4px 6px;
 }
+/* Disabled menu items (used by MenuBar dropdown — Pass 2).
+   Native disabled attr makes onClick inert at the DOM level;
+   these rules handle the visual side. */
+.chat-ctx-item:disabled,
+.chat-ctx-item[aria-disabled="true"] {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.chat-ctx-item:disabled:hover,
+.chat-ctx-item[aria-disabled="true"]:hover {
+  background: transparent;
+}

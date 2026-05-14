@@ -502,6 +502,19 @@ export function getCommandById(id: string): Command | undefined {
 }
 
 /**
+ * Format a keybinding token array into a compact display string.
+ * e.g. ["Cmd", "Shift", "K"] → "⌘⇧K"
+ * Extracted from CommandPalette (RootLayout.tsx) in Pass 2 so MenuBar can share it.
+ */
+export function fmtKbd(tokens: string[] | undefined): string {
+  if (!tokens || tokens.length === 0) return "";
+  const map: Record<string, string> = {
+    Cmd: "⌘", Ctrl: "⌃", Alt: "⌥", Shift: "⇧", Enter: "↵", Tab: "⇥", Space: "␣",
+  };
+  return tokens.map((t) => map[t] ?? t).join("");
+}
+
+/**
  * Build a canonical string key from a keybinding token array.
  * Matches the recording order in settings-extras.tsx:
  *   Cmd → Ctrl → Alt → Shift → KEY

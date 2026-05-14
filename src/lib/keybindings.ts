@@ -120,11 +120,11 @@ function buildKeymap(overrides: Map<string, string[]>): Map<string, string> {
  * commands (Cmd+K, Cmd+P, …) must fire regardless of focus target.
  */
 function shouldSkip(e: KeyboardEvent): boolean {
-  const target = e.target as HTMLElement | null;
-  if (!target) return false;
+  const target = e.target;
+  if (!target || typeof (target as any).closest !== "function") return false;
 
   // Guard: CodeMirror editor — CM6 owns its own keymap; do not fight it.
-  if (target.closest(".cm-editor")) return true;
+  if ((target as Element).closest(".cm-editor")) return true;
 
   return false;
 }

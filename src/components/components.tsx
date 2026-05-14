@@ -54,7 +54,9 @@ export function LiquidLayers() {
 }
 
 // ── Titlebar ────────────────────────────────────────────────
-export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettings, sideCollapsed, onToggleSide }: any) {
+// `menu` is a ReactNode slot for the MenuBar — keeps Titlebar decoupled from
+// the command system. MenuBar is assembled in RootLayout and passed down.
+export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettings, sideCollapsed, onToggleSide, menu }: any) {
   return (
     <div className="titlebar">
       <div className="traffic">
@@ -75,6 +77,7 @@ export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettin
         <div className="brand-mark"></div>
         <div className="brand-name">Shugu Forge<span className="sub">/ {project}</span></div>
       </div>
+      {menu}
       <div className="tb-spacer"></div>
       <div className="tb-search" onClick={onSearch}>
         <Icon name="search" size={13}/>
