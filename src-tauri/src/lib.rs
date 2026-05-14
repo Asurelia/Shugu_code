@@ -50,14 +50,48 @@ CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at);
 ";
 
+const MIGRATION_V2: &str = "
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload TEXT,
+    result TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    level TEXT NOT NULL,
+    source TEXT,
+    message TEXT NOT NULL,
+    ts INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts);
+";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let migrations = vec![Migration {
-        version: 1,
-        description: "create_initial_tables",
-        sql: MIGRATION_V1,
-        kind: MigrationKind::Up,
-    }];
+    let migrations = vec![
+        Migration {
+            version: 1,
+            description: "create_initial_tables",
+            sql: MIGRATION_V1,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 2,
+            description: "jobs_logs_settings",
+            sql: MIGRATION_V2,
+            kind: MigrationKind::Up,
+        },
+    ];
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -75,6 +109,9 @@ pub fn run() {
             commands::terminal::term_run,
             commands::image::image_generate,
             commands::models::models_list,
+            commands::vector::vec_index,
+            commands::vector::vec_search,
+            commands::vector::vec_delete,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

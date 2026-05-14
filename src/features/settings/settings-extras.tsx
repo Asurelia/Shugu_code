@@ -4,6 +4,7 @@
 import { useState, useEffect } from "react";
 import { Icon } from "@/components/components";
 import { SettingRow, Switch } from "@/features/code/views-code";
+import { db } from "@/lib/db";
 
 export const DEFAULT_SHORTCUTS = [
   { group: "General", items: [
@@ -79,12 +80,29 @@ export const DEFAULT_INTERFACE = {
 const LS_SHORTCUTS = "shugu.shortcuts.v1";
 const LS_INTERFACE = "shugu.interface.v1";
 
+/**
+ * Settings persistence strategy — localStorage-primary + SQLite mirror.
+ *
+ * Why: `loadJSON` is used as a `useState` initializer (must be synchronous).
+ * Making it async would cascade into ~10 component changes for no UX gain.
+ * Instead:
+ *   - `loadJSON`  reads localStorage synchronously (web-compatible, instant).
+ *   - `saveJSON`  writes localStorage AND fires a fire-and-forget SQLite write.
+ * Both stores are local, so this still honours the local-first constraint.
+ * SQLite becomes the durable, queryable record; localStorage is the fast cache.
+ *
+ * TODO: On Tauri startup, call hydrateSettingsFromSqlite() to push SQLite
+ * values back into localStorage (for cross-device parity after future sync).
+ */
 export function loadJSON<T>(key: string, fallback: T): T {
   try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : fallback; }
   catch { return fallback; }
 }
+
 export function saveJSON(key: string, val: any) {
   try { localStorage.setItem(key, JSON.stringify(val)); } catch { /* quota / disabled */ }
+  // Mirror to SQLite (fire-and-forget; no-op in web mode)
+  void db.settings.set(key, JSON.stringify(val));
 }
 
 export function applyInterfaceVars(s: typeof DEFAULT_INTERFACE) {

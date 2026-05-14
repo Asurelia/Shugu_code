@@ -3,6 +3,8 @@
 
 import { useState, useEffect, useRef, useMemo } from "react";
 import { Icon } from "@/components/components";
+import { db, rowToConvo, convoToRow } from "@/lib/db";
+import { seedIfEmpty } from "@/lib/db";
 
 export const SEED_GROUPS = [
   { id: "pinned",    label: "Pinned",    pinnedSection: true },
@@ -36,6 +38,8 @@ export const FMT_RELATIVE = (ts: number) => {
 };
 
 export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
+  // Initial state from seeds ensures web mode and first paint always show data.
+  // In Tauri mode the useEffect below replaces with SQLite data after mount.
   const [groups, setGroups]   = useState<any[]>(SEED_GROUPS);
   const [convos, setConvos]   = useState<any[]>(SEED_CONVOS);
   const [filtersOpen, setFiltersOpen] = useState(false);
@@ -59,6 +63,19 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
       || convos.flatMap((c: any) => c.children || []).find((c: any) => c.id === activeId);
     onActiveTitle(c?.title || null);
   }, [activeId, convos, onActiveTitle]);
+
+  // Hydrate from SQLite on mount (Tauri mode only; no-op in web mode).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      await seedIfEmpty();
+      const rows = await db.conversations.list();
+      if (!cancelled && rows.length > 0) {
+        setConvos(rows.map(rowToConvo));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   const visible = useMemo(() => {
     return convos.filter((c: any) => {
@@ -108,16 +125,35 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
   }, [visible, filters.groupBy, groups]);
 
   const patch = (id: string, p: any) => setConvos(cs => cs.map((c: any) => c.id === id ? { ...c, ...p, updated: p.updated ?? c.updated } : c));
-  const remove = (id: string) => setConvos(cs => cs.filter((c: any) => c.id !== id));
-  const togglePin = (id: string) => patch(id, { pinned: !convos.find((c: any) => c.id === id)?.pinned });
-  const archive   = (id: string) => patch(id, { status: "archived" });
-  const unarchive = (id: string) => patch(id, { status: "active" });
+  const remove = (id: string) => {
+    setConvos(cs => cs.filter((c: any) => c.id !== id));
+    void db.conversations.remove(id);
+  };
+  const togglePin = (id: string) => {
+    const cur = convos.find((c: any) => c.id === id);
+    const next = !cur?.pinned;
+    patch(id, { pinned: next });
+    void db.conversations.setPinned(id, next);
+  };
+  const archive   = (id: string) => {
+    patch(id, { status: "archived" });
+    void db.conversations.setArchived(id, true);
+  };
+  const unarchive = (id: string) => {
+    patch(id, { status: "active" });
+    void db.conversations.setArchived(id, false);
+  };
   const duplicate = (id: string) => {
     const c = convos.find((c: any) => c.id === id);
     if (!c) return;
-    setConvos(cs => [{ ...c, id: c.id + "-copy-" + Date.now(), title: c.title + " (copy)", updated: Date.now() }, ...cs]);
+    const newConvoData = { ...c, id: c.id + "-copy-" + Date.now(), title: c.title + " (copy)", updated: Date.now() };
+    setConvos(cs => [newConvoData, ...cs]);
+    void db.conversations.create(convoToRow(newConvoData));
   };
-  const moveTo   = (id: string, groupId: string) => patch(id, { group: groupId, updated: Date.now() });
+  const moveTo   = (id: string, groupId: string) => {
+    patch(id, { group: groupId, updated: Date.now() });
+    void db.conversations.setGroup(id, groupId);
+  };
   const addGroup = (label: string) => {
     const id = "g-" + Date.now();
     setGroups(g => [...g.slice(0, -1), { id, label }, g[g.length - 1]]);
@@ -191,7 +227,7 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
       if (tag === "INPUT" || tag === "TEXTAREA") return;
       const k = e.key.toLowerCase();
       if (k === "p") { togglePin(targetId); closeCtx(); }
-      else if (k === "u") { patch(targetId, { unread: !convos.find((c: any) => c.id === targetId)?.unread }); closeCtx(); }
+      else if (k === "u") { const cur2 = convos.find((c: any) => c.id === targetId); const nu = !cur2?.unread; patch(targetId, { unread: nu }); void db.conversations.setUnread(targetId, nu); closeCtx(); }
       else if (k === "r") { setRenaming(targetId); closeCtx(); }
       else if (k === "f") { duplicate(targetId); closeCtx(); }
       else if (k === "a") { archive(targetId); closeCtx(); }
@@ -205,7 +241,9 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
     const id = "c-" + Date.now();
     const titles = ["New conversation", "Untitled chat", "Fresh thread", "amazing-grothendieck-" + Math.random().toString(36).slice(2, 8), "vibrant-noether-" + Math.random().toString(36).slice(2, 8)];
     const title = titles[Math.floor(Math.random() * titles.length)];
-    setConvos(cs => [{ id, title, group: "ungrouped", status: "active", env: "dev", updated: Date.now(), unread: false }, ...cs]);
+    const newConvoData = { id, title, group: "ungrouped", status: "active" as const, env: "dev", updated: Date.now(), unread: false };
+    setConvos(cs => [newConvoData, ...cs]);
+    void db.conversations.create(convoToRow(newConvoData));
     setActiveId(id);
     setRenaming(id);
   };
@@ -287,7 +325,7 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
                 renaming={renaming === c.id}
                 onPick={() => setActiveId(c.id)}
                 onCtx={(e: any) => openCtx(e, c)}
-                onRename={(title: string) => { patch(c.id, { title, updated: Date.now() }); setRenaming(null); }}
+                onRename={(title: string) => { patch(c.id, { title, updated: Date.now() }); void db.conversations.rename(c.id, title); setRenaming(null); }}
                 onCancelRename={() => setRenaming(null)}
                 onDragStart={(e: any) => onDragStart(e, c.id)}
                 onDragEnd={onDragEnd}
@@ -312,7 +350,7 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
           groups={groups}
           onClose={closeCtx}
           onPin={() => { togglePin(ctx.convo.id); closeCtx(); }}
-          onUnread={() => { patch(ctx.convo.id, { unread: !ctx.convo.unread }); closeCtx(); }}
+          onUnread={() => { const nu = !ctx.convo.unread; patch(ctx.convo.id, { unread: nu }); void db.conversations.setUnread(ctx.convo.id, nu); closeCtx(); }}
           onRename={() => { setRenaming(ctx.convo.id); closeCtx(); }}
           onDuplicate={() => { duplicate(ctx.convo.id); closeCtx(); }}
           onMove={(gid: string) => {
@@ -337,7 +375,7 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
             <button className="chat-ctx-item" onClick={closeGroupCtx}>
               <span className="label">Tout marquer comme lu</span>
             </button>
-            <button className="chat-ctx-item" onClick={() => { setConvos(cs => cs.map((c: any) => c.group === groupCtx.group.id ? { ...c, status: "archived" } : c)); closeGroupCtx(); }}>
+            <button className="chat-ctx-item" onClick={() => { setConvos(cs => cs.map((c: any) => { if (c.group === groupCtx.group.id) { void db.conversations.setArchived(c.id, true); return { ...c, status: "archived" }; } return c; })); closeGroupCtx(); }}>
               <span className="label">Archiver toutes les conversations</span>
             </button>
             <div className="chat-ctx-sep"></div>

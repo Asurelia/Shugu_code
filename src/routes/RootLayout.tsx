@@ -48,6 +48,7 @@ import { seedGenerations } from "@/mocks/seedGenerations";
 import { seedGalleryFolders } from "@/mocks/seedGalleryFolders";
 import { seedMessages } from "@/mocks/seedMessages";
 import type { DockState } from "@/lib/types";
+import { db, seedIfEmpty } from "@/lib/db";
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -350,6 +351,33 @@ export function RootLayout() {
   const [annotations, setAnnotations] = useState<any[]>([]);
   const [pinnedAnno, setPinnedAnno] = useState<any>(null);
   const [accountOpen, setAccountOpen] = useState(false);
+
+  // Hydrate generations from SQLite on mount (Tauri mode only).
+  // seedIfEmpty() ensures a fresh DB has prototype data on first run.
+  // TODO: write-through on new generation — wire db.generations.create()
+  //        inside ImageView / wherever setGenerations is called downstream.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      await seedIfEmpty();
+      const rows = await db.generations.list();
+      if (!cancelled && rows.length > 0) {
+        setGenerations(rows.map((r) => ({
+          id: r.id,
+          prompt: r.prompt,
+          ratio: r.ratio ?? "1:1",
+          hue: r.hue ?? 0,
+          ts: String(r.ts),
+          model: r.model ?? undefined,
+          seed: r.seed ?? undefined,
+          steps: r.steps ?? undefined,
+          guidance: r.guidance ?? undefined,
+          style: r.style ?? undefined,
+        })));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   // CSS variable sync from tweaks
   useEffect(() => {

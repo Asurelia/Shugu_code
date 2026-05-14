@@ -15,9 +15,15 @@ dist-ssr
 src-tauri/target
 src-tauri/gen
 
+# machine-specific cargo linker config (hardcoded MSVC path — per-machine)
+.cargo/config.toml
+
 # convex
 .convex
 
 # design bundle (kept locally as reference, not versioned)
 _design_extracted
 _design_package.tar
+
+# TS incremental build cache
+*.tsbuildinfo
