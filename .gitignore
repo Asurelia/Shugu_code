@@ -34,3 +34,9 @@ _design_package.tar
 # playwright MCP output + smoke-test screenshots
 .playwright-mcp/
 smoke-*.png
+
+# Claude Code project instructions — kept local, not versioned
+CLAUDE.md
+
+# design handoff archive — extracted to docs/design-kit/, the zip stays local
+Shugu_Dev.zip
