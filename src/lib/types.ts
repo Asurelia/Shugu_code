@@ -75,7 +75,9 @@ export interface GalleryFolder {
 export interface DockTab { id: string; kind: "term" | "agent" | "output" | "problems"; name: string }
 export interface DockState {
   side: "bottom" | "top" | "left" | "right" | "hidden";
-  size: number;
+  size: number;            // legacy px size (no longer used for layout — kept for compat)
+  sizePct?: number;        // dock panel size as a % of the workspace (react-resizable-panels)
+  resizeNonce?: number;    // bump to force the PanelGroup to remount at sizePct (Reset/Maximize)
   tabs: DockTab[];
   activeId: string | null;
   split: boolean;

@@ -2,6 +2,7 @@
 // Ported from panels.jsx (60KB original). Window globals removed in favor of ES exports.
 
 import { useState, useEffect, useRef } from "react";
+import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import { Icon } from "@/components/components";
 import { Terminal } from "@xterm/xterm";
 import type { ITheme } from "@xterm/xterm";
@@ -9,10 +10,90 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { invoke } from "@/lib/tauri";
 
-// ─── Dock host (terminal + agent chat + output + problems) ─────────
-export function DockHost({ dockState, setDockState, fileContents }: any) {
-  const { side, size, tabs, activeId, split, splitId, splitRatio } = dockState;
+// ─── Dock workspace: editor + dock as constraint-solved resizable panels ──
+// Replaces the old hand-rolled CSS-grid + mousemove resize, which could squeeze
+// the editor to 0px (the prototype fought this for ~8 iterations and never won).
+// react-resizable-panels does percentage-based, constraint-solved sizing: each
+// panel's minSize/maxSize is GUARANTEED — neither the editor nor the dock can
+// collapse, and the layout total always stays consistent.
+//
+// `children` is the editor body (content-body + <Outlet/>), supplied by RootLayout.
+export function DockWorkspace({ dockState, setDockState, fileContents, children }: any) {
+  const { side } = dockState;
   const set = (patch: any) => setDockState((s: any) => ({ ...s, ...patch }));
+  const isHorizontal = side === "bottom" || side === "top"; // panels stacked vertically
+  const dockFirst = side === "top" || side === "left";
+
+  const [draggingDock, setDraggingDock] = useState(false);
+  const [hoverZone, setHoverZone] = useState<string | null>(null);
+
+  const onDockDragStart = (e: React.DragEvent) => {
+    setDraggingDock(true);
+    e.dataTransfer.setData("text/plain", "dock");
+    e.dataTransfer.effectAllowed = "move";
+    const el = document.createElement("div");
+    el.style.width = "100px"; el.style.height = "30px";
+    el.style.background = "rgba(224,142,254,0.4)";
+    el.style.borderRadius = "8px";
+    document.body.appendChild(el);
+    e.dataTransfer.setDragImage(el, 50, 15);
+    setTimeout(() => document.body.removeChild(el), 0);
+  };
+  const onDockDragEnd = () => { setDraggingDock(false); setHoverZone(null); };
+
+  const editorPanel = (
+    <Panel id="editor" order={dockFirst ? 2 : 1} minSize={20}>
+      {children}
+    </Panel>
+  );
+  const dockPanel = (
+    <Panel id="dock" order={dockFirst ? 1 : 2} defaultSize={dockState.sizePct ?? 32} minSize={12} maxSize={80}>
+      <DockPanelInner
+        dockState={dockState}
+        setDockState={setDockState}
+        fileContents={fileContents}
+        onDockDragStart={onDockDragStart}
+        onDockDragEnd={onDockDragEnd}
+      />
+    </Panel>
+  );
+  const handle = <PanelResizeHandle className={"dock-rrp-handle " + (isHorizontal ? "h" : "v")} />;
+
+  return (
+    <>
+      <PanelGroup
+        // Re-key on side change (direction + order flip) and on resizeNonce
+        // bump (Reset/Maximize re-apply defaultSize via a clean remount).
+        key={side + ":" + (dockState.resizeNonce ?? 0)}
+        direction={isHorizontal ? "vertical" : "horizontal"}
+        style={{ flex: 1, minHeight: 0 }}
+      >
+        {dockFirst
+          ? <>{dockPanel}{handle}{editorPanel}</>
+          : <>{editorPanel}{handle}{dockPanel}</>}
+      </PanelGroup>
+      {draggingDock && (
+        <div className="dock-zones">
+          {["bottom", "top", "left", "right"].map((z) => (
+            <div
+              key={z}
+              className={"dock-zone zone-" + z + (hoverZone === z ? " over" : "")}
+              onDragOver={(e) => { e.preventDefault(); setHoverZone(z); }}
+              onDragLeave={() => setHoverZone(null)}
+              onDrop={(e) => { e.preventDefault(); set({ side: z }); setDraggingDock(false); setHoverZone(null); }}
+            >dock {z}</div>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+// ─── Dock panel inner: chrome (tabs/actions) + body (panes + optional split) ──
+function DockPanelInner({ dockState, setDockState, fileContents, onDockDragStart, onDockDragEnd }: any) {
+  const { side, tabs, activeId, split, splitId, splitRatio } = dockState;
+  const set = (patch: any) => setDockState((s: any) => ({ ...s, ...patch }));
+  const isHorizontal = side === "bottom" || side === "top";
 
   const moveDock = (next: string) => set({ side: next });
   const closeTab = (id: string) => {
@@ -37,48 +118,20 @@ export function DockHost({ dockState, setDockState, fileContents }: any) {
     const other = tabs.find((t: any) => t.id !== activeId);
     if (other) set({ split: true, splitId: other.id, splitRatio: 0.55 });
   };
+  // Maximize: re-apply an 80% dock via a PanelGroup remount (see DockState.resizeNonce).
+  const maximize = () => set({ sizePct: 80, resizeNonce: (dockState.resizeNonce ?? 0) + 1 });
 
-  const dragRef = useRef<HTMLDivElement | null>(null);
-  const onResize = (e: React.MouseEvent) => {
-    e.preventDefault();
-    const startX = e.clientX, startY = e.clientY;
-    const startSize = size;
-    const host = (dragRef.current?.closest(".workspace") || dragRef.current?.parentElement) as HTMLElement | null;
-    if (!host) return;
-    const parent = host.getBoundingClientRect();
-    const computedMax = (side === "left" || side === "right")
-      ? Math.max(200, parent.width  - 80)
-      : Math.max(160, parent.height - 60);
-    const dynamicMax = Math.max(computedMax, startSize);
-    const onMove = (ev: MouseEvent) => {
-      let next = startSize;
-      if (side === "bottom") next = startSize - (ev.clientY - startY);
-      if (side === "top")    next = startSize + (ev.clientY - startY);
-      if (side === "left")   next = startSize + (ev.clientX - startX);
-      if (side === "right")  next = startSize - (ev.clientX - startX);
-      set({ size: Math.max(120, Math.min(dynamicMax, next)) });
-    };
-    const onUp = () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-      document.body.style.cursor = "";
-    };
-    document.body.style.cursor = (side === "left" || side === "right") ? "ew-resize" : "ns-resize";
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-  };
-
+  // Split-bar resize between the two dock panes — internal to the dock,
+  // bounded 0.2–0.8 so a pane can never collapse.
   const onSplit = (e: React.MouseEvent) => {
     e.preventDefault();
-    const startR = splitRatio;
-    const splitVertical = (side === "bottom" || side === "top");
+    const splitVertical = isHorizontal; // bottom/top dock → panes side by side
     const bodyEl = (e.currentTarget as HTMLElement).parentElement!;
     const rect = bodyEl.getBoundingClientRect();
-    void startR;
     const onMove = (ev: MouseEvent) => {
-      let r: number;
-      if (splitVertical) r = (ev.clientX - rect.left) / rect.width;
-      else r = (ev.clientY - rect.top) / rect.height;
+      const r = splitVertical
+        ? (ev.clientX - rect.left) / rect.width
+        : (ev.clientY - rect.top) / rect.height;
       set({ splitRatio: Math.max(0.2, Math.min(0.8, r)) });
     };
     const onUp = () => {
@@ -89,112 +142,56 @@ export function DockHost({ dockState, setDockState, fileContents }: any) {
     window.addEventListener("mouseup", onUp);
   };
 
-  const [draggingDock, setDraggingDock] = useState(false);
-  const [hoverZone, setHoverZone] = useState<string | null>(null);
-
-  const onDockDragStart = (e: React.DragEvent) => {
-    setDraggingDock(true);
-    e.dataTransfer.setData("text/plain", "dock");
-    e.dataTransfer.effectAllowed = "move";
-    const el = document.createElement("div");
-    el.style.width = "100px"; el.style.height = "30px";
-    el.style.background = "rgba(224,142,254,0.4)";
-    el.style.borderRadius = "8px";
-    document.body.appendChild(el);
-    e.dataTransfer.setDragImage(el, 50, 15);
-    setTimeout(() => document.body.removeChild(el), 0);
-  };
-  const onDockDragEnd = () => { setDraggingDock(false); setHoverZone(null); };
-
   const activeTab = tabs.find((t: any) => t.id === activeId);
   const splitTab = split && splitId ? tabs.find((t: any) => t.id === splitId) : null;
-  const isHorizontal = side === "bottom" || side === "top";
 
-  const grid = (() => {
-    if (side === "bottom") return { gridTemplate: `1fr ${size}px / 1fr`, areas: `"main" "dock"` };
-    if (side === "top")    return { gridTemplate: `${size}px 1fr / 1fr`, areas: `"dock" "main"` };
-    if (side === "left")   return { gridTemplate: `1fr / ${size}px 1fr`, areas: `"dock main"` };
-    if (side === "right")  return { gridTemplate: `1fr / 1fr ${size}px`, areas: `"main dock"` };
-    return { gridTemplate: `1fr / 1fr`, areas: `"main"` };
-  })();
-
-  return {
-    gridStyle: { gridTemplate: grid.gridTemplate, gridTemplateAreas: grid.areas },
-    dockNode: (
-      <div
-        className={"dock dock-" + side}
-        style={{ gridArea: "dock" }}
-        ref={dragRef}
-      >
+  return (
+    <div className={"dock dock-" + side} style={{ width: "100%", height: "100%" }}>
+      <div className="dock-chrome">
         <div
-          className={"dock-resize " + (isHorizontal ? "h" : "v")}
-          style={
-            side === "bottom" ? { top: -2, left: 0, right: 0 } :
-            side === "top"    ? { bottom: -2, left: 0, right: 0 } :
-            side === "left"   ? { right: -2, top: 0, bottom: 0 } :
-                                { left: -2, top: 0, bottom: 0 }
-          }
-          onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); onResize(e); }}
+          className="dock-drag"
+          title="Drag to dock to a different edge"
+          draggable
+          onDragStart={onDockDragStart}
+          onDragEnd={onDockDragEnd}
         />
-        <div className="dock-chrome">
-          <div
-            className="dock-drag"
-            title="Drag to dock to a different edge"
-            draggable
-            onDragStart={onDockDragStart}
-            onDragEnd={onDockDragEnd}
-          />
-          <div className="dock-tabs">
-            {tabs.map((t: any) => (
-              <button
-                key={t.id}
-                className={"dock-tab kind-" + t.kind + (t.id === activeId ? " active" : "")}
-                onClick={() => set({ activeId: t.id })}
-              >
-                <span className="led"></span>
-                <span>{t.name}</span>
-                <span className="x" onClick={(e) => { e.stopPropagation(); closeTab(t.id); }}>×</span>
-              </button>
-            ))}
-            <DockAddMenu onPick={addTab}/>
-          </div>
-          <div className="dock-actions">
-            <button className={"dock-act" + (split ? " on" : "")} title="Split pane" onClick={toggleSplit}>
-              <Icon name="diff" size={13}/>
+        <div className="dock-tabs">
+          {tabs.map((t: any) => (
+            <button
+              key={t.id}
+              className={"dock-tab kind-" + t.kind + (t.id === activeId ? " active" : "")}
+              onClick={() => set({ activeId: t.id })}
+            >
+              <span className="led"></span>
+              <span>{t.name}</span>
+              <span className="x" onClick={(e) => { e.stopPropagation(); closeTab(t.id); }}>×</span>
             </button>
-            <DockSideMenu side={side} onPick={moveDock}/>
-            <button className="dock-act" title="Maximize" onClick={() => set({ size: Math.max(size, 540) })}>
-              <Icon name="up" size={13}/>
-            </button>
-          </div>
+          ))}
+          <DockAddMenu onPick={addTab}/>
         </div>
-        <div className={"dock-body " + (split ? (isHorizontal ? "split-h" : "split-v") : "")}>
-          <div className="dock-pane" style={split ? { flex: splitRatio } : {}}>
-            <DockPaneContent tab={activeTab} fileContents={fileContents}/>
-          </div>
-          {split && splitTab && <>
-            <div className={"dock-split-bar " + (isHorizontal ? "h" : "v")} onMouseDown={onSplit}></div>
-            <div className="dock-pane" style={{ flex: 1 - splitRatio }}>
-              <DockPaneContent tab={splitTab} fileContents={fileContents}/>
-            </div>
-          </>}
+        <div className="dock-actions">
+          <button className={"dock-act" + (split ? " on" : "")} title="Split pane" onClick={toggleSplit}>
+            <Icon name="diff" size={13}/>
+          </button>
+          <DockSideMenu side={side} onPick={moveDock}/>
+          <button className="dock-act" title="Maximize" onClick={maximize}>
+            <Icon name="up" size={13}/>
+          </button>
         </div>
       </div>
-    ),
-    dropZones: draggingDock && (
-      <div className="dock-zones">
-        {["bottom", "top", "left", "right"].map(z => (
-          <div
-            key={z}
-            className={"dock-zone zone-" + z + (hoverZone === z ? " over" : "")}
-            onDragOver={(e) => { e.preventDefault(); setHoverZone(z); }}
-            onDragLeave={() => setHoverZone(null)}
-            onDrop={(e) => { e.preventDefault(); moveDock(z); setDraggingDock(false); setHoverZone(null); }}
-          >dock {z}</div>
-        ))}
+      <div className={"dock-body " + (split ? (isHorizontal ? "split-h" : "split-v") : "")}>
+        <div className="dock-pane" style={split ? { flex: splitRatio } : {}}>
+          <DockPaneContent tab={activeTab} fileContents={fileContents}/>
+        </div>
+        {split && splitTab && <>
+          <div className={"dock-split-bar " + (isHorizontal ? "h" : "v")} onMouseDown={onSplit}></div>
+          <div className="dock-pane" style={{ flex: 1 - splitRatio }}>
+            <DockPaneContent tab={splitTab} fileContents={fileContents}/>
+          </div>
+        </>}
       </div>
-    ),
-  };
+    </div>
+  );
 }
 
 function DockAddMenu({ onPick }: { onPick: (k: string) => void }) {
@@ -1349,10 +1346,4 @@ export function ProfileView() {
       </div>
     </div>
   );
-}
-
-// Wrap DockHost (returns a non-element object) into a renderable component.
-export function DockHostMount(props: any) {
-  const r = DockHost(props) as any;
-  return <>{r.dockNode}{r.dropZones}</>;
 }

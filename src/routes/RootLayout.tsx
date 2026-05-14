@@ -25,7 +25,7 @@ import {
 } from "@/components/components";
 import { ChatSidebar } from "@/features/chat/chat-sidebar";
 import {
-  DockHostMount,
+  DockWorkspace,
   ContextMenu,
   AccountDropdown,
   FloatChat,
@@ -568,6 +568,20 @@ export function RootLayout() {
     setMessages, setOpenFiles, setActiveFile, setFileContents, setGenerationsPersisted,
   ]);
 
+  // The per-view content (the routed <Outlet/> + the absolute annotation layer).
+  // Reused in both the plain (flex) layout and the resizable dock workspace.
+  const editorBody = (
+    <>
+      <Suspense fallback={<div className="loading"><div className="ring"></div></div>}>
+        <Outlet/>
+      </Suspense>
+      <AnnotationLayer
+        annotations={annotations}
+        onRemove={(id: number) => setAnnotations(a => a.filter(x => x.id !== id))}
+      />
+    </>
+  );
+
   return (
     <ShellContext.Provider value={shellValue}>
       <>
@@ -593,23 +607,8 @@ export function RootLayout() {
             <SidePanel width={sideWidth} setWidth={setSideWidth} collapsed={sideCollapsed}>
               {sidePanel}
             </SidePanel>
-            <div
-              className={"content" + (isCode ? " workspace" : "")}
-              style={isCode ? {
-                display: "grid",
-                gridTemplate:
-                  dockState.side === "bottom" ? `auto 1fr ${dockState.size}px / 1fr` :
-                  dockState.side === "top"    ? `auto ${dockState.size}px 1fr / 1fr` :
-                  dockState.side === "left"   ? `auto 1fr / ${dockState.size}px 1fr` :
-                                                `auto 1fr / 1fr ${dockState.size}px`,
-                gridTemplateAreas:
-                  dockState.side === "bottom" ? `"head" "main" "dock"` :
-                  dockState.side === "top"    ? `"head" "dock" "main"` :
-                  dockState.side === "left"   ? `"head head" "dock main"` :
-                                                `"head head" "main dock"`,
-              } : {}}
-            >
-              <div className="content-head" style={isCode ? { gridArea: "head" } : {}}>
+            <div className="content">
+              <div className="content-head">
                 <div className="content-title">{heading.title}</div>
                 <div className="content-sub">{heading.sub}</div>
                 <div style={{ flex: 1 }}/>
@@ -627,24 +626,20 @@ export function RootLayout() {
                   <button className="lgb lgb-sm"><Icon name="download" size={11}/> Export</button>
                 </>}
               </div>
-              <div
-                className="content-body"
-                style={isCode ? { gridArea: "main", position: "relative" } : { position: "relative" }}
-              >
-                <Suspense fallback={<div className="loading"><div className="ring"></div></div>}>
-                  <Outlet/>
-                </Suspense>
-                <AnnotationLayer
-                  annotations={annotations}
-                  onRemove={(id: number) => setAnnotations(a => a.filter(x => x.id !== id))}
-                />
-              </div>
-              {isCode && (
-                <DockHostMount
+              {isCode ? (
+                <DockWorkspace
                   dockState={dockState}
                   setDockState={setDockState}
                   fileContents={fileContents}
-                />
+                >
+                  <div className="content-body" style={{ position: "relative", height: "100%" }}>
+                    {editorBody}
+                  </div>
+                </DockWorkspace>
+              ) : (
+                <div className="content-body" style={{ position: "relative" }}>
+                  {editorBody}
+                </div>
               )}
             </div>
           </div>
