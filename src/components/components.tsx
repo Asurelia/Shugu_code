@@ -54,7 +54,7 @@ export function LiquidLayers() {
 }
 
 // ── Titlebar ────────────────────────────────────────────────
-export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, sideCollapsed, onToggleSide }: any) {
+export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettings, sideCollapsed, onToggleSide }: any) {
   return (
     <div className="titlebar">
       <div className="traffic">
@@ -82,9 +82,11 @@ export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, sideColl
         <span className="kbd">⌘K</span>
       </div>
       <div className="tb-spacer"></div>
+      {/* TODO(Pass 2): wire to command */}
       <button className="tb-action" title="History"><Icon name="history" size={15}/></button>
+      {/* TODO(Pass 2): wire to command */}
       <button className="tb-action" title="Notifications"><Icon name="bell" size={15}/></button>
-      <button className="tb-action" title="Settings"><Icon name="gear" size={15}/></button>
+      <button className="tb-action" title="Settings" onClick={onSettings}><Icon name="gear" size={15}/></button>
       <button className="tb-avatar" title="Account" onClick={onAvatar}>
         <span>VU</span>
         <span className="online"></span>

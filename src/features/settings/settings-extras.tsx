@@ -5,61 +5,38 @@ import { useState, useEffect } from "react";
 import { Icon } from "@/components/components";
 import { SettingRow, Switch } from "@/features/code/views-code";
 import { db } from "@/lib/db";
+import { COMMANDS } from "@/lib/commands";
 
-export const DEFAULT_SHORTCUTS = [
-  { group: "General", items: [
-    { id: "open-palette",  label: "Open command palette",   keys: ["Cmd", "K"] },
-    { id: "toggle-side",   label: "Toggle side panel",      keys: ["Cmd", "B"] },
-    { id: "toggle-tweaks", label: "Toggle Tweaks panel",    keys: ["Cmd", ","] },
-    { id: "settings",      label: "Open Settings",          keys: ["Cmd", "Shift", ","] },
-    { id: "find-global",   label: "Find anywhere",          keys: ["Cmd", "P"] },
-  ]},
-  { group: "Navigation", items: [
-    { id: "view-chat",    label: "Open Chat",               keys: ["Cmd", "Shift", "C"] },
-    { id: "view-code",    label: "Open Editor",             keys: ["Cmd", "Shift", "E"] },
-    { id: "view-image",   label: "Open Image Studio",       keys: ["Cmd", "Shift", "I"] },
-    { id: "view-agents",  label: "Open Agents",             keys: ["Cmd", "Shift", "A"] },
-    { id: "view-gallery", label: "Open Gallery",            keys: ["Cmd", "Shift", "G"] },
-    { id: "next-tab",     label: "Next tab",                keys: ["Ctrl", "Tab"] },
-    { id: "prev-tab",     label: "Previous tab",            keys: ["Ctrl", "Shift", "Tab"] },
-  ]},
-  { group: "Chat", items: [
-    { id: "new-chat",      label: "New conversation",       keys: ["Cmd", "N"] },
-    { id: "send-message",  label: "Send message",           keys: ["Enter"] },
-    { id: "new-line",      label: "New line",               keys: ["Shift", "Enter"] },
-    { id: "focus-float",   label: "Focus floating chat",    keys: ["Cmd", "Shift", "Space"] },
-    { id: "switch-model",  label: "Switch model",           keys: ["Cmd", "/"] },
-    { id: "regenerate",    label: "Regenerate last reply",  keys: ["Cmd", "R"] },
-  ]},
-  { group: "Editor", items: [
-    { id: "save-file",     label: "Save file",              keys: ["Cmd", "S"] },
-    { id: "save-all",      label: "Save all",               keys: ["Cmd", "Alt", "S"] },
-    { id: "find",          label: "Find in file",           keys: ["Cmd", "F"] },
-    { id: "replace",       label: "Replace",                keys: ["Cmd", "Alt", "F"] },
-    { id: "toggle-terminal", label: "Toggle terminal",      keys: ["Cmd", "`"] },
-    { id: "toggle-diff",   label: "Toggle diff view",       keys: ["Cmd", "D"] },
-    { id: "ai-rewrite",    label: "AI rewrite selection",   keys: ["Cmd", "E"] },
-    { id: "ai-explain",    label: "Explain selection",      keys: ["Cmd", "Shift", "E"] },
-  ]},
-  { group: "Image", items: [
-    { id: "img-generate",  label: "Generate",               keys: ["Cmd", "Enter"] },
-    { id: "img-variation", label: "Variations of current",  keys: ["Cmd", "Shift", "V"] },
-    { id: "img-save",      label: "Save to gallery",        keys: ["Cmd", "S"] },
-  ]},
-  { group: "Annotations", items: [
-    { id: "anno-comment",  label: "Add comment to selection", keys: ["Cmd", "Shift", "M"] },
-    { id: "anno-flag",     label: "Add flag",               keys: ["Cmd", "Shift", "F"] },
-    { id: "anno-pin",      label: "Pin to floating chat",   keys: ["Cmd", "P"] },
-  ]},
-  { group: "Conversation list", items: [
-    { id: "list-pin",      label: "Pin / unpin",            keys: ["P"] },
-    { id: "list-rename",   label: "Rename",                 keys: ["R"] },
-    { id: "list-unread",   label: "Toggle unread",          keys: ["U"] },
-    { id: "list-duplicate",label: "Duplicate",              keys: ["F"] },
-    { id: "list-archive",  label: "Archive",                keys: ["A"] },
-    { id: "list-delete",   label: "Delete",                 keys: ["Shift", "D"] },
-  ]},
-];
+// ─── DEFAULT_SHORTCUTS derived from COMMANDS ──────────────────
+//
+// Single source of truth: COMMANDS array in src/lib/commands.ts.
+// This function groups commands by category and maps each to the
+// {id, label, keys} shape that ShortcutsSettings expects.
+//
+// Only commands with a keybinding are included (palette-only commands
+// like set-model* are omitted since they have no chord to display).
+// Input-local commands (scope: "input") ARE included so they remain
+// visible in the shortcuts editor — the dispatcher itself won't fire them.
+
+function buildDefaultShortcuts(): Array<{ group: string; items: Array<{ id: string; label: string; keys: string[] }> }> {
+  const groups = new Map<string, Array<{ id: string; label: string; keys: string[] }>>();
+
+  for (const cmd of COMMANDS) {
+    if (!cmd.keybinding || cmd.keybinding.length === 0) continue;
+
+    const group = cmd.category;
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group)!.push({
+      id: cmd.id,
+      label: cmd.title,
+      keys: cmd.keybinding,
+    });
+  }
+
+  return [...groups.entries()].map(([group, items]) => ({ group, items }));
+}
+
+export const DEFAULT_SHORTCUTS = buildDefaultShortcuts();
 
 export const DEFAULT_INTERFACE = {
   fontScale: 100,

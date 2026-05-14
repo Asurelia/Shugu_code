@@ -49,6 +49,8 @@ import { seedGalleryFolders } from "@/mocks/seedGalleryFolders";
 import { seedMessages } from "@/mocks/seedMessages";
 import type { DockState } from "@/lib/types";
 import { db, seedIfEmpty, toGenerationRow } from "@/lib/db";
+import { COMMANDS, getCommandById, type CommandContext } from "@/lib/commands";
+import { useCommandKeybindings } from "@/lib/keybindings";
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -126,45 +128,53 @@ const TWEAK_DEFAULTS = {
 
 // ─── CommandPalette (moved from App.tsx) ─────────────────────
 
-function CommandPalette({ open, onClose, setView, onNewChat }: any) {
+function CommandPalette({ open, onClose, ctx }: { open: boolean; onClose: () => void; ctx: CommandContext }) {
   const [q, setQ] = useState("");
   const [idx, setIdx] = useState(0);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
-  const cmds = useMemo(() => [
-    { id: "view-chat",     group: "Navigate", name: "Open Chat",         hint: "switch to conversation",      icon: "chat",    kbd: "⇧⌘C", run: () => setView("chat") },
-    { id: "view-code",     group: "Navigate", name: "Open Editor",       hint: "switch to code editor",       icon: "code",    kbd: "⇧⌘E", run: () => setView("code") },
-    { id: "view-image",    group: "Navigate", name: "Open Image Studio", hint: "switch to image generator",   icon: "image",   kbd: "⇧⌘I", run: () => setView("image") },
-    { id: "view-agents",   group: "Navigate", name: "Show Agents",       hint: "background workers",          icon: "agent",   kbd: "⇧⌘A", run: () => setView("agents") },
-    { id: "view-gallery",  group: "Navigate", name: "Open Gallery",      hint: "past generations",            icon: "gallery", kbd: "⇧⌘G", run: () => setView("gallery") },
-    { id: "new-chat",      group: "Create",   name: "New Conversation",  hint: "fresh chat",                  icon: "plus",    kbd: "⌘N",  run: () => { setView("chat"); onNewChat(); } },
-    { id: "new-image",     group: "Create",   name: "Generate Image…",   hint: "open prompt with cursor",     icon: "sparkle",              run: () => setView("image") },
-    { id: "new-agent",     group: "Create",   name: "Dispatch Agent…",   hint: "background task",             icon: "agent",                run: () => setView("agents") },
-    { id: "set-model",     group: "Models",   name: "Switch Model · shugu-sonnet-5",   hint: "balanced · 200k ctx", icon: "sparkle", run: () => {} },
-    { id: "set-model-h",   group: "Models",   name: "Switch Model · shugu-haiku-4-5",  hint: "fast · default",      icon: "sparkle", run: () => {} },
-    { id: "set-model-l",   group: "Models",   name: "Switch Model · local qwen-32b",   hint: "ollama",              icon: "sparkle", run: () => {} },
-    { id: "view-settings", group: "Tools",    name: "Settings",          hint: "preferences",                 icon: "gear",    kbd: "⌘,",  run: () => setView("settings") },
-  ], [setView, onNewChat]);
+  // Build the active command list from COMMANDS, filtered by when() and search query.
+  // Commands with when()===false are hidden (Pass 1 behaviour: filter rather than grey-out).
+  // Input-local commands and commands without icons are excluded from palette display.
+  const activeCmds = useMemo(() => {
+    return COMMANDS.filter(c => {
+      if (c.scope === "input") return false;
+      if (c.when && !c.when(ctx)) return false;
+      return true;
+    });
+  }, [ctx]);
 
   const filtered = useMemo(() => {
     const qq = q.trim().toLowerCase();
-    if (!qq) return cmds;
-    return cmds.filter(c => (c.name + " " + (c.hint || "")).toLowerCase().includes(qq));
-  }, [q, cmds]);
+    if (!qq) return activeCmds;
+    return activeCmds.filter(c =>
+      (c.title + " " + (c.description || "")).toLowerCase().includes(qq)
+    );
+  }, [q, activeCmds]);
 
   useEffect(() => { setIdx(0); }, [q]);
   useEffect(() => {
     if (open) requestAnimationFrame(() => inputRef.current?.focus());
   }, [open]);
 
+  // Group by category (replaces old group field).
   const grouped = useMemo(() => {
-    const m = new Map<string, typeof cmds>();
+    const m = new Map<string, typeof filtered>();
     filtered.forEach(c => {
-      if (!m.has(c.group)) m.set(c.group, []);
-      m.get(c.group)!.push(c);
+      if (!m.has(c.category)) m.set(c.category, []);
+      m.get(c.category)!.push(c);
     });
     return [...m.entries()];
   }, [filtered]);
+
+  // Format keybinding tokens into a display string (e.g. ["Cmd","K"] → "⌘K").
+  const fmtKbd = (tokens: string[] | undefined): string => {
+    if (!tokens || tokens.length === 0) return "";
+    const map: Record<string, string> = {
+      Cmd: "⌘", Ctrl: "⌃", Alt: "⌥", Shift: "⇧", Enter: "↵", Tab: "⇥", Space: "␣",
+    };
+    return tokens.map(t => map[t] ?? t).join("");
+  };
 
   const onKey = (e: React.KeyboardEvent) => {
     if (e.key === "Escape") { e.preventDefault(); onClose(); return; }
@@ -173,7 +183,7 @@ function CommandPalette({ open, onClose, setView, onNewChat }: any) {
     if (e.key === "Enter") {
       e.preventDefault();
       const c = filtered[idx];
-      if (c) { c.run(); onClose(); }
+      if (c) { void c.run(ctx); onClose(); }
     }
   };
 
@@ -194,19 +204,20 @@ function CommandPalette({ open, onClose, setView, onNewChat }: any) {
               <div className="palette-section-label">{group}</div>
               {items.map(c => {
                 const me = cursor++;
+                const kbd = fmtKbd(c.keybinding);
                 return (
                   <div
                     key={c.id}
                     className={"palette-item" + (me === idx ? " active" : "")}
                     onMouseEnter={() => setIdx(me)}
-                    onClick={() => { c.run(); onClose(); }}
+                    onClick={() => { void c.run(ctx); onClose(); }}
                   >
-                    <div className="ico"><Icon name={c.icon} size={13}/></div>
+                    <div className="ico"><Icon name={c.icon ?? "search"} size={13}/></div>
                     <div className="body">
-                      <div className="name">{c.name}</div>
-                      {c.hint && <div className="hint">{c.hint}</div>}
+                      <div className="name">{c.title}</div>
+                      {c.description && <div className="hint">{c.description}</div>}
                     </div>
-                    {c.kbd && <span className="kbd">{c.kbd}</span>}
+                    {kbd && <span className="kbd">{kbd}</span>}
                   </div>
                 );
               })}
@@ -410,20 +421,6 @@ export function RootLayout() {
     root.style.setProperty("--lg-tint", `rgba(18, 14, 30, ${tweaks.glassTint / 100})`);
   }, [tweaks.palette, tweaks.glassBlur, tweaks.glassTint]);
 
-  // Cmd+K
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        setPaletteOpen(true);
-      } else if (e.key === "Escape" && paletteOpen) {
-        setPaletteOpen(false);
-      }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [paletteOpen]);
-
   // Right-click context menu
   const onContext = useCallback((e: React.MouseEvent) => {
     const t = e.target as HTMLElement;
@@ -472,6 +469,43 @@ export function RootLayout() {
   const navigateTo = useCallback((v: string) => {
     navigate({ to: railTargetFor(v) as any });
   }, [navigate]);
+
+  // ── CommandContext ─────────────────────────────────────────
+  // Assembled from RootLayout-local state. NOT lifted into ShellContext.
+  // Must be declared AFTER navigateTo, newChat, onAnnotate, setTweak, etc.
+  // setTweak is wrapped to satisfy the generic (key: string, value: any) signature.
+  const cmdCtx: CommandContext = useMemo(() => ({
+    navigateTo,
+    currentView: view,
+    setPaletteOpen,
+    sideCollapsed,
+    setSideCollapsed,
+    dockState,
+    setDockState,
+    tweaks,
+    setTweak: (key: string, value: any) => setTweak(key as any, value),
+    newChat,
+    messages,
+    setMessages,
+    openFiles,
+    activeFile,
+    generations,
+    agents,
+    onAnnotate,
+  }), [
+    navigateTo, view, setPaletteOpen,
+    sideCollapsed, setSideCollapsed,
+    dockState, setDockState,
+    tweaks, setTweak,
+    newChat, messages, setMessages,
+    openFiles, activeFile,
+    generations, agents,
+    onAnnotate,
+  ]);
+
+  // Global keybinding dispatcher — replaces the hardcoded Cmd+K useEffect.
+  // Escape-to-close is handled inside CommandPalette's own onKey handler.
+  useCommandKeybindings(cmdCtx);
 
   // SideSettings section navigation
   const onSideSettingsSection = useCallback((s: string) => {
@@ -599,6 +633,7 @@ export function RootLayout() {
           <Titlebar
             onSearch={() => setPaletteOpen(true)}
             onAvatar={() => setAccountOpen(o => !o)}
+            onSettings={() => getCommandById("open-settings")?.run(cmdCtx)}
             sideCollapsed={sideCollapsed}
             onToggleSide={() => setSideCollapsed(c => !c)}
           />
@@ -663,8 +698,7 @@ export function RootLayout() {
         <CommandPalette
           open={paletteOpen}
           onClose={() => setPaletteOpen(false)}
-          setView={navigateTo}
-          onNewChat={newChat}
+          ctx={cmdCtx}
         />
 
         <TweaksPanel title="Tweaks">
