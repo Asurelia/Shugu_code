@@ -49,8 +49,20 @@ export function useConversations(): ConversationsResult {
   // --- Resolution ---
 
   if (inTauri) {
-    // SQLite is the primary source. Convex data is available for future reconciliation.
-    // TODO: Convex↔SQLite reconciliation — merge convexData into SQLite when available.
+    // ---------------------------------------------------------------------------
+    // Convex↔SQLite strategy — LOCAL-FIRST, SQLite is the source of truth.
+    //
+    // When Convex is enabled it is a one-way sync TARGET:
+    //   - Local changes should be pushed UP to Convex (follow-up work).
+    //   - Convex data is NEVER pulled down as authoritative here.
+    //   - Full bidirectional reconciliation with conflict resolution is a
+    //     deliberate follow-up — do not implement ad-hoc merges here.
+    //
+    // Consequence: convexData is intentionally unused in the Tauri branch.
+    // The source field is always "sqlite" whenever SQLite has data.
+    // Convex is subscribed (useQuery above) so its connection is kept live
+    // for future push-up writes, but it never overwrites the returned data.
+    // ---------------------------------------------------------------------------
     return {
       data: sqliteData ?? [],
       isLoading: sqliteLoading,

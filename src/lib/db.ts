@@ -10,6 +10,8 @@
  * never tries to resolve the native Tauri plugin module.
  */
 
+import type { Generation } from "@/lib/types";
+
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -151,6 +153,28 @@ export function convoToRow(c: ConvoUI): ConversationRow {
   };
 }
 
+/**
+ * Convert a Generation UI shape to a GenerationRow for SQLite persistence.
+ * id: string coercion; ts: numeric guard; nullable fields default to null.
+ */
+export function toGenerationRow(g: Generation): GenerationRow {
+  return {
+    id: String(g.id),
+    prompt: g.prompt,
+    negative: null,
+    ratio: g.ratio ?? null,
+    model: g.model ?? null,
+    seed: g.seed ?? null,
+    steps: g.steps ?? null,
+    guidance: g.guidance ?? null,
+    style: g.style ?? null,
+    hue: g.hue ?? null,
+    status: null,
+    result_url: null,
+    ts: Number(g.ts) || Date.now(),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // conversations
 // ---------------------------------------------------------------------------
@@ -247,6 +271,34 @@ const conversations = {
          r.unread, r.env, r.parent_id, r.updated_at]
       );
     }
+  },
+
+  /**
+   * Load all conversations and reconstruct the parent→children tree from
+   * the flat parent_id foreign key. Rows with parent_id == null are top-level;
+   * rows with a parent_id are attached to their parent's children[] array.
+   * Orphaned rows (parent_id set but parent not found) are kept as top-level
+   * rather than silently dropped. Top-level order matches list() (updated DESC).
+   *
+   * The existing flat list() is left untouched for callers that want flat rows.
+   */
+  async listNested(): Promise<ConvoUI[]> {
+    const rows = await conversations.list();
+    const byId = new Map<string, ConvoUI>();
+    const ui = rows.map(rowToConvo);
+    for (const c of ui) {
+      byId.set(c.id, { ...c, children: [] });
+    }
+    const top: ConvoUI[] = [];
+    for (const c of ui) {
+      const node = byId.get(c.id)!;
+      if (c.parent_id && byId.has(c.parent_id)) {
+        byId.get(c.parent_id)!.children!.push(node);
+      } else {
+        top.push(node);
+      }
+    }
+    return top;
   },
 };
 

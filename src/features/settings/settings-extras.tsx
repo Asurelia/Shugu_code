@@ -105,6 +105,23 @@ export function saveJSON(key: string, val: any) {
   void db.settings.set(key, JSON.stringify(val));
 }
 
+/**
+ * Hydrate localStorage from SQLite on startup.
+ * Only writes keys ABSENT from localStorage (localStorage-present wins,
+ * since it is the live session store). This recovers a fresh session on a
+ * machine that has SQLite data but cleared localStorage (e.g. after a
+ * browser cache wipe or cross-device sync).
+ * No-op in web mode (db.settings.all() returns [] when getDb() is null).
+ */
+export async function hydrateSettingsFromSqlite(): Promise<void> {
+  const rows = await db.settings.all();
+  for (const row of rows) {
+    if (localStorage.getItem(row.key) === null) {
+      try { localStorage.setItem(row.key, row.value); } catch { /* quota / disabled */ }
+    }
+  }
+}
+
 export function applyInterfaceVars(s: typeof DEFAULT_INTERFACE) {
   const r = document.documentElement;
   r.style.setProperty("--ui-font-scale", (s.fontScale / 100).toString());

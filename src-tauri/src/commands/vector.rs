@@ -59,12 +59,28 @@ fn get_conn(app: &tauri::AppHandle) -> Result<&'static Mutex<Connection>, String
     }
 
     // Resolve to the exact same path as tauri-plugin-sql.
+    // tauri-plugin-sql v2 (wrapper.rs) calls `app.path().app_config_dir()`
+    // then pushes the bare db name from after the `sqlite:` prefix.
     // On Windows this is %APPDATA%\dev.shugu.forge\shugu.db (Roaming).
     let db_path = app
         .path()
         .app_config_dir()
         .map_err(|e| format!("cannot resolve app config dir: {e}"))?
         .join("shugu.db");
+
+    // Log the resolved path once at startup so developers can verify it
+    // matches what tauri-plugin-sql uses (both call app_config_dir()).
+    static LOG_ONCE: OnceLock<()> = OnceLock::new();
+    LOG_ONCE.get_or_init(|| {
+        eprintln!("[vector] shugu.db resolved to: {}", db_path.display());
+    });
+
+    // Ensure the parent directory exists (mirrors what tauri-plugin-sql does
+    // via create_dir_all before its own Connection::open).
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create app config dir: {e}"))?;
+    }
 
     // Extension must be registered before any Connection::open.
     register_vec_extension();

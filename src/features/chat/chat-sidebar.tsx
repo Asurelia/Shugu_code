@@ -3,7 +3,7 @@
 
 import { useState, useEffect, useRef, useMemo } from "react";
 import { Icon } from "@/components/components";
-import { db, rowToConvo, convoToRow } from "@/lib/db";
+import { db, convoToRow } from "@/lib/db";
 import { seedIfEmpty } from "@/lib/db";
 
 export const SEED_GROUPS = [
@@ -65,13 +65,16 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
   }, [activeId, convos, onActiveTitle]);
 
   // Hydrate from SQLite on mount (Tauri mode only; no-op in web mode).
+  // listNested() reconstructs the parent→children tree from parent_id so that
+  // sub-conversations (e.g. c6a/c6b under c6) are properly nested instead of
+  // appearing as flat top-level rows after a SQLite round-trip.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       await seedIfEmpty();
-      const rows = await db.conversations.list();
-      if (!cancelled && rows.length > 0) {
-        setConvos(rows.map(rowToConvo));
+      const nested = await db.conversations.listNested();
+      if (!cancelled && nested.length > 0) {
+        setConvos(nested);
       }
     })();
     return () => { cancelled = true; };

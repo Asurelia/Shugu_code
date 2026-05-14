@@ -48,7 +48,7 @@ import { seedGenerations } from "@/mocks/seedGenerations";
 import { seedGalleryFolders } from "@/mocks/seedGalleryFolders";
 import { seedMessages } from "@/mocks/seedMessages";
 import type { DockState } from "@/lib/types";
-import { db, seedIfEmpty } from "@/lib/db";
+import { db, seedIfEmpty, toGenerationRow } from "@/lib/db";
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -319,6 +319,24 @@ export function RootLayout() {
 
   // Image / gallery state
   const [generations, setGenerations] = useState(seedGenerations);
+
+  /**
+   * Write-through wrapper: whenever a generation is ADDED (new id appears),
+   * persist it to SQLite via db.generations.create. No-op in web mode since
+   * getDb() returns null when not running under Tauri.
+   */
+  const setGenerationsPersisted: React.Dispatch<React.SetStateAction<any[]>> = useCallback(
+    (updater) => {
+      setGenerations((prev) => {
+        const next: any[] = typeof updater === "function" ? (updater as (p: any[]) => any[])(prev) : updater;
+        const added = next.filter((g) => !prev.some((p) => p.id === g.id));
+        added.forEach((g) => void db.generations.create(toGenerationRow(g)));
+        return next;
+      });
+    },
+    []
+  );
+
   const [galleryFolders] = useState(seedGalleryFolders);
   const [activeFolder, setActiveFolder] = useState("g1");
 
@@ -354,8 +372,7 @@ export function RootLayout() {
 
   // Hydrate generations from SQLite on mount (Tauri mode only).
   // seedIfEmpty() ensures a fresh DB has prototype data on first run.
-  // TODO: write-through on new generation — wire db.generations.create()
-  //        inside ImageView / wherever setGenerations is called downstream.
+  // Write-through is handled by setGenerationsPersisted passed into ShellContext.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -544,11 +561,11 @@ export function RootLayout() {
     openFiles, setOpenFiles,
     activeFile, setActiveFile,
     fileContents, setFileContents,
-    generations, setGenerations,
+    generations, setGenerations: setGenerationsPersisted,
     agents,
   }), [
     messages, openFiles, activeFile, fileContents, generations, agents,
-    setMessages, setOpenFiles, setActiveFile, setFileContents, setGenerations,
+    setMessages, setOpenFiles, setActiveFile, setFileContents, setGenerationsPersisted,
   ]);
 
   return (
