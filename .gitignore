@@ -1,0 +1,23 @@
+node_modules
+dist
+dist-ssr
+*.local
+.vite
+.DS_Store
+*.log
+
+# editors
+.vscode/*
+!.vscode/extensions.json
+.idea
+
+# tauri
+src-tauri/target
+src-tauri/gen
+
+# convex
+.convex
+
+# design bundle (kept locally as reference, not versioned)
+_design_extracted
+_design_package.tar

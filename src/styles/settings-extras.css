@@ -1,0 +1,138 @@
+/* ── Shortcuts & Interface settings ─────────────────────────── */
+.search-icon {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--on-surface-muted);
+  pointer-events: none;
+}
+
+.shortcut-list {
+  display: grid;
+  gap: 2px;
+  margin-top: 6px;
+}
+.shortcut-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 10px;
+  align-items: center;
+  padding: 9px 10px;
+  border-radius: 8px;
+  transition: background 140ms ease;
+}
+.shortcut-row:hover { background: rgba(255,255,255,0.03); }
+.shortcut-row.active { background: rgba(224,142,254,0.08); }
+.shortcut-row .label {
+  font-size: 13px;
+  color: var(--on-surface);
+}
+.shortcut-trigger {
+  background: rgba(10,8,20,0.6);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 7px;
+  padding: 4px 8px;
+  cursor: pointer;
+  transition: all 160ms ease;
+  min-width: 100px;
+}
+.shortcut-trigger:hover { border-color: rgba(224,142,254,0.35); background: rgba(224,142,254,0.06); }
+.shortcut-trigger.recording {
+  border-color: rgba(224,142,254,0.7);
+  background: rgba(224,142,254,0.12);
+  box-shadow: 0 0 0 4px rgba(224,142,254,0.12), 0 0 18px rgba(224,142,254,0.3);
+  animation: shortcut-pulse 1.6s ease-in-out infinite;
+}
+@keyframes shortcut-pulse {
+  0%, 100% { box-shadow: 0 0 0 4px rgba(224,142,254,0.12), 0 0 18px rgba(224,142,254,0.3); }
+  50%      { box-shadow: 0 0 0 4px rgba(224,142,254,0.2),  0 0 28px rgba(224,142,254,0.5); }
+}
+.shortcut-clear {
+  width: 26px; height: 26px;
+  display: inline-grid; place-items: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--on-surface-muted);
+  cursor: pointer;
+}
+.shortcut-clear:hover { color: var(--danger); border-color: rgba(255,106,138,0.3); }
+
+.keycombo {
+  display: inline-flex; align-items: center; gap: 4px;
+  min-height: 22px;
+}
+.keycombo .kb {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 7px;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 5px;
+  color: var(--on-surface);
+  min-width: 16px;
+  text-align: center;
+}
+.keycombo.recording .kb {
+  border-color: rgba(224,142,254,0.5);
+  color: var(--primary);
+  background: rgba(224,142,254,0.10);
+}
+.keycombo .prompt {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--primary);
+  letter-spacing: 0.04em;
+  animation: pulse-text 1.2s ease-in-out infinite;
+}
+@keyframes pulse-text {
+  0%, 100% { opacity: 0.8; }
+  50% { opacity: 1; }
+}
+
+/* Interface density vars (applied via [data-density]) */
+html[data-density="compact"] {
+  --setting-row-pad: 8px 0;
+  --section-pad: 14px 16px;
+}
+html[data-density="spacious"] {
+  --setting-row-pad: 16px 0;
+  --section-pad: 26px 28px;
+}
+html[data-density="compact"] .setting-section {
+  padding: 14px 16px;
+}
+html[data-density="spacious"] .setting-section {
+  padding: 26px 28px;
+}
+html[data-density="compact"] .setting-row { padding: 8px 0; }
+html[data-density="spacious"] .setting-row { padding: 16px 0; }
+
+/* Font scale */
+html { font-size: calc(16px * var(--ui-font-scale, 1)); }
+body { font-size: 14px; }
+
+/* Animations kill switch */
+html[data-animations="off"] *,
+html[data-reducedmotion="on"] * {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+}
+
+/* Glass kill */
+html[data-glass="off"] .lg,
+html[data-glass="off"] .lg-strong,
+html[data-glass="off"] .lg-weak,
+html[data-glass="off"] .lgb,
+html[data-glass="off"] .lgi,
+html[data-glass="off"] .palette,
+html[data-glass="off"] .float-chat,
+html[data-glass="off"] .float-panel,
+html[data-glass="off"] .composer,
+html[data-glass="off"] .window {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}

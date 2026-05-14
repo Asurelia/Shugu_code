@@ -1,0 +1,81 @@
+mod commands;
+
+use tauri_plugin_sql::{Builder as SqlBuilder, Migration, MigrationKind};
+
+const MIGRATION_V1: &str = "
+CREATE TABLE IF NOT EXISTS conversations (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    project_id TEXT,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0,
+    unread INTEGER NOT NULL DEFAULT 0,
+    env TEXT,
+    parent_id TEXT,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS messages (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    role TEXT NOT NULL,
+    text TEXT,
+    body TEXT,
+    code_lang TEXT,
+    code_text TEXT,
+    image INTEGER NOT NULL DEFAULT 0,
+    ts INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    color TEXT,
+    sort_order INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS generations (
+    id TEXT PRIMARY KEY,
+    prompt TEXT NOT NULL,
+    negative TEXT,
+    ratio TEXT,
+    model TEXT,
+    seed INTEGER,
+    steps INTEGER,
+    guidance REAL,
+    style TEXT,
+    hue INTEGER,
+    status TEXT,
+    result_url TEXT,
+    ts INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at);
+";
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    let migrations = vec![Migration {
+        version: 1,
+        description: "create_initial_tables",
+        sql: MIGRATION_V1,
+        kind: MigrationKind::Up,
+    }];
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_fs::init())
+        .plugin(
+            SqlBuilder::default()
+                .add_migrations("sqlite:shugu.db", migrations)
+                .build(),
+        )
+        .invoke_handler(tauri::generate_handler![
+            commands::chat::chat_send,
+            commands::fs::fs_read_dir,
+            commands::fs::fs_read_file,
+            commands::fs::fs_write_file,
+            commands::terminal::term_run,
+            commands::image::image_generate,
+            commands::models::models_list,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}

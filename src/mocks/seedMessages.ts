@@ -1,0 +1,8 @@
+import type { Message } from "@/lib/types";
+
+export const seedMessages: Message[] = [
+  { id: 1, role: "user", text: "Comment je structure mon Tauri command pour ouvrir une fenêtre flottante de génération d'images, avec un thème dark forcé ?", ts: "14:30" },
+  { id: 2, role: "ai", ts: "14:30", body: "Tu peux utiliser `WebviewWindowBuilder` — la clé est de passer `Theme::Dark` et de désactiver les décorations pour ton chrome custom, comme ceci :", code: { lang: "rust", text: `#[tauri::command]\nfn open_forge_panel(app: tauri::AppHandle) -> Result<(), String> {\n  WebviewWindowBuilder::new(&app, "forge",\n    WebviewUrl::App("forge.html".into())\n  )\n  .title("Shugu · Forge")\n  .decorations(false)\n  .inner_size(960., 640.)\n  .theme(Some(tauri::Theme::Dark))\n  .build()\n  .map_err(|e| e.to_string())?;\n  Ok(())\n}` }},
+  { id: 3, role: "user", text: "Parfait. Et pour l'animation d'entrée glassmorph quand la fenêtre apparaît ?", ts: "14:31" },
+  { id: 4, role: "ai", ts: "14:31", body: "Trois couches : (1) Tauri émet `window-opened`, (2) ton root React applique une classe `forge--enter` avec backdrop-filter qui monte de 0 → 20px en 240ms, (3) un keyframe `scale(0.98) → scale(1)` synchronisé. Le piège : Safari/Linux ne supportent pas `backdrop-filter` animé — fallback sur opacity.", image: true },
+];

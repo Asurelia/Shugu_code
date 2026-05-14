@@ -1,0 +1,52 @@
+{
+  "name": "shugu-forge",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Shugu Forge — Tauri 2 / React / CodeMirror 6 desktop workshop (glassmorph Celestial Veil)",
+  "packageManager": "pnpm@9.7.0",
+  "engines": {
+    "pnpm": ">=9"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "typecheck": "tsc -b --noEmit",
+    "convex": "convex",
+    "convex:dev": "convex dev"
+  },
+  "dependencies": {
+    "@codemirror/commands": "^6.5.0",
+    "@codemirror/lang-javascript": "^6.2.2",
+    "@codemirror/lang-json": "^6.0.1",
+    "@codemirror/lang-markdown": "^6.2.5",
+    "@codemirror/lang-python": "^6.1.6",
+    "@codemirror/language": "^6.10.2",
+    "@codemirror/state": "^6.4.1",
+    "@codemirror/view": "^6.26.3",
+    "@convex-dev/react-query": "^0.0.0-alpha.8",
+    "@lezer/highlight": "^1.2.0",
+    "@tanstack/react-query": "^5.51.23",
+    "@tanstack/react-router": "^1.49.1",
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-sql": "^2.4.0",
+    "@xterm/addon-fit": "^0.10.0",
+    "convex": "^1.14.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-resizable-panels": "^2.0.22",
+    "xterm": "^5.3.0",
+    "zustand": "^4.5.4"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/node": "^20.14.10",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "typescript": "^5.5.3",
+    "vite": "^5.3.4"
+  }
+}
