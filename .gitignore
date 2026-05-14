@@ -27,3 +27,10 @@ _design_package.tar
 
 # TS incremental build cache
 *.tsbuildinfo
+
+# remember plugin — local session memory state (logs, tmp, pids); not source
+.remember/
+
+# playwright MCP output + smoke-test screenshots
+.playwright-mcp/
+smoke-*.png

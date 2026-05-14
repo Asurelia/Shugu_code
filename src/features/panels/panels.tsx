@@ -3,10 +3,10 @@
 
 import { useState, useEffect, useRef } from "react";
 import { Icon } from "@/components/components";
-import { Terminal } from "xterm";
-import type { ITheme } from "xterm";
+import { Terminal } from "@xterm/xterm";
+import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import "xterm/css/xterm.css";
+import "@xterm/xterm/css/xterm.css";
 import { invoke } from "@/lib/tauri";
 
 // ─── Dock host (terminal + agent chat + output + problems) ─────────
@@ -308,59 +308,84 @@ export function DockTerminal({ name }: { name: string }) {
       cursorBlink: true,
       convertEol: false,
     });
-
     const fit = new FitAddon();
     term.loadAddon(fit);
-    term.open(el);
 
-    // ResizeObserver provides the initial fit and re-fits on container resize.
-    const ro = new ResizeObserver(() => {
-      try { fit.fit(); } catch (_) { /* container may have zero dimensions briefly */ }
-    });
-    ro.observe(el);
-
-    // Print banner and initial prompt.
-    term.write(`Shugu Forge · ${name}\r\n`);
-    term.write(PROMPT);
-    term.focus();
-
-    // Line buffer — must live in a plain var, not React state, to avoid stale closures.
+    // Line buffer — plain var, not React state, to avoid stale closures.
     let lineBuf = "";
+    let opened = false;
+    let disposed = false;
+    let rafId = 0;
+    let dataSub: { dispose: () => void } | null = null;
 
-    const dataSub = term.onData((data: string) => {
-      // Backspace (\x7f): erase one character from buffer and screen.
-      if (data === "\x7f") {
-        if (lineBuf.length > 0) {
-          lineBuf = lineBuf.slice(0, -1);
-          term.write("\b \b");
+    // Two distinct hazards make a naive open()+write() throw
+    // "Cannot read properties of undefined (reading 'dimensions')":
+    //   1. open() on a 0-sized container → render service never measures.
+    //      Fix: gate open() on the container actually being laid out, driven
+    //      by the ResizeObserver (the dock pane is 0-sized on mount frame).
+    //   2. Even on a sized container, xterm's initial char-cell measurement
+    //      isn't ready on the SAME synchronous tick as open(). Writing/fitting
+    //      immediately hits Viewport.syncScrollArea before renderService
+    //      .dimensions exists. Fix: defer fit()+first write() one frame.
+    const writeInitial = () => {
+      if (disposed) return;
+      try { fit.fit(); } catch (_) { /* transient zero size */ }
+      term.write(`Shugu Forge · ${name}\r\n`);
+      term.write(PROMPT);
+      term.focus();
+      dataSub = term.onData((data: string) => {
+        // Backspace (\x7f): erase one character from buffer and screen.
+        if (data === "\x7f") {
+          if (lineBuf.length > 0) {
+            lineBuf = lineBuf.slice(0, -1);
+            term.write("\b \b");
+          }
+          return;
         }
+        // Enter (\r): run the buffered command.
+        if (data === "\r") {
+          const cmd = lineBuf.trim();
+          lineBuf = "";
+          term.write("\r\n");
+          if (cmd) {
+            invoke<string>("term_run", { command: cmd }).then((out) => {
+              term.write(out + "\r\n" + PROMPT);
+            });
+          } else {
+            term.write(PROMPT);
+          }
+          return;
+        }
+        // Printable characters: echo and append to buffer.
+        if (data >= " " || data === "\t") {
+          lineBuf += data;
+          term.write(data);
+        }
+      });
+    };
+
+    const initOrFit = () => {
+      if (disposed) return;
+      if (opened) {
+        try { fit.fit(); } catch (_) { /* transient zero size */ }
         return;
       }
+      if (el.clientWidth === 0 || el.clientHeight === 0) return; // not laid out yet
+      opened = true;
+      term.open(el);
+      // Defer fit + first write one frame so xterm's renderer finishes its
+      // initial measurement and renderService.dimensions becomes defined.
+      rafId = requestAnimationFrame(writeInitial);
+    };
 
-      // Enter (\r): run the buffered command.
-      if (data === "\r") {
-        const cmd = lineBuf.trim();
-        lineBuf = "";
-        term.write("\r\n");
-        if (cmd) {
-          invoke<string>("term_run", { command: cmd }).then((out) => {
-            term.write(out + "\r\n" + PROMPT);
-          });
-        } else {
-          term.write(PROMPT);
-        }
-        return;
-      }
-
-      // Printable characters: echo and append to buffer.
-      if (data >= " " || data === "\t") {
-        lineBuf += data;
-        term.write(data);
-      }
-    });
+    const ro = new ResizeObserver(initOrFit);
+    ro.observe(el);
+    initOrFit(); // try immediately in case the container is already sized
 
     return () => {
-      dataSub.dispose();
+      disposed = true;
+      if (rafId) cancelAnimationFrame(rafId);
+      dataSub?.dispose();
       ro.disconnect();
       term.dispose();
     };
