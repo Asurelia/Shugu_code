@@ -5,6 +5,7 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 import { Icon } from "@/components/components";
 import { invoke } from "@/lib/tauri";
 import { resolveProvider } from "@/lib/providers";
+import { useChatStream } from "./useChatStream";
 import { resolveImageProvider } from "@/lib/imageProviders";
 
 type ImageResult = {
@@ -29,10 +30,11 @@ export function ChatView({ messages, setMessages, model }: any) {
   const [mode, setMode] = useState("chat");
   const feedRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const chatStream = useChatStream();
 
   useEffect(() => {
     if (feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
-  }, [messages, typing]);
+  }, [messages, typing, chatStream.partial]);
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -47,15 +49,17 @@ export function ChatView({ messages, setMessages, model }: any) {
     setMessages((m: any[]) => [...m, userMsg]);
     setInput("");
     setTyping(true);
+    chatStream.start();
     try {
       const reply = await invoke<string>("chat_send", { prompt: text, model: realModel, protocol, baseUrl });
-      setTyping(false);
       setMessages((m: any[]) => [...m, { id: Date.now() + 1, role: "ai", ts: nowTime(), body: reply }]);
     } catch (err) {
-      setTyping(false);
       setMessages((m: any[]) => [...m, { id: Date.now() + 1, role: "ai", ts: nowTime(), body: "⚠ chat_send failed: " + String(err) }]);
+    } finally {
+      setTyping(false);
+      chatStream.stop();
     }
-  }, [input, model, setMessages]);
+  }, [input, model, setMessages, chatStream]);
 
   const onKey = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
@@ -71,7 +75,10 @@ export function ChatView({ messages, setMessages, model }: any) {
               <div className="avatar">S</div>
               <div className="body">
                 <div className="who">Shugu <span className="ts">— {model}</span></div>
-                <div className="typing"><span className="d"></span><span className="d"></span><span className="d"></span></div>
+                {chatStream.streaming && chatStream.partial
+                  ? <div className="text"><p>{chatStream.partial}</p></div>
+                  : <div className="typing"><span className="d"></span><span className="d"></span><span className="d"></span></div>
+                }
               </div>
             </div>
           )}

@@ -1,6 +1,8 @@
 // Shugu Forge — TanStack Router (code-based, memory history for Tauri).
 // All route definitions live here. createRouter is called at module scope (never inside a component).
 
+import { lazy } from "react";
+
 import {
   createRouter,
   createRootRoute,
@@ -11,11 +13,17 @@ import {
 } from "@tanstack/react-router";
 
 import { RootLayout } from "./routes/RootLayout";
-import { useShell } from "./routes/RootLayout";
 
-import { ChatView, ImageView } from "@/features/chat/views-chat";
-import { CodeView, AgentsView, GalleryView, SettingsView } from "@/features/code/views-code";
-import { ConnectionsView, ProfileView } from "@/features/panels/panels";
+// ─── Lazy route components (code-split by route) ─────────────
+const LazyChatRoute        = lazy(() => import("./routes/chat"));
+const LazyCodeRoute        = lazy(() => import("./routes/code"));
+const LazyImageRoute       = lazy(() => import("./routes/image"));
+const LazyAgentsRoute      = lazy(() => import("./routes/agents"));
+const LazyGalleryRoute     = lazy(() => import("./routes/gallery"));
+const LazySettingsRoute    = lazy(() => import("./routes/settings"));
+const LazySettingsSection  = lazy(() => import("./routes/settings.section"));
+const LazyProfileRoute     = lazy(() => import("./routes/profile"));
+const LazyConnectionsRoute = lazy(() => import("./routes/connections"));
 
 // ─── Root route (shell chrome) ────────────────────────────────
 const rootRoute = createRootRoute({ component: RootLayout });
@@ -29,98 +37,66 @@ const indexRoute = createRoute({
 });
 
 // ─── /chat ───────────────────────────────────────────────────
-function ChatRouteComponent() {
-  const { messages, setMessages } = useShell();
-  return <ChatView messages={messages} setMessages={setMessages} model="shugu-haiku-4-5" />;
-}
 const chatRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/chat",
-  component: ChatRouteComponent,
+  component: () => <LazyChatRoute />,
 });
 
 // ─── /code ───────────────────────────────────────────────────
-function CodeRouteComponent() {
-  const { openFiles, setOpenFiles, activeFile, setActiveFile, fileContents, setFileContents } = useShell();
-  return (
-    <CodeView
-      activeFile={activeFile}
-      openFiles={openFiles}
-      setOpenFiles={setOpenFiles}
-      setActiveFile={setActiveFile}
-      fileContents={fileContents}
-      setFileContents={setFileContents}
-    />
-  );
-}
 const codeRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/code",
-  component: CodeRouteComponent,
+  component: () => <LazyCodeRoute />,
 });
 
 // ─── /image ──────────────────────────────────────────────────
-function ImageRouteComponent() {
-  const { generations, setGenerations } = useShell();
-  return <ImageView generations={generations} setGenerations={setGenerations} />;
-}
 const imageRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/image",
-  component: ImageRouteComponent,
+  component: () => <LazyImageRoute />,
 });
 
 // ─── /agents ─────────────────────────────────────────────────
-function AgentsRouteComponent() {
-  const { agents } = useShell();
-  return <AgentsView agents={agents} />;
-}
 const agentsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/agents",
-  component: AgentsRouteComponent,
+  component: () => <LazyAgentsRoute />,
 });
 
 // ─── /gallery ────────────────────────────────────────────────
-function GalleryRouteComponent() {
-  const { generations } = useShell();
-  return <GalleryView generations={generations} />;
-}
 const galleryRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/gallery",
-  component: GalleryRouteComponent,
+  component: () => <LazyGalleryRoute />,
 });
 
 // ─── /settings (index — defaults to "general") ───────────────
 const settingsIndexRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings",
-  component: () => <SettingsView section="general" />,
+  component: () => <LazySettingsRoute />,
 });
 
 // ─── /settings/$section ──────────────────────────────────────
 const settingsSectionRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings/$section",
-  component: function SettingsSectionRouteComponent() {
-    const { section } = settingsSectionRoute.useParams();
-    return <SettingsView section={section} />;
-  },
+  component: () => <LazySettingsSection />,
 });
 
 // ─── /profile ────────────────────────────────────────────────
 const profileRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/profile",
-  component: ProfileView,
+  component: () => <LazyProfileRoute />,
 });
 
 // ─── /connections ────────────────────────────────────────────
 const connectionsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/connections",
-  component: ConnectionsView,
+  component: () => <LazyConnectionsRoute />,
 });
 
 // ─── Route tree ──────────────────────────────────────────────

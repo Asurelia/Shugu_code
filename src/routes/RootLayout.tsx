@@ -9,6 +9,7 @@ import {
   useMemo,
   createContext,
   useContext,
+  Suspense,
 } from "react";
 import { useNavigate, useRouterState, Outlet } from "@tanstack/react-router";
 
@@ -585,7 +586,9 @@ export function RootLayout() {
                 className="content-body"
                 style={isCode ? { gridArea: "main", position: "relative" } : { position: "relative" }}
               >
-                <Outlet/>
+                <Suspense fallback={<div className="loading"><div className="ring"></div></div>}>
+                  <Outlet/>
+                </Suspense>
                 <AnnotationLayer
                   annotations={annotations}
                   onRemove={(id: number) => setAnnotations(a => a.filter(x => x.id !== id))}
