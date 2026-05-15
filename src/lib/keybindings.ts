@@ -117,14 +117,18 @@ function buildKeymap(overrides: Map<string, string[]>): Map<string, string> {
  * new-line, list-pin, etc.) are declared with scope:"input" in commands.ts
  * and are already excluded from buildKeymap() above — that is the canonical
  * safety mechanism, not an input-type check here.  Modifier-bearing global
- * commands (Cmd+K, Cmd+P, …) must fire regardless of focus target.
+ * commands (Cmd+K, Cmd+S, Cmd+Shift+O, …) must fire regardless of focus
+ * target — including when focus is inside the CodeMirror editor.
+ * CM6's own chords (Cmd+Z, Cmd+A, Tab, …) are not registered in COMMANDS,
+ * so they naturally fall through (no match → no preventDefault → CM6 handles
+ * them normally).
+ *
+ * FUTURE NOTE: when @codemirror/search is added later, Cmd+F (find-in-file)
+ * will become a real conflict to resolve at the keymap level — not here.
  */
 function shouldSkip(e: KeyboardEvent): boolean {
   const target = e.target;
   if (!target || typeof (target as any).closest !== "function") return false;
-
-  // Guard: CodeMirror editor — CM6 owns its own keymap; do not fight it.
-  if ((target as Element).closest(".cm-editor")) return true;
 
   return false;
 }

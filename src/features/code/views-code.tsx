@@ -8,6 +8,33 @@ import { ShortcutsSettings, InterfaceSettings } from "@/features/settings/settin
 
 // ─── Code view (editor + tabs + statusbar) ──────────────────
 export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, fileContents, setFileContents }: any) {
+  const [savedFlash, setSavedFlash] = useState(false);
+  // Track previous dirty state for the active file to detect true→false transitions.
+  // Reset the ref when the active file changes to avoid cross-tab false positives.
+  const prevDirtyRef = useRef<boolean | undefined>(undefined);
+  const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const activeDirty = fileContents[activeFile]?.dirty;
+
+  useEffect(() => {
+    // Reset baseline when switching tabs.
+    prevDirtyRef.current = activeDirty;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeFile]);
+
+  useEffect(() => {
+    // Detect a true → false transition (a successful save).
+    if (prevDirtyRef.current === true && activeDirty === false) {
+      setSavedFlash(true);
+      if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+      flashTimerRef.current = setTimeout(() => setSavedFlash(false), 1500);
+    }
+    prevDirtyRef.current = activeDirty;
+    return () => {
+      if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+    };
+  }, [activeDirty]);
+
   const closeTab = (path: string, e: React.MouseEvent) => {
     e.stopPropagation();
     const nextOpen = openFiles.filter((f: string) => f !== path);
@@ -33,9 +60,9 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
             >
               <span className="ico">{fileIcon(p)}</span>
               <span>{basename(p)}</span>
-              {f.dirty
-                ? <span className="dot" style={{width:6,height:6,borderRadius:"50%",background:"var(--primary)"}}/>
-                : <span className="x" onClick={(e) => closeTab(p, e)}>×</span>}
+              {/* Fix 2: dirty tabs show dot by default; on hover (CSS) dot hides and × appears. */}
+              {f.dirty && <span className="dot" />}
+              <span className="x" onClick={(e) => closeTab(p, e)}>×</span>
             </button>
           );
         })}
@@ -53,6 +80,12 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
           <span className="item">UTF-8</span>
           <span className="item">{activeFile ? (fileContents[activeFile]?.lang || "text") : "—"}</span>
           <span className="spacer"></span>
+          {/* Fix 3: save-state indicator + transient "Saved ✓" flash */}
+          {activeFile && (
+            savedFlash
+              ? <span className="item" style={{color:"var(--success)"}}>Saved ✓</span>
+              : <span className="item">{activeDirty ? "● unsaved" : "saved"}</span>
+          )}
           <span className="item"><Icon name="shield" size={11}/> Sandbox · trusted</span>
           <span className="item">Ln 24, Col 18</span>
           <span className="item" style={{color:"var(--tertiary)"}}>● connected</span>

@@ -202,6 +202,10 @@ export function FileNode({ node, depth, active, onPick }: any) {
         style={{ paddingLeft: pad }}
         onClick={() => isDir ? setOpen(o => !o) : onPick(node.path)}
       >
+        {/* Fix 4: chevron for directories, spacer for files (alignment). */}
+        {isDir
+          ? <span className="file-chevron">{open ? "▾" : "▸"}</span>
+          : <span className="file-chevron-spacer" />}
         {isDir
           ? <Icon name="folder" size={13} className="ico" />
           : <Icon name="file" size={13} className="ico" />}
