@@ -832,12 +832,12 @@ export function MascotAstronaut({ size = 92, mood = "neutral" }: { size?: number
 // (which relies on the chibi's intra-window pos.x). Used by the mascot
 // window to flip the chibi + dock the chat panel based on where the WINDOW
 // sits on the monitor, not where the chibi is inside the window.
-// `forcePos`: when provided, overrides the chibi cluster's intra-window
-// (x, y). Lets the mascot host pin the chibi to any of 9 anchor points
-// (corners, edges, center) so a screen-edge snap lands the chibi's
-// VISIBLE body flush against that edge — not just the 600 px transparent
-// frame around it.
-export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceSide, forcePos }: any) {
+// `freezePos`: when true, NO useEffect touches the chibi's intra-window
+// position. Used by the mascot window so a screen-edge snap can slide the
+// OS window into place without ever repositioning the chibi inside the
+// frame — keeps the chibi visually anchored to wherever the user dropped
+// it, no "teleport" feel.
+export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceSide, freezePos }: any) {
   const [mode, setMode] = useState<"closed" | "compact" | "full">("compact");
   // moodOverride: null = derived from state; otherwise forces a mood (alt+click cycle).
   const [moodOverride, setMoodOverride] = useState<ChibiMood | null>(null);
@@ -858,24 +858,26 @@ export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceS
       y: Math.round(window.innerHeight / 2 - h / 2),
     };
   });
-  // Two-way coupling with the mascot host:
-  //   - forcePos overrides pos entirely (used for corner/edge snaps so the
-  //     chibi's VISIBLE body lands flush against the screen edge).
-  //   - forceSide alone (no forcePos) is the lighter, M3-v2 behaviour:
-  //     slide pos.x to match the side so the chat panel stays inside the
-  //     window viewport.
+  // Coupling with the mascot host:
+  //   - freezePos=true  → never touch pos (mascot mode: window slides for snap)
+  //   - freezePos=false + forceSide set → M3-v2 slide pos.x to side
+  //
+  // The "freeze" mode trades chat-panel clipping risk for visual stability:
+  // when the user drops the chibi loosely on the left half of the screen
+  // but the chibi is still rendered at the right of the window, the chat
+  // panel may extend past the window's right edge. That's the next thing to
+  // address but it's a SOFT bug; the previous "anchor preset" behaviour had
+  // a HARD bug where the chibi visually jumped on every snap, which felt
+  // like a teleport.
   useEffect(() => {
-    if (forcePos && typeof forcePos.x === "number" && typeof forcePos.y === "number") {
-      setPos({ x: forcePos.x, y: forcePos.y });
-      return;
-    }
+    if (freezePos) return;
     if (forceSide === "left" || forceSide === "right") {
       setPos(p => ({
         x: forceSide === "left" ? 12 : window.innerWidth - 156 - 12,
         y: p.y,
       }));
     }
-  }, [forceSide, forcePos]);
+  }, [forceSide, freezePos]);
   const [dragging, setDragging] = useState(false);
   const [edge, setEdge] = useState<string | null>(null);
   const [speech, setSpeech] = useState({ visible: true, text: "Hey · clic pour parler" });
