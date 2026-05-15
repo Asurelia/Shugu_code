@@ -15,11 +15,19 @@
       /* The mascot window is rendered transparent at the OS level
          (tauri.conf.json: transparent: true). We force html/body to
          match — no background colour, no scrollbars, no margins —
-         so only the painted React tree is visible on the desktop. */
+         so only the painted React tree is visible on the desktop.
+
+         `!important` matters here: src/mascot.tsx imports the shared
+         styles.css for design tokens (--primary, fonts, etc.), and
+         that file sets `body { background: #050510 }` which is
+         injected AFTER this inline <style> by Vite. Without
+         `!important` the opaque dark background wins the cascade and
+         the OS transparency is invisible. */
       html, body, #mascot-root {
-        margin: 0; padding: 0;
+        margin: 0 !important;
+        padding: 0 !important;
         width: 100%; height: 100%;
-        background: transparent;
+        background: transparent !important;
         overflow: hidden;
       }
     </style>
