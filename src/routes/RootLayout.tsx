@@ -27,7 +27,6 @@ import {
   DockWorkspace,
   ContextMenu,
   AccountDropdown,
-  FloatChat,
   AnnotationLayer,
 } from "@/features/panels/panels";
 import {
@@ -725,7 +724,10 @@ export function RootLayout() {
           onClose={() => setAccountOpen(false)}
           onView={navigateTo}
         />
-        <FloatChat pinnedAnno={pinnedAnno} clearPinned={() => setPinnedAnno(null)}/>
+        {/* FloatChat moved to the dedicated mascot window (src/mascot.tsx) —
+            the chibi now lives in its own transparent Tauri window instead
+            of being embedded in the IDE. pinnedAnno will flow to the mascot
+            window via Tauri events at M4 (chat://pin). */}
 
         <CommandPalette
           open={paletteOpen}
