@@ -15,7 +15,7 @@ import type { FileNode, FileContent } from "@/lib/types";
 import { seedFileTree } from "@/mocks/seedFileTree";
 import { seedFileContents } from "@/mocks/seedFileContents";
 
-const inTauri =
+export const inTauri =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 // ---------------------------------------------------------------------------

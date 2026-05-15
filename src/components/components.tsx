@@ -175,11 +175,13 @@ export function SideHistory({ items, active, onPick, onNew }: any) {
   );
 }
 
-export function SideFiles({ tree, active, onPick }: any) {
+export function SideFiles({ tree, active, onPick, onOpenFolder }: any) {
   return (
     <aside className="side">
       <div className="side-head">
         <div className="side-title">Explorer · shugu-forge</div>
+        <button className="side-new" onClick={onOpenFolder} title="Open Folder…"><Icon name="folder" size={11}/></button>
+        {/* TODO: new file/folder */}
         <button className="side-new"><Icon name="plus" size={11}/></button>
       </div>
       <div className="side-list scroll">

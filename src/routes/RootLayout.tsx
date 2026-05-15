@@ -42,14 +42,13 @@ import {
 } from "@/features/tweaks/tweaks-panel";
 import { shiftHsl } from "@/lib/colors";
 
-import { seedFileTree } from "@/mocks/seedFileTree";
-import { seedFileContents } from "@/mocks/seedFileContents";
 import { seedAgents } from "@/mocks/seedAgents";
 import { seedGenerations } from "@/mocks/seedGenerations";
 import { seedGalleryFolders } from "@/mocks/seedGalleryFolders";
 import { seedMessages } from "@/mocks/seedMessages";
-import type { DockState } from "@/lib/types";
+import type { DockState, FileNode } from "@/lib/types";
 import { db, seedIfEmpty, toGenerationRow } from "@/lib/db";
+import { inTauri, fsReadDir, fsReadFile, fsWriteFile } from "@/lib/fs";
 import { COMMANDS, getCommandById, fmtKbd, type CommandContext } from "@/lib/commands";
 import { useCommandKeybindings } from "@/lib/keybindings";
 
@@ -315,10 +314,11 @@ export function RootLayout() {
   const [messages, setMessages] = useState(seedMessages);
 
   // File state
-  const [openFiles, setOpenFiles] = useState(["src/components/Forge.tsx", "src-tauri/src/main.rs", "src/lib/store.ts"]);
-  const [activeFile, setActiveFile] = useState<string | null>("src/components/Forge.tsx");
-  const [fileContents, setFileContents] = useState<any>(seedFileContents);
-  const [filesPanelActive, setFilesPanelActive] = useState("src/components/Forge.tsx");
+  const [fileTree, setFileTree] = useState<FileNode[]>([]);
+  const [openFiles, setOpenFiles] = useState<string[]>([]);
+  const [activeFile, setActiveFile] = useState<string | null>(null);
+  const [fileContents, setFileContents] = useState<Record<string, any>>({});
+  const [filesPanelActive, setFilesPanelActive] = useState("");
 
   // Image / gallery state
   const [generations, setGenerations] = useState(seedGenerations);
@@ -399,6 +399,14 @@ export function RootLayout() {
     return () => { cancelled = true; };
   }, []);
 
+  // Load the workspace file tree on mount.
+  // In web mode: fsReadDir() returns seedFileTree (never rejects).
+  // In Tauri mode with no workspace: fs_read_dir rejects with "no workspace open"
+  // — the .catch must yield [] to avoid crashing the app.
+  useEffect(() => {
+    fsReadDir().then(setFileTree).catch(() => setFileTree([]));
+  }, []);
+
   // CSS variable sync from tweaks
   useEffect(() => {
     const root = document.documentElement;
@@ -449,11 +457,32 @@ export function RootLayout() {
     }
   }, []);
 
-  const openFile = (path: string) => {
-    setFilesPanelActive(path);
-    if (!openFiles.includes(path)) setOpenFiles(p => [...p, path]);
+  const openFile = useCallback(async (path: string) => {
+    if (!(path in fileContents)) {
+      const content = await fsReadFile(path);
+      setFileContents(c => ({ ...c, [path]: content }));
+    }
+    setOpenFiles(p => p.includes(path) ? p : [...p, path]);
     setActiveFile(path);
-  };
+    setFilesPanelActive(path);
+  }, [fileContents]);
+
+  const saveFile = useCallback(async (path: string) => {
+    const content = fileContents[path];
+    if (!content) return;
+    await fsWriteFile(path, content.text);
+    if (inTauri) {
+      setFileContents(c => ({
+        ...c,
+        [path]: { ...c[path], dirty: false, original: content.text },
+      }));
+    }
+  }, [fileContents]);
+
+  const saveAll = useCallback(async () => {
+    const dirty = openFiles.filter(p => fileContents[p]?.dirty);
+    await Promise.all(dirty.map(saveFile));
+  }, [openFiles, fileContents, saveFile]);
 
   const newChat = () => { setMessages([]); };
 
@@ -479,8 +508,18 @@ export function RootLayout() {
     newChat,
     messages,
     setMessages,
-    openFiles,
+    // Files (alphabetical)
     activeFile,
+    fileContents,
+    fileTree,
+    openFiles,
+    saveAll,
+    saveFile,
+    setActiveFile,
+    setFileContents,
+    setFileTree,
+    setOpenFiles,
+    // Gallery / Agents
     generations,
     agents,
     onAnnotate,
@@ -490,7 +529,11 @@ export function RootLayout() {
     dockState, setDockState,
     tweaks, setTweak,
     newChat, messages, setMessages,
-    openFiles, activeFile,
+    // Files (alphabetical)
+    activeFile, fileContents, fileTree, openFiles,
+    saveAll, saveFile,
+    setActiveFile, setFileContents, setFileTree, setOpenFiles,
+    // Gallery / Agents
     generations, agents,
     onAnnotate,
   ]);
@@ -530,9 +573,10 @@ export function RootLayout() {
     if (view === "code") {
       return (
         <SideFiles
-          tree={seedFileTree}
+          tree={fileTree}
           active={filesPanelActive}
           onPick={openFile}
+          onOpenFolder={() => getCommandById("open-folder")?.run(cmdCtx)}
         />
       );
     }

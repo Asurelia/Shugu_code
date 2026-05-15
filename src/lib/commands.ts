@@ -2,6 +2,8 @@
 // Pure data module — no React imports. Safe to import from anywhere.
 // Pass 1: flat COMMANDS array with default keybindings, categories, run/when predicates.
 
+import { fsOpenFolder, fsReadDir } from "@/lib/fs";
+
 // ─── Types ────────────────────────────────────────────────────
 
 export type CommandCategory =
@@ -45,8 +47,16 @@ export interface CommandContext {
   setMessages: React.Dispatch<React.SetStateAction<any[]>>;
 
   // Files
-  openFiles: string[];
   activeFile: string | null;
+  fileContents: Record<string, any>;
+  fileTree: any[];
+  openFiles: string[];
+  saveAll: () => Promise<void>;
+  saveFile: (path: string) => Promise<void>;
+  setActiveFile: React.Dispatch<React.SetStateAction<string | null>>;
+  setFileContents: React.Dispatch<React.SetStateAction<Record<string, any>>>;
+  setFileTree: React.Dispatch<React.SetStateAction<any[]>>;
+  setOpenFiles: React.Dispatch<React.SetStateAction<string[]>>;
 
   // Gallery / Agents
   generations: any[];
@@ -182,17 +192,32 @@ export const COMMANDS: Command[] = [
     title: "Save file",
     category: "File",
     keybinding: ["Cmd", "S"],
-    // Filesystem backend not yet wired; editor-context only.
-    when: () => false,
-    run: () => { /* TODO: save active file via Tauri fs command */ },
+    when: (ctx) => ctx.currentView === "code" && ctx.activeFile !== null,
+    run: (ctx) => ctx.saveFile(ctx.activeFile!),
   },
   {
     id: "save-all",
     title: "Save all",
     category: "File",
     keybinding: ["Cmd", "Alt", "S"],
-    when: () => false,
-    run: () => { /* TODO: save all open files */ },
+    when: (ctx) => ctx.currentView === "code",
+    run: (ctx) => ctx.saveAll(),
+  },
+  {
+    id: "open-folder",
+    title: "Open Folder…",
+    category: "File",
+    icon: "folder",
+    keybinding: ["Cmd", "Shift", "O"],
+    run: async (ctx) => {
+      const root = await fsOpenFolder();
+      if (!root) return;
+      const tree = await fsReadDir();
+      ctx.setFileTree(tree);
+      ctx.setOpenFiles([]);
+      ctx.setActiveFile(null);
+      ctx.setFileContents({});
+    },
   },
 
   // ── View ─────────────────────────────────────────────────
