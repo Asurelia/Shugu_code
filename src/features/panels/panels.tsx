@@ -850,11 +850,14 @@ export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceS
     return () => clearInterval(t);
   }, []);
   const [pos, setPos] = useState(() => {
-    // Default: right edge, vertically centered. The chibi hugs the
-    // right side with a small margin; the panel docks to its left.
+    // Default: CENTER of viewport, both axes. With FloatChat now only used
+    // in the mascot window (M2), the wide-enough mascot frame (≥ 844 px)
+    // ensures the chat panel fits flush on EITHER side of the chibi —
+    // critical when the host (mascot.tsx) flips forceSide based on which
+    // half of the monitor the chibi visible body sits on.
     const w = 156, h = 156;
     return {
-      x: window.innerWidth - w - 12,
+      x: Math.round(window.innerWidth  / 2 - w / 2),
       y: Math.round(window.innerHeight / 2 - h / 2),
     };
   });
