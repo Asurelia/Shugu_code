@@ -42,9 +42,9 @@ import { shiftHsl } from "@/lib/colors";
 import { seedAgents } from "@/mocks/seedAgents";
 import { seedGenerations } from "@/mocks/seedGenerations";
 import { seedGalleryFolders } from "@/mocks/seedGalleryFolders";
-import { seedMessages } from "@/mocks/seedMessages";
 import type { DockState, FileNode } from "@/lib/types";
 import { db, seedIfEmpty, toGenerationRow } from "@/lib/db";
+import { useActiveConv, createConversation } from "@/features/chat/chat-sync";
 import { inTauri, fsReadDir, fsReadFile, fsWriteFile, onFsChanged } from "@/lib/fs";
 import { COMMANDS, getCommandById, fmtKbd, type CommandContext } from "@/lib/commands";
 import { useCommandKeybindings } from "@/lib/keybindings";
@@ -285,10 +285,12 @@ export function RootLayout() {
   const [tweaks, setTweak] = useTweaks(TWEAK_DEFAULTS);
   const [paletteOpen, setPaletteOpen] = useState(false);
 
-  // Chat state
-  const [activeConvo, setActiveConvo] = useState("c1");
+  // Chat state — activeConvo is cross-window synchronised via chat-sync's
+  // useActiveConv hook (localStorage + Tauri event). Messages no longer
+  // live in component state: ChatView and FloatChat each subscribe via
+  // useMessages(activeConv) and read directly from SQLite (LOCAL-FIRST).
+  const [activeConvo, setActiveConvo] = useActiveConv();
   const [activeConvoTitle, setActiveConvoTitle] = useState<string | null>(null);
-  const [messages, setMessages] = useState(seedMessages);
 
   // File state
   const [fileTree, setFileTree] = useState<FileNode[]>([]);
@@ -478,7 +480,17 @@ export function RootLayout() {
     await Promise.all(dirty.map(saveFile));
   }, [openFiles, fileContents, saveFile]);
 
-  const newChat = () => { setMessages([]); };
+  // newChat creates a fresh conversation row in SQLite and switches the
+  // active conv to it. The empty-messages render falls out naturally:
+  // useMessages(newId) returns [] for a conv with no rows. The active
+  // conv change broadcasts via chat://active-changed so the mascot
+  // window switches in lock-step.
+  const newChat = useCallback(() => {
+    void (async () => {
+      const id = await createConversation("New chat");
+      setActiveConvo(id);
+    })();
+  }, [setActiveConvo]);
 
   // Navigate helper used by Rail, CommandPalette, AccountDropdown, SideSettings
   const navigateTo = useCallback((v: string) => {
@@ -500,8 +512,6 @@ export function RootLayout() {
     tweaks,
     setTweak: (key: string, value: any) => setTweak(key as any, value),
     newChat,
-    messages,
-    setMessages,
     // Files (alphabetical)
     activeFile,
     fileContents,
@@ -522,7 +532,7 @@ export function RootLayout() {
     sideCollapsed, setSideCollapsed,
     dockState, setDockState,
     tweaks, setTweak,
-    newChat, messages, setMessages,
+    newChat,
     // Files (alphabetical)
     activeFile, fileContents, fileTree, openFiles,
     saveAll, saveFile,
@@ -621,15 +631,14 @@ export function RootLayout() {
 
   // Shared state exposed to leaf routes via context
   const shellValue: ShellContextValue = useMemo(() => ({
-    messages, setMessages,
     openFiles, setOpenFiles,
     activeFile, setActiveFile,
     fileContents, setFileContents,
     generations, setGenerations: setGenerationsPersisted,
     agents,
   }), [
-    messages, openFiles, activeFile, fileContents, generations, agents,
-    setMessages, setOpenFiles, setActiveFile, setFileContents, setGenerationsPersisted,
+    openFiles, activeFile, fileContents, generations, agents,
+    setOpenFiles, setActiveFile, setFileContents, setGenerationsPersisted,
   ]);
 
   // The per-view content (the routed <Outlet/> + the absolute annotation layer).

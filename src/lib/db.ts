@@ -564,43 +564,86 @@ export async function seedIfEmpty(): Promise<void> {
   const existing: ConversationRow[] = await database.select(
     "SELECT id FROM conversations LIMIT 1"
   );
-  if (existing.length > 0) return; // already seeded
+  const conversationsAlreadySeeded = existing.length > 0;
 
-  // Lazy-import seed data to avoid circular dependency at module level
-  const [{ SEED_CONVOS }, { seedGenerations }] = await Promise.all([
-    import("@/features/chat/chat-sidebar"),
-    import("@/mocks/seedGenerations"),
-  ]);
+  if (!conversationsAlreadySeeded) {
+    // Lazy-import seed data to avoid circular dependency at module level
+    const [{ SEED_CONVOS }, { seedGenerations }] = await Promise.all([
+      import("@/features/chat/chat-sidebar"),
+      import("@/mocks/seedGenerations"),
+    ]);
 
-  // Flatten conversations (including children with parent_id)
-  const allConvos: ConvoUI[] = [];
-  for (const c of SEED_CONVOS) {
-    allConvos.push(c);
-    if (c.children) {
-      for (const child of c.children) {
-        allConvos.push({ ...child, parent_id: c.id });
+    // Flatten conversations (including children with parent_id)
+    const allConvos: ConvoUI[] = [];
+    for (const c of SEED_CONVOS) {
+      allConvos.push(c);
+      if (c.children) {
+        for (const child of c.children) {
+          allConvos.push({ ...child, parent_id: c.id });
+        }
+      }
+    }
+
+    await conversations.upsertMany(allConvos.map(convoToRow));
+
+    // Seed generations — coerce types to match DDL (id: TEXT, ts: INTEGER)
+    const genRows: GenerationRow[] = seedGenerations.map((g, i) => ({
+      id: String(g.id),
+      prompt: g.prompt,
+      negative: null,
+      ratio: g.ratio ?? null,
+      model: g.model ?? null,
+      seed: g.seed ?? null,
+      steps: g.steps ?? null,
+      guidance: g.guidance ?? null,
+      style: g.style ?? null,
+      hue: g.hue ?? null,
+      status: null,
+      result_url: null,
+      ts: Date.now() - (18 - i) * 60_000,
+    }));
+
+    await generations.upsertMany(genRows);
+  }
+
+  // ─── Seed messages for the c1 conversation if it has none yet ──────────
+  //
+  // This is conditional on c1's per-conversation emptiness, NOT on the
+  // global messages table being empty (per M4 advisor note #4). Rationale:
+  // a user who has chatted in other conversations might still have an
+  // untouched c1; we want to seed it so the prototype demo content renders
+  // on first open. We do NOT overwrite an existing c1 conversation — if
+  // the user has already written messages there, leave them alone.
+  const c1Exists = await database.select(
+    "SELECT id FROM conversations WHERE id = $1 LIMIT 1",
+    ["c1"]
+  );
+  if (c1Exists.length > 0) {
+    const c1Messages = await database.select(
+      "SELECT id FROM messages WHERE conversation_id = $1 LIMIT 1",
+      ["c1"]
+    );
+    if (c1Messages.length === 0) {
+      const { seedMessages } = await import("@/mocks/seedMessages");
+      // Spread the seed messages over a 60-second window ending now, so
+      // the read-back ORDER BY ts ASC preserves the prototype's narrative
+      // sequence. Original seed used "14:30"/"14:31" string timestamps —
+      // we lose the absolute clock value but keep the relative order.
+      const base = Date.now() - 60_000;
+      const messageRows: MessageRow[] = seedMessages.map((m, i) => ({
+        id: String(m.id),
+        conversation_id: "c1",
+        role: m.role,
+        text: m.text ?? null,
+        body: m.body ?? null,
+        code_lang: m.code?.lang ?? null,
+        code_text: m.code?.text ?? null,
+        image: m.image ? 1 : 0,
+        ts: base + i * 1000,
+      }));
+      for (const row of messageRows) {
+        await messages.append(row);
       }
     }
   }
-
-  await conversations.upsertMany(allConvos.map(convoToRow));
-
-  // Seed generations — coerce types to match DDL (id: TEXT, ts: INTEGER)
-  const genRows: GenerationRow[] = seedGenerations.map((g, i) => ({
-    id: String(g.id),
-    prompt: g.prompt,
-    negative: null,
-    ratio: g.ratio ?? null,
-    model: g.model ?? null,
-    seed: g.seed ?? null,
-    steps: g.steps ?? null,
-    guidance: g.guidance ?? null,
-    style: g.style ?? null,
-    hue: g.hue ?? null,
-    status: null,
-    result_url: null,
-    ts: Date.now() - (18 - i) * 60_000,
-  }));
-
-  await generations.upsertMany(genRows);
 }

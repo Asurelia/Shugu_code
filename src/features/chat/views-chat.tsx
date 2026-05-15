@@ -4,8 +4,8 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { Icon } from "@/components/components";
 import { invoke } from "@/lib/tauri";
-import { resolveProvider } from "@/lib/providers";
 import { useChatStream } from "./useChatStream";
+import { useMessages, sendChatMessage } from "./chat-sync";
 import { resolveImageProvider } from "@/lib/imageProviders";
 
 type ImageResult = {
@@ -24,13 +24,20 @@ type ImageResult = {
 };
 
 // ─── Chat ───────────────────────────────────────────────────
-export function ChatView({ messages, setMessages, model }: any) {
+//
+// ChatView reads its message list from the shared chat-sync layer, which
+// is backed by SQLite (Tauri) or an in-memory module-level cache (web mode).
+// Cross-window sync with the mascot's FloatChat rides on the
+// chat://messages-changed Tauri event — both windows render the same
+// SQLite truth.
+export function ChatView({ activeConv, model }: { activeConv: string; model: string }) {
   const [input, setInput] = useState("");
   const [typing, setTyping] = useState(false);
   const [mode, setMode] = useState("chat");
   const feedRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const chatStream = useChatStream();
+  const { data: messages } = useMessages(activeConv);
 
   useEffect(() => {
     if (feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
@@ -43,23 +50,16 @@ export function ChatView({ messages, setMessages, model }: any) {
   const send = useCallback(async () => {
     const text = input.trim();
     if (!text) return;
-    const modelId = model?.includes("/") ? model : "anthropic/claude-haiku-4-5";
-    const { protocol, baseUrl, model: realModel } = resolveProvider(modelId);
-    const userMsg = { id: Date.now(), role: "user", text, ts: nowTime() };
-    setMessages((m: any[]) => [...m, userMsg]);
     setInput("");
     setTyping(true);
     chatStream.start();
     try {
-      const reply = await invoke<string>("chat_send", { prompt: text, model: realModel, protocol, baseUrl });
-      setMessages((m: any[]) => [...m, { id: Date.now() + 1, role: "ai", ts: nowTime(), body: reply }]);
-    } catch (err) {
-      setMessages((m: any[]) => [...m, { id: Date.now() + 1, role: "ai", ts: nowTime(), body: "⚠ chat_send failed: " + String(err) }]);
+      await sendChatMessage(activeConv, text, model);
     } finally {
       setTyping(false);
       chatStream.stop();
     }
-  }, [input, model, setMessages, chatStream]);
+  }, [input, model, activeConv, chatStream]);
 
   const onKey = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }

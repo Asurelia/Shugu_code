@@ -16,8 +16,6 @@ import type { Dispatch, SetStateAction } from "react";
 // ─── Shape ────────────────────────────────────────────────────
 
 export interface ShellContextValue {
-  messages: any[];
-  setMessages: Dispatch<SetStateAction<any[]>>;
   openFiles: string[];
   setOpenFiles: Dispatch<SetStateAction<string[]>>;
   activeFile: string | null;

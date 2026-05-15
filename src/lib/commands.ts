@@ -43,8 +43,6 @@ export interface CommandContext {
 
   // Chat
   newChat: () => void;
-  messages: any[];
-  setMessages: React.Dispatch<React.SetStateAction<any[]>>;
 
   // Files
   activeFile: string | null;

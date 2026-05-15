@@ -9,6 +9,7 @@ import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { invoke } from "@/lib/tauri";
+import { useMessages, useActiveConv, sendChatMessage } from "@/features/chat/chat-sync";
 
 // ─── Dock workspace: editor + dock as constraint-solved resizable panels ──
 // Replaces the old hand-rolled CSS-grid + mousemove resize, which could squeeze
@@ -901,12 +902,33 @@ export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceS
   const [hasKey, setHasKey] = useState(false);
   const [model, setModel] = useState("anthropic/claude-haiku-4-5");
   const [tokens, setTokens] = useState(0);
-  const [msgs, setMsgs] = useState<any[]>([]);
+  // Messages are no longer local state — they live in SQLite and stream in
+  // from the chat-sync layer. The mascot window READS the active conv from
+  // useActiveConv() (the main IDE's ChatSidebar drives the writes); this
+  // window has no conv switcher.
+  const [activeConv] = useActiveConv();
+  const { data: msgs } = useMessages(activeConv);
+  const [lastMsgCount, setLastMsgCount] = useState(0);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [hasUnread, setHasUnread] = useState(false); // an LLM reply arrived while tucked / closed
   const historyRef = useRef<HTMLDivElement | null>(null);
   const movedRef = useRef(false);
+
+  // Detect "new AI message landed while tucked/closed" so the chibi pops
+  // the peek_open expression. Compare the message count against the last
+  // observed count — only AI messages added since the user last saw the
+  // panel count toward unread.
+  useEffect(() => {
+    if (msgs.length > lastMsgCount) {
+      const newest = msgs[msgs.length - 1];
+      if (newest?.role === "ai" && (mode !== "full" || edge)) {
+        setHasUnread(true);
+      }
+    }
+    setLastMsgCount(msgs.length);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [msgs.length]);
 
   const side: "left" | "right" =
     forceSide === "left" || forceSide === "right"
@@ -947,20 +969,23 @@ export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceS
   const send = () => {
     const t = input.trim();
     if (!t || !hasKey) return;
-    setMsgs(m => [...m, { who: "you", text: t }]);
     setInput("");
     setBusy(true);
     setMode("full");
     setLastInteract(Date.now());
-    setTimeout(() => {
-      setMsgs(m => [...m, { who: "ai", text: "Mock reply — connect a real Anthropic key in Settings → Connections." }]);
-      setTokens(n => n + Math.floor(80 + Math.random() * 200));
-      setBusy(false);
-      setLastInteract(Date.now());
-      // The reply just landed. If the mascot is tucked or closed the
-      // user won't see it, so flag it as unread → peek_open expression.
-      setHasUnread(true);
-    }, 900);
+    // sendChatMessage handles both user + AI message persistence in SQLite
+    // and broadcasts chat://messages-changed — useMessages above picks up
+    // both events and re-renders the history feed. The main IDE's ChatView
+    // sees the same updates on its side.
+    void (async () => {
+      try {
+        await sendChatMessage(activeConv, t, model);
+        setTokens(n => n + Math.floor(80 + Math.random() * 200));
+      } finally {
+        setBusy(false);
+        setLastInteract(Date.now());
+      }
+    })();
   };
 
   // Clear the unread flag once the user actually sees the conversation
@@ -1133,7 +1158,11 @@ export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceS
                   No conversation yet — say something.
                 </div>
               )}
-              {msgs.map((m, i) => <div key={i} className={"fm " + m.who}>{m.text}</div>)}
+              {msgs.map((m) => (
+                <div key={String(m.id)} className={"fm " + (m.role === "user" ? "you" : "ai")}>
+                  {m.text ?? m.body ?? ""}
+                </div>
+              ))}
             </div>
           </div>
         )}
