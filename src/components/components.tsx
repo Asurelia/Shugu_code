@@ -1,7 +1,9 @@
 // Shugu Forge — shared atoms (icons, layout chrome)
 // Ported from prototype components.jsx — exports replace window globals.
 
-import React, { useState } from "react";
+import React, { useState, useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
+import { fsCreateFile, fsCreateDir, fsRename, fsDelete } from "@/lib/fs";
 
 // ── Icons (24x24 stroke) ────────────────────────────────────
 export function Icon({ name, size = 18, className = "" }: { name: string; size?: number; className?: string }) {
@@ -175,51 +177,379 @@ export function SideHistory({ items, active, onPick, onNew }: any) {
   );
 }
 
+// ── File tree (controlled expansion + CRUD UX) ─────────────
+//
+// Why expansion state is HOISTED into SideFiles rather than kept inside each
+// FileNode: when the user picks "New file" / "New folder" from a closed
+// folder's context menu, that target folder must auto-open so the inline
+// create row is visible. Internal per-node useState makes that impossible
+// from the parent. We track *collapsed* paths (default = open) so newly
+// arrived folders from a tree refresh feel "open by default" as before.
+
+type FileCtxAction = "newFile" | "newFolder" | "rename" | "delete";
+
 export function SideFiles({ tree, active, onPick, onOpenFolder }: any) {
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [renaming, setRenaming] = useState<string | null>(null); // path of node being renamed
+  const [ctxMenu, setCtxMenu] = useState<{ node: any; x: number; y: number } | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<any | null>(null);
+  const [creating, setCreating] = useState<{ parent: string; kind: "file" | "folder" } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const toggleCollapsed = (path: string) => {
+    setCollapsed(s => {
+      const n = new Set(s);
+      if (n.has(path)) n.delete(path); else n.add(path);
+      return n;
+    });
+  };
+  const forceExpand = (path: string) => {
+    setCollapsed(s => { const n = new Set(s); n.delete(path); return n; });
+  };
+
+  const openCtxMenu = (node: any, e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setCtxMenu({ node, x: e.clientX, y: e.clientY });
+  };
+
+  const doCtxAction = (action: FileCtxAction) => {
+    if (!ctxMenu) return;
+    const node = ctxMenu.node;
+    setCtxMenu(null);
+    if (action === "rename") {
+      setRenaming(node.path);
+    } else if (action === "delete") {
+      setConfirmDelete(node);
+    } else if (action === "newFile" || action === "newFolder") {
+      const isDir = Array.isArray(node.children);
+      // New file in a folder = child; new file on a file = sibling.
+      const parent = isDir ? node.path : node.path.split("/").slice(0, -1).join("/");
+      if (isDir) forceExpand(node.path);
+      setCreating({ parent, kind: action === "newFile" ? "file" : "folder" });
+    }
+  };
+
+  // Helpers that talk to the Rust backend. Errors surface in the toast strip.
+  // The tree refresh happens automatically via fs://changed (RootLayout listener).
+  const doRename = async (oldPath: string, newName: string) => {
+    setRenaming(null);
+    const trimmed = newName.trim();
+    if (!trimmed) return;
+    const oldName = oldPath.split("/").pop();
+    if (trimmed === oldName) return; // no-op
+    const dir = oldPath.split("/").slice(0, -1).join("/");
+    const newPath = dir ? `${dir}/${trimmed}` : trimmed;
+    try { await fsRename(oldPath, newPath); }
+    catch (e: any) { setError(String(e)); }
+  };
+  const doDelete = async (node: any) => {
+    setConfirmDelete(null);
+    try { await fsDelete(node.path); }
+    catch (e: any) { setError(String(e)); }
+  };
+  const doCreate = async (parent: string, kind: "file" | "folder", name: string) => {
+    setCreating(null);
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    const newPath = parent ? `${parent}/${trimmed}` : trimmed;
+    try {
+      if (kind === "file") await fsCreateFile(newPath);
+      else await fsCreateDir(newPath);
+    } catch (e: any) { setError(String(e)); }
+  };
+
   return (
     <aside className="side">
       <div className="side-head">
         <div className="side-title">Explorer · shugu-forge</div>
         <button className="side-new" onClick={onOpenFolder} title="Open Folder…"><Icon name="folder" size={11}/></button>
-        {/* TODO: new file/folder */}
-        <button className="side-new"><Icon name="plus" size={11}/></button>
+        <button className="side-new" onClick={() => setCreating({ parent: "", kind: "file" })} title="New file at root"><Icon name="plus" size={11}/></button>
       </div>
       <div className="side-list scroll">
-        {tree.map((node: any) => <FileNode key={node.path} node={node} depth={0} active={active} onPick={onPick}/>) }
+        {creating?.parent === "" && (
+          <FileCreateRow
+            depth={0}
+            kind={creating.kind}
+            onCommit={(name) => doCreate("", creating.kind, name)}
+            onCancel={() => setCreating(null)}
+          />
+        )}
+        {tree.map((node: any) => (
+          <FileNode
+            key={node.path}
+            node={node}
+            depth={0}
+            active={active}
+            onPick={onPick}
+            collapsed={collapsed}
+            onToggleCollapsed={toggleCollapsed}
+            renaming={renaming}
+            onCommitRename={doRename}
+            onCancelRename={() => setRenaming(null)}
+            onContextMenu={openCtxMenu}
+            creating={creating}
+            onCommitCreate={doCreate}
+            onCancelCreate={() => setCreating(null)}
+          />
+        ))}
       </div>
+      {/* Portal the overlay UIs to document.body — the side panel's
+          `backdrop-filter` creates a containing block that would otherwise
+          trap our `position: fixed` menus and modals inside .side. */}
+      {ctxMenu && createPortal(
+        <FileCtxMenu
+          node={ctxMenu.node}
+          x={ctxMenu.x}
+          y={ctxMenu.y}
+          onClose={() => setCtxMenu(null)}
+          onAction={doCtxAction}
+        />,
+        document.body
+      )}
+      {confirmDelete && createPortal(
+        <FileDeleteConfirm
+          node={confirmDelete}
+          onCancel={() => setConfirmDelete(null)}
+          onConfirm={() => doDelete(confirmDelete)}
+        />,
+        document.body
+      )}
+      {error && (
+        <div className="side-toast" onClick={() => setError(null)} title="Click to dismiss">
+          {error}
+        </div>
+      )}
     </aside>
   );
 }
 
-export function FileNode({ node, depth, active, onPick }: any) {
-  const [open, setOpen] = useState(node.open !== false);
+export function FileNode({
+  node, depth, active, onPick,
+  collapsed, onToggleCollapsed,
+  renaming, onCommitRename, onCancelRename,
+  onContextMenu,
+  creating, onCommitCreate, onCancelCreate,
+}: any) {
   const isDir = Array.isArray(node.children);
+  // creating.parent === node.path keeps a folder force-open while the user
+  // is typing the new child's name (the create row lives inside its children).
+  const isOpen = !collapsed.has(node.path) || creating?.parent === node.path;
+  const isRenaming = renaming === node.path;
   const pad = 10 + depth * 14;
+
   return (
     <>
       <div
         className={"side-item" + (!isDir && node.path === active ? " active" : "")}
         style={{ paddingLeft: pad }}
-        onClick={() => isDir ? setOpen(o => !o) : onPick(node.path)}
+        onClick={() => {
+          if (isRenaming) return;
+          if (isDir) onToggleCollapsed(node.path);
+          else onPick(node.path);
+        }}
+        onContextMenu={(e) => onContextMenu(node, e)}
       >
-        {/* Chevron for directories, spacer for files (keeps labels aligned).
-            The chevron is its own click target (stopPropagation) so clicking
-            the glyph toggles directly — the row click toggles too, but the
-            explicit affordance matches IDE convention. */}
         {isDir
           ? <span
               className="file-chevron"
-              onClick={(e) => { e.stopPropagation(); setOpen(o => !o); }}
-            >{open ? "▾" : "▸"}</span>
+              onClick={(e) => { e.stopPropagation(); onToggleCollapsed(node.path); }}
+            >{isOpen ? "▾" : "▸"}</span>
           : <span className="file-chevron-spacer" />}
         {isDir
           ? <Icon name="folder" size={13} className="ico" />
           : <Icon name="file" size={13} className="ico" />}
-        <span className="label">{node.name}</span>
-        {!isDir && node.git && <span className="meta" style={{color: node.git === 'M' ? 'var(--warn)' : node.git === 'A' ? 'var(--success)' : 'var(--on-surface-muted)'}}>{node.git}</span>}
+        {isRenaming
+          ? <FileRenameInput
+              initial={node.name}
+              onCommit={(newName) => onCommitRename(node.path, newName)}
+              onCancel={onCancelRename}
+            />
+          : <span className="label">{node.name}</span>}
+        {!isRenaming && !isDir && node.git && (
+          <span className="meta" style={{color: node.git === "M" ? "var(--warn)" : node.git === "A" ? "var(--success)" : "var(--on-surface-muted)"}}>{node.git}</span>
+        )}
       </div>
-      {isDir && open && node.children.map((c: any) => <FileNode key={c.path} node={c} depth={depth+1} active={active} onPick={onPick}/>) }
+      {isDir && isOpen && (
+        <>
+          {creating?.parent === node.path && (
+            <FileCreateRow
+              depth={depth + 1}
+              kind={creating.kind}
+              onCommit={(name) => onCommitCreate(node.path, creating.kind, name)}
+              onCancel={onCancelCreate}
+            />
+          )}
+          {node.children.map((c: any) => (
+            <FileNode
+              key={c.path}
+              node={c}
+              depth={depth + 1}
+              active={active}
+              onPick={onPick}
+              collapsed={collapsed}
+              onToggleCollapsed={onToggleCollapsed}
+              renaming={renaming}
+              onCommitRename={onCommitRename}
+              onCancelRename={onCancelRename}
+              onContextMenu={onContextMenu}
+              creating={creating}
+              onCommitCreate={onCommitCreate}
+              onCancelCreate={onCancelCreate}
+            />
+          ))}
+        </>
+      )}
     </>
+  );
+}
+
+// ── Inline edit input (rename) ──────────────────────────────
+// Same pattern as VS Code: Enter commits, Escape cancels, blur commits too.
+function FileRenameInput({ initial, onCommit, onCancel }: { initial: string; onCommit: (v: string) => void; onCancel: () => void }) {
+  const [value, setValue] = useState(initial);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  // committedRef avoids the double-fire of blur AFTER Enter/Escape.
+  const committedRef = useRef(false);
+
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.focus();
+    // Select the basename only (everything before the last dot) so the
+    // extension is preserved when the user starts typing — VS Code behavior.
+    const dot = initial.lastIndexOf(".");
+    if (dot > 0) el.setSelectionRange(0, dot);
+    else el.select();
+  }, [initial]);
+
+  const commit = () => {
+    if (committedRef.current) return;
+    committedRef.current = true;
+    onCommit(value);
+  };
+  const cancel = () => {
+    if (committedRef.current) return;
+    committedRef.current = true;
+    onCancel();
+  };
+
+  return (
+    <input
+      ref={inputRef}
+      className="file-rename-input"
+      value={value}
+      onChange={(e) => setValue(e.target.value)}
+      onClick={(e) => e.stopPropagation()}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") { e.preventDefault(); commit(); }
+        else if (e.key === "Escape") { e.preventDefault(); cancel(); }
+        e.stopPropagation();
+      }}
+      onBlur={commit}
+    />
+  );
+}
+
+// ── Inline create row (new file / new folder) ───────────────
+function FileCreateRow({ depth, kind, onCommit, onCancel }: { depth: number; kind: "file" | "folder"; onCommit: (name: string) => void; onCancel: () => void }) {
+  const [value, setValue] = useState("");
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const committedRef = useRef(false);
+  const pad = 10 + depth * 14;
+
+  useEffect(() => { inputRef.current?.focus(); }, []);
+
+  const commit = () => {
+    if (committedRef.current) return;
+    committedRef.current = true;
+    onCommit(value);
+  };
+  const cancel = () => {
+    if (committedRef.current) return;
+    committedRef.current = true;
+    onCancel();
+  };
+
+  return (
+    <div className="side-item side-item-create" style={{ paddingLeft: pad }}>
+      <span className="file-chevron-spacer" />
+      <Icon name={kind === "folder" ? "folder" : "file"} size={13} className="ico" />
+      <input
+        ref={inputRef}
+        className="file-rename-input"
+        value={value}
+        placeholder={kind === "folder" ? "New folder name…" : "New file name…"}
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") { e.preventDefault(); commit(); }
+          else if (e.key === "Escape") { e.preventDefault(); cancel(); }
+          e.stopPropagation();
+        }}
+        onBlur={commit}
+      />
+    </div>
+  );
+}
+
+// ── Right-click context menu (file tree only) ───────────────
+// Anchored to the click coords. Mouse-down outside closes it.
+function FileCtxMenu({ node, x, y, onClose, onAction }: { node: any; x: number; y: number; onClose: () => void; onAction: (a: FileCtxAction) => void }) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
+    };
+    const onEsc = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onEsc);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onEsc);
+    };
+  }, [onClose]);
+
+  const isDir = Array.isArray(node.children);
+  return (
+    <div ref={ref} className="file-ctx-menu" style={{ left: x, top: y }}>
+      {/* "New" items live at the top — VS Code convention. For a file we
+          interpret them as "new sibling" (handled in doCtxAction above). */}
+      <button onClick={() => onAction("newFile")}>New File…</button>
+      <button onClick={() => onAction("newFolder")}>New Folder…</button>
+      <div className="file-ctx-sep" />
+      <button onClick={() => onAction("rename")}>Rename…</button>
+      <button onClick={() => onAction("delete")} className="danger">Delete</button>
+      {/* Hint at the bottom so the user knows what they're targeting. */}
+      <div className="file-ctx-target">{isDir ? "📁" : "📄"} {node.name}</div>
+    </div>
+  );
+}
+
+// ── Delete confirmation modal ───────────────────────────────
+// Centered overlay; click on backdrop = cancel, Escape = cancel.
+function FileDeleteConfirm({ node, onCancel, onConfirm }: { node: any; onCancel: () => void; onConfirm: () => void }) {
+  useEffect(() => {
+    const onEsc = (e: KeyboardEvent) => { if (e.key === "Escape") onCancel(); };
+    document.addEventListener("keydown", onEsc);
+    return () => document.removeEventListener("keydown", onEsc);
+  }, [onCancel]);
+
+  const isDir = Array.isArray(node.children);
+  return (
+    <div className="file-delete-overlay" onClick={onCancel}>
+      <div className="file-delete-modal" onClick={(e) => e.stopPropagation()}>
+        <h3>Delete {isDir ? "folder" : "file"}?</h3>
+        <p>
+          <strong>{node.name}</strong> will be permanently removed
+          {isDir ? ", along with everything inside it." : "."}
+        </p>
+        <p className="muted">This cannot be undone.</p>
+        <div className="file-delete-actions">
+          <button className="lgb lgb-sm" onClick={onCancel}>Cancel</button>
+          <button className="lgb lgb-sm danger" onClick={onConfirm}>Delete</button>
+        </div>
+      </div>
+    </div>
   );
 }
 

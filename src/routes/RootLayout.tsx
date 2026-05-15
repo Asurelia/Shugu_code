@@ -48,7 +48,7 @@ import { seedGalleryFolders } from "@/mocks/seedGalleryFolders";
 import { seedMessages } from "@/mocks/seedMessages";
 import type { DockState, FileNode } from "@/lib/types";
 import { db, seedIfEmpty, toGenerationRow } from "@/lib/db";
-import { inTauri, fsReadDir, fsReadFile, fsWriteFile } from "@/lib/fs";
+import { inTauri, fsReadDir, fsReadFile, fsWriteFile, onFsChanged } from "@/lib/fs";
 import { COMMANDS, getCommandById, fmtKbd, type CommandContext } from "@/lib/commands";
 import { useCommandKeybindings } from "@/lib/keybindings";
 
@@ -405,6 +405,23 @@ export function RootLayout() {
   // — the .catch must yield [] to avoid crashing the app.
   useEffect(() => {
     fsReadDir().then(setFileTree).catch(() => setFileTree([]));
+  }, []);
+
+  // Re-fetch the tree whenever the Rust watcher reports a workspace change
+  // (200 ms debounced).  No-op in web mode (the listener never fires).
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    void onFsChanged(() => {
+      // Latest-write-wins: a new fetch supersedes any in-flight one.
+      fsReadDir().then(t => { if (!cancelled) setFileTree(t); }).catch(() => {});
+    }).then(fn => {
+      if (cancelled) fn(); else unlisten = fn;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
   }, []);
 
   // CSS variable sync from tweaks

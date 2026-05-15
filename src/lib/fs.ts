@@ -10,7 +10,7 @@
 // the IPC boundary are forward-slash-normalised strings relative to the
 // workspace root (e.g. "src/lib/fs.ts", never "/home/user/project/src/lib/fs.ts").
 
-import { invoke } from "@/lib/tauri";
+import { invoke, listen } from "@/lib/tauri";
 import type { FileNode, FileContent } from "@/lib/types";
 import { seedFileTree } from "@/mocks/seedFileTree";
 import { seedFileContents } from "@/mocks/seedFileContents";
@@ -146,4 +146,58 @@ export async function fsReadFile(path: string): Promise<FileContent> {
 export async function fsWriteFile(path: string, content: string): Promise<void> {
   if (!inTauri) return;
   await invoke<void>("fs_write_file", { path, content });
+}
+
+/**
+ * Create a new file at a workspace-relative path with optional initial content.
+ *
+ * Errors (rejected promise with a string message) if the file already exists
+ * or if `path` escapes the workspace root.  Parent directories are created
+ * automatically if missing.  Silent no-op in web mode.
+ */
+export async function fsCreateFile(path: string, content?: string): Promise<void> {
+  if (!inTauri) return;
+  await invoke<void>("fs_create_file", { path, content });
+}
+
+/**
+ * Create a directory (and any missing parents) at a workspace-relative path.
+ * Idempotent — succeeds if the directory already exists.  Silent no-op in web mode.
+ */
+export async function fsCreateDir(path: string): Promise<void> {
+  if (!inTauri) return;
+  await invoke<void>("fs_create_dir", { path });
+}
+
+/**
+ * Rename / move a workspace-relative path.
+ *
+ * `from` must exist; `to` must NOT exist (no silent overwrite).  Both must
+ * remain inside the workspace.  Silent no-op in web mode.
+ */
+export async function fsRename(from: string, to: string): Promise<void> {
+  if (!inTauri) return;
+  await invoke<void>("fs_rename", { from, to });
+}
+
+/**
+ * Delete a workspace-relative path.  Files are removed directly; directories
+ * are deleted recursively without following symlinks.  Silent no-op in web mode.
+ */
+export async function fsDelete(path: string): Promise<void> {
+  if (!inTauri) return;
+  await invoke<void>("fs_delete", { path });
+}
+
+/**
+ * Subscribe to filesystem-change events emitted by the Rust watcher.
+ *
+ * The handler is invoked once per debounced burst (≈200 ms quiet window)
+ * whenever any file under the workspace changes.  The payload is empty —
+ * callers should re-fetch the tree via `fsReadDir()` when notified.
+ *
+ * Returns an unlisten function.  Always returns a no-op unlisten in web mode.
+ */
+export async function onFsChanged(handler: () => void): Promise<() => void> {
+  return listen<void>("fs://changed", () => handler());
 }

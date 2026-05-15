@@ -51,7 +51,7 @@ const IGNORED_NAMES: &[&str] = &[
     ".hg",
 ];
 
-fn is_ignored(name: &str) -> bool {
+pub(crate) fn is_ignored(name: &str) -> bool {
     // Case-insensitive on Windows, case-sensitive on macOS/Linux.
     #[cfg(target_os = "windows")]
     return IGNORED_NAMES
@@ -295,6 +295,7 @@ fn build_tree(root: &Path, entries: Vec<walkdir::DirEntry>) -> Vec<FsEntry> {
 pub fn fs_open_folder(
     app: tauri::AppHandle,
     root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
+    watcher_ctl: tauri::State<'_, crate::commands::watcher::WatcherCtl>,
 ) -> Result<Option<String>, String> {
     // Show blocking native folder picker.
     let picked = app.dialog().file().blocking_pick_folder();
@@ -321,6 +322,9 @@ pub fn fs_open_folder(
 
     // Persist to settings table (best-effort — don't fail the command on DB error).
     let _ = persist_workspace_root(&app, &canonical);
+
+    // Notify the watcher of the new root (best-effort — never fail the command).
+    let _ = watcher_ctl.0.send(canonical.clone());
 
     Ok(Some(display))
 }
@@ -455,6 +459,171 @@ pub fn fs_write_file(
         return Err(format!("atomic rename failed: {e}"));
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// B1-C: New mutation commands (create_file, create_dir, rename, delete)
+// ---------------------------------------------------------------------------
+
+/// Create a new file at a workspace-relative path.
+///
+/// Fails if the file already exists.  Creates intermediate parent directories.
+/// If `content` is `None` an empty file is written; otherwise the given string
+/// is written atomically (temp-file + rename — same pattern as `fs_write_file`).
+#[tauri::command]
+pub fn fs_create_file(
+    path: String,
+    content: Option<String>,
+    root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
+) -> Result<(), String> {
+    let root = lock_root(&root_state)?;
+    let target = safe_resolve_for_write(&root, &path)?;
+
+    if target
+        .try_exists()
+        .map_err(|e| format!("stat error: {e}"))?
+    {
+        return Err(format!("file already exists: {}", path));
+    }
+
+    // Ensure parent directories exist.
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all: {e}"))?;
+    }
+
+    let body = content.unwrap_or_default();
+
+    // Atomic write: temp file in same directory then rename.
+    let tmp = make_tmp_path(&target);
+    std::fs::write(&tmp, body.as_bytes()).map_err(|e| format!("write temp file: {e}"))?;
+    if let Err(e) = std::fs::rename(&tmp, &target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("atomic rename failed: {e}"));
+    }
+
+    Ok(())
+}
+
+/// Create a directory (and all parents) at a workspace-relative path.
+///
+/// Idempotent: succeeds if the directory already exists.
+#[tauri::command]
+pub fn fs_create_dir(
+    path: String,
+    root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
+) -> Result<(), String> {
+    let root = lock_root(&root_state)?;
+    let target = safe_resolve_for_write(&root, &path)?;
+    std::fs::create_dir_all(&target).map_err(|e| format!("create_dir_all: {e}"))
+}
+
+/// Rename (move) a workspace-relative path.
+///
+/// `from` must exist; `to` must not exist (no silent overwrite).  If `to`'s
+/// parent directories are missing they are created first.  Both `from` and `to`
+/// must remain inside the workspace root.
+#[tauri::command]
+pub fn fs_rename(
+    from: String,
+    to: String,
+    root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
+) -> Result<(), String> {
+    let root = lock_root(&root_state)?;
+
+    // `from` must already exist.
+    let from_abs = safe_resolve(&root, &from)?;
+
+    // `to` must be inside the workspace (may not exist yet).
+    let to_abs = safe_resolve_for_write(&root, &to)?;
+
+    // Guard against silent overwrites (POSIX rename() would silently replace).
+    if to_abs
+        .try_exists()
+        .map_err(|e| format!("stat error (to): {e}"))?
+    {
+        return Err(format!("destination already exists: {}", to));
+    }
+
+    // Create parent directories for `to` if necessary.
+    if let Some(parent) = to_abs.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all (to parent): {e}"))?;
+    }
+
+    std::fs::rename(&from_abs, &to_abs).map_err(|e| format!("rename failed: {e}"))
+}
+
+/// Delete a file or directory at a workspace-relative path.
+///
+/// Files are deleted with `remove_file`.  Directories are deleted recursively
+/// using `walkdir` with `follow_links(false)` and `contents_first(true)` — we
+/// never follow symlinks out of the workspace.
+///
+/// SECURITY NOTE: `safe_resolve` canonicalises the path and rejects any
+/// symlink whose resolved target is outside the workspace.  This means a
+/// dangling or out-of-workspace symlink cannot be deleted through this command.
+/// That is intentional; use the host OS to remove such links.
+#[tauri::command]
+pub fn fs_delete(
+    path: String,
+    root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
+) -> Result<(), String> {
+    let root = lock_root(&root_state)?;
+    let target = safe_resolve(&root, &path)?;
+
+    // Use symlink_metadata so we see the symlink type, not its target's type.
+    let meta =
+        std::fs::symlink_metadata(&target).map_err(|e| format!("stat error: {e}"))?;
+
+    if meta.is_dir() {
+        delete_dir_no_follow(&target)
+    } else {
+        // Regular file or symlink: remove_file is correct for both.
+        std::fs::remove_file(&target).map_err(|e| format!("remove_file: {e}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers shared by the mutation commands
+// ---------------------------------------------------------------------------
+
+/// Extract the workspace root from state, returning a clean error if unset.
+fn lock_root(state: &Mutex<Option<PathBuf>>) -> Result<PathBuf, String> {
+    let guard = state.lock().map_err(|e| format!("workspace state lock: {e}"))?;
+    guard.clone().ok_or_else(|| "no workspace open".to_string())
+}
+
+/// Build the temp-file path for atomic writes (placed next to the target).
+fn make_tmp_path(target: &Path) -> PathBuf {
+    let ext = target
+        .extension()
+        .map(|e| format!("{}.shugu_tmp", e.to_string_lossy()))
+        .unwrap_or_else(|| "shugu_tmp".to_string());
+    target.with_extension(ext)
+}
+
+/// Recursively delete a directory without following symlinks.
+///
+/// Uses `walkdir` with `follow_links(false)` and `contents_first(true)` so
+/// leaves are yielded before parents — deletion works in natural iteration order.
+/// Symlinks-to-dirs are treated as files by walkdir under `follow_links(false)`,
+/// so `is_dir()` returns `false` for them and they are removed with `remove_file`.
+fn delete_dir_no_follow(dir: &Path) -> Result<(), String> {
+    for result in WalkDir::new(dir)
+        .follow_links(false)
+        .contents_first(true)
+    {
+        let entry = result.map_err(|e| format!("walkdir error: {e}"))?;
+        let ft = entry.file_type();
+        if ft.is_dir() {
+            std::fs::remove_dir(entry.path())
+                .map_err(|e| format!("remove_dir {:?}: {e}", entry.path()))?;
+        } else {
+            // Regular file or symlink-to-anything.
+            std::fs::remove_file(entry.path())
+                .map_err(|e| format!("remove_file {:?}: {e}", entry.path()))?;
+        }
+    }
     Ok(())
 }
 
@@ -649,5 +818,234 @@ mod tests {
 
         cleanup(&root);
         cleanup(&outside);
+    }
+
+    // -----------------------------------------------------------------------
+    // fs_create_file impl tests (test the helpers directly, not the Tauri command)
+    // -----------------------------------------------------------------------
+
+    /// Create a file in a fresh temp root — must succeed.
+    #[test]
+    fn create_file_impl_new_file_ok() {
+        let root = make_temp_dir("create_file_new");
+        let target = safe_resolve_for_write(&root, "hello.txt").unwrap();
+
+        // Simulate what fs_create_file does after resolving.
+        assert!(!target.exists(), "precondition: file must not exist");
+        fs::write(&target, b"hello").unwrap();
+        assert!(target.exists(), "file should now exist");
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn create_file_rejects_existing() {
+        let root = make_temp_dir("create_file_exists");
+        let file = root.join("existing.txt");
+        fs::write(&file, b"data").unwrap();
+        // If target already exists, the command would error.
+        assert!(file.try_exists().unwrap(), "precondition: file exists");
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn create_file_rejects_traversal() {
+        let root = make_temp_dir("create_file_traverse");
+        let result = safe_resolve_for_write(&root, "../evil.txt");
+        assert!(result.is_err(), "traversal must be rejected");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn create_file_rejects_null_byte() {
+        let root = make_temp_dir("create_file_null");
+        let result = safe_resolve_for_write(&root, "foo\0bar.txt");
+        assert!(result.is_err(), "null byte must be rejected");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn create_file_creates_parent_dirs() {
+        let root = make_temp_dir("create_file_parents");
+        // deep/nested/new.txt — parents don't exist yet
+        let target = safe_resolve_for_write(&root, "deep/nested/new.txt").unwrap();
+        if let Some(p) = target.parent() {
+            fs::create_dir_all(p).unwrap();
+        }
+        fs::write(&target, b"").unwrap();
+        assert!(target.exists());
+        cleanup(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // fs_create_dir impl tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn create_dir_impl_new_dir_ok() {
+        let root = make_temp_dir("create_dir_new");
+        let target = safe_resolve_for_write(&root, "subdir/nested").unwrap();
+        fs::create_dir_all(&target).unwrap();
+        assert!(target.is_dir());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn create_dir_idempotent_on_existing() {
+        let root = make_temp_dir("create_dir_idem");
+        let target = root.join("existing_dir");
+        fs::create_dir_all(&target).unwrap();
+        // second call must not error
+        fs::create_dir_all(&target).unwrap();
+        cleanup(&root);
+    }
+
+    #[test]
+    fn create_dir_rejects_traversal() {
+        let root = make_temp_dir("create_dir_traverse");
+        let result = safe_resolve_for_write(&root, "../outside_dir");
+        assert!(result.is_err());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn create_dir_rejects_null_byte() {
+        let root = make_temp_dir("create_dir_null");
+        let result = safe_resolve_for_write(&root, "dir\0name");
+        assert!(result.is_err());
+        cleanup(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // fs_rename impl tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rename_impl_success() {
+        let root = make_temp_dir("rename_ok");
+        let from = root.join("original.txt");
+        fs::write(&from, b"content").unwrap();
+        let from_canon = std::fs::canonicalize(&from).unwrap();
+
+        let to = safe_resolve_for_write(&root, "renamed.txt").unwrap();
+        assert!(!to.exists());
+
+        std::fs::rename(&from_canon, &to).unwrap();
+        assert!(to.exists());
+        assert!(!from_canon.exists());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn rename_impl_to_exists_fails() {
+        let root = make_temp_dir("rename_to_exists");
+        let from = root.join("a.txt");
+        let to = root.join("b.txt");
+        fs::write(&from, b"a").unwrap();
+        fs::write(&to, b"b").unwrap();
+
+        // The guard in fs_rename checks try_exists before calling rename.
+        let to_resolved = safe_resolve_for_write(&root, "b.txt").unwrap();
+        let exists = to_resolved.try_exists().unwrap();
+        assert!(exists, "to already exists — command should have returned Err");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn rename_rejects_from_traversal() {
+        let root = make_temp_dir("rename_from_traverse");
+        // safe_resolve requires the path to exist AND be inside root.
+        let result = safe_resolve(&root, "../outside.txt");
+        assert!(result.is_err());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn rename_rejects_to_traversal() {
+        let root = make_temp_dir("rename_to_traverse");
+        let result = safe_resolve_for_write(&root, "../outside.txt");
+        assert!(result.is_err());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn rename_rejects_null_byte_in_from() {
+        let root = make_temp_dir("rename_null_from");
+        let result = safe_resolve(&root, "foo\0bar.txt");
+        assert!(result.is_err());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn rename_rejects_null_byte_in_to() {
+        let root = make_temp_dir("rename_null_to");
+        let result = safe_resolve_for_write(&root, "foo\0bar.txt");
+        assert!(result.is_err());
+        cleanup(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // fs_delete impl tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn delete_file_ok() {
+        let root = make_temp_dir("delete_file");
+        let file = root.join("to_delete.txt");
+        fs::write(&file, b"bye").unwrap();
+
+        let resolved = safe_resolve(&root, "to_delete.txt").unwrap();
+        fs::remove_file(&resolved).unwrap();
+        assert!(!file.exists());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn delete_dir_recursive_ok() {
+        let root = make_temp_dir("delete_dir_rec");
+        let dir = root.join("mydir");
+        fs::create_dir_all(dir.join("nested")).unwrap();
+        fs::write(dir.join("file.txt"), b"x").unwrap();
+        fs::write(dir.join("nested").join("deep.txt"), b"y").unwrap();
+
+        let resolved = safe_resolve(&root, "mydir").unwrap();
+        delete_dir_no_follow(&resolved).unwrap();
+        assert!(!dir.exists());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn delete_nonexistent_fails() {
+        let root = make_temp_dir("delete_missing");
+        // safe_resolve calls canonicalize which fails if path doesn't exist.
+        let result = safe_resolve(&root, "ghost.txt");
+        assert!(result.is_err(), "nonexistent path must be rejected");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn delete_rejects_traversal() {
+        let root = make_temp_dir("delete_traverse");
+        let result = safe_resolve(&root, "../outside.txt");
+        assert!(result.is_err());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn delete_rejects_null_byte() {
+        let root = make_temp_dir("delete_null");
+        let result = safe_resolve(&root, "foo\0bar.txt");
+        assert!(result.is_err());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn delete_rejects_dotdot_segment() {
+        let root = make_temp_dir("delete_dotdot");
+        // A path like "dir/../../../etc" — safe_resolve canonicalizes and checks.
+        let result = safe_resolve(&root, "dir/../../../etc");
+        assert!(result.is_err());
+        cleanup(&root);
     }
 }

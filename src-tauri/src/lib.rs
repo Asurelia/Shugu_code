@@ -107,6 +107,11 @@ pub fn run() {
         // Workspace root — set by fs_open_folder, read by all other fs commands.
         .manage(Mutex::new(None::<std::path::PathBuf>))
         .setup(|app| {
+            // Spawn the filesystem watcher before restoring the workspace root
+            // so the watcher is ready to receive the seed path below.
+            let watcher_tx = commands::watcher::spawn_watcher(app.handle().clone());
+            app.manage(commands::watcher::WatcherCtl(watcher_tx.clone()));
+
             // Restore the last workspace root from the settings table.
             // This runs after plugin init (so the DB migrations have run).
             // Any failure (missing row, path gone, DB error) is silently ignored —
@@ -117,7 +122,10 @@ pub fn run() {
                     let state = app
                         .state::<Mutex<Option<std::path::PathBuf>>>();
                     let mut guard = state.lock().map_err(|_| ())?;
-                    *guard = Some(canonical);
+                    *guard = Some(canonical.clone());
+                    // Seed the watcher with the restored root so file-change
+                    // events are watched immediately on startup.
+                    let _ = watcher_tx.send(canonical);
                 }
                 Ok(())
             })();
@@ -129,6 +137,10 @@ pub fn run() {
             commands::fs::fs_read_dir,
             commands::fs::fs_read_file,
             commands::fs::fs_write_file,
+            commands::fs::fs_create_file,
+            commands::fs::fs_create_dir,
+            commands::fs::fs_rename,
+            commands::fs::fs_delete,
             commands::terminal::term_run,
             commands::image::image_generate,
             commands::models::models_list,
