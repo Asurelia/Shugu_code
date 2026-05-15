@@ -730,10 +730,15 @@
   width: var(--avatar-size); height: var(--avatar-size);
   min-width: 0; min-height: 0;
   display: grid;
-  /* Float the chibi centered in the cluster (where the original robot
-     sat). The chat panel is sized separately and doesn't anchor to
-     the character. */
-  place-items: center;
+  /* `place-content: center` (not `place-items: center`) so the chibi
+     is truly centered inside the 156×156 flip box. With an oversized
+     child (240×288), `place-items: center` would auto-size the grid
+     cell to the child and anchor it at the flip top — its feet would
+     hang 132px below the cluster bottom and the chat panel (anchored
+     to the cluster bottom) could never align with them. Centering the
+     grid tracks instead pins the chibi's center to the cluster center,
+     so visible feet land roughly at cluster bottom = panel bottom. */
+  place-content: center;
   transform: rotate(var(--avatar-edge-rotate)) scaleX(var(--avatar-face-scale-x));
   transform-origin: center;
   transition: transform var(--side-shift-duration) var(--side-shift-ease);
