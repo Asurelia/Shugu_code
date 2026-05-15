@@ -770,76 +770,79 @@ export function ModelPicker({ model, onChange }: { model: string; onChange: (m: 
   );
 }
 
-// ─── Mascot — Shugu astronaut (drop-in SVG) ─────────────────
-export function MascotAstronaut({ size = 92 }: { size?: number }) {
+// ─── Mascot — Shugu chibi (drop-in image) ───────────────────
+// Replaces the original astronaut SVG. Moods map to one of 5
+// hand-drawn expressions; the 2 "peek" poses are used only when the
+// mascot is tucked against a screen edge.
+export type ChibiMood =
+  | "neutral" | "smile" | "joy" | "sad" | "cry"
+  | "peek_open" | "peek_closed";
+
+// PNG assets live in public/assets/chibi/ → served at /assets/chibi/*
+// (works identically in web mode and the bundled Tauri webview).
+const CHIBI_VARIANTS: Record<ChibiMood, string> = {
+  neutral: "/assets/chibi/neutral.png", // calm idle, blue eyes
+  smile:   "/assets/chibi/smile.png",   // content, closed eyes
+  joy:     "/assets/chibi/joy.png",     // excited, eyes squished shut
+  sad:     "/assets/chibi/sad.png",     // worried / half-closed eyes
+  cry:     "/assets/chibi/cry.png",     // big teary eyes
+  // Peek poses — the figure grips the edge with its hands, the rest
+  // off-screen. peek_open = new LLM reply waiting; peek_closed = idle.
+  peek_open:   "/assets/chibi/peek_open.png",
+  peek_closed: "/assets/chibi/peek_closed.png",
+};
+
+const CHIBI_LABELS: Record<ChibiMood, string> = {
+  neutral: "Calme",
+  smile: "Content·e",
+  joy: "Excité·e",
+  sad: "Triste",
+  cry: "Pleure",
+  peek_open: "Coucou !",
+  peek_closed: "Repos",
+};
+
+export function MascotAstronaut({ size = 92, mood = "neutral" }: { size?: number; mood?: ChibiMood }) {
+  const src = CHIBI_VARIANTS[mood] || CHIBI_VARIANTS.neutral;
+  const isPeek = mood === "peek_open" || mood === "peek_closed";
+  // Peek poses are stickers — render smaller and squarer than the
+  // full-body chibi so the head fills the visible area at the edge.
+  const w = isPeek ? Math.round(size * 0.4) : size;
+  const h = isPeek ? Math.round(size * 0.4) : Math.round(size * 1.2);
   return (
-    <svg viewBox="0 0 120 144" width={size} height={Math.round(size * 1.2)} xmlns="http://www.w3.org/2000/svg">
-      <defs>
-        <radialGradient id="m-helmet" cx="35%" cy="32%" r="80%">
-          <stop offset="0%" stopColor="#5c4d8a"/>
-          <stop offset="60%" stopColor="#2a1f4d"/>
-          <stop offset="100%" stopColor="#160d2a"/>
-        </radialGradient>
-        <radialGradient id="m-visor" cx="40%" cy="35%" r="70%">
-          <stop offset="0%" stopColor="#a0b3ff"/>
-          <stop offset="40%" stopColor="#5063c5"/>
-          <stop offset="100%" stopColor="#1c1a4d"/>
-        </radialGradient>
-        <linearGradient id="m-body" x1="0%" y1="0%" x2="0%" y2="100%">
-          <stop offset="0%" stopColor="#f5f1ff"/>
-          <stop offset="100%" stopColor="#c9c1e3"/>
-        </linearGradient>
-        <linearGradient id="m-bodyShade" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" stopColor="rgba(255,255,255,0)"/>
-          <stop offset="100%" stopColor="rgba(30,16,60,0.35)"/>
-        </linearGradient>
-        <linearGradient id="m-accent" x1="0%" y1="0%" x2="0%" y2="100%">
-          <stop offset="0%" stopColor="#fd6c9c"/>
-          <stop offset="100%" stopColor="#e08efe"/>
-        </linearGradient>
-      </defs>
-      <ellipse cx="60" cy="142" rx="32" ry="3.5" fill="rgba(0,0,0,0.4)"/>
-      <rect x="44" y="98" width="14" height="32" rx="6" fill="url(#m-body)"/>
-      <rect x="62" y="98" width="14" height="32" rx="6" fill="url(#m-body)"/>
-      <rect x="44" y="98" width="14" height="32" rx="6" fill="url(#m-bodyShade)" opacity="0.6"/>
-      <rect x="62" y="98" width="14" height="32" rx="6" fill="url(#m-bodyShade)" opacity="0.6"/>
-      <rect x="42" y="124" width="18" height="10" rx="4" fill="#2a1f4d"/>
-      <rect x="60" y="124" width="18" height="10" rx="4" fill="#2a1f4d"/>
-      <path d="M40,70 Q40,55 60,55 Q80,55 80,70 L82,108 Q82,116 76,116 L44,116 Q38,116 38,108 Z" fill="url(#m-body)"/>
-      <path d="M40,70 Q40,55 60,55 Q80,55 80,70 L82,108 Q82,116 76,116 L44,116 Q38,116 38,108 Z" fill="url(#m-bodyShade)" opacity="0.5"/>
-      <rect x="50" y="78" width="20" height="14" rx="3" fill="#1d1438"/>
-      <circle cx="55" cy="85" r="1.8" fill="#81ecff"/>
-      <circle cx="60" cy="85" r="1.8" fill="#fd6c9c"/>
-      <circle cx="65" cy="85" r="1.8" fill="#8aefc7"/>
-      <rect x="38" y="72" width="44" height="3" fill="url(#m-accent)"/>
-      <rect x="24" y="68" width="14" height="34" rx="6" fill="url(#m-body)"/>
-      <rect x="82" y="68" width="14" height="34" rx="6" fill="url(#m-body)"/>
-      <rect x="24" y="68" width="14" height="34" rx="6" fill="url(#m-bodyShade)" opacity="0.5"/>
-      <rect x="82" y="68" width="14" height="34" rx="6" fill="url(#m-bodyShade)" opacity="0.5"/>
-      <circle cx="31" cy="104" r="8" fill="url(#m-accent)"/>
-      <circle cx="89" cy="104" r="8" fill="url(#m-accent)"/>
-      <ellipse cx="60" cy="56" rx="26" ry="6" fill="#1d1438"/>
-      <circle cx="60" cy="40" r="28" fill="url(#m-helmet)"/>
-      <ellipse cx="60" cy="40" rx="20" ry="18" fill="url(#m-visor)"/>
-      <ellipse cx="54" cy="34" rx="6" ry="3" fill="rgba(255,255,255,0.55)"/>
-      <ellipse cx="65" cy="38" rx="3" ry="1.5" fill="rgba(255,255,255,0.4)"/>
-      <circle cx="54" cy="42" r="1.2" fill="rgba(255,255,255,0.65)"/>
-      <circle cx="66" cy="42" r="1.2" fill="rgba(255,255,255,0.65)"/>
-      <line x1="60" y1="12" x2="60" y2="6" stroke="#e08efe" strokeWidth="1.5" strokeLinecap="round"/>
-      <circle cx="60" cy="5" r="2.5" fill="#fd6c9c">
-        <animate attributeName="r" values="2.5;3.4;2.5" dur="1.8s" repeatCount="indefinite"/>
-        <animate attributeName="fill-opacity" values="1;0.6;1" dur="1.8s" repeatCount="indefinite"/>
-      </circle>
-    </svg>
+    <div className={"chibi-mascot mood-" + mood} style={{ width: w, height: h }}>
+      <img
+        src={src}
+        alt={"Shugu — " + (CHIBI_LABELS[mood] || mood)}
+        draggable={false}
+        width={w}
+        height={h}
+      />
+    </div>
   );
 }
 
 // ─── Floating mini-chat (space-agent style) ─────────────────
 export function FloatChat({ pinnedAnno, clearPinned }: any) {
   const [mode, setMode] = useState<"closed" | "compact" | "full">("compact");
+  // moodOverride: null = derived from state; otherwise forces a mood (alt+click cycle).
+  const [moodOverride, setMoodOverride] = useState<ChibiMood | null>(null);
+  // Last user-interaction timestamp — drives the "lonely" sad face after long idle.
+  const [lastInteract, setLastInteract] = useState(Date.now());
+  // Ticking clock so we re-derive mood as time passes.
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 5000);
+    return () => clearInterval(t);
+  }, []);
   const [pos, setPos] = useState(() => {
-    const m = 24;
-    return { x: window.innerWidth - 78 - m, y: window.innerHeight - 78 - m };
+    // Default: right edge, vertically centered. The chibi hugs the
+    // right side with a small margin; the panel docks to its left.
+    const w = 156, h = 156;
+    return {
+      x: window.innerWidth - w - 12,
+      y: Math.round(window.innerHeight / 2 - h / 2),
+    };
   });
   const [dragging, setDragging] = useState(false);
   const [edge, setEdge] = useState<string | null>(null);
@@ -850,6 +853,7 @@ export function FloatChat({ pinnedAnno, clearPinned }: any) {
   const [msgs, setMsgs] = useState<any[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [hasUnread, setHasUnread] = useState(false); // an LLM reply arrived while tucked / closed
   const historyRef = useRef<HTMLDivElement | null>(null);
   const movedRef = useRef(false);
 
@@ -878,8 +882,8 @@ export function FloatChat({ pinnedAnno, clearPinned }: any) {
   useEffect(() => {
     const onResize = () => {
       setPos(p => ({
-        x: Math.max(0, Math.min(p.x, window.innerWidth - 78)),
-        y: Math.max(0, Math.min(p.y, window.innerHeight - 78)),
+        x: Math.max(0, Math.min(p.x, window.innerWidth - 156)),
+        y: Math.max(0, Math.min(p.y, window.innerHeight - 156)),
       }));
     };
     window.addEventListener("resize", onResize);
@@ -893,12 +897,54 @@ export function FloatChat({ pinnedAnno, clearPinned }: any) {
     setInput("");
     setBusy(true);
     setMode("full");
+    setLastInteract(Date.now());
     setTimeout(() => {
       setMsgs(m => [...m, { who: "ai", text: "Mock reply — connect a real Anthropic key in Settings → Connections." }]);
       setTokens(n => n + Math.floor(80 + Math.random() * 200));
       setBusy(false);
+      setLastInteract(Date.now());
+      // The reply just landed. If the mascot is tucked or closed the
+      // user won't see it, so flag it as unread → peek_open expression.
+      setHasUnread(true);
     }, 900);
   };
+
+  // Clear the unread flag once the user actually sees the conversation
+  // (panel expanded to "full") or starts typing again.
+  useEffect(() => {
+    if (mode === "full" && hasUnread) setHasUnread(false);
+  }, [mode, hasUnread]);
+  useEffect(() => {
+    if (input && hasUnread) setHasUnread(false);
+  }, [input, hasUnread]);
+
+  // Alt+click cycles the mood override; null → first → … → last → null (auto).
+  const MOOD_CYCLE: ChibiMood[] = ["neutral", "smile", "joy", "sad", "cry"];
+  const cycleMood = () => {
+    setMoodOverride(curr => {
+      if (curr === null) return MOOD_CYCLE[0];
+      const i = MOOD_CYCLE.indexOf(curr);
+      if (i === MOOD_CYCLE.length - 1) return null;
+      return MOOD_CYCLE[i + 1];
+    });
+  };
+
+  // ── Mood derivation ──
+  // Priority: edge-tucked (peek pose) → manual override → busy (joy) →
+  // no key (cry) → pinned annotation (smile) → long idle (sad) →
+  // recent interaction (smile) → neutral default.
+  const idleMs = now - lastInteract;
+  const derivedMood: ChibiMood = (() => {
+    if (edge) return hasUnread ? "peek_open" : "peek_closed";
+    if (busy) return "joy";
+    if (!hasKey) return "cry";
+    if (pinnedAnno) return "smile";
+    if (idleMs > 60_000) return "sad";
+    if (idleMs < 10_000 && msgs.length > 0) return "smile";
+    return "neutral";
+  })();
+  // Manual override doesn't apply when tucked — the peek pose is geometry, not expression.
+  const mood: ChibiMood = edge ? derivedMood : (moodOverride || derivedMood);
 
   const onAvatarMouseDown = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -920,8 +966,8 @@ export function FloatChat({ pinnedAnno, clearPinned }: any) {
       window.removeEventListener("mouseup", onUp);
       setPos(p => {
         const SNAP = 14;
-        const aw = 78;
-        const ah = 78;
+        const aw = 156;
+        const ah = 156;
         const distLeft   = p.x;
         const distRight  = window.innerWidth - (p.x + aw);
         const distTop    = p.y;
@@ -942,12 +988,13 @@ export function FloatChat({ pinnedAnno, clearPinned }: any) {
     window.addEventListener("mouseup", onUp);
   };
 
-  const onAvatarClick = () => {
+  const onAvatarClick = (e: React.MouseEvent) => {
     if (movedRef.current) return;
+    if (e.altKey) { cycleMood(); return; }
     if (edge) {
       setEdge(null);
       setPos(p => {
-        const aw = 78;
+        const aw = 156;
         let nx = p.x, ny = p.y;
         if (edge === "left")   nx = 24;
         if (edge === "right")  nx = window.innerWidth - aw - 24;
@@ -967,7 +1014,7 @@ export function FloatChat({ pinnedAnno, clearPinned }: any) {
 
   const onCtx = (e: React.MouseEvent) => {
     e.preventDefault();
-    setPos(p => ({ x: window.innerWidth - p.x - 78, y: p.y }));
+    setPos(p => ({ x: window.innerWidth - p.x - 156, y: p.y }));
   };
 
   const shellClass = [
@@ -994,11 +1041,15 @@ export function FloatChat({ pinnedAnno, clearPinned }: any) {
           onClick={onAvatarClick}
           onDoubleClick={onAvatarDouble}
           onContextMenu={onCtx}
-          title={edge ? "Cliquer pour ramener" : (mode === "closed" ? "Cliquer pour ouvrir · drag" : "Cliquer pour fermer · double pour étendre · drag pour déplacer")}
+          title={edge
+            ? "Cliquer pour ramener"
+            : (mode === "closed"
+              ? "Cliquer pour ouvrir · drag · alt+clic pour changer d'humeur"
+              : "Cliquer pour fermer · double pour étendre · drag pour déplacer · alt+clic pour humeur")}
         >
           <span className="float-avatar-orbit">
             <span className="float-avatar-flip">
-              <MascotAstronaut size={72}/>
+              <MascotAstronaut size={240} mood={mood}/>
             </span>
           </span>
           <span className="float-avatar-glow"></span>

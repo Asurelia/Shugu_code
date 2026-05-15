@@ -671,8 +671,11 @@
 .float-shell {
   position: fixed;
   z-index: 9100;
-  --avatar-size: 78px;
-  --gap: 12px;
+  --avatar-size: 156px;
+  /* Slight negative gap: the chibi image has ~40px of transparent
+     padding on each side. We pull the chat panel in just a bit so it
+     sits close to the visible character, without overlapping it. */
+  --gap: -16px;
   --side-shift-duration: 280ms;
   --side-shift-ease: cubic-bezier(0.22, 1, 0.36, 1);
   --mode-transition-duration: 260ms;
@@ -699,12 +702,14 @@
 .float-avatar-btn {
   width: 100%;
   height: 100%;
+  min-width: 0; min-height: 0;
   padding: 0; border: 0;
   background: transparent;
   cursor: grab;
   display: grid; place-items: center;
   position: relative;
   touch-action: none;
+  overflow: visible;
 }
 .float-avatar-btn:active { cursor: grabbing; }
 .float-avatar-btn:focus-visible {
@@ -714,20 +719,66 @@
 }
 
 .float-avatar-orbit {
-  width: 100%; height: 100%;
+  width: var(--avatar-size); height: var(--avatar-size);
+  min-width: 0; min-height: 0;
   display: grid; place-items: center;
   animation: avatar-float 8.4s ease-in-out infinite;
 }
 .float-shell.edge-hidden .float-avatar-orbit { animation: none; }
 
 .float-avatar-flip {
-  width: 100%; height: 100%;
-  display: grid; place-items: center;
+  width: var(--avatar-size); height: var(--avatar-size);
+  min-width: 0; min-height: 0;
+  display: grid;
+  /* Float the chibi centered in the cluster (where the original robot
+     sat). The chat panel is sized separately and doesn't anchor to
+     the character. */
+  place-items: center;
   transform: rotate(var(--avatar-edge-rotate)) scaleX(var(--avatar-face-scale-x));
   transform-origin: center;
   transition: transform var(--side-shift-duration) var(--side-shift-ease);
   will-change: transform;
-  filter: drop-shadow(0 10px 18px rgba(0,0,0,0.55)) drop-shadow(0 0 18px rgba(224,142,254,0.22));
+  filter: drop-shadow(0 8px 14px rgba(0,0,0,0.5)) drop-shadow(0 0 14px rgba(224,142,254,0.18));
+}
+
+/* Chibi mascot — rendered as an <img>, sized to fill the avatar
+   cluster so the full-body figure reads clearly. The chibi floats
+   centered in the cluster (free-floating, not anchored to the chat). */
+.chibi-mascot {
+  position: relative;
+  display: grid; place-items: center;
+  pointer-events: none;
+}
+.chibi-mascot img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  -webkit-user-drag: none;
+  user-select: none;
+  /* Slight saturation bump so the pastel character harmonizes with
+     the Celestial Veil palette. */
+  filter: saturate(1.05) contrast(1.02);
+  /* Filter only — no transform here so per-mood swaps stay pixel-
+     locked (see note below). */
+  transition: filter 260ms ease;
+}
+/* Per-mood treatment — color/filter ONLY (no transform, no animation)
+   so all 5 open states render at the exact same size & position. This
+   deviates from the prototype's micro-anims (joy bounce / cry quiver /
+   sad slump) on purpose: the user wants state changes to be fluid
+   (superposition identique). Ambient life still happens at the cluster
+   level via avatar-float on the orbit, which is mood-independent. */
+.chibi-mascot.mood-joy img {
+  filter: saturate(1.15) brightness(1.05);
+}
+.chibi-mascot.mood-cry img {
+  filter: saturate(0.95) contrast(1.02) drop-shadow(0 0 6px rgba(129,236,255,0.35));
+}
+.chibi-mascot.mood-sad img {
+  filter: saturate(0.85) brightness(0.95);
+}
+.chibi-mascot.mood-smile img {
+  filter: saturate(1.1) brightness(1.03);
 }
 
 /* When the mascot is on the right side of screen, face the panel (left) */
@@ -739,6 +790,32 @@
 .float-shell.edge-hidden-right  { --avatar-edge-rotate: -90deg; }
 .float-shell.edge-hidden-top    { --avatar-edge-rotate: 180deg; }
 .float-shell.edge-hidden-bottom { --avatar-edge-rotate:   0deg; }
+
+/* Peek poses: when tucked at an edge, the chibi uses dedicated
+   "gripping the edge" art. Override the upright-mascot rotation
+   with per-edge transforms so the hands land exactly on the screen
+   edge while head/upper-body peeks inside. */
+.float-shell.edge-hidden .float-avatar-flip {
+  --avatar-face-scale-x: 1;
+  filter: drop-shadow(0 8px 14px rgba(0,0,0,0.45)) drop-shadow(0 0 18px rgba(224,142,254,0.20));
+}
+/* The peek image has ~10% transparent padding around the character,
+   so we translate slightly less than half the cluster to bring the
+   *visible* hands onto the screen edge. */
+.float-shell.edge-hidden-bottom .float-avatar-flip { transform: translateY(-32px); }
+.float-shell.edge-hidden-top    .float-avatar-flip { transform: translateY( 32px) rotate(180deg); }
+.float-shell.edge-hidden-left   .float-avatar-flip { transform: translateX( 32px) rotate( 90deg); }
+.float-shell.edge-hidden-right  .float-avatar-flip { transform: translateX(-32px) rotate(-90deg); }
+
+/* Subtle bob on the peek so it feels alive — small enough that hands
+   stay visually anchored to the edge. */
+@keyframes chibi-peek-bob {
+  0%, 100% { translate: 0 0; }
+  50%      { translate: 0 -3px; }
+}
+.float-shell.edge-hidden .chibi-mascot img {
+  animation: chibi-peek-bob 3.6s ease-in-out infinite;
+}
 
 @keyframes avatar-float {
   0%,100% { transform: translate3d(0,0,0)   rotate(-2deg); }
@@ -752,11 +829,11 @@
   position: absolute;
   bottom: -4px; left: 50%;
   transform: translateX(-50%);
-  width: 64px; height: 8px;
+  width: 120px; height: 12px;
   border-radius: 50%;
   background: radial-gradient(ellipse, var(--primary), transparent 70%);
   opacity: 0.45;
-  filter: blur(3px);
+  filter: blur(4px);
   pointer-events: none;
 }
 .float-shell.edge-hidden .float-avatar-glow { opacity: 0; }
