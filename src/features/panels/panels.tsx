@@ -828,7 +828,11 @@ export function MascotAstronaut({ size = 92, mood = "neutral" }: { size?: number
 // mascot window in src/mascot.tsx) is then free to install its own
 // mousedown handler that moves the OS window instead of repositioning the
 // chibi inside the viewport.
-export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag }: any) {
+// `forceSide`: when provided, overrides the default left/right detection
+// (which relies on the chibi's intra-window pos.x). Used by the mascot
+// window to flip the chibi + dock the chat panel based on where the WINDOW
+// sits on the monitor, not where the chibi is inside the window.
+export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceSide }: any) {
   const [mode, setMode] = useState<"closed" | "compact" | "full">("compact");
   // moodOverride: null = derived from state; otherwise forces a mood (alt+click cycle).
   const [moodOverride, setMoodOverride] = useState<ChibiMood | null>(null);
@@ -862,7 +866,10 @@ export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag }: any)
   const historyRef = useRef<HTMLDivElement | null>(null);
   const movedRef = useRef(false);
 
-  const side = pos.x + 39 > window.innerWidth / 2 ? "right" : "left";
+  const side: "left" | "right" =
+    forceSide === "left" || forceSide === "right"
+      ? forceSide
+      : pos.x + 39 > window.innerWidth / 2 ? "right" : "left";
 
   useEffect(() => {
     if (pinnedAnno) {

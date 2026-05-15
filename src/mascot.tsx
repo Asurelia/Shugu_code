@@ -14,7 +14,7 @@
 //   clearPinned will arrive via Tauri events at M4 — for now we pass
 //   inert defaults so the pinned-annotation UI stays hidden.
 
-import React, { useEffect } from "react";
+import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles/styles.css";
 import "./styles/panels.css";
@@ -22,6 +22,14 @@ import "./styles/chat-sidebar.css";
 import "./styles/settings-extras.css";
 import { FloatChat } from "@/features/panels/panels";
 import { ThemeBootstrap } from "@/lib/ThemeBootstrap";
+
+// Cross-hook flag: while the user is actively dragging the mascot window,
+// the click-through hook MUST NOT toggle setIgnoreCursorEvents(true) — even
+// if the cursor briefly exits the painted area during a fast drag. Ignoring
+// cursor events mid-drag drops the mouseup, which kills snap detection.
+// Module-level rather than a ref so both hooks share the same instance
+// without a Context.
+let mascotIsDragging = false;
 
 // ─── Click-through hook (M5) ─────────────────────────────────
 //
@@ -67,6 +75,10 @@ function useMascotClickThrough() {
       let lastIgnore: boolean | null = null;
       let ignoreErrLogged = false;
       const setIgnore = async (ignore: boolean) => {
+        // While the user is dragging the window we MUST keep events on
+        // so the mouseup reaches us — even if the cursor briefly slips
+        // off the painted area during a fast drag. See useMascotWindowDrag.
+        if (mascotIsDragging && ignore) return;
         if (lastIgnore === ignore) return;
         lastIgnore = ignore;
         try {
@@ -157,7 +169,14 @@ function useMascotClickThrough() {
 // Coordinate model: Tauri positions are PHYSICAL pixels (raw OS pixels,
 // not CSS-scaled). The DOM gives us CSS pixels via `screenX/Y`. We bridge
 // the two by multiplying CSS deltas by `devicePixelRatio`.
-function useMascotWindowDrag() {
+//
+// The hook also derives `forcedSide` ("left" | "right") from the window's
+// position on its monitor and pushes it back via `setForcedSide`. That way
+// the chibi flips to face the screen interior and the chat panel docks
+// AWAY from the screen edge after every drag — when the window sits on
+// the right half, side="right" so the panel grows leftward into the
+// visible screen, not off-screen.
+function useMascotWindowDrag(setForcedSide: (s: "left" | "right" | null) => void) {
   useEffect(() => {
     let cancelled = false;
     let cleanup: (() => void) | null = null;
@@ -175,19 +194,42 @@ function useMascotWindowDrag() {
       } catch { return; }
       if (cancelled || !win || !availableMonitorsFn) return;
 
-      // Pixels (in physical units, post-DPR). A drop within this distance
-      // of a monitor edge after release snaps the window flush.
-      const SNAP_THRESHOLD_PHYS = 40;
-      // CSS pixels — below this delta we treat the gesture as a click,
+      // CSS pixels. Multiplied by devicePixelRatio at use-site so the snap
+      // feels the same on a 100 % screen and a 200 % HiDPI screen.
+      const SNAP_THRESHOLD_CSS = 80;
+      // CSS pixels — below this drag-delta we treat the gesture as a click,
       // above it as a drag (matches FloatChat's own threshold).
       const DRAG_THRESHOLD_CSS = 4;
+
+      // Refresh side based on where the window center sits on its monitor.
+      // Right half → side="right" (chibi faces left, chat docks left into
+      // visible screen). Left half → side="left" (mirror).
+      const refreshSide = async () => {
+        try {
+          const winPos = await win.outerPosition();
+          const winSize = await win.outerSize();
+          const monitors = await availableMonitorsFn!();
+          const cx = winPos.x + winSize.width / 2;
+          const cy = winPos.y + winSize.height / 2;
+          const m =
+            monitors.find((mn: any) =>
+              cx >= mn.position.x && cx < mn.position.x + mn.size.width &&
+              cy >= mn.position.y && cy < mn.position.y + mn.size.height
+            ) || monitors[0];
+          if (!m) return;
+          const mCenterX = m.position.x + m.size.width / 2;
+          setForcedSide(cx > mCenterX ? "right" : "left");
+        } catch (err) {
+          console.warn("[mascot drag] refreshSide failed:", err);
+        }
+      };
+
+      // Initial side — for the very first paint, before any drag happens.
+      await refreshSide();
 
       const onMouseDown = async (e: MouseEvent) => {
         const target = e.target as Element | null;
         if (!target) return;
-        // Only the chibi cluster is a drag handle. NOT the chat panel
-        // (so the user can still click inputs/buttons) and NOT the
-        // speech bubble (let it dismiss on click).
         if (!target.closest(".float-cluster")) return;
         if (target.closest(".float-speech")) return;
         if (e.button !== 0) return;
@@ -205,6 +247,13 @@ function useMascotWindowDrag() {
         }
         let didDrag = false;
 
+        // Mark the drag window for the click-through hook — it'll keep
+        // cursor events ON even if the cursor slips off the painted area
+        // during a fast drag. Also force events ON right now, in case the
+        // poll left them OFF.
+        mascotIsDragging = true;
+        try { await win.setIgnoreCursorEvents(false); } catch {}
+
         const onMove = (mv: MouseEvent) => {
           const dxCss = mv.screenX - startScreenX;
           const dyCss = mv.screenY - startScreenY;
@@ -212,15 +261,13 @@ function useMascotWindowDrag() {
           didDrag = true;
           const nx = Math.round(startWinPos.x + dxCss * scale);
           const ny = Math.round(startWinPos.y + dyCss * scale);
-          // Best-effort: setPosition is async but we don't await — we want
-          // to schedule the next frame's position update without blocking
-          // the mousemove loop (which fires at ~120 Hz on modern mice).
           win.setPosition(new PhysicalPositionCtor(nx, ny)).catch(() => {});
         };
 
         const onUp = async () => {
           window.removeEventListener("mousemove", onMove);
           window.removeEventListener("mouseup", onUp);
+          mascotIsDragging = false;
           if (!didDrag) return;
 
           // Snap to the closest edge of the monitor under the window's center.
@@ -235,19 +282,30 @@ function useMascotWindowDrag() {
                 cx >= mn.position.x && cx < mn.position.x + mn.size.width &&
                 cy >= mn.position.y && cy < mn.position.y + mn.size.height
               ) || monitors[0];
-            if (!m) return;
+            if (!m) {
+              await refreshSide();
+              return;
+            }
             const dLeft   = winPos.x - m.position.x;
             const dRight  = (m.position.x + m.size.width)  - (winPos.x + winSize.width);
             const dTop    = winPos.y - m.position.y;
             const dBottom = (m.position.y + m.size.height) - (winPos.y + winSize.height);
             const minD = Math.min(dLeft, dRight, dTop, dBottom);
-            if (minD > SNAP_THRESHOLD_PHYS) return;
-            let nx = winPos.x, ny = winPos.y;
-            if (minD === dLeft)        nx = m.position.x;
-            else if (minD === dRight)  nx = m.position.x + m.size.width  - winSize.width;
-            else if (minD === dTop)    ny = m.position.y;
-            else if (minD === dBottom) ny = m.position.y + m.size.height - winSize.height;
-            await win.setPosition(new PhysicalPositionCtor(nx, ny));
+            const thresholdPhys = SNAP_THRESHOLD_CSS * scale;
+            if (minD <= thresholdPhys) {
+              let nx = winPos.x, ny = winPos.y;
+              if (minD === dLeft)        nx = m.position.x;
+              else if (minD === dRight)  nx = m.position.x + m.size.width  - winSize.width;
+              else if (minD === dTop)    ny = m.position.y;
+              else if (minD === dBottom) ny = m.position.y + m.size.height - winSize.height;
+              await win.setPosition(new PhysicalPositionCtor(nx, ny));
+              console.log(`[mascot drag] snapped to ${
+                minD === dLeft ? "left" : minD === dRight ? "right" : minD === dTop ? "top" : "bottom"
+              } edge of monitor "${m.name}"`);
+            }
+            // Always refresh side after a drag — even if no snap fired,
+            // the chibi may have moved across the monitor center.
+            await refreshSide();
           } catch (err) {
             console.warn("[mascot drag] snap failed:", err);
           }
@@ -275,7 +333,7 @@ function useMascotWindowDrag() {
     })();
 
     return () => { cancelled = true; cleanup?.(); };
-  }, []);
+  }, [setForcedSide]);
 }
 
 function MascotApp() {
@@ -284,12 +342,18 @@ function MascotApp() {
   // model picker all theme identically across the two windows. Without it
   // the mascot would render with the raw CSS-variable defaults (cyan/teal
   // baseline) instead of whatever the user picked in Settings → Tweaks.
+  const [forcedSide, setForcedSide] = useState<"left" | "right" | null>(null);
   useMascotClickThrough();
-  useMascotWindowDrag();
+  useMascotWindowDrag(setForcedSide);
   return (
     <>
       <ThemeBootstrap />
-      <FloatChat pinnedAnno={null} clearPinned={() => {}} disableInternalDrag />
+      <FloatChat
+        pinnedAnno={null}
+        clearPinned={() => {}}
+        disableInternalDrag
+        forceSide={forcedSide ?? undefined}
+      />
     </>
   );
 }
