@@ -33,13 +33,31 @@ export interface ChibiCalibration {
   snapThreshold: number;
 }
 
-/** Defaults derived from the M2/M3-v6 alpha-scan of the chibi PNGs. */
+/**
+ * Defaults — visual preference rather than raw alpha-scan geometry.
+ *
+ * The original M3-v6 values (32 / 124 / 19 / 156, threshold 80) were
+ * derived strictly from a canvas alpha scan of the chibi PNGs: they
+ * make the alpha-non-zero pixel of the sprite land exactly on the
+ * monitor edge. In practice the user judged that "too tight" and
+ * tuned via the Settings → Mascot sliders to these values, which:
+ *
+ *   - leave a small visual breathing margin so anti-aliased pixels
+ *     and the drop-shadow halo don't feel clipped against the edge
+ *   - keep top/bottom roughly symmetric to match the visible centre
+ *     of mass of the chibi (which is in its body, not its feet)
+ *   - tighten the snap threshold so the magnetism only kicks in when
+ *     the user has clearly committed to an edge, not on every near-pass
+ *
+ * Reset in Settings → Mascot restores these. Keep them in sync with
+ * what feels right on a typical 1080p/4K display at standard DPI.
+ */
 export const DEFAULT_CALIBRATION: ChibiCalibration = {
-  left: 32,
-  right: 124,
-  top: 19,
-  bottom: 156,
-  snapThreshold: 80,
+  left: 73,
+  right: 85,
+  top: 73,
+  bottom: 85,
+  snapThreshold: 35,
 };
 
 const STORAGE_KEY = "shugu.mascot.calibration.v1";
