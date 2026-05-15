@@ -1,5 +1,7 @@
 mod commands;
 
+use std::sync::Mutex;
+use tauri::Manager;
 use tauri_plugin_sql::{Builder as SqlBuilder, Migration, MigrationKind};
 
 const MIGRATION_V1: &str = "
@@ -96,13 +98,34 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(
             SqlBuilder::default()
                 .add_migrations("sqlite:shugu.db", migrations)
                 .build(),
         )
+        // Workspace root — set by fs_open_folder, read by all other fs commands.
+        .manage(Mutex::new(None::<std::path::PathBuf>))
+        .setup(|app| {
+            // Restore the last workspace root from the settings table.
+            // This runs after plugin init (so the DB migrations have run).
+            // Any failure (missing row, path gone, DB error) is silently ignored —
+            // we never crash app boot over a missing workspace.
+            let _ = (|| -> Result<(), ()> {
+                let restored = commands::fs::restore_workspace_root(app.handle());
+                if let Some(canonical) = restored {
+                    let state = app
+                        .state::<Mutex<Option<std::path::PathBuf>>>();
+                    let mut guard = state.lock().map_err(|_| ())?;
+                    *guard = Some(canonical);
+                }
+                Ok(())
+            })();
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::chat::chat_send,
+            commands::fs::fs_open_folder,
             commands::fs::fs_read_dir,
             commands::fs::fs_read_file,
             commands::fs::fs_write_file,
