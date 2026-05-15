@@ -193,7 +193,7 @@ export function SideFiles({ tree, active, onPick, onOpenFolder }: any) {
 
 export function FileNode({ node, depth, active, onPick }: any) {
   const [open, setOpen] = useState(node.open !== false);
-  const isDir = node.children;
+  const isDir = Array.isArray(node.children);
   const pad = 10 + depth * 14;
   return (
     <>
@@ -202,9 +202,15 @@ export function FileNode({ node, depth, active, onPick }: any) {
         style={{ paddingLeft: pad }}
         onClick={() => isDir ? setOpen(o => !o) : onPick(node.path)}
       >
-        {/* Fix 4: chevron for directories, spacer for files (alignment). */}
+        {/* Chevron for directories, spacer for files (keeps labels aligned).
+            The chevron is its own click target (stopPropagation) so clicking
+            the glyph toggles directly — the row click toggles too, but the
+            explicit affordance matches IDE convention. */}
         {isDir
-          ? <span className="file-chevron">{open ? "▾" : "▸"}</span>
+          ? <span
+              className="file-chevron"
+              onClick={(e) => { e.stopPropagation(); setOpen(o => !o); }}
+            >{open ? "▾" : "▸"}</span>
           : <span className="file-chevron-spacer" />}
         {isDir
           ? <Icon name="folder" size={13} className="ico" />

@@ -308,14 +308,14 @@ export const COMMANDS: Command[] = [
     title: "Find in file",
     category: "Edit",
     keybinding: ["Cmd", "F"],
-    // When inside CM6 editor, CM6 handles this natively via its own keymap.
-    // When outside the editor this is a no-op (no EditorView ref in ctx yet).
-    when: (ctx) => ctx.currentView === "code",
-    run: () => {
-      // CM6 handles ⌘F internally; dispatcher will not reach here from inside .cm-editor
-      // (the cm-editor guard in useCommandKeybindings blocks it).
-      // This run() fires only when ⌘F is pressed outside the editor while in code view.
-    },
+    // DISABLED until @codemirror/search is wired. The dispatcher no longer
+    // skips events originating inside .cm-editor, so an enabled find-in-file
+    // would preventDefault ⌘F and run an empty handler — i.e. swallow both
+    // CM6's native find AND the browser's. `when:() => false` lets ⌘F fall
+    // through to CM6 untouched. Flip to `currentView === "code"` once a real
+    // search panel exists.
+    when: () => false,
+    run: () => { /* TODO: open @codemirror/search find panel */ },
   },
   {
     // Renamed from `replace` per mapping doc.
@@ -323,8 +323,9 @@ export const COMMANDS: Command[] = [
     title: "Replace",
     category: "Edit",
     keybinding: ["Cmd", "Alt", "F"],
-    when: (ctx) => ctx.currentView === "code",
-    run: () => { /* Delegates to CM6 replace panel */ },
+    // DISABLED for the same reason as find-in-file — see note above.
+    when: () => false,
+    run: () => { /* TODO: open @codemirror/search replace panel */ },
   },
   {
     id: "regenerate",

@@ -90,10 +90,15 @@ function loadUserOverrides(): Map<string, string[]> {
 /**
  * Build the active keymap: for each global-scope command, resolve its
  * effective binding (user override wins over COMMANDS default).
- * Returns Map<canonicalKeyString, commandId>.
+ * Returns Map<canonicalKeyString, commandId[]>.
+ *
+ * Multiple commands MAY share one chord (e.g. ⌘S → save-file in code view,
+ * img-save in image view). Candidates are kept in COMMANDS declaration order;
+ * the dispatcher runs the first whose `when` predicate passes. A plain
+ * Map<string,string> would silently drop all but the last-declared command.
  */
-function buildKeymap(overrides: Map<string, string[]>): Map<string, string> {
-  const map = new Map<string, string>();
+function buildKeymap(overrides: Map<string, string[]>): Map<string, string[]> {
+  const map = new Map<string, string[]>();
   for (const cmd of COMMANDS) {
     // Skip input-local commands — they are never globally dispatched.
     if (cmd.scope === "input") continue;
@@ -102,7 +107,11 @@ function buildKeymap(overrides: Map<string, string[]>): Map<string, string> {
     if (!effectiveTokens || effectiveTokens.length === 0) continue;
 
     const key = bindingToKey(effectiveTokens);
-    if (key) map.set(key, cmd.id);
+    if (!key) continue;
+
+    const existing = map.get(key);
+    if (existing) existing.push(cmd.id);
+    else map.set(key, [cmd.id]);
   }
   return map;
 }
@@ -151,18 +160,22 @@ export function useCommandKeybindings(ctx: CommandContext): void {
     const overrides = loadUserOverrides();
     const keymap = buildKeymap(overrides);
 
-    const cmdId = keymap.get(pressedKey);
-    if (!cmdId) return;
+    const candidates = keymap.get(pressedKey);
+    if (!candidates || candidates.length === 0) return;
 
-    const cmd = COMMANDS.find((c) => c.id === cmdId);
-    if (!cmd) return;
+    // Try candidates in COMMANDS declaration order; run the first whose
+    // `when` predicate passes. This is how same-chord/different-view commands
+    // (⌘S → save-file vs img-save) are disambiguated at dispatch time.
+    for (const cmdId of candidates) {
+      const cmd = COMMANDS.find((c) => c.id === cmdId);
+      if (!cmd) continue;
+      if (cmd.when && !cmd.when(ctx)) continue;
 
-    // Check the when predicate.
-    if (cmd.when && !cmd.when(ctx)) return;
-
-    // Command matched — consume the event and run.
-    e.preventDefault();
-    void cmd.run(ctx);
+      // Command matched — consume the event and run.
+      e.preventDefault();
+      void cmd.run(ctx);
+      return;
+    }
   }, [ctx]);
 
   useEffect(() => {
