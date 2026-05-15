@@ -7,8 +7,6 @@ import {
   useRef,
   useCallback,
   useMemo,
-  createContext,
-  useContext,
   Suspense,
 } from "react";
 import { useNavigate, useRouterState, Outlet } from "@tanstack/react-router";
@@ -52,31 +50,11 @@ import { inTauri, fsReadDir, fsReadFile, fsWriteFile, onFsChanged } from "@/lib/
 import { COMMANDS, getCommandById, fmtKbd, type CommandContext } from "@/lib/commands";
 import { useCommandKeybindings } from "@/lib/keybindings";
 
-// ─── Types ────────────────────────────────────────────────────
-
-export interface ShellContextValue {
-  messages: any[];
-  setMessages: React.Dispatch<React.SetStateAction<any[]>>;
-  openFiles: string[];
-  setOpenFiles: React.Dispatch<React.SetStateAction<string[]>>;
-  activeFile: string | null;
-  setActiveFile: React.Dispatch<React.SetStateAction<string | null>>;
-  fileContents: any;
-  setFileContents: React.Dispatch<React.SetStateAction<any>>;
-  generations: any[];
-  setGenerations: React.Dispatch<React.SetStateAction<any[]>>;
-  agents: any[];
-}
-
-// ─── Context ─────────────────────────────────────────────────
-
-const ShellContext = createContext<ShellContextValue | null>(null);
-
-export function useShell(): ShellContextValue {
-  const ctx = useContext(ShellContext);
-  if (!ctx) throw new Error("useShell must be used inside RootLayout");
-  return ctx;
-}
+// Context + hook live in ./shell-context to keep this file Fast-Refresh
+// friendly (a module exporting both a hook and a component forces a full
+// page reload on every HMR edit, which in turn caused the intermittent
+// "useShell must be used inside RootLayout" errors in the Tauri webview).
+import { ShellContext, type ShellContextValue } from "./shell-context";
 
 // ─── Path → view string (derived navigation) ─────────────────
 

@@ -1,5 +1,5 @@
 // Lazy route module for /image — loaded on first navigation to /image.
-import { useShell } from "@/routes/RootLayout";
+import { useShell } from "@/routes/shell-context";
 import { ImageView } from "@/features/chat/views-chat";
 
 export default function ImageRouteComponent() {

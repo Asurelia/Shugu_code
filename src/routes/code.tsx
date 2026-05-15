@@ -1,5 +1,5 @@
 // Lazy route module for /code — loaded on first navigation to /code.
-import { useShell } from "@/routes/RootLayout";
+import { useShell } from "@/routes/shell-context";
 import { CodeView } from "@/features/code/views-code";
 
 export default function CodeRouteComponent() {

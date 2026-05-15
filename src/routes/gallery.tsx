@@ -1,5 +1,5 @@
 // Lazy route module for /gallery — loaded on first navigation to /gallery.
-import { useShell } from "@/routes/RootLayout";
+import { useShell } from "@/routes/shell-context";
 import { GalleryView } from "@/features/code/views-code";
 
 export default function GalleryRouteComponent() {

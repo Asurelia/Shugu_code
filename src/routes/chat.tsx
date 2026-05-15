@@ -1,5 +1,5 @@
 // Lazy route module for /chat — loaded on first navigation to /chat.
-import { useShell } from "@/routes/RootLayout";
+import { useShell } from "@/routes/shell-context";
 import { ChatView } from "@/features/chat/views-chat";
 
 export default function ChatRouteComponent() {
