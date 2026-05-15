@@ -145,6 +145,139 @@ function useMascotClickThrough() {
   }, []);
 }
 
+// ─── Window-level drag + multi-monitor edge snap (M3) ───────
+//
+// The chibi LIVES in its own Tauri window now, so dragging it should move
+// the WINDOW across the desktop, not reposition the chibi inside the
+// window. We pass `disableInternalDrag={true}` to FloatChat to silence its
+// intra-window drag and replace it here with a window-level drag that
+// queries every connected monitor via Tauri's `availableMonitors()` to
+// snap to the closest screen edge on release.
+//
+// Coordinate model: Tauri positions are PHYSICAL pixels (raw OS pixels,
+// not CSS-scaled). The DOM gives us CSS pixels via `screenX/Y`. We bridge
+// the two by multiplying CSS deltas by `devicePixelRatio`.
+function useMascotWindowDrag() {
+  useEffect(() => {
+    let cancelled = false;
+    let cleanup: (() => void) | null = null;
+
+    (async () => {
+      let win: any = null;
+      let availableMonitorsFn: (() => Promise<any[]>) | null = null;
+      let PhysicalPositionCtor: any = null;
+      try {
+        const m1 = await import("@tauri-apps/api/webviewWindow");
+        const m2 = await import("@tauri-apps/api/window");
+        win = m1.getCurrentWebviewWindow();
+        availableMonitorsFn = m2.availableMonitors;
+        PhysicalPositionCtor = m2.PhysicalPosition;
+      } catch { return; }
+      if (cancelled || !win || !availableMonitorsFn) return;
+
+      // Pixels (in physical units, post-DPR). A drop within this distance
+      // of a monitor edge after release snaps the window flush.
+      const SNAP_THRESHOLD_PHYS = 40;
+      // CSS pixels — below this delta we treat the gesture as a click,
+      // above it as a drag (matches FloatChat's own threshold).
+      const DRAG_THRESHOLD_CSS = 4;
+
+      const onMouseDown = async (e: MouseEvent) => {
+        const target = e.target as Element | null;
+        if (!target) return;
+        // Only the chibi cluster is a drag handle. NOT the chat panel
+        // (so the user can still click inputs/buttons) and NOT the
+        // speech bubble (let it dismiss on click).
+        if (!target.closest(".float-cluster")) return;
+        if (target.closest(".float-speech")) return;
+        if (e.button !== 0) return;
+
+        const startScreenX = e.screenX;
+        const startScreenY = e.screenY;
+        const scale = window.devicePixelRatio || 1;
+
+        let startWinPos: { x: number; y: number };
+        try {
+          startWinPos = await win.outerPosition();
+        } catch (err) {
+          console.warn("[mascot drag] outerPosition failed at start:", err);
+          return;
+        }
+        let didDrag = false;
+
+        const onMove = (mv: MouseEvent) => {
+          const dxCss = mv.screenX - startScreenX;
+          const dyCss = mv.screenY - startScreenY;
+          if (!didDrag && Math.abs(dxCss) + Math.abs(dyCss) < DRAG_THRESHOLD_CSS) return;
+          didDrag = true;
+          const nx = Math.round(startWinPos.x + dxCss * scale);
+          const ny = Math.round(startWinPos.y + dyCss * scale);
+          // Best-effort: setPosition is async but we don't await — we want
+          // to schedule the next frame's position update without blocking
+          // the mousemove loop (which fires at ~120 Hz on modern mice).
+          win.setPosition(new PhysicalPositionCtor(nx, ny)).catch(() => {});
+        };
+
+        const onUp = async () => {
+          window.removeEventListener("mousemove", onMove);
+          window.removeEventListener("mouseup", onUp);
+          if (!didDrag) return;
+
+          // Snap to the closest edge of the monitor under the window's center.
+          try {
+            const winPos = await win.outerPosition();
+            const winSize = await win.outerSize();
+            const monitors = await availableMonitorsFn!();
+            const cx = winPos.x + winSize.width / 2;
+            const cy = winPos.y + winSize.height / 2;
+            const m =
+              monitors.find((mn: any) =>
+                cx >= mn.position.x && cx < mn.position.x + mn.size.width &&
+                cy >= mn.position.y && cy < mn.position.y + mn.size.height
+              ) || monitors[0];
+            if (!m) return;
+            const dLeft   = winPos.x - m.position.x;
+            const dRight  = (m.position.x + m.size.width)  - (winPos.x + winSize.width);
+            const dTop    = winPos.y - m.position.y;
+            const dBottom = (m.position.y + m.size.height) - (winPos.y + winSize.height);
+            const minD = Math.min(dLeft, dRight, dTop, dBottom);
+            if (minD > SNAP_THRESHOLD_PHYS) return;
+            let nx = winPos.x, ny = winPos.y;
+            if (minD === dLeft)        nx = m.position.x;
+            else if (minD === dRight)  nx = m.position.x + m.size.width  - winSize.width;
+            else if (minD === dTop)    ny = m.position.y;
+            else if (minD === dBottom) ny = m.position.y + m.size.height - winSize.height;
+            await win.setPosition(new PhysicalPositionCtor(nx, ny));
+          } catch (err) {
+            console.warn("[mascot drag] snap failed:", err);
+          }
+        };
+
+        // Suppress the click that would otherwise fire after a drag-mouseup
+        // (FloatChat's onAvatarClick toggles the panel — surprising after a drag).
+        const onClickCapture = (ev: MouseEvent) => {
+          if (didDrag) {
+            ev.stopPropagation();
+            ev.preventDefault();
+          }
+          document.removeEventListener("click", onClickCapture, { capture: true } as any);
+        };
+
+        window.addEventListener("mousemove", onMove);
+        window.addEventListener("mouseup", onUp);
+        document.addEventListener("click", onClickCapture, { capture: true });
+      };
+
+      document.addEventListener("mousedown", onMouseDown);
+      cleanup = () => {
+        document.removeEventListener("mousedown", onMouseDown);
+      };
+    })();
+
+    return () => { cancelled = true; cleanup?.(); };
+  }, []);
+}
+
 function MascotApp() {
   // ThemeBootstrap applies the persisted Celestial Veil palette to
   // document.documentElement so the chibi's halo, the chat panel, and the
@@ -152,10 +285,11 @@ function MascotApp() {
   // the mascot would render with the raw CSS-variable defaults (cyan/teal
   // baseline) instead of whatever the user picked in Settings → Tweaks.
   useMascotClickThrough();
+  useMascotWindowDrag();
   return (
     <>
       <ThemeBootstrap />
-      <FloatChat pinnedAnno={null} clearPinned={() => {}} />
+      <FloatChat pinnedAnno={null} clearPinned={() => {}} disableInternalDrag />
     </>
   );
 }

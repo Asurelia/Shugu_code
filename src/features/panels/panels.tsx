@@ -823,7 +823,12 @@ export function MascotAstronaut({ size = 92, mood = "neutral" }: { size?: number
 }
 
 // ─── Floating mini-chat (space-agent style) ─────────────────
-export function FloatChat({ pinnedAnno, clearPinned }: any) {
+// `disableInternalDrag`: when true, the chibi avatar's mousedown becomes a
+// no-op for drag purposes — click-to-toggle still works. The host (e.g. the
+// mascot window in src/mascot.tsx) is then free to install its own
+// mousedown handler that moves the OS window instead of repositioning the
+// chibi inside the viewport.
+export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag }: any) {
   const [mode, setMode] = useState<"closed" | "compact" | "full">("compact");
   // moodOverride: null = derived from state; otherwise forces a mood (alt+click cycle).
   const [moodOverride, setMoodOverride] = useState<ChibiMood | null>(null);
@@ -947,6 +952,13 @@ export function FloatChat({ pinnedAnno, clearPinned }: any) {
   const mood: ChibiMood = edge ? derivedMood : (moodOverride || derivedMood);
 
   const onAvatarMouseDown = (e: React.MouseEvent) => {
+    // When the host (mascot window) drives drag at the OS level, bail
+    // out — but still preventDefault so the browser doesn't initiate
+    // text selection on the SVG/img inside the avatar.
+    if (disableInternalDrag) {
+      e.preventDefault();
+      return;
+    }
     e.preventDefault();
     movedRef.current = false;
     const startX = e.clientX, startY = e.clientY;
