@@ -65,6 +65,42 @@ export function langFromPath(path: string): string {
   return LANG_MAP[ext] ?? "text";
 }
 
+// Reverse of LANG_MAP — given a markdown fence lang id (e.g. "rust",
+// "typescript", "csharp"), return the canonical file extension to use
+// when materializing the snippet on disk. Defaults to "txt" for unknown
+// or "text" lang values.
+const EXT_FROM_LANG: Record<string, string> = {
+  typescript: "ts",
+  javascript: "js",
+  rust:       "rs",
+  python:     "py",
+  json:       "json",
+  markdown:   "md",
+  css:        "css",
+  scss:       "scss",
+  html:       "html",
+  toml:       "toml",
+  yaml:       "yaml",
+  shell:      "sh",
+  bash:       "sh",
+  sql:        "sql",
+  xml:        "xml",
+  go:         "go",
+  java:       "java",
+  kotlin:     "kt",
+  swift:      "swift",
+  cpp:        "cpp",
+  c:          "c",
+  csharp:     "cs",
+  ruby:       "rb",
+  php:        "php",
+  lua:        "lua",
+};
+
+export function langToExt(lang: string): string {
+  return EXT_FROM_LANG[lang.toLowerCase()] ?? "txt";
+}
+
 // ---------------------------------------------------------------------------
 // FsEntry — shape returned by the Rust fs_read_dir command
 // ---------------------------------------------------------------------------

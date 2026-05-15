@@ -188,12 +188,15 @@ export function SideHistory({ items, active, onPick, onNew }: any) {
 
 type FileCtxAction = "newFile" | "newFolder" | "rename" | "delete";
 
-export function SideFiles({ tree, active, onPick, onOpenFolder }: any) {
+export function SideFiles({ tree, active, onPick }: any) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [renaming, setRenaming] = useState<string | null>(null); // path of node being renamed
   const [ctxMenu, setCtxMenu] = useState<{ node: any; x: number; y: number } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<any | null>(null);
   const [creating, setCreating] = useState<{ parent: string; kind: "file" | "folder" } | null>(null);
+  // Popover that asks the user "file or folder?" before the inline
+  // create row appears. Anchored at the (x, y) of the trigger button.
+  const [createPopover, setCreatePopover] = useState<{ parent: string; x: number; y: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const toggleCollapsed = (path: string) => {
@@ -259,12 +262,29 @@ export function SideFiles({ tree, active, onPick, onOpenFolder }: any) {
     } catch (e: any) { setError(String(e)); }
   };
 
+  // Open the create-kind popover positioned just below an anchor button.
+  // `parent` is the directory path the new file/folder should land in;
+  // root creation uses `parent === ""`.
+  const openCreatePopover = (parent: string, e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    setCreatePopover({ parent, x: rect.left, y: rect.bottom + 4 });
+  };
+
   return (
     <aside className="side">
       <div className="side-head">
         <div className="side-title">Explorer · shugu-forge</div>
-        <button className="side-new" onClick={onOpenFolder} title="Open Folder…"><Icon name="folder" size={11}/></button>
-        <button className="side-new" onClick={() => setCreating({ parent: "", kind: "file" })} title="New file at root"><Icon name="plus" size={11}/></button>
+        {/* Open Folder retiré du header — accessible via File menu côté Titlebar.
+            Le "+" ouvre maintenant un popover qui demande fichier ou dossier. */}
+        <button
+          className="side-new"
+          onClick={(e) => openCreatePopover("", e)}
+          title="New file or folder at root"
+        >
+          <Icon name="plus" size={11}/>
+        </button>
       </div>
       <div className="side-list scroll">
         {creating?.parent === "" && (
@@ -291,6 +311,7 @@ export function SideFiles({ tree, active, onPick, onOpenFolder }: any) {
             creating={creating}
             onCommitCreate={doCreate}
             onCancelCreate={() => setCreating(null)}
+            onOpenCreatePopover={openCreatePopover}
           />
         ))}
       </div>
@@ -304,6 +325,20 @@ export function SideFiles({ tree, active, onPick, onOpenFolder }: any) {
           y={ctxMenu.y}
           onClose={() => setCtxMenu(null)}
           onAction={doCtxAction}
+        />,
+        document.body
+      )}
+      {createPopover && createPortal(
+        <FileCreatePopover
+          x={createPopover.x}
+          y={createPopover.y}
+          onPick={(kind) => {
+            const parent = createPopover.parent;
+            setCreatePopover(null);
+            if (parent) forceExpand(parent);
+            setCreating({ parent, kind });
+          }}
+          onClose={() => setCreatePopover(null)}
         />,
         document.body
       )}
@@ -330,6 +365,7 @@ export function FileNode({
   renaming, onCommitRename, onCancelRename,
   onContextMenu,
   creating, onCommitCreate, onCancelCreate,
+  onOpenCreatePopover,
 }: any) {
   const isDir = Array.isArray(node.children);
   // creating.parent === node.path keeps a folder force-open while the user
@@ -369,6 +405,19 @@ export function FileNode({
         {!isRenaming && !isDir && node.git && (
           <span className="meta" style={{color: node.git === "M" ? "var(--warn)" : node.git === "A" ? "var(--success)" : "var(--on-surface-muted)"}}>{node.git}</span>
         )}
+        {/* Hover-visible "+" — only on folders. Clicking opens the same
+            file/folder choice popover used by the header "+", with this
+            node's path as the parent. The popover's onPick will
+            forceExpand(node.path) so the new child is immediately visible. */}
+        {isDir && !isRenaming && onOpenCreatePopover && (
+          <button
+            className="file-add-btn"
+            title="New file or folder here"
+            onClick={(e) => onOpenCreatePopover(node.path, e)}
+          >
+            <Icon name="plus" size={10}/>
+          </button>
+        )}
       </div>
       {isDir && isOpen && (
         <>
@@ -396,6 +445,7 @@ export function FileNode({
               creating={creating}
               onCommitCreate={onCommitCreate}
               onCancelCreate={onCancelCreate}
+              onOpenCreatePopover={onOpenCreatePopover}
             />
           ))}
         </>
@@ -488,6 +538,39 @@ function FileCreateRow({ depth, kind, onCommit, onCancel }: { depth: number; kin
         }}
         onBlur={commit}
       />
+    </div>
+  );
+}
+
+// ── File-or-folder choice popover ───────────────────────────
+// Shown when the user clicks the "+" button in the explorer header or
+// next to a folder row. Reuses the .file-ctx-menu visual style so it
+// matches the right-click context menu. Click-outside / Escape closes.
+function FileCreatePopover({
+  x, y, onPick, onClose,
+}: {
+  x: number; y: number;
+  onPick: (kind: "file" | "folder") => void;
+  onClose: () => void;
+}) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
+    };
+    const onEsc = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onEsc);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onEsc);
+    };
+  }, [onClose]);
+
+  return (
+    <div ref={ref} className="file-ctx-menu" style={{ left: x, top: y, minWidth: 140 }}>
+      <button onClick={() => onPick("file")}>New File…</button>
+      <button onClick={() => onPick("folder")}>New Folder…</button>
     </div>
   );
 }

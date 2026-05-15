@@ -30,7 +30,15 @@ type ImageResult = {
 // Cross-window sync with the mascot's FloatChat rides on the
 // chat://messages-changed Tauri event — both windows render the same
 // SQLite truth.
-export function ChatView({ activeConv, model }: { activeConv: string; model: string }) {
+export function ChatView({
+  activeConv,
+  model,
+  onOpenSnippet,
+}: {
+  activeConv: string;
+  model: string;
+  onOpenSnippet?: (code: string, lang: string) => void;
+}) {
   const [input, setInput] = useState("");
   const [typing, setTyping] = useState(false);
   const [mode, setMode] = useState("chat");
@@ -69,7 +77,7 @@ export function ChatView({ activeConv, model }: { activeConv: string; model: str
     <div className="chat-shell">
       <div className="chat-feed scroll" ref={feedRef}>
         <div className="chat-feed-inner">
-          {messages.map((m: any) => <ChatMessage key={m.id} m={m}/>)}
+          {messages.map((m: any) => <ChatMessage key={m.id} m={m} onOpenSnippet={onOpenSnippet}/>)}
           {typing && (
             <div className="msg ai">
               <div className="avatar">S</div>
@@ -118,7 +126,13 @@ export function ChatView({ activeConv, model }: { activeConv: string; model: str
   );
 }
 
-export function ChatMessage({ m }: any) {
+export function ChatMessage({
+  m,
+  onOpenSnippet,
+}: {
+  m: any;
+  onOpenSnippet?: (code: string, lang: string) => void;
+}) {
   if (m.role === "user") {
     return (
       <div className="msg user">
@@ -137,7 +151,7 @@ export function ChatMessage({ m }: any) {
         <div className="who">Shugu <span className="ts">— {m.ts}</span><span className="chip primary" style={{marginLeft:4}}>shugu-haiku</span></div>
         <div className="text">
           {m.body && <p>{m.body}</p>}
-          {m.code && <CodeBlock lang={m.code.lang} text={m.code.text}/>}
+          {m.code && <CodeBlock lang={m.code.lang} text={m.code.text} onOpenInEditor={onOpenSnippet}/>}
           {m.image && <InlineImage prompt="dreamy aurora, soft pinks and cyan"/>}
         </div>
       </div>
@@ -145,14 +159,34 @@ export function ChatMessage({ m }: any) {
   );
 }
 
-export function CodeBlock({ lang, text }: { lang: string; text: string }) {
+export function CodeBlock({
+  lang,
+  text,
+  onOpenInEditor,
+}: {
+  lang: string;
+  text: string;
+  onOpenInEditor?: (code: string, lang: string) => void;
+}) {
+  const copyToClipboard = () => {
+    if (typeof navigator !== "undefined" && navigator.clipboard) {
+      void navigator.clipboard.writeText(text).catch(() => {});
+    }
+  };
   return (
     <div className="code-block">
       <div className="code-block-head">
         <span className="lang"><span className="dot"></span> {lang}</span>
         <span style={{display:"flex", gap:6}}>
-          <button className="composer-tool" title="Copy"><Icon name="copy" size={12}/></button>
-          <button className="composer-tool" title="Open in editor"><Icon name="code" size={12}/></button>
+          <button className="composer-tool" title="Copy" onClick={copyToClipboard}><Icon name="copy" size={12}/></button>
+          <button
+            className="composer-tool"
+            title="Open in editor"
+            onClick={() => onOpenInEditor?.(text, lang)}
+            disabled={!onOpenInEditor}
+          >
+            <Icon name="code" size={12}/>
+          </button>
         </span>
       </div>
       <pre><code>{highlightRust(text)}</code></pre>

@@ -44,8 +44,9 @@ import { seedGenerations } from "@/mocks/seedGenerations";
 import { seedGalleryFolders } from "@/mocks/seedGalleryFolders";
 import type { DockState, FileNode } from "@/lib/types";
 import { db, seedIfEmpty, toGenerationRow } from "@/lib/db";
-import { useActiveConv, createConversation } from "@/features/chat/chat-sync";
-import { inTauri, fsReadDir, fsReadFile, fsWriteFile, onFsChanged } from "@/lib/fs";
+import { useActiveConv, createConversation, sendChatMessage } from "@/features/chat/chat-sync";
+import { loadOpenFiles, saveOpenFiles } from "@/lib/ide-state";
+import { inTauri, fsReadDir, fsReadFile, fsWriteFile, fsCreateDir, fsCreateFile, langToExt, onFsChanged } from "@/lib/fs";
 import { COMMANDS, getCommandById, fmtKbd, type CommandContext } from "@/lib/commands";
 import { useCommandKeybindings } from "@/lib/keybindings";
 
@@ -386,6 +387,50 @@ export function RootLayout() {
     fsReadDir().then(setFileTree).catch(() => setFileTree([]));
   }, []);
 
+  // Restore the previously open tabs + active file from SQLite.
+  //
+  // Runs once on mount, AFTER the workspace tree is requested (they run in
+  // parallel; that's fine — fsReadFile in openFile() doesn't need the tree
+  // to be loaded, it just needs the workspace root). Each persisted path is
+  // attempted; missing files (renamed/deleted since last session) are
+  // silently skipped so a stale state can't crash the boot.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const restored = await loadOpenFiles();
+      if (cancelled || !restored) return;
+      for (const path of restored.openFiles) {
+        try {
+          const content = await fsReadFile(path);
+          if (cancelled) return;
+          setFileContents(c => ({ ...c, [path]: content }));
+          setOpenFiles(p => p.includes(path) ? p : [...p, path]);
+        } catch {
+          // File no longer exists — skip silently.
+        }
+      }
+      if (cancelled) return;
+      // Only restore activeFile if it actually made it into openFiles
+      // (avoids a "blank editor pointing at a deleted file" state).
+      if (restored.activeFile) {
+        setOpenFiles(p => {
+          if (p.includes(restored.activeFile!)) setActiveFile(restored.activeFile);
+          return p;
+        });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // Persist the open-tabs set on every change, debounced 500ms. Bursts
+  // (opening 5 files in quick succession) collapse into one SQLite write.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      void saveOpenFiles({ openFiles, activeFile });
+    }, 500);
+    return () => clearTimeout(t);
+  }, [openFiles, activeFile]);
+
   // Re-fetch the tree whenever the Rust watcher reports a workspace change
   // (200 ms debounced).  No-op in web mode (the listener never fires).
   useEffect(() => {
@@ -430,17 +475,41 @@ export function RootLayout() {
       t.closest(".titlebar") ||
       t.closest(".tweaks-panel")
     ) return;
-    const label =
-      (window.getSelection()?.toString() || "").slice(0, 60) ||
+    // Collect the active selection at two granularities:
+    //   - label: short (60 chars) for the pinned-annotation UI overlay
+    //   - fullText: longer (2000 chars) for the prompt body sent to the IA
+    // Right-click on something OTHER than a selection (no text selected)
+    // falls back to data-ctx-label or the tag name, in which case fullText
+    // is identical to label (no real code to send to the LLM).
+    const sel = (window.getSelection()?.toString() || "").trim();
+    const label = sel.slice(0, 60) ||
       t?.closest("[data-ctx-label]")?.getAttribute("data-ctx-label") ||
       t?.tagName?.toLowerCase();
+    const fullText = sel ? sel.slice(0, 2000) : label;
     e.preventDefault();
-    setCtx({ open: true, x: e.clientX, y: e.clientY, target: { label, kind: t?.tagName?.toLowerCase(), x: e.clientX, y: e.clientY } });
+    setCtx({ open: true, x: e.clientX, y: e.clientY, target: { label, fullText, kind: t?.tagName?.toLowerCase(), x: e.clientX, y: e.clientY } });
   }, []);
 
   const onAnnotate = useCallback(({ kind, payload, target }: any) => {
     if (kind === "pin") { setPinnedAnno({ label: target?.label, text: target?.label }); return; }
-    if (kind === "ask" || kind === "explain" || kind === "rewrite") { setPinnedAnno({ label: target?.label }); return; }
+    if (kind === "ask" || kind === "explain" || kind === "rewrite") {
+      // Pin the short label for the mascot's "tu as épinglé X" overlay…
+      setPinnedAnno({ label: target?.label });
+      // …and actually send the full selection as a structured prompt to
+      // the active conversation. Both windows (main IDE + mascot) receive
+      // the chat://messages-changed event and render the user message +
+      // the IA reply.
+      const fullText: string = target?.fullText || target?.label || "";
+      if (!fullText) return;
+      const prompts: Record<string, string> = {
+        ask:     `Question about this:\n\n${fullText}`,
+        explain: `Explain this:\n\n${fullText}`,
+        rewrite: `Rewrite this for clarity:\n\n${fullText}`,
+      };
+      const prompt = prompts[kind];
+      void sendChatMessage(activeConvo, prompt, "shugu-haiku-4-5");
+      return;
+    }
     if (kind === "comment") {
       const text = window.prompt("Comment:", "") || "";
       if (!text) return;
@@ -451,7 +520,7 @@ export function RootLayout() {
       setAnnotations(a => [...a, { id: Date.now(), kind, x: target.x, y: target.y, payload, label: target.label }]);
       return;
     }
-  }, []);
+  }, [activeConvo]);
 
   const openFile = useCallback(async (path: string) => {
     if (!(path in fileContents)) {
@@ -479,6 +548,29 @@ export function RootLayout() {
     const dirty = openFiles.filter(p => fileContents[p]?.dirty);
     await Promise.all(dirty.map(saveFile));
   }, [openFiles, fileContents, saveFile]);
+
+  // openSnippetInEditor — turn a chat code block into an editable file.
+  //
+  // Path: <workspace>/.shugu-snippets/snippet-<unix-ms>.<ext>. Stable folder
+  // name so all snippets cluster together; timestamped filename so no
+  // collision and no overwrites. The folder is created on demand
+  // (fsCreateDir is idempotent on the Rust side — succeeds if the dir
+  // already exists). After the file lands on disk, openFile() does the
+  // standard read+tab dance, and we navigate to /code so the user
+  // immediately sees their snippet in CodeMirror.
+  const openSnippetInEditor = useCallback(async (code: string, lang: string) => {
+    const ext = langToExt(lang);
+    const filename = `snippet-${Date.now()}.${ext}`;
+    const path = `.shugu-snippets/${filename}`;
+    try {
+      await fsCreateDir(".shugu-snippets");
+      await fsCreateFile(path, code);
+      await openFile(path);
+      navigate({ to: "/code" });
+    } catch (err) {
+      console.warn("[openSnippetInEditor] failed:", err);
+    }
+  }, [openFile, navigate]);
 
   // newChat creates a fresh conversation row in SQLite and switches the
   // active conv to it. The empty-messages render falls out naturally:
@@ -580,7 +672,6 @@ export function RootLayout() {
           tree={fileTree}
           active={filesPanelActive}
           onPick={openFile}
-          onOpenFolder={() => getCommandById("open-folder")?.run(cmdCtx)}
         />
       );
     }
@@ -636,9 +727,11 @@ export function RootLayout() {
     fileContents, setFileContents,
     generations, setGenerations: setGenerationsPersisted,
     agents,
+    openSnippetInEditor,
   }), [
     openFiles, activeFile, fileContents, generations, agents,
     setOpenFiles, setActiveFile, setFileContents, setGenerationsPersisted,
+    openSnippetInEditor,
   ]);
 
   // The per-view content (the routed <Outlet/> + the absolute annotation layer).

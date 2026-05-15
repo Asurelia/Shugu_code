@@ -34,6 +34,7 @@ import { useCallback, useEffect, useState } from "react";
 import { db } from "@/lib/db";
 import { invoke } from "@/lib/tauri";
 import { resolveProvider } from "@/lib/providers";
+import { parseAiReply } from "@/lib/markdown";
 import type { Message } from "@/lib/types";
 
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -245,12 +246,23 @@ export async function sendChatMessage(
       protocol,
       baseUrl,
     });
-    await appendMessage(convId, {
+    // Parse fenced ```code blocks``` out of the reply so the UI gets the
+    // structured Message.code shape (CodeBlock component highlights + the
+    // "Open in editor" button works). v1 keeps only the FIRST extracted
+    // block because Message.code is singleton; surplus blocks remain in
+    // prose. See src/lib/markdown.ts header for the rationale.
+    const parsed = parseAiReply(reply);
+    const aiMsg: Message = {
       id: newMessageId("a"),
       role: "ai",
-      body: reply,
       ts: nowHHMM(),
-    });
+    };
+    if (parsed.prose) aiMsg.body = parsed.prose;
+    if (parsed.codeBlocks.length > 0) aiMsg.code = parsed.codeBlocks[0];
+    // Safety: a reply that was JUST whitespace would produce neither body
+    // nor code — fall back to the raw text so the user sees SOMETHING.
+    if (!aiMsg.body && !aiMsg.code) aiMsg.body = reply;
+    await appendMessage(convId, aiMsg);
   } catch (err) {
     await appendMessage(convId, {
       id: newMessageId("e"),

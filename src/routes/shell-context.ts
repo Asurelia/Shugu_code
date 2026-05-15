@@ -25,6 +25,13 @@ export interface ShellContextValue {
   generations: any[];
   setGenerations: Dispatch<SetStateAction<any[]>>;
   agents: any[];
+  /**
+   * Take a code snippet (e.g. from a chat AI reply's CodeBlock) and open it
+   * as a real file in the editor. Writes to `.shugu-snippets/snippet-<ts>.<ext>`
+   * under the current workspace, then opens that path as a tab and navigates
+   * to /code. The file is real on disk so the user can edit + save normally.
+   */
+  openSnippetInEditor: (code: string, lang: string) => Promise<void>;
 }
 
 // ─── Context ──────────────────────────────────────────────────
