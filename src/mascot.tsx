@@ -198,8 +198,12 @@ const CHIBI_BOTTOM = 156;   // visible feet  = cluster.top  + 156
 const CLUSTER_SIZE = 156;
 
 type ForcedSide = "left" | "right" | null;
+type ForcedEdge = "left" | "right" | "top" | "bottom" | null;
 
-function useMascotWindowDrag(setForcedSide: (s: ForcedSide) => void) {
+function useMascotWindowDrag(
+  setForcedSide: (s: ForcedSide) => void,
+  setForceEdge: (e: ForcedEdge) => void,
+) {
   useEffect(() => {
     let cancelled = false;
     let cleanup: (() => void) | null = null;
@@ -289,6 +293,11 @@ function useMascotWindowDrag(setForcedSide: (s: ForcedSide) => void) {
         mascotIsDragging = true;
         try { await win.setIgnoreCursorEvents(false); } catch {}
 
+        // Un-tuck the chibi at drag start so the peek-pose sprite doesn't
+        // travel with the cursor mid-drag — it should only appear once a
+        // snap actually fires on release.
+        setForceEdge(null);
+
         const onMove = (mv: MouseEvent) => {
           const dxCss = mv.screenX - startScreenX;
           const dyCss = mv.screenY - startScreenY;
@@ -362,6 +371,27 @@ function useMascotWindowDrag(setForcedSide: (s: ForcedSide) => void) {
               const edges = [lHit && "left", rHit && "right", tHit && "top", bHit && "bottom"]
                 .filter(Boolean).join("+");
               console.log(`[mascot drag] snapped ${edges} on monitor "${m.name}"`);
+
+              // Visual confirmation: pick the dominant edge (smallest
+              // signed distance — the one the chibi is "most against") and
+              // tell FloatChat to switch to the matching peek-pose sprite.
+              // The CSS bundles peek-pose with chat-hide, so the chibi
+              // appears tucked at the screen edge until the user clicks it
+              // to wake up.
+              const hits: Array<[ForcedEdge, number]> = [
+                [lHit ? "left"   : null, dLeft  ],
+                [rHit ? "right"  : null, dRight ],
+                [tHit ? "top"    : null, dTop   ],
+                [bHit ? "bottom" : null, dBottom],
+              ];
+              const winner = hits
+                .filter(([dir]) => dir !== null)
+                .sort((a, b) => a[1] - b[1])[0]?.[0] ?? null;
+              setForceEdge(winner);
+            } else {
+              // No snap — make sure any previous peek pose is cleared so
+              // the chibi doesn't stay tucked after being dragged away.
+              setForceEdge(null);
             }
 
             // Always re-derive forcedSide from the chibi's final visible
@@ -395,7 +425,7 @@ function useMascotWindowDrag(setForcedSide: (s: ForcedSide) => void) {
     })();
 
     return () => { cancelled = true; cleanup?.(); };
-  }, [setForcedSide]);
+  }, [setForcedSide, setForceEdge]);
 }
 
 function MascotApp() {
@@ -407,11 +437,15 @@ function MascotApp() {
   //
   // freezePos: keep the chibi's intra-window position frozen so the snap
   // logic in useMascotWindowDrag is free to slide the OS window without
-  // any visual jump of the chibi inside its frame. The chibi visible body
-  // stays exactly where the user dropped it.
+  // any visual jump of the chibi inside its frame.
+  // forceEdge: the host pushes "left"|"right"|"top"|"bottom" on snap so
+  // FloatChat shows the peek-pose sprite (visual confirmation of snap),
+  // and clears it on drag start so the peek pose doesn't follow the
+  // cursor mid-drag.
   const [forcedSide, setForcedSide] = useState<ForcedSide>(null);
+  const [forceEdge, setForceEdge] = useState<ForcedEdge>(null);
   useMascotClickThrough();
-  useMascotWindowDrag(setForcedSide);
+  useMascotWindowDrag(setForcedSide, setForceEdge);
   return (
     <>
       <ThemeBootstrap />
@@ -421,6 +455,7 @@ function MascotApp() {
         disableInternalDrag
         freezePos
         forceSide={forcedSide ?? undefined}
+        forceEdge={forceEdge}
       />
     </>
   );

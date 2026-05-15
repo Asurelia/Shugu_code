@@ -837,7 +837,13 @@ export function MascotAstronaut({ size = 92, mood = "neutral" }: { size?: number
 // OS window into place without ever repositioning the chibi inside the
 // frame — keeps the chibi visually anchored to wherever the user dropped
 // it, no "teleport" feel.
-export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceSide, freezePos }: any) {
+// `forceEdge`: when "left"|"right"|"top"|"bottom", the chibi switches to
+// the matching peek pose (gripping the screen edge sprite) and the chat
+// panel hides — the shimeji-style "tucked at the edge" state. Pass null
+// to un-tuck (e.g. before the user drags away). The host (mascot.tsx)
+// sets this on a screen-edge snap so the snap is VISUALLY confirmed by
+// the chibi's pose change.
+export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceSide, freezePos, forceEdge }: any) {
   const [mode, setMode] = useState<"closed" | "compact" | "full">("compact");
   // moodOverride: null = derived from state; otherwise forces a mood (alt+click cycle).
   const [moodOverride, setMoodOverride] = useState<ChibiMood | null>(null);
@@ -883,6 +889,14 @@ export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceS
   }, [forceSide, freezePos]);
   const [dragging, setDragging] = useState(false);
   const [edge, setEdge] = useState<string | null>(null);
+  // Bridge: when the host pushes a new forceEdge value, mirror it into the
+  // internal `edge` state so the rest of the component (peek-pose mood,
+  // edge-hidden CSS class, chat hide) works unchanged. The host CLEARS by
+  // sending null; subsequent clicks on the chibi (onAvatarClick) can also
+  // clear `edge` locally — both paths converge on the same state.
+  useEffect(() => {
+    if (forceEdge !== undefined) setEdge(forceEdge ?? null);
+  }, [forceEdge]);
   const [speech, setSpeech] = useState({ visible: true, text: "Hey · clic pour parler" });
   const [hasKey, setHasKey] = useState(false);
   const [model, setModel] = useState("anthropic/claude-haiku-4-5");
@@ -1040,15 +1054,21 @@ export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceS
     if (e.altKey) { cycleMood(); return; }
     if (edge) {
       setEdge(null);
-      setPos(p => {
-        const aw = 156;
-        let nx = p.x, ny = p.y;
-        if (edge === "left")   nx = 24;
-        if (edge === "right")  nx = window.innerWidth - aw - 24;
-        if (edge === "top")    ny = 24;
-        if (edge === "bottom") ny = window.innerHeight - aw - 24;
-        return { x: nx, y: ny };
-      });
+      // In mascot-mode (freezePos), don't auto-reposition the chibi inside
+      // the window on un-tuck — the host is responsible for window
+      // positioning. Without this guard, clicking the chibi after a screen-
+      // edge snap would teleport it 360 px to the side-buffer position.
+      if (!freezePos) {
+        setPos(p => {
+          const aw = 156;
+          let nx = p.x, ny = p.y;
+          if (edge === "left")   nx = 24;
+          if (edge === "right")  nx = window.innerWidth - aw - 24;
+          if (edge === "top")    ny = 24;
+          if (edge === "bottom") ny = window.innerHeight - aw - 24;
+          return { x: nx, y: ny };
+        });
+      }
       if (mode === "closed") setMode("compact");
       return;
     }
