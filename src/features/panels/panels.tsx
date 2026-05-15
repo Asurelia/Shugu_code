@@ -2,13 +2,14 @@
 // Ported from panels.jsx (60KB original). Window globals removed in favor of ES exports.
 
 import { useState, useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import { Icon } from "@/components/components";
 import { Terminal } from "@xterm/xterm";
 import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
-import { invoke } from "@/lib/tauri";
+import { invoke, listen } from "@/lib/tauri";
 import { useMessages, useActiveConv, sendChatMessage } from "@/features/chat/chat-sync";
 
 // ─── Dock workspace: editor + dock as constraint-solved resizable panels ──
@@ -42,13 +43,18 @@ export function DockWorkspace({ dockState, setDockState, fileContents, children 
   };
   const onDockDragEnd = () => { setDraggingDock(false); setHoverZone(null); };
 
+  // Stable React keys ("editor", "dock") so React tracks each Panel by
+  // identity rather than by position. Without them, the JSX-order flip
+  // driven by `dockFirst` (line below) causes React to interpret the
+  // first child as a NEW component on side change, unmounting the
+  // existing one — which would kill every DockTerminal inside.
   const editorPanel = (
-    <Panel id="editor" order={dockFirst ? 2 : 1} minSize={20}>
+    <Panel key="editor" id="editor" order={dockFirst ? 2 : 1} minSize={20}>
       {children}
     </Panel>
   );
   const dockPanel = (
-    <Panel id="dock" order={dockFirst ? 1 : 2} defaultSize={dockState.sizePct ?? 32} minSize={12} maxSize={80}>
+    <Panel key="dock" id="dock" order={dockFirst ? 1 : 2} defaultSize={dockState.sizePct ?? 32} minSize={12} maxSize={80}>
       <DockPanelInner
         dockState={dockState}
         setDockState={setDockState}
@@ -63,9 +69,14 @@ export function DockWorkspace({ dockState, setDockState, fileContents, children 
   return (
     <>
       <PanelGroup
-        // Re-key on side change (direction + order flip) and on resizeNonce
-        // bump (Reset/Maximize re-apply defaultSize via a clean remount).
-        key={side + ":" + (dockState.resizeNonce ?? 0)}
+        // Re-key ONLY on resizeNonce bump (Reset/Maximize re-apply defaultSize
+        // via a clean remount). NOT on side change — re-keying on side change
+        // would unmount every DockTerminal (term_kill → PTY dies → all shell
+        // state lost) every time the user drags the dock to a different edge.
+        // react-resizable-panels handles direction changes natively in v2+.
+        // The dockFirst-driven JSX-order flip (line ~73) is enough for layout
+        // reordering without a remount.
+        key={"dock-pg:" + (dockState.resizeNonce ?? 0)}
         direction={isHorizontal ? "vertical" : "horizontal"}
         style={{ flex: 1, minHeight: 0 }}
       >
@@ -92,32 +103,92 @@ export function DockWorkspace({ dockState, setDockState, fileContents, children 
 
 // ─── Dock panel inner: chrome (tabs/actions) + body (panes + optional split) ──
 function DockPanelInner({ dockState, setDockState, fileContents, onDockDragStart, onDockDragEnd }: any) {
-  const { side, tabs, activeId, split, splitId, splitRatio } = dockState;
+  const { side, tabs, activeId, splitActiveId, split, splitRatio } = dockState;
   const set = (patch: any) => setDockState((s: any) => ({ ...s, ...patch }));
   const isHorizontal = side === "bottom" || side === "top";
 
+  // Per-pane tab filtering: each tab carries `pane: 0 | 1` so the main
+  // and split panes have INDEPENDENT tabs strips (vscode/iTerm/tmux
+  // pattern). Tabs with no pane field default to pane 0 for back-compat.
+  const paneTabs = (paneIdx: 0 | 1) => tabs.filter((t: any) => (t.pane ?? 0) === paneIdx);
+  const mainTabs = paneTabs(0);
+  const splitTabs = paneTabs(1);
+
   const moveDock = (next: string) => set({ side: next });
+
   const closeTab = (id: string) => {
-    const idx = tabs.findIndex((t: any) => t.id === id);
-    if (idx < 0) return;
-    const next = tabs.filter((t: any) => t.id !== id);
-    let nActive = activeId;
-    let nSplit = splitId;
-    if (id === activeId) nActive = next[Math.max(0, idx - 1)]?.id || null;
-    if (id === splitId) nSplit = null;
-    set({ tabs: next, activeId: nActive, splitId: nSplit, split: nSplit ? split : false });
+    const closing = tabs.find((t: any) => t.id === id);
+    if (!closing) return;
+    // term_kill on the BACKEND PTY happens here (the user-intent path).
+    // Component unmount via route nav / side change does NOT kill — the
+    // PTY survives so reattach replays scrollback via term_snapshot.
+    if (closing.kind === "term") void invoke('term_kill', { tabId: id });
+
+    const remaining = tabs.filter((t: any) => t.id !== id);
+    const inPane = closing.pane ?? 0;
+    let nMainActive = activeId;
+    let nSplitActive = splitActiveId;
+    let nSplit = split;
+
+    if (inPane === 0 && id === activeId) {
+      const rest = remaining.filter((t: any) => (t.pane ?? 0) === 0);
+      nMainActive = rest[rest.length - 1]?.id || null;
+    }
+    if (inPane === 1) {
+      if (id === splitActiveId) {
+        const rest = remaining.filter((t: any) => (t.pane ?? 0) === 1);
+        nSplitActive = rest[rest.length - 1]?.id || null;
+      }
+      // Auto-unsplit when the split pane goes empty: the chrome+body
+      // for an empty pane would be confusing.
+      if (remaining.filter((t: any) => (t.pane ?? 0) === 1).length === 0) {
+        nSplit = false;
+        nSplitActive = null;
+      }
+    }
+
+    set({ tabs: remaining, activeId: nMainActive, splitActiveId: nSplitActive, split: nSplit });
   };
-  const addTab = (kind: string) => {
+
+  const addTab = (kind: string, pane: 0 | 1 = 0) => {
     const id = "t" + Date.now();
     const counts = tabs.filter((t: any) => t.kind === kind).length + 1;
     const nameMap: Record<string, string> = { term: "bash", agent: "agent", output: "output", problems: "problems" };
-    const newTab = { id, kind, name: `${nameMap[kind]}${kind === "term" ? " · " + counts : ""}` };
-    set({ tabs: [...tabs, newTab], activeId: id });
+    const newTab: any = {
+      id, kind,
+      name: `${nameMap[kind]}${kind === "term" ? " · " + counts : ""}`,
+      pane,
+    };
+    if (pane === 0) {
+      set({ tabs: [...tabs, newTab], activeId: id });
+    } else {
+      set({ tabs: [...tabs, newTab], splitActiveId: id, split: true });
+    }
   };
+
   const toggleSplit = () => {
-    if (split) { set({ split: false, splitId: null }); return; }
-    const other = tabs.find((t: any) => t.id !== activeId);
-    if (other) set({ split: true, splitId: other.id, splitRatio: 0.55 });
+    if (split) {
+      // Unsplit: MERGE pane-1 tabs into pane-0 so the user doesn't lose
+      // their split-pane terminals (PTYs are still in the registry and
+      // their state survives — same pattern vscode uses when collapsing
+      // terminal groups). The next "Split" creates a fresh second pane.
+      const merged = tabs.map((t: any) => (
+        t.pane === 1 ? { ...t, pane: 0 as const } : t
+      ));
+      set({ tabs: merged, split: false, splitActiveId: null });
+      return;
+    }
+    // Split: create a new shell in pane 1 (vscode/cursor/wezterm pattern,
+    // confirmed in research). The active main-pane tab stays where it is.
+    const id = "t" + Date.now();
+    const counts = tabs.filter((t: any) => t.kind === "term").length + 1;
+    const newTab: any = { id, kind: "term", name: `bash · ${counts}`, pane: 1 };
+    set({
+      tabs: [...tabs, newTab],
+      split: true,
+      splitActiveId: id,
+      splitRatio: 0.55,
+    });
   };
   // Maximize: re-apply an 80% dock via a PanelGroup remount (see DockState.resizeNonce).
   const maximize = () => set({ sizePct: 80, resizeNonce: (dockState.resizeNonce ?? 0) + 1 });
@@ -143,11 +214,69 @@ function DockPanelInner({ dockState, setDockState, fileContents, onDockDragStart
     window.addEventListener("mouseup", onUp);
   };
 
-  const activeTab = tabs.find((t: any) => t.id === activeId);
-  const splitTab = split && splitId ? tabs.find((t: any) => t.id === splitId) : null;
+  // A "panel" (one of the up-to-two visible panes) has its own tabs strip,
+  // its own active id, and its own + button. Closing a tab kills its PTY
+  // (when applicable); closing the last tab of the split pane auto-merges
+  // back into a non-split state.
+  const renderPane = (paneIdx: 0 | 1, paneTabsList: any[], paneActiveId: string | null) => (
+    <div
+      key={`pane-${paneIdx}`}
+      className="dock-pane"
+      style={{
+        flex: split ? (paneIdx === 0 ? splitRatio : 1 - splitRatio) : 1,
+        display: "flex",
+        flexDirection: "column",
+        minWidth: 0,
+        minHeight: 0,
+      }}
+    >
+      <div
+        className="dock-tabs"
+        style={{ flex: "0 0 auto" }}
+      >
+        {paneTabsList.map((t: any) => (
+          <button
+            key={t.id}
+            className={"dock-tab kind-" + t.kind + (t.id === paneActiveId ? " active" : "")}
+            onClick={() => set(paneIdx === 0 ? { activeId: t.id } : { splitActiveId: t.id })}
+          >
+            <span className="led"></span>
+            <span>{t.name}</span>
+            <span className="x" onClick={(e) => { e.stopPropagation(); closeTab(t.id); }}>×</span>
+          </button>
+        ))}
+        <DockAddMenu onPick={(k) => addTab(k, paneIdx)} />
+      </div>
+      <div style={{ flex: 1, minHeight: 0, minWidth: 0, display: "flex", position: "relative" }}>
+        {/* Render every tab of THIS pane simultaneously and toggle CSS
+            visibility — keeps each PTY+xterm view mounted across tab
+            switches WITHIN this pane. Switching pane changes the
+            corresponding paneActiveId but doesn't unmount anything. */}
+        {paneTabsList.map((t: any) => (
+          <div
+            key={t.id}
+            style={{
+              display: t.id === paneActiveId ? "flex" : "none",
+              flex: 1,
+              flexDirection: "column",
+              minHeight: 0,
+              minWidth: 0,
+              width: "100%",
+              height: "100%",
+            }}
+          >
+            <DockPaneContent tab={t} fileContents={fileContents} />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 
   return (
     <div className={"dock dock-" + side} style={{ width: "100%", height: "100%" }}>
+      {/* Outer chrome: drag handle + global actions (Split, Maximize).
+          Tabs strips moved INTO each pane (iTerm/tmux convention) so each
+          split pane has its own independent tab group + add button. */}
       <div className="dock-chrome">
         <div
           className="dock-drag"
@@ -156,40 +285,28 @@ function DockPanelInner({ dockState, setDockState, fileContents, onDockDragStart
           onDragStart={onDockDragStart}
           onDragEnd={onDockDragEnd}
         />
-        <div className="dock-tabs">
-          {tabs.map((t: any) => (
-            <button
-              key={t.id}
-              className={"dock-tab kind-" + t.kind + (t.id === activeId ? " active" : "")}
-              onClick={() => set({ activeId: t.id })}
-            >
-              <span className="led"></span>
-              <span>{t.name}</span>
-              <span className="x" onClick={(e) => { e.stopPropagation(); closeTab(t.id); }}>×</span>
-            </button>
-          ))}
-          <DockAddMenu onPick={addTab}/>
-        </div>
+        <div style={{ flex: 1 }} />
         <div className="dock-actions">
-          <button className={"dock-act" + (split ? " on" : "")} title="Split pane" onClick={toggleSplit}>
-            <Icon name="diff" size={13}/>
+          <button
+            className={"dock-act" + (split ? " on" : "")}
+            title={split ? "Close split (merge tabs back into pane 1)" : "Split: open a new terminal in a second pane"}
+            onClick={toggleSplit}
+          >
+            <Icon name="diff" size={13} />
           </button>
-          <DockSideMenu side={side} onPick={moveDock}/>
           <button className="dock-act" title="Maximize" onClick={maximize}>
-            <Icon name="up" size={13}/>
+            <Icon name="up" size={13} />
           </button>
         </div>
       </div>
       <div className={"dock-body " + (split ? (isHorizontal ? "split-h" : "split-v") : "")}>
-        <div className="dock-pane" style={split ? { flex: splitRatio } : {}}>
-          <DockPaneContent tab={activeTab} fileContents={fileContents}/>
-        </div>
-        {split && splitTab && <>
-          <div className={"dock-split-bar " + (isHorizontal ? "h" : "v")} onMouseDown={onSplit}></div>
-          <div className="dock-pane" style={{ flex: 1 - splitRatio }}>
-            <DockPaneContent tab={splitTab} fileContents={fileContents}/>
-          </div>
-        </>}
+        {renderPane(0, mainTabs, activeId)}
+        {split && (
+          <>
+            <div className={"dock-split-bar " + (isHorizontal ? "h" : "v")} onMouseDown={onSplit}></div>
+            {renderPane(1, splitTabs, splitActiveId)}
+          </>
+        )}
       </div>
     </div>
   );
@@ -197,17 +314,36 @@ function DockPanelInner({ dockState, setDockState, fileContents, onDockDragStart
 
 function DockAddMenu({ onPick }: { onPick: (k: string) => void }) {
   const [open, setOpen] = useState(false);
+  const btnRef = useRef<HTMLButtonElement | null>(null);
+  // Portal the dropdown to document.body so it isn't clipped by the
+  // `.dock-tabs` container (which has `overflow-x: auto` in panels.css:67
+  // — that overflow rule clips ANY absolute-positioned child of the tabs
+  // strip, including this dropdown). The button stays in place; we
+  // compute its bounding rect at open time and position the menu in
+  // fixed-coordinate space below it.
+  const rect = open && btnRef.current ? btnRef.current.getBoundingClientRect() : null;
   return (
-    <span style={{position:"relative"}}>
-      <button className="dock-tab-add" title="New panel" onClick={() => setOpen(o => !o)}>+</button>
-      {open && (
+    <>
+      <button
+        ref={btnRef}
+        className="dock-tab-add"
+        title="New panel"
+        onClick={() => setOpen((o) => !o)}
+      >+</button>
+      {open && rect && createPortal(
         <>
-          <div style={{position:"fixed",inset:0,zIndex:9}} onClick={() => setOpen(false)}/>
-          <div className="ctx-menu" style={{position:"absolute", top:24, left:0, minWidth:200, zIndex:20}}>
+          <div style={{position:"fixed", inset:0, zIndex:9997}} onClick={() => setOpen(false)}/>
+          <div className="ctx-menu" style={{
+            position: "fixed",
+            top: rect.bottom + 4,
+            left: rect.left,
+            minWidth: 200,
+            zIndex: 9998,
+          }}>
             <div className="ctx-section">New panel</div>
             {[
-              { k: "term", l: "Terminal", i: "term", kbd: "⌘`" },
-              { k: "output", l: "Output", i: "term" },
+              { k: "term",     l: "Terminal", i: "term",   kbd: "⌘`" },
+              { k: "output",   l: "Output",   i: "term" },
               { k: "problems", l: "Problems", i: "shield" },
             ].map(o => (
               <button key={o.k} className="ctx-item" onClick={() => { onPick(o.k); setOpen(false); }}>
@@ -217,9 +353,10 @@ function DockAddMenu({ onPick }: { onPick: (k: string) => void }) {
               </button>
             ))}
           </div>
-        </>
+        </>,
+        document.body
       )}
-    </span>
+    </>
   );
 }
 
@@ -257,7 +394,7 @@ function DockSideMenu({ side, onPick }: { side: string; onPick: (s: string) => v
 
 function DockPaneContent({ tab, fileContents }: any) {
   if (!tab) return <div style={{padding:24, color:"var(--on-surface-muted)", fontSize:12, fontFamily:"var(--font-mono)"}}>No tab</div>;
-  if (tab.kind === "term") return <DockTerminal name={tab.name}/>;
+  if (tab.kind === "term") return <DockTerminal tabId={tab.id} name={tab.name}/>;
   if (tab.kind === "output") return <DockOutput/>;
   if (tab.kind === "problems") return <DockProblems fileContents={fileContents}/>;
   return null;
@@ -288,10 +425,8 @@ const VEIL_XTERM_THEME: ITheme = {
   brightWhite:             "#ffffff",
 };
 
-const PROMPT = "shugu ❯ ";
-
-// ─── Dock terminal (xterm.js, real line editing) ────────────────
-export function DockTerminal({ name }: { name: string }) {
+// ─── Dock terminal (xterm.js + real PTY via term_spawn) ────────────────
+export function DockTerminal({ tabId, name: _name }: { tabId: string; name: string }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -309,12 +444,12 @@ export function DockTerminal({ name }: { name: string }) {
     const fit = new FitAddon();
     term.loadAddon(fit);
 
-    // Line buffer — plain var, not React state, to avoid stale closures.
-    let lineBuf = "";
     let opened = false;
     let disposed = false;
     let rafId = 0;
     let dataSub: { dispose: () => void } | null = null;
+    let unlistenOut: (() => void) | null = null;
+    let unlistenExit: (() => void) | null = null;
 
     // Two distinct hazards make a naive open()+write() throw
     // "Cannot read properties of undefined (reading 'dimensions')":
@@ -325,65 +460,117 @@ export function DockTerminal({ name }: { name: string }) {
     //      isn't ready on the SAME synchronous tick as open(). Writing/fitting
     //      immediately hits Viewport.syncScrollArea before renderService
     //      .dimensions exists. Fix: defer fit()+first write() one frame.
-    const writeInitial = () => {
+    const writeInitial = async () => {
       if (disposed) return;
       try { fit.fit(); } catch (_) { /* transient zero size */ }
-      term.write(`Shugu Forge · ${name}\r\n`);
-      term.write(PROMPT);
+      const cols = term.cols;
+      const rows = term.rows;
       term.focus();
+
+      try {
+        await invoke('term_spawn', { tabId, cols, rows });
+      } catch (err) {
+        if (err) term.write(`\r\n[term_spawn error: ${err}]\r\n`);
+      }
+
+      // Replay the PTY's recent output buffer (set up by the Rust side
+      // for this tab_id) so visual state — cursor, colors, scrollback —
+      // is restored when re-mounting against an existing PTY (route
+      // navigation, dock side change, React strict-mode double-mount).
+      // For a freshly-spawned PTY the snapshot is empty (no-op).
+      // This MUST happen BEFORE the listen() below so we don't get a
+      // race where new output arrives mid-replay and ends up before
+      // the replayed scrollback in the visual buffer.
+      try {
+        const snapshot = await invoke<string>('term_snapshot', { tabId });
+        if (snapshot) term.write(snapshot);
+      } catch (err) {
+        console.warn('[DockTerminal] term_snapshot failed:', err);
+      }
+
+      unlistenOut = await listen<{ data: string }>(`term://output/${tabId}`, (payload) => {
+        if (disposed) return;
+        term.write(payload.data);
+      });
+      unlistenExit = await listen(`term://exit/${tabId}`, () => {
+        if (disposed) return;
+        term.write('\r\n[Process exited]\r\n');
+      });
+
       dataSub = term.onData((data: string) => {
-        // Backspace (\x7f): erase one character from buffer and screen.
-        if (data === "\x7f") {
-          if (lineBuf.length > 0) {
-            lineBuf = lineBuf.slice(0, -1);
-            term.write("\b \b");
-          }
-          return;
-        }
-        // Enter (\r): run the buffered command.
-        if (data === "\r") {
-          const cmd = lineBuf.trim();
-          lineBuf = "";
-          term.write("\r\n");
-          if (cmd) {
-            invoke<string>("term_run", { command: cmd }).then((out) => {
-              term.write(out + "\r\n" + PROMPT);
-            });
-          } else {
-            term.write(PROMPT);
-          }
-          return;
-        }
-        // Printable characters: echo and append to buffer.
-        if (data >= " " || data === "\t") {
-          lineBuf += data;
-          term.write(data);
-        }
+        void invoke('term_write', { tabId, data });
       });
     };
 
     const initOrFit = () => {
       if (disposed) return;
+      // GUARD: never resize against a 0-sized container. The "render all
+      // tabs with display:none" pattern in DockPanelInner means inactive
+      // tabs report 0×0 dimensions via the ResizeObserver. Calling
+      // fit.fit() then would compute nonsense cols/rows, and any
+      // resulting term_resize would put the PTY in a degenerate state
+      // (column wrap goes wrong on the next render). Skip silently —
+      // the next real layout change brings us back here with real size.
+      if (el.clientWidth === 0 || el.clientHeight === 0) return;
       if (opened) {
         try { fit.fit(); } catch (_) { /* transient zero size */ }
+        // Sync PTY resize with xterm resize (no debounce). The previous
+        // 100ms debounce opened a window where xterm rendered at the
+        // NEW cols/rows while the PTY still thought it was at the OLD
+        // cols/rows — output would wrap at the wrong column and the
+        // visual would corrupt. ResizeObserver doesn't fire in a tight
+        // loop during normal drag (it batches by frame), so per-event
+        // IPC is fine cost-wise.
+        void invoke('term_resize', { tabId, cols: term.cols, rows: term.rows });
         return;
       }
-      if (el.clientWidth === 0 || el.clientHeight === 0) return; // not laid out yet
       opened = true;
       term.open(el);
-      // Defer fit + first write one frame so xterm's renderer finishes its
+      // Defer fit + PTY spawn one frame so xterm's renderer finishes its
       // initial measurement and renderService.dimensions becomes defined.
-      rafId = requestAnimationFrame(writeInitial);
+      rafId = requestAnimationFrame(() => { void writeInitial(); });
     };
 
-    const ro = new ResizeObserver(initOrFit);
+    // Trailing-edge debounce ~150 ms on ResizeObserver before calling
+    // fit() + term_resize. This is the pattern used by VSCode's terminal
+    // and recommended in xterm.js issues #3584, #3962, #4841 — the rAF
+    // throttle we tried earlier still fired ~60Hz which left a window
+    // where xterm rendered NEW cols while the PTY emitted output at OLD
+    // cols, producing the "écrire entre les lignes imprimées" symptom
+    // when the user dragged the dock or split-bar horizontally. The 150
+    // ms wait holds xterm at its old dimensions until the drag settles,
+    // then snaps both xterm and PTY to the final size in one atomic step.
+    //
+    // The initial fit (on first mount, no drag) still runs synchronously
+    // via the bare initOrFit() call below — only subsequent observer
+    // fires go through the debounce.
+    let resizeTimer = 0;
+    const onResize = () => {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(() => {
+        resizeTimer = 0;
+        initOrFit();
+      }, 150);
+    };
+    const ro = new ResizeObserver(onResize);
     ro.observe(el);
     initOrFit(); // try immediately in case the container is already sized
 
     return () => {
+      // Cleanup tears down the FRONTEND view (xterm instance + event
+      // listeners + observers). It does NOT call term_kill — that would
+      // kill the PTY on every unmount, including route navigations away
+      // from /code and React strict-mode double-mount. Instead the Rust
+      // PTY persists until the user explicitly closes the tab via the ×
+      // button in the chrome (which dispatches term_kill from the dock's
+      // closeTab handler). On re-mount, term_spawn is idempotent and
+      // simply re-attaches.
       disposed = true;
       if (rafId) cancelAnimationFrame(rafId);
+      if (resizeTimer) clearTimeout(resizeTimer);
       dataSub?.dispose();
+      unlistenOut?.();
+      unlistenExit?.();
       ro.disconnect();
       term.dispose();
     };

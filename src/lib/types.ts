@@ -72,16 +72,25 @@ export interface GalleryFolder {
   count: number;
 }
 
-export interface DockTab { id: string; kind: "term" | "agent" | "output" | "problems"; name: string }
+export interface DockTab {
+  id: string;
+  kind: "term" | "agent" | "output" | "problems";
+  name: string;
+  /** Which pane the tab belongs to: 0 = main pane, 1 = split pane.
+   *  Undefined is treated as 0 for backwards compatibility. */
+  pane?: 0 | 1;
+}
 export interface DockState {
   side: "bottom" | "top" | "left" | "right" | "hidden";
   size: number;            // legacy px size (no longer used for layout — kept for compat)
   sizePct?: number;        // dock panel size as a % of the workspace (react-resizable-panels)
   resizeNonce?: number;    // bump to force the PanelGroup to remount at sizePct (Reset/Maximize)
   tabs: DockTab[];
-  activeId: string | null;
+  activeId: string | null;       // active tab id in pane 0
+  splitActiveId: string | null;  // active tab id in pane 1 (null when not split)
   split: boolean;
-  splitId: string | null;
+  /** @deprecated use splitActiveId. Kept transiently for migration of in-memory state. */
+  splitId?: string | null;
   splitRatio: number;
   _lastSide?: string;
 }

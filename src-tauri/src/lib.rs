@@ -108,6 +108,7 @@ pub fn run() {
         )
         // Workspace root — set by fs_open_folder, read by all other fs commands.
         .manage(Mutex::new(None::<std::path::PathBuf>))
+        .manage(commands::terminal::PtyRegistry::default())
         .setup(|app| {
             // Spawn the filesystem watcher before restoring the workspace root
             // so the watcher is ready to receive the seed path below.
@@ -220,7 +221,11 @@ pub fn run() {
             commands::fs::fs_create_dir,
             commands::fs::fs_rename,
             commands::fs::fs_delete,
-            commands::terminal::term_run,
+            commands::terminal::term_spawn,
+            commands::terminal::term_write,
+            commands::terminal::term_resize,
+            commands::terminal::term_kill,
+            commands::terminal::term_snapshot,
             commands::image::image_generate,
             commands::models::models_list,
             commands::vector::vec_index,

@@ -222,10 +222,13 @@ function DockToggleButton({ dockState, setDockState }: any) {
   return (
     <span style={{position:"relative"}}>
       <button
+        // Left-click opens the placement menu (the user's preferred flow —
+        // see the in-menu "Show / Hide panel" item for the toggle behavior
+        // we used to expose as left-click). The DockSideMenu inside the
+        // dock chrome was removed in favor of this single source of truth.
         className={"lgb lgb-sm" + (isHidden ? "" : " lgb-primary")}
-        onClick={cycle}
-        onContextMenu={(e) => { e.preventDefault(); setOpen(o => !o); }}
-        title={isHidden ? "Show panel (right-click for position)" : "Hide panel (right-click for position)"}
+        onClick={() => setOpen((o) => !o)}
+        title="Panel placement & options"
       >
         <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <rect x="3" y="3" width="18" height="18" rx="2"/>
@@ -254,7 +257,32 @@ function DockToggleButton({ dockState, setDockState }: any) {
               </button>
             ))}
             <div className="chat-ctx-sep"></div>
-            <button className={"chat-ctx-item" + (dockState.split ? " on" : "")} onClick={() => { setDockState((s: any) => ({ ...s, split: !s.split, splitId: s.split ? null : s.tabs.find((t: any) => t.id !== s.activeId)?.id || s.tabs[1]?.id, splitRatio: 0.55 })); setOpen(false); }}>
+            <button className={"chat-ctx-item" + (dockState.split ? " on" : "")} onClick={() => {
+              // Use the same per-pane logic as the dock chrome's split
+              // toggle: when turning ON, create a NEW terminal tab in
+              // pane 1 (vscode/cursor pattern); when turning OFF, merge
+              // pane-1 tabs back into pane 0 to preserve the user's PTYs.
+              setDockState((s: any) => {
+                if (s.split) {
+                  return {
+                    ...s,
+                    tabs: s.tabs.map((t: any) => t.pane === 1 ? { ...t, pane: 0 } : t),
+                    split: false,
+                    splitActiveId: null,
+                  };
+                }
+                const id = "t" + Date.now();
+                const counts = s.tabs.filter((t: any) => t.kind === "term").length + 1;
+                return {
+                  ...s,
+                  tabs: [...s.tabs, { id, kind: "term", name: `bash · ${counts}`, pane: 1 }],
+                  split: true,
+                  splitActiveId: id,
+                  splitRatio: 0.55,
+                };
+              });
+              setOpen(false);
+            }}>
               <span className="label">Split pane</span>
               {dockState.split && <span className="kbd" style={{color:"var(--primary)"}}>✓</span>}
             </button>
@@ -336,15 +364,15 @@ export function RootLayout() {
     side: "bottom",
     size: 280,
     tabs: [
-      { id: "t1", kind: "term",     name: "bash · 1" },
-      { id: "t2", kind: "agent",    name: "agent" },
-      { id: "t3", kind: "output",   name: "output" },
-      { id: "t4", kind: "problems", name: "problems" },
+      { id: "t1", kind: "term",     name: "bash · 1", pane: 0 },
+      { id: "t2", kind: "agent",    name: "agent",    pane: 0 },
+      { id: "t3", kind: "output",   name: "output",   pane: 0 },
+      { id: "t4", kind: "problems", name: "problems", pane: 0 },
     ],
     activeId: "t1",
-    split: true,
-    splitId: "t2",
-    splitRatio: 0.6,
+    splitActiveId: null,
+    split: false,
+    splitRatio: 0.55,
   });
 
   // Context menu + annotations + account

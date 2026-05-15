@@ -17,7 +17,11 @@ const mocks: Record<string, (args?: any) => any> = {
   fs_read_dir: () => seedFileTree,
   fs_read_file: ({ path }: { path: string }) => (seedFileContents as any)[path]?.text ?? "",
   fs_write_file: () => ({ ok: true }),
-  term_run: ({ command }: { command: string }) => `(mock) ran: ${command}`,
+  term_spawn: () => undefined,
+  term_write: () => undefined,
+  term_resize: () => undefined,
+  term_kill: () => undefined,
+  term_snapshot: () => "",
   chat_send: ({ prompt, model, protocol, baseUrl }: { prompt: string; model: string; protocol: string; baseUrl: string }) => {
     void baseUrl;
     const keyHint = protocol === "anthropic"
