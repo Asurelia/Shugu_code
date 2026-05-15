@@ -853,6 +853,18 @@ export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceS
       y: Math.round(window.innerHeight / 2 - h / 2),
     };
   });
+  // When the host (mascot window) forces a side via prop, also slide the
+  // chibi to that side INSIDE the window — otherwise pos.x stays at the
+  // right-edge default and the chat panel, which docks AWAY from the
+  // chibi, would extend past the window's bounds (clipped). Coupling
+  // pos.x to forceSide keeps the chat panel always inside the viewport.
+  useEffect(() => {
+    if (forceSide !== "left" && forceSide !== "right") return;
+    setPos(p => ({
+      x: forceSide === "left" ? 12 : window.innerWidth - 156 - 12,
+      y: p.y,
+    }));
+  }, [forceSide]);
   const [dragging, setDragging] = useState(false);
   const [edge, setEdge] = useState<string | null>(null);
   const [speech, setSpeech] = useState({ visible: true, text: "Hey · clic pour parler" });
