@@ -65,10 +65,22 @@ function useMascotClickThrough() {
       // Idempotent toggle — only call setIgnoreCursorEvents when state
       // changes, to avoid spamming the Rust side on every mousemove.
       let lastIgnore: boolean | null = null;
+      let ignoreErrLogged = false;
       const setIgnore = async (ignore: boolean) => {
         if (lastIgnore === ignore) return;
         lastIgnore = ignore;
-        try { await win.setIgnoreCursorEvents(ignore); } catch {}
+        try {
+          await win.setIgnoreCursorEvents(ignore);
+        } catch (e) {
+          // Most common cause: missing
+          // `core:window:allow-set-ignore-cursor-events` permission in
+          // the mascot capability file. Log ONCE so it shows up in the
+          // mascot window's devtools without spamming on every move.
+          if (!ignoreErrLogged) {
+            ignoreErrLogged = true;
+            console.warn("[mascot] setIgnoreCursorEvents failed — click-through inactive:", e);
+          }
+        }
       };
 
       // Hit-test: is the painted UI under (cssX, cssY) in this document?
@@ -87,6 +99,7 @@ function useMascotClickThrough() {
 
       // Path 2: cursor events are IGNORED — DOM is silent. Poll the OS
       // cursor position via Tauri and convert to local CSS coordinates.
+      let pollErrLogged = false;
       const tick = async () => {
         if (lastIgnore !== true) return; // path 1 has us covered
         try {
@@ -102,7 +115,15 @@ function useMascotClickThrough() {
           if (isOverPainted(localX, localY)) {
             await setIgnore(false);
           }
-        } catch { /* poll best-effort */ }
+        } catch (e) {
+          // Same hint as setIgnore — missing permissions on
+          // core:window:allow-cursor-position / allow-outer-position.
+          // core:window:default *should* include both; log once if not.
+          if (!pollErrLogged) {
+            pollErrLogged = true;
+            console.warn("[mascot] cursor poll failed — recovery from ignored state will stick:", e);
+          }
+        }
       };
       const pollHandle = window.setInterval(tick, 50);
 

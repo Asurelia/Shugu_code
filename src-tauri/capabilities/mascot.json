@@ -1,0 +1,20 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "mascot",
+  "description": "Capabilities for the floating mascot window (chibi + chat). Separate from the main IDE window so each surface follows least-privilege: the mascot only gets what it needs to render the overlay, toggle click-through, and (later in M4) read/write the shared chat DB.",
+  "windows": ["mascot"],
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "core:window:allow-set-ignore-cursor-events",
+    "core:window:allow-set-position",
+    "core:window:allow-set-size",
+    "core:window:allow-start-dragging",
+    "core:event:default",
+    "sql:default",
+    "sql:allow-execute",
+    "sql:allow-select",
+    "sql:allow-load",
+    "sql:allow-close"
+  ]
+}
