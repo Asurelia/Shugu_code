@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>Shugu Mascot</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      /* The mascot window is rendered transparent at the OS level
+         (tauri.conf.json: transparent: true). We force html/body to
+         match — no background colour, no scrollbars, no margins —
+         so only the painted React tree is visible on the desktop. */
+      html, body, #mascot-root {
+        margin: 0; padding: 0;
+        width: 100%; height: 100%;
+        background: transparent;
+        overflow: hidden;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="mascot-root"></div>
+    <script type="module" src="/src/mascot.tsx"></script>
+  </body>
+</html>

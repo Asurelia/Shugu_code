@@ -33,5 +33,15 @@ export default defineConfig({
     minify: "esbuild",
     sourcemap: false,
     chunkSizeWarningLimit: 1500,
+    // Multi-page: index.html (main IDE) + mascot.html (floating chibi window).
+    // Both bundle to dist/ as separate HTML entries so Tauri's second window
+    // can load mascot.html in production. In dev mode Vite serves both
+    // directly from project root.
+    rollupOptions: {
+      input: {
+        main: path.resolve(__dirname, "index.html"),
+        mascot: path.resolve(__dirname, "mascot.html"),
+      },
+    },
   },
 });

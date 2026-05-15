@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Shugu Forge",
         "width": 1280,
         "height": 800,
@@ -21,6 +22,21 @@
         "transparent": false,
         "resizable": true,
         "fullscreen": false
+      },
+      {
+        "label": "mascot",
+        "url": "mascot.html",
+        "title": "Shugu Mascot",
+        "width": 600,
+        "height": 600,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false,
+        "resizable": false,
+        "focus": false,
+        "visible": true
       }
     ],
     "security": {
