@@ -14,7 +14,7 @@
 //   clearPinned will arrive via Tauri events at M4 — for now we pass
 //   inert defaults so the pinned-annotation UI stays hidden.
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles/styles.css";
 import "./styles/panels.css";
@@ -22,6 +22,11 @@ import "./styles/chat-sidebar.css";
 import "./styles/settings-extras.css";
 import { FloatChat } from "@/features/panels/panels";
 import { ThemeBootstrap } from "@/lib/ThemeBootstrap";
+import {
+  loadCalibration,
+  subscribeCalibration,
+  type ChibiCalibration,
+} from "@/features/mascot/calibration";
 
 // Cross-hook flag: while the user is actively dragging the mascot window,
 // the click-through hook MUST NOT toggle setIgnoreCursorEvents(true) — even
@@ -181,37 +186,12 @@ function useMascotClickThrough() {
 // in the matching corner/edge of the window — that way window.x =
 // monitor.left lands chibi visible at screen.x = monitor.left exactly.
 //
-// CHIBI VISIBLE GEOMETRY (constants, in CSS pixels relative to the
-// .float-cluster's top-left):
-//
-//   - cluster is 156×156
-//   - chibi-mascot div is 240×288, centered in cluster via grid place-content
-//   - rendered <img> is 240×240 (object-fit:contain on the square PNG),
-//     centered vertically with 24 px letterbox top + bottom
-//   - PNG transparent margins, measured via canvas-alpha-scan across all
-//     5 open-mood expressions (M3 v5+):
-//       top:    25.2%  → visible head at  0.252 × 240 =  60.5 px from img top
-//       bottom: 17.4%  → visible feet at  0.825 × 240 = 198   px from img top
-//       left:  ~30.8%  → visible left at  0.308 × 240 =  74   px from img left
-//       right: ~30.8%  → visible right at 0.692 × 240 = 166   px from img left
-//
-// Resulting offsets from cluster top-left to chibi VISIBLE pixels:
-//   img.left  = cluster.left - 42  (chibi-mascot overflows cluster 42 px each side)
-//   img.top   = cluster.top  - 42  (-66 div top + 24 letterbox)
-// + visible_left_in_img  =  74  → CHIBI_LEFT  = -42 +  74 =  32
-// + visible_right_in_img = 166  → CHIBI_RIGHT = -42 + 166 = 124
-// + visible_top_in_img   =  60.5 → CHIBI_TOP    = -42 + 60.5 ≈ 19  (img.top is -42, so 19 from cluster)
-// + visible_bottom_in_img= 198   → CHIBI_BOTTOM = -42 + 198      = 156
-//
-// The previous (M3 v3-v5) constants were CHIBI_LEFT=-42 / CHIBI_RIGHT=198,
-// which measured the IMG element's CSS bounds — they ignored the ~74 px of
-// transparent padding inside the PNG on each horizontal side. That's why
-// the snap landed flush with the IMG edge but visually 74 px short of the
-// screen edge: the chibi's actual painted body ends well inside the IMG.
-const CHIBI_LEFT   =  32;   // visible left  = cluster.left + 32
-const CHIBI_RIGHT  = 124;   // visible right = cluster.left + 124
-const CHIBI_TOP    =  19;   // visible head  = cluster.top  + 19
-const CHIBI_BOTTOM = 156;   // visible feet  = cluster.top  + 156
+// CHIBI VISIBLE GEOMETRY — the 4 offsets that say where the visible chibi
+// body sits inside its 240×288 wrapper, relative to .float-cluster's
+// top-left (CSS pixels). Defaults derived in M3-v6 from a canvas alpha
+// scan of every open-mood PNG; the user can tune them live from
+// Settings → Mascot, persisted in localStorage. See features/mascot/
+// calibration.ts for the storage + cross-window broadcast plumbing.
 const CLUSTER_SIZE = 156;
 
 type ForcedSide = "left" | "right" | null;
@@ -220,6 +200,7 @@ type ForcedEdge = "left" | "right" | "top" | "bottom" | null;
 function useMascotWindowDrag(
   setForcedSide: (s: ForcedSide) => void,
   setForceEdge: (e: ForcedEdge) => void,
+  calibrationRef: React.MutableRefObject<ChibiCalibration>,
 ) {
   useEffect(() => {
     let cancelled = false;
@@ -238,9 +219,6 @@ function useMascotWindowDrag(
       } catch { return; }
       if (cancelled || !win || !availableMonitorsFn) return;
 
-      // CSS pixels. Multiplied by devicePixelRatio at use-site so the snap
-      // feels the same on a 100 % screen and a 200 % HiDPI screen.
-      const SNAP_THRESHOLD_CSS = 80;
       // CSS pixels — below this drag-delta we treat the gesture as a click,
       // above it as a drag (matches FloatChat's own threshold).
       const DRAG_THRESHOLD_CSS = 4;
@@ -268,9 +246,10 @@ function useMascotWindowDrag(
           const cr = cluster.getBoundingClientRect();
           const winPos = await win.outerPosition();
           const dpr = window.devicePixelRatio || 1;
+          const cal = calibrationRef.current;
           // Chibi visible center in screen physical pixels.
-          const cx = winPos.x + (cr.left + (CHIBI_LEFT + CHIBI_RIGHT) / 2) * dpr;
-          const cy = winPos.y + (cr.top  + (CHIBI_TOP  + CHIBI_BOTTOM) / 2) * dpr;
+          const cx = winPos.x + (cr.left + (cal.left + cal.right) / 2) * dpr;
+          const cy = winPos.y + (cr.top  + (cal.top  + cal.bottom) / 2) * dpr;
           const m = await findMonitor(cx, cy);
           if (!m) return;
           const mCenterX = m.position.x + m.size.width / 2;
@@ -343,10 +322,11 @@ function useMascotWindowDrag(
             const cluster = document.querySelector(".float-cluster") as HTMLElement | null;
             if (!cluster) { await refreshSide(); return; }
             const cr = cluster.getBoundingClientRect();
-            const chibiL = winPos.x + (cr.left + CHIBI_LEFT)   * dpr;
-            const chibiR = winPos.x + (cr.left + CHIBI_RIGHT)  * dpr;
-            const chibiT = winPos.y + (cr.top  + CHIBI_TOP)    * dpr;
-            const chibiB = winPos.y + (cr.top  + CHIBI_BOTTOM) * dpr;
+            const cal = calibrationRef.current;
+            const chibiL = winPos.x + (cr.left + cal.left)   * dpr;
+            const chibiR = winPos.x + (cr.left + cal.right)  * dpr;
+            const chibiT = winPos.y + (cr.top  + cal.top)    * dpr;
+            const chibiB = winPos.y + (cr.top  + cal.bottom) * dpr;
             const chibiCx = (chibiL + chibiR) / 2;
             const chibiCy = (chibiT + chibiB) / 2;
 
@@ -365,7 +345,7 @@ function useMascotWindowDrag(
             const dRight  = (m.position.x + m.size.width)  - chibiR;
             const dTop    = chibiT - m.position.y;
             const dBottom = (m.position.y + m.size.height) - chibiB;
-            const thresholdPhys = SNAP_THRESHOLD_CSS * dpr;
+            const thresholdPhys = cal.snapThreshold * dpr;
 
             const lHit = dLeft   <= thresholdPhys;
             const rHit = dRight  <= thresholdPhys;
@@ -380,10 +360,10 @@ function useMascotWindowDrag(
               // Window may extend off-screen on the opposite side; that's
               // fine because that area is transparent + click-through.
               let nx = winPos.x, ny = winPos.y;
-              if (lHit) nx = m.position.x        - (cr.left + CHIBI_LEFT)   * dpr;
-              if (rHit) nx = m.position.x + m.size.width  - (cr.left + CHIBI_RIGHT)  * dpr;
-              if (tHit) ny = m.position.y        - (cr.top  + CHIBI_TOP)    * dpr;
-              if (bHit) ny = m.position.y + m.size.height - (cr.top  + CHIBI_BOTTOM) * dpr;
+              if (lHit) nx = m.position.x        - (cr.left + cal.left)   * dpr;
+              if (rHit) nx = m.position.x + m.size.width  - (cr.left + cal.right)  * dpr;
+              if (tHit) ny = m.position.y        - (cr.top  + cal.top)    * dpr;
+              if (bHit) ny = m.position.y + m.size.height - (cr.top  + cal.bottom) * dpr;
               await win.setPosition(new PhysicalPositionCtor(Math.round(nx), Math.round(ny)));
               const edges = [lHit && "left", rHit && "right", tHit && "top", bHit && "bottom"]
                 .filter(Boolean).join("+");
@@ -461,8 +441,18 @@ function MascotApp() {
   // cursor mid-drag.
   const [forcedSide, setForcedSide] = useState<ForcedSide>(null);
   const [forceEdge, setForceEdge] = useState<ForcedEdge>(null);
+
+  // Calibration: load once, then subscribe to cross-window changes from
+  // the main IDE's Settings → Mascot panel. The ref pattern keeps the
+  // drag hook reading the LATEST values without re-registering listeners
+  // on every render.
+  const [calibration, setCalibration] = useState<ChibiCalibration>(() => loadCalibration());
+  const calibrationRef = useRef(calibration);
+  calibrationRef.current = calibration;
+  useEffect(() => subscribeCalibration(setCalibration), []);
+
   useMascotClickThrough();
-  useMascotWindowDrag(setForcedSide, setForceEdge);
+  useMascotWindowDrag(setForcedSide, setForceEdge, calibrationRef);
   return (
     <>
       <ThemeBootstrap />

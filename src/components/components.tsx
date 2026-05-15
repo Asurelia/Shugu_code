@@ -610,6 +610,7 @@ export function SideSettings({ section, setSection }: any) {
     { id: 'models', label: 'Models & Keys' },
     { id: 'image', label: 'Image Generation' },
     { id: 'editor', label: 'Editor' },
+    { id: 'mascot', label: 'Mascot' },
     { id: 'shortcuts', label: 'Keyboard shortcuts' },
     { id: 'privacy', label: 'Privacy' },
     { id: 'about', label: 'About' },

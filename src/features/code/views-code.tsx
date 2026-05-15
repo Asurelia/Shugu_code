@@ -5,6 +5,7 @@ import { useState, useEffect, useRef } from "react";
 import { Icon } from "@/components/components";
 import { CodeMirrorEditor } from "./CodeMirrorEditor";
 import { ShortcutsSettings, InterfaceSettings } from "@/features/settings/settings-extras";
+import { MascotCalibration } from "@/features/settings/MascotCalibration";
 
 // ─── Code view (editor + tabs + statusbar) ──────────────────
 export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, fileContents, setFileContents }: any) {
@@ -331,6 +332,7 @@ export function SettingsView({ section }: { section: string }) {
   if (section === 'editor') return <SettingsEditor/>;
   if (section === 'shortcuts') return <ShortcutsSettings/>;
   if (section === 'interface') return <InterfaceSettings/>;
+  if (section === 'mascot') return <MascotCalibration/>;
   if (section === 'privacy') return <SettingsPrivacy/>;
   if (section === 'about') return <SettingsAbout/>;
   return <SettingsGeneral/>;
