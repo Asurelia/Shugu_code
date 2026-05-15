@@ -58,13 +58,67 @@ export function LiquidLayers() {
 // ── Titlebar ────────────────────────────────────────────────
 // `menu` is a ReactNode slot for the MenuBar — keeps Titlebar decoupled from
 // the command system. MenuBar is assembled in RootLayout and passed down.
+//
+// Window controls (close / minimize / maximize) are wired directly here via
+// dynamic Tauri imports — same pattern as src/mascot.tsx. In web mode (no
+// Tauri runtime), the handlers no-op silently so `pnpm dev` browsers don't
+// crash on click.
+//
+// CLOSE: hides the main window to the system tray (Discord/Steam pattern).
+// Does NOT actually exit the app — the Rust side keeps running so the user
+// can restore via the tray icon. Real shutdown is "Quit" in the tray menu,
+// which calls app.exit(0) on the Rust side.
+//
+// The mascot window is intentionally left alone. It has its own visibility
+// state (tucked/un-tucked, click-through) and the user typically wants it
+// to keep floating even when the main IDE is hidden.
+const inTauri =
+  typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+async function windowClose(): Promise<void> {
+  if (!inTauri) return;
+  try {
+    const mod = await import("@tauri-apps/api/webviewWindow");
+    // Hide the current window only — Rust tray code handles restore on
+    // tray click and explicit Quit on tray menu.
+    await mod.getCurrentWebviewWindow().hide();
+  } catch (err) {
+    console.warn("[Titlebar] hide failed:", err);
+  }
+}
+
+async function windowMinimize(): Promise<void> {
+  if (!inTauri) return;
+  try {
+    const mod = await import("@tauri-apps/api/webviewWindow");
+    await mod.getCurrentWebviewWindow().minimize();
+  } catch (err) {
+    console.warn("[Titlebar] minimize failed:", err);
+  }
+}
+
+async function windowToggleMaximize(): Promise<void> {
+  if (!inTauri) return;
+  try {
+    const mod = await import("@tauri-apps/api/webviewWindow");
+    const win = mod.getCurrentWebviewWindow();
+    if (await win.isMaximized()) {
+      await win.unmaximize();
+    } else {
+      await win.maximize();
+    }
+  } catch (err) {
+    console.warn("[Titlebar] toggle maximize failed:", err);
+  }
+}
+
 export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettings, sideCollapsed, onToggleSide, menu }: any) {
   return (
     <div className="titlebar">
       <div className="traffic">
-        <button className="dot close" aria-label="Close"></button>
-        <button className="dot min" aria-label="Minimize"></button>
-        <button className="dot max" aria-label="Maximize"></button>
+        <button className="dot close" aria-label="Close" title="Close Shugu Forge" onClick={() => void windowClose()}></button>
+        <button className="dot min"   aria-label="Minimize" title="Minimize" onClick={() => void windowMinimize()}></button>
+        <button className="dot max"   aria-label="Maximize" title="Toggle maximize" onClick={() => void windowToggleMaximize()}></button>
       </div>
       <button className="tb-action tb-side-toggle" title={sideCollapsed ? "Show side panel" : "Hide side panel"} onClick={onToggleSide}>
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">

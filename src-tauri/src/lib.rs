@@ -1,6 +1,8 @@
 mod commands;
 
 use std::sync::Mutex;
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
 use tauri_plugin_sql::{Builder as SqlBuilder, Migration, MigrationKind};
 
@@ -129,6 +131,83 @@ pub fn run() {
                 }
                 Ok(())
             })();
+
+            // ──────────────────────────────────────────────────────────────
+            // System tray icon — Discord/Steam-style "minimize to tray".
+            //
+            // The frontend's titlebar close button calls window.hide()
+            // (not close()), which leaves the Rust runtime alive. This tray
+            // icon is the user's only way back: left-click toggles the main
+            // window's visibility, right-click reveals a menu with "Show
+            // Shugu Forge" and "Quit". Quit calls app.exit(0) which tears
+            // down ALL windows (main + mascot) plus the dev pipeline.
+            //
+            // The mascot window is intentionally not touched here — it has
+            // its own visibility state (tucked / un-tucked / click-through)
+            // and the user typically wants it to keep floating even when
+            // the main IDE is hidden.
+            let show_item = MenuItem::with_id(
+                app, "tray-show", "Show Shugu Forge", true, None::<&str>,
+            )?;
+            let separator = PredefinedMenuItem::separator(app)?;
+            let quit_item = MenuItem::with_id(
+                app, "tray-quit", "Fermer Shugu Forge", true, None::<&str>,
+            )?;
+            let tray_menu = Menu::with_items(
+                app,
+                &[&show_item, &separator, &quit_item],
+            )?;
+
+            let _tray = TrayIconBuilder::with_id("main-tray")
+                .icon(
+                    app.default_window_icon()
+                        .expect("default window icon missing in tauri.conf.json bundle")
+                        .clone(),
+                )
+                .tooltip("Shugu Forge")
+                .menu(&tray_menu)
+                // Left-click does NOT open the menu — we use it as a quick
+                // toggle (show ↔ hide). Right-click opens the menu by Tauri's
+                // default behavior.
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "tray-show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "tray-quit" => {
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            match window.is_visible() {
+                                Ok(true) => {
+                                    let _ = window.hide();
+                                }
+                                Ok(false) => {
+                                    let _ = window.show();
+                                    let _ = window.unminimize();
+                                    let _ = window.set_focus();
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                })
+                .build(app)?;
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
