@@ -170,13 +170,40 @@ function useMascotClickThrough() {
 // not CSS-scaled). The DOM gives us CSS pixels via `screenX/Y`. We bridge
 // the two by multiplying CSS deltas by `devicePixelRatio`.
 //
-// The hook also derives `forcedSide` ("left" | "right") from the window's
-// position on its monitor and pushes it back via `setForcedSide`. That way
-// the chibi flips to face the screen interior and the chat panel docks
-// AWAY from the screen edge after every drag — when the window sits on
-// the right half, side="right" so the panel grows leftward into the
-// visible screen, not off-screen.
-function useMascotWindowDrag(setForcedSide: (s: "left" | "right" | null) => void) {
+// Snap detection uses the CHIBI's VISIBLE bounds, not the 600×600
+// transparent window. The window has a lot of click-through padding;
+// snapping against its frame puts the chibi 100+ px inside the screen,
+// which feels wrong. We compute the chibi's visible rectangle in screen
+// physical pixels (cluster.getBoundingClientRect() + the constants below
+// for the chibi-mascot's overflow + the PNG's transparent margins) and
+// snap when ANY of those edges falls within SNAP_THRESHOLD of a monitor
+// edge. On release we also pin pos (via setForcePos) so the chibi sits
+// in the matching corner/edge of the window — that way window.x =
+// monitor.left lands chibi visible at screen.x = monitor.left exactly.
+//
+// CHIBI VISIBLE GEOMETRY (constants, in CSS pixels relative to the
+// .float-cluster's top-left):
+//   - cluster is 156×156
+//   - chibi-mascot div is 240×288, centered in cluster via grid place-content
+//   - rendered <img> is 240×240 (object-fit:contain on the square PNG),
+//     centered vertically with 24 px letterbox top + bottom
+//   - PNG itself has ~25.2 % transparent above the head and ~17.4 %
+//     transparent below the feet (measured by alpha-scan in M2)
+//
+// Resulting offsets from cluster top-left to chibi VISIBLE pixels:
+const CHIBI_LEFT   = -42;   // visible left  = cluster.left + (-42)
+const CHIBI_RIGHT  = 198;   // visible right = cluster.left + 198 (156 + 42)
+const CHIBI_TOP    = 19;    // visible head  = cluster.top  + 19
+const CHIBI_BOTTOM = 156;   // visible feet  = cluster.top  + 156
+const CLUSTER_SIZE = 156;
+
+type ForcePos = { x: number; y: number } | null;
+type ForcedSide = "left" | "right" | null;
+
+function useMascotWindowDrag(
+  setForcedSide: (s: ForcedSide) => void,
+  setForcePos: (p: ForcePos) => void,
+) {
   useEffect(() => {
     let cancelled = false;
     let cleanup: (() => void) | null = null;
@@ -201,31 +228,69 @@ function useMascotWindowDrag(setForcedSide: (s: "left" | "right" | null) => void
       // above it as a drag (matches FloatChat's own threshold).
       const DRAG_THRESHOLD_CSS = 4;
 
-      // Refresh side based on where the window center sits on its monitor.
-      // Right half → side="right" (chibi faces left, chat docks left into
-      // visible screen). Left half → side="left" (mirror).
-      const refreshSide = async () => {
-        try {
-          const winPos = await win.outerPosition();
-          const winSize = await win.outerSize();
-          const monitors = await availableMonitorsFn!();
-          const cx = winPos.x + winSize.width / 2;
-          const cy = winPos.y + winSize.height / 2;
-          const m =
-            monitors.find((mn: any) =>
-              cx >= mn.position.x && cx < mn.position.x + mn.size.width &&
-              cy >= mn.position.y && cy < mn.position.y + mn.size.height
-            ) || monitors[0];
-          if (!m) return;
-          const mCenterX = m.position.x + m.size.width / 2;
-          setForcedSide(cx > mCenterX ? "right" : "left");
-        } catch (err) {
-          console.warn("[mascot drag] refreshSide failed:", err);
+      // Anchor presets — where INSIDE the window the chibi cluster should
+      // sit for each of the 9 conceptual positions. Used both for initial
+      // state (center-left / center-right depending on monitor side) and
+      // for post-snap positioning so the chibi visible edge lines up
+      // flush with the snapped screen edge.
+      const anchor = (preset:
+        | "topLeft"   | "top"    | "topRight"
+        | "centerLeft"| "center" | "centerRight"
+        | "bottomLeft"| "bottom" | "bottomRight",
+        winCssW: number, winCssH: number,
+      ): { x: number; y: number } => {
+        const cx = Math.round(winCssW / 2 - CLUSTER_SIZE / 2);
+        const cy = Math.round(winCssH / 2 - CLUSTER_SIZE / 2);
+        const xL = -CHIBI_LEFT;                // 42  — chibi visible left at 0 in window
+        const xR = winCssW - CHIBI_RIGHT;      // visible right at winW
+        const yT = -CHIBI_TOP;                 // -19 — visible head at 0 in window
+        const yB = winCssH - CHIBI_BOTTOM;     // visible feet at winH
+        switch (preset) {
+          case "topLeft":     return { x: xL, y: yT };
+          case "top":         return { x: cx, y: yT };
+          case "topRight":    return { x: xR, y: yT };
+          case "centerLeft":  return { x: xL, y: cy };
+          case "center":      return { x: cx, y: cy };
+          case "centerRight": return { x: xR, y: cy };
+          case "bottomLeft":  return { x: xL, y: yB };
+          case "bottom":      return { x: cx, y: yB };
+          case "bottomRight": return { x: xR, y: yB };
         }
       };
 
-      // Initial side — for the very first paint, before any drag happens.
-      await refreshSide();
+      // Find the monitor under a given physical (cx, cy) point.
+      const findMonitor = async (cx: number, cy: number) => {
+        const monitors = await availableMonitorsFn!();
+        return monitors.find((mn: any) =>
+          cx >= mn.position.x && cx < mn.position.x + mn.size.width &&
+          cy >= mn.position.y && cy < mn.position.y + mn.size.height
+        ) || monitors[0];
+      };
+
+      // Refresh BOTH forcedSide and forcePos based on the window's current
+      // position. Side is determined by horizontal position on the monitor;
+      // forcePos snaps the chibi to the matching center-side anchor.
+      const refreshIdle = async () => {
+        try {
+          const winPos = await win.outerPosition();
+          const winSize = await win.outerSize();
+          const cx = winPos.x + winSize.width / 2;
+          const cy = winPos.y + winSize.height / 2;
+          const m = await findMonitor(cx, cy);
+          if (!m) return;
+          const winCssW = winSize.width / (window.devicePixelRatio || 1);
+          const winCssH = winSize.height / (window.devicePixelRatio || 1);
+          const mCenterX = m.position.x + m.size.width / 2;
+          const side: ForcedSide = cx > mCenterX ? "right" : "left";
+          setForcedSide(side);
+          setForcePos(anchor(side === "right" ? "centerRight" : "centerLeft", winCssW, winCssH));
+        } catch (err) {
+          console.warn("[mascot drag] refreshIdle failed:", err);
+        }
+      };
+
+      // Initial state — chibi at center-side based on spawn position.
+      await refreshIdle();
 
       const onMouseDown = async (e: MouseEvent) => {
         const target = e.target as Element | null;
@@ -270,42 +335,101 @@ function useMascotWindowDrag(setForcedSide: (s: "left" | "right" | null) => void
           mascotIsDragging = false;
           if (!didDrag) return;
 
-          // Snap to the closest edge of the monitor under the window's center.
           try {
             const winPos = await win.outerPosition();
             const winSize = await win.outerSize();
-            const monitors = await availableMonitorsFn!();
-            const cx = winPos.x + winSize.width / 2;
-            const cy = winPos.y + winSize.height / 2;
-            const m =
-              monitors.find((mn: any) =>
-                cx >= mn.position.x && cx < mn.position.x + mn.size.width &&
-                cy >= mn.position.y && cy < mn.position.y + mn.size.height
-              ) || monitors[0];
-            if (!m) {
-              await refreshSide();
-              return;
-            }
-            const dLeft   = winPos.x - m.position.x;
-            const dRight  = (m.position.x + m.size.width)  - (winPos.x + winSize.width);
-            const dTop    = winPos.y - m.position.y;
-            const dBottom = (m.position.y + m.size.height) - (winPos.y + winSize.height);
-            const minD = Math.min(dLeft, dRight, dTop, dBottom);
-            const thresholdPhys = SNAP_THRESHOLD_CSS * scale;
-            if (minD <= thresholdPhys) {
+            const dpr = window.devicePixelRatio || 1;
+            const winCssW = winSize.width / dpr;
+            const winCssH = winSize.height / dpr;
+
+            // Find the monitor under the WINDOW center (still uses window
+            // center to pick the monitor — that part is fine, we just
+            // measure snap against the CHIBI's visible bounds, below).
+            const m = await findMonitor(
+              winPos.x + winSize.width / 2,
+              winPos.y + winSize.height / 2,
+            );
+            if (!m) { await refreshIdle(); return; }
+
+            // Chibi VISIBLE rect in screen physical pixels. The cluster's
+            // current CSS-pixel position in the window is read from the
+            // DOM (it reflects whatever forcePos last set), then offsets
+            // for the chibi-mascot overflow + PNG transparent margins
+            // give us the actual painted edges the user sees.
+            const cluster = document.querySelector(".float-cluster") as HTMLElement | null;
+            if (!cluster) { await refreshIdle(); return; }
+            const cr = cluster.getBoundingClientRect();
+            const chibiL = winPos.x + (cr.left + CHIBI_LEFT)   * dpr;
+            const chibiR = winPos.x + (cr.left + CHIBI_RIGHT)  * dpr;
+            const chibiT = winPos.y + (cr.top  + CHIBI_TOP)    * dpr;
+            const chibiB = winPos.y + (cr.top  + CHIBI_BOTTOM) * dpr;
+
+            // Signed distance from each chibi edge to the matching monitor
+            // edge. Negative = chibi edge already past the monitor edge
+            // (e.g. chibi feet are below the visible monitor) — still
+            // counts as "within threshold" so off-screen drops snap back.
+            const dLeft   = chibiL - m.position.x;
+            const dRight  = (m.position.x + m.size.width)  - chibiR;
+            const dTop    = chibiT - m.position.y;
+            const dBottom = (m.position.y + m.size.height) - chibiB;
+            const thresholdPhys = SNAP_THRESHOLD_CSS * dpr;
+
+            const lHit = dLeft   <= thresholdPhys;
+            const rHit = dRight  <= thresholdPhys;
+            const tHit = dTop    <= thresholdPhys;
+            const bHit = dBottom <= thresholdPhys;
+
+            // Corner snaps take priority when two adjacent edges both hit,
+            // so a release near a screen corner sticks to that corner
+            // instead of just the closer of the two edges.
+            type Preset = Parameters<typeof anchor>[0];
+            let preset: Preset | null = null;
+            if      (lHit && tHit) preset = "topLeft";
+            else if (rHit && tHit) preset = "topRight";
+            else if (lHit && bHit) preset = "bottomLeft";
+            else if (rHit && bHit) preset = "bottomRight";
+            else if (lHit) preset = "centerLeft";
+            else if (rHit) preset = "centerRight";
+            else if (tHit) preset = "top";
+            else if (bHit) preset = "bottom";
+
+            if (preset) {
+              // Pin the chibi to the anchor preset inside the window so its
+              // VISIBLE body will line up flush with the snapped edges.
+              const pos = anchor(preset, winCssW, winCssH);
+              setForcePos(pos);
+
+              // Compute the window's snapped physical position so the chibi
+              // visible edges land exactly on the monitor edges. With the
+              // anchor presets above, this reduces to placing the window
+              // flush against the matching monitor edges.
               let nx = winPos.x, ny = winPos.y;
-              if (minD === dLeft)        nx = m.position.x;
-              else if (minD === dRight)  nx = m.position.x + m.size.width  - winSize.width;
-              else if (minD === dTop)    ny = m.position.y;
-              else if (minD === dBottom) ny = m.position.y + m.size.height - winSize.height;
+              if (lHit) nx = m.position.x;
+              if (rHit) nx = m.position.x + m.size.width  - winSize.width;
+              if (tHit) ny = m.position.y;
+              if (bHit) ny = m.position.y + m.size.height - winSize.height;
               await win.setPosition(new PhysicalPositionCtor(nx, ny));
-              console.log(`[mascot drag] snapped to ${
-                minD === dLeft ? "left" : minD === dRight ? "right" : minD === dTop ? "top" : "bottom"
-              } edge of monitor "${m.name}"`);
+
+              // forcedSide drives the chat-panel dock direction. Left/right
+              // edges and their corners pin it directly; top/bottom-only
+              // snaps fall back to monitor-center horizontal test so the
+              // chat docks AWAY from the screen edge it's closest to.
+              if (lHit) {
+                setForcedSide("left");
+              } else if (rHit) {
+                setForcedSide("right");
+              } else {
+                const finalCx = nx + winSize.width / 2;
+                const mCx = m.position.x + m.size.width / 2;
+                setForcedSide(finalCx > mCx ? "right" : "left");
+              }
+              console.log(`[mascot drag] snapped ${preset} on monitor "${m.name}"`);
+            } else {
+              // No snap. Re-derive forcedSide + center-side forcePos from
+              // the post-drag position so the chibi flips when crossing the
+              // monitor midline even without an edge snap.
+              await refreshIdle();
             }
-            // Always refresh side after a drag — even if no snap fired,
-            // the chibi may have moved across the monitor center.
-            await refreshSide();
           } catch (err) {
             console.warn("[mascot drag] snap failed:", err);
           }
@@ -333,7 +457,7 @@ function useMascotWindowDrag(setForcedSide: (s: "left" | "right" | null) => void
     })();
 
     return () => { cancelled = true; cleanup?.(); };
-  }, [setForcedSide]);
+  }, [setForcedSide, setForcePos]);
 }
 
 function MascotApp() {
@@ -342,9 +466,10 @@ function MascotApp() {
   // model picker all theme identically across the two windows. Without it
   // the mascot would render with the raw CSS-variable defaults (cyan/teal
   // baseline) instead of whatever the user picked in Settings → Tweaks.
-  const [forcedSide, setForcedSide] = useState<"left" | "right" | null>(null);
+  const [forcedSide, setForcedSide] = useState<ForcedSide>(null);
+  const [forcePos, setForcePos] = useState<ForcePos>(null);
   useMascotClickThrough();
-  useMascotWindowDrag(setForcedSide);
+  useMascotWindowDrag(setForcedSide, setForcePos);
   return (
     <>
       <ThemeBootstrap />
@@ -353,6 +478,7 @@ function MascotApp() {
         clearPinned={() => {}}
         disableInternalDrag
         forceSide={forcedSide ?? undefined}
+        forcePos={forcePos ?? undefined}
       />
     </>
   );

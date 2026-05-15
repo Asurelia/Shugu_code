@@ -832,7 +832,12 @@ export function MascotAstronaut({ size = 92, mood = "neutral" }: { size?: number
 // (which relies on the chibi's intra-window pos.x). Used by the mascot
 // window to flip the chibi + dock the chat panel based on where the WINDOW
 // sits on the monitor, not where the chibi is inside the window.
-export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceSide }: any) {
+// `forcePos`: when provided, overrides the chibi cluster's intra-window
+// (x, y). Lets the mascot host pin the chibi to any of 9 anchor points
+// (corners, edges, center) so a screen-edge snap lands the chibi's
+// VISIBLE body flush against that edge — not just the 600 px transparent
+// frame around it.
+export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceSide, forcePos }: any) {
   const [mode, setMode] = useState<"closed" | "compact" | "full">("compact");
   // moodOverride: null = derived from state; otherwise forces a mood (alt+click cycle).
   const [moodOverride, setMoodOverride] = useState<ChibiMood | null>(null);
@@ -853,18 +858,24 @@ export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceS
       y: Math.round(window.innerHeight / 2 - h / 2),
     };
   });
-  // When the host (mascot window) forces a side via prop, also slide the
-  // chibi to that side INSIDE the window — otherwise pos.x stays at the
-  // right-edge default and the chat panel, which docks AWAY from the
-  // chibi, would extend past the window's bounds (clipped). Coupling
-  // pos.x to forceSide keeps the chat panel always inside the viewport.
+  // Two-way coupling with the mascot host:
+  //   - forcePos overrides pos entirely (used for corner/edge snaps so the
+  //     chibi's VISIBLE body lands flush against the screen edge).
+  //   - forceSide alone (no forcePos) is the lighter, M3-v2 behaviour:
+  //     slide pos.x to match the side so the chat panel stays inside the
+  //     window viewport.
   useEffect(() => {
-    if (forceSide !== "left" && forceSide !== "right") return;
-    setPos(p => ({
-      x: forceSide === "left" ? 12 : window.innerWidth - 156 - 12,
-      y: p.y,
-    }));
-  }, [forceSide]);
+    if (forcePos && typeof forcePos.x === "number" && typeof forcePos.y === "number") {
+      setPos({ x: forcePos.x, y: forcePos.y });
+      return;
+    }
+    if (forceSide === "left" || forceSide === "right") {
+      setPos(p => ({
+        x: forceSide === "left" ? 12 : window.innerWidth - 156 - 12,
+        y: p.y,
+      }));
+    }
+  }, [forceSide, forcePos]);
   const [dragging, setDragging] = useState(false);
   const [edge, setEdge] = useState<string | null>(null);
   const [speech, setSpeech] = useState({ visible: true, text: "Hey · clic pour parler" });
