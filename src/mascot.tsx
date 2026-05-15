@@ -183,17 +183,34 @@ function useMascotClickThrough() {
 //
 // CHIBI VISIBLE GEOMETRY (constants, in CSS pixels relative to the
 // .float-cluster's top-left):
+//
 //   - cluster is 156×156
 //   - chibi-mascot div is 240×288, centered in cluster via grid place-content
 //   - rendered <img> is 240×240 (object-fit:contain on the square PNG),
 //     centered vertically with 24 px letterbox top + bottom
-//   - PNG itself has ~25.2 % transparent above the head and ~17.4 %
-//     transparent below the feet (measured by alpha-scan in M2)
+//   - PNG transparent margins, measured via canvas-alpha-scan across all
+//     5 open-mood expressions (M3 v5+):
+//       top:    25.2%  → visible head at  0.252 × 240 =  60.5 px from img top
+//       bottom: 17.4%  → visible feet at  0.825 × 240 = 198   px from img top
+//       left:  ~30.8%  → visible left at  0.308 × 240 =  74   px from img left
+//       right: ~30.8%  → visible right at 0.692 × 240 = 166   px from img left
 //
 // Resulting offsets from cluster top-left to chibi VISIBLE pixels:
-const CHIBI_LEFT   = -42;   // visible left  = cluster.left + (-42)
-const CHIBI_RIGHT  = 198;   // visible right = cluster.left + 198 (156 + 42)
-const CHIBI_TOP    = 19;    // visible head  = cluster.top  + 19
+//   img.left  = cluster.left - 42  (chibi-mascot overflows cluster 42 px each side)
+//   img.top   = cluster.top  - 42  (-66 div top + 24 letterbox)
+// + visible_left_in_img  =  74  → CHIBI_LEFT  = -42 +  74 =  32
+// + visible_right_in_img = 166  → CHIBI_RIGHT = -42 + 166 = 124
+// + visible_top_in_img   =  60.5 → CHIBI_TOP    = -42 + 60.5 ≈ 19  (img.top is -42, so 19 from cluster)
+// + visible_bottom_in_img= 198   → CHIBI_BOTTOM = -42 + 198      = 156
+//
+// The previous (M3 v3-v5) constants were CHIBI_LEFT=-42 / CHIBI_RIGHT=198,
+// which measured the IMG element's CSS bounds — they ignored the ~74 px of
+// transparent padding inside the PNG on each horizontal side. That's why
+// the snap landed flush with the IMG edge but visually 74 px short of the
+// screen edge: the chibi's actual painted body ends well inside the IMG.
+const CHIBI_LEFT   =  32;   // visible left  = cluster.left + 32
+const CHIBI_RIGHT  = 124;   // visible right = cluster.left + 124
+const CHIBI_TOP    =  19;   // visible head  = cluster.top  + 19
 const CHIBI_BOTTOM = 156;   // visible feet  = cluster.top  + 156
 const CLUSTER_SIZE = 156;
 
