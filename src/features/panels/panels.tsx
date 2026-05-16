@@ -1066,7 +1066,7 @@ const CHIBI_LABELS: Record<ChibiMood, string> = {
   peek_closed: "Repos",
 };
 
-export function MascotAstronaut({ size = 92, mood = "neutral" }: { size?: number; mood?: ChibiMood }) {
+export function Chibi({ size = 92, mood = "neutral" }: { size?: number; mood?: ChibiMood }) {
   const src = CHIBI_VARIANTS[mood] || CHIBI_VARIANTS.neutral;
   const isPeek = mood === "peek_open" || mood === "peek_closed";
   // Peek poses are stickers — render smaller and squarer than the
@@ -1478,7 +1478,7 @@ export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceS
         >
           <span className="float-avatar-orbit">
             <span className="float-avatar-flip">
-              <MascotAstronaut size={240} mood={mood}/>
+              <Chibi size={240} mood={mood}/>
             </span>
           </span>
           <span className="float-avatar-glow"></span>

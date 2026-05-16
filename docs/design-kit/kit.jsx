@@ -712,7 +712,7 @@ function UsageSection() {
 <ContextMenu open={…} x={…} y={…} target={…} onClose={…} onAnnotate={…}/>
 <AccountDropdown open={…} onClose={…} onView={…}/>
 <FloatChat pinnedAnno={…} clearPinned={…}/>
-<MascotAstronaut size={92}/>
+<Chibi size={92}/>
 <ConnCard c={{name, meta, logo, color, status, fields:[…]}}/>
 <AddProviderModal onClose={…} onAdd={…}/>
 <ModelPicker model={…} onChange={…}/>`}/>
