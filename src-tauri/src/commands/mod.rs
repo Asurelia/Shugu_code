@@ -1,4 +1,5 @@
 pub mod chat;
+pub mod credentials;
 pub mod fs;
 pub mod terminal;
 pub mod image;

@@ -10,7 +10,25 @@ import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { invoke, listen } from "@/lib/tauri";
-import { useMessages, useActiveConv, sendChatMessage } from "@/features/chat/chat-sync";
+import { useMessages, useActiveConv, useActiveModel, sendChatMessage, createConversation } from "@/features/chat/chat-sync";
+import { db } from "@/lib/db";
+import { getProviderField, setProviderField, clearProviderConfig, setProviderEnabled } from "@/lib/credentials";
+import { useDiscoveredModels, invalidateDiscovery, useDiscoveryStore } from "@/lib/modelDiscovery";
+// Reuse import for FloatChat — same hook, single source of truth for the
+// "are any providers actually configured?" question used by both the
+// ModelPicker popover and the chibi's mood/send-enabled gating.
+// `invalidateDiscovery` is called by ConnCard and AddProviderModal so the
+// model picker in every window picks up newly-saved keys without a manual
+// refresh.
+
+// Relative time format for chibi history rows (handoff helper).
+function fmtAgo(ts: number): string {
+  const s = Math.max(0, (Date.now() - ts) / 1000);
+  if (s < 60) return "à l'instant";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  if (s < 86400) return Math.floor(s / 3600) + "h";
+  return Math.floor(s / 86400) + "j";
+}
 
 // ─── Dock workspace: editor + dock as constraint-solved resizable panels ──
 // Replaces the old hand-rolled CSS-grid + mousemove resize, which could squeeze
@@ -894,31 +912,24 @@ export function AccountDropdown({ open, onClose, onView }: any) {
   );
 }
 
-// ─── Model picker popover (used by float chat footer) ─────────
-export function ModelPicker({ model, onChange }: { model: string; onChange: (m: string) => void }) {
+// ─── Model picker popover ─────────
+// Used by both:
+//   - the mascot's FloatChat footer (className="float-foot-model")
+//   - the main IDE composer in ChatView   (className="composer-model")
+// Pass `className` so the trigger button inherits the right look-and-feel
+// from each context's stylesheet. Default keeps the original FloatChat skin.
+export function ModelPicker({ model, onChange, className = "float-foot-model" }: { model: string; onChange: (m: string) => void; className?: string }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLSpanElement | null>(null);
-  const models = [
-    { group: "Anthropic", items: [
-      { id: "anthropic/claude-haiku-4-5", label: "claude-haiku-4-5", meta: "fast · default" },
-      { id: "anthropic/claude-sonnet-5",  label: "claude-sonnet-5",  meta: "balanced · 200k" },
-      { id: "anthropic/claude-opus-4",    label: "claude-opus-4",    meta: "deep · slow" },
-    ]},
-    { group: "OpenAI", items: [
-      { id: "openai/gpt-4o",       label: "gpt-4o",       meta: "vision · 128k" },
-      { id: "openai/gpt-4o-mini",  label: "gpt-4o-mini",  meta: "cheap" },
-      { id: "openai/o1-preview",   label: "o1-preview",   meta: "reasoning" },
-    ]},
-    { group: "Local", items: [
-      { id: "ollama/qwen2.5:32b",  label: "qwen2.5:32b",  meta: "local · 32B" },
-      { id: "ollama/llama3.3:70b", label: "llama3.3:70b", meta: "local · 70B" },
-    ]},
-    { group: "Other", items: [
-      { id: "mistral/mistral-large", label: "mistral-large", meta: "EU · 128k" },
-      { id: "groq/llama-3.3-70b",    label: "groq · llama-3.3-70b", meta: "fast lpu" },
-    ]},
-  ];
+  // Real, live model discovery. No more hardcoded fake lists. Models appear
+  // ONLY for providers the user has actually configured AND that respond to
+  // their list-models endpoint. Errors per provider surface as a small line
+  // under the group header so the user can debug (wrong key, server down, etc.).
+  const { data: discovered, errors, unconfigured, isLoading, refresh } = useDiscoveredModels();
 
+  // Re-discovery is handled by the shared store: the 60s TTL kicks in on
+  // next consume, and ConnCard / AddProviderModal explicitly invalidate
+  // after a save. The picker only needs to react to clicks outside.
   useEffect(() => {
     if (!open) return;
     const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
@@ -926,37 +937,102 @@ export function ModelPicker({ model, onChange }: { model: string; onChange: (m: 
     return () => document.removeEventListener("mousedown", onDoc);
   }, [open]);
 
+  // The composer button shows the active model id by default. BUT a value
+  // saved in localStorage from a previous session (e.g. "llamacpp/foo") can
+  // outlive its provider being disconnected — the picker would correctly
+  // show "Aucun provider configuré", but the button would still display the
+  // stale id, contradicting the truth one popover above. We detect that
+  // mismatch and display a neutral "Choisir un modèle" until either the
+  // user picks something new or re-saves the provider in Settings.
+  const isActiveModelAvailable = isLoading || discovered.some((m) => m.id === model);
+  const displayName: string = isActiveModelAvailable
+    ? (model || "Choisir un modèle")
+    : (isLoading ? "…" : "Choisir un modèle");
+
+  // Group discovered models by providerId for display. We preserve the order
+  // in which providers appeared in the discovery result (which respects the
+  // PROVIDER_REGISTRY key order then custom providers).
+  const groups = (() => {
+    const byProvider = new Map<string, { label: string; items: typeof discovered }>();
+    for (const m of discovered) {
+      const g = byProvider.get(m.providerId);
+      if (g) g.items.push(m);
+      else byProvider.set(m.providerId, { label: m.providerLabel, items: [m] });
+    }
+    return Array.from(byProvider.entries()).map(([providerId, { label, items }]) => ({ providerId, label, items }));
+  })();
+
   return (
     <span ref={ref} style={{position:"relative", minWidth:0}}>
-      <button className="float-foot-model" title="Switch model" onClick={() => setOpen(o => !o)}>
+      <button className={className} title="Switch model" onClick={() => setOpen(o => !o)}>
         <span className="live"></span>
-        <span className="name">{model}</span>
+        <span className="name">{displayName}</span>
         <Icon name="down" size={10}/>
       </button>
       {open && (
         <div className="model-pop">
-          {models.map(g => (
-            <div key={g.group}>
-              <div className="model-pop-group">{g.group}</div>
+          {isLoading && (
+            <div className="model-pop-group" style={{ opacity: 0.6 }}>Découverte des modèles…</div>
+          )}
+          {!isLoading && groups.length === 0 && (
+            <div style={{ padding: "12px 14px", fontSize: 12, color: "var(--on-surface-variant)" }}>
+              Aucun provider configuré. Va dans <b>Settings → Connections</b> pour brancher Anthropic, OpenAI, Ollama, llama.cpp, etc.
+            </div>
+          )}
+          {groups.map(g => (
+            <div key={g.providerId}>
+              <div className="model-pop-group">{g.label}</div>
               {g.items.map(m => (
                 <button key={m.id} className={"model-pop-item" + (m.id === model ? " on" : "")} onClick={() => { onChange(m.id); setOpen(false); }}>
                   <span className="name">{m.label}</span>
-                  <span className="meta">{m.meta}</span>
+                  <span className="meta">{m.providerId}</span>
                   {m.id === model && <span className="check">✓</span>}
                 </button>
               ))}
+              {errors[g.providerId] && (
+                <div style={{ padding: "2px 14px 6px", fontSize: 10, color: "var(--error, #ff6b6b)" }} title={errors[g.providerId]}>
+                  ⚠ {errors[g.providerId]}
+                </div>
+              )}
             </div>
           ))}
+          {Object.entries(errors).filter(([k]) => !groups.find(g => g.providerId === k)).map(([providerId, msg]) => (
+            <div key={providerId}>
+              <div className="model-pop-group" style={{ opacity: 0.5 }}>{PROVIDER_LABELS_DISPLAY[providerId] ?? providerId}</div>
+              <div style={{ padding: "2px 14px 6px", fontSize: 10, color: "var(--error, #ff6b6b)" }} title={msg}>
+                ⚠ {msg}
+              </div>
+            </div>
+          ))}
+          {!isLoading && unconfigured.length > 0 && (
+            <div style={{ padding: "6px 14px 8px", fontSize: 10, color: "var(--on-surface-muted)" }}>
+              Non configurés : {unconfigured.map(id => PROVIDER_LABELS_DISPLAY[id] ?? id).join(", ")}
+            </div>
+          )}
           <div className="model-pop-foot">
-            <button className="lgb lgb-sm"><Icon name="plus" size={11}/> Add provider</button>
+            <button className="lgb lgb-sm" onClick={refresh} title="Re-fetch the model lists">
+              <Icon name="sparkle" size={11}/> Refresh
+            </button>
             <span style={{flex:1}}></span>
-            <button className="lgb lgb-sm" onClick={() => setOpen(false)}>Settings →</button>
+            <button className="lgb lgb-sm" onClick={() => setOpen(false)}>Close</button>
           </div>
         </div>
       )}
     </span>
   );
 }
+
+// Mirrors the labels used in ConnectionsView's card catalog. Local copy here
+// so ModelPicker can label provider groups even when discovery reports only
+// an error (no model row available to read the label from).
+const PROVIDER_LABELS_DISPLAY: Record<string, string> = {
+  anthropic: "Anthropic",
+  openai:    "OpenAI",
+  ollama:    "Ollama",
+  llamacpp:  "llama.cpp",
+  mistral:   "Mistral",
+  groq:      "Groq",
+};
 
 // ─── Mascot — Shugu chibi (drop-in image) ───────────────────
 // Replaces the original astronaut SVG. Moods map to one of 5
@@ -1086,19 +1162,35 @@ export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceS
     if (forceEdge !== undefined) setEdge(forceEdge ?? null);
   }, [forceEdge]);
   const [speech, setSpeech] = useState({ visible: true, text: "Hey · clic pour parler" });
-  const [hasKey, setHasKey] = useState(false);
-  const [model, setModel] = useState("anthropic/claude-haiku-4-5");
-  const [tokens, setTokens] = useState(0);
+  // `hasKey` is the truth-source for "can the chibi actually chat?". It used
+  // to be a local `useState(false)` that toggled when the user clicked the
+  // "Set API key" badge — purely decorative, never persisted, never matched
+  // reality. Now we derive it from the live discovery: if AT LEAST ONE
+  // provider responded with at least one model, we have somewhere to talk to.
+  const { data: discoveredModels } = useDiscoveredModels();
+  const hasKey = discoveredModels.length > 0;
+  // The selected model is shared with the main IDE composer via the
+  // chat-sync useActiveModel hook (localStorage + Tauri event). Whatever
+  // the user picks in either window applies to BOTH from now on.
+  const [model] = useActiveModel();
   // Messages are no longer local state — they live in SQLite and stream in
   // from the chat-sync layer. The mascot window READS the active conv from
   // useActiveConv() (the main IDE's ChatSidebar drives the writes); this
-  // window has no conv switcher.
-  const [activeConv] = useActiveConv();
+  // window now ALSO writes via the new-convo / load-history actions below.
+  const [activeConv, setActiveConv] = useActiveConv();
   const { data: msgs } = useMessages(activeConv);
   const [lastMsgCount, setLastMsgCount] = useState(0);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [hasUnread, setHasUnread] = useState(false); // an LLM reply arrived while tucked / closed
+  // Tab switches the .float-history-shell content: "feed" → current convo,
+  // "history" → list of past conversations (loaded from SQLite).
+  const [tab, setTab] = useState<"feed" | "history">("feed");
+  // Past conversations (excluding the active one) — populated lazily when
+  // the history tab opens. `histRefresh` bumps to re-pull after delete /
+  // new-convo so the list stays in sync without a full hook rewrite.
+  const [historyConvs, setHistoryConvs] = useState<{ id: string; title: string; ts: number }[]>([]);
+  const [histRefresh, setHistRefresh] = useState(0);
   const historyRef = useRef<HTMLDivElement | null>(null);
   const movedRef = useRef(false);
 
@@ -1121,6 +1213,65 @@ export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceS
     forceSide === "left" || forceSide === "right"
       ? forceSide
       : pos.x + 39 > window.innerWidth / 2 ? "right" : "left";
+
+  // ── History tab: load conversations (excluding the active one) ──
+  // Only fetch when the history tab is visible and the panel is open. In
+  // web mode (no Tauri / no SQLite), db.conversations.list() returns [] —
+  // the empty-state message takes over.
+  useEffect(() => {
+    if (mode !== "full" || tab !== "history") return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const rows = await db.conversations.list();
+        if (cancelled) return;
+        const mapped = rows
+          .filter((r: any) => r.id !== activeConv && !r.archived)
+          .map((r: any) => ({ id: r.id as string, title: (r.title as string) || "Untitled", ts: (r.updated_at as number) ?? Date.now() }));
+        setHistoryConvs(mapped);
+      } catch {
+        if (!cancelled) setHistoryConvs([]);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [mode, tab, activeConv, histRefresh]);
+
+  // ── Chibi tab actions ──
+  // newConvo: only fork a fresh row when the current convo has messages —
+  // avoids polluting SQLite with empty rows on rapid "+" clicks. After
+  // creating, we flip active to the new id so useMessages reloads to [].
+  const newConvo = async () => {
+    if (msgs.length === 0) {
+      // Already on a fresh empty convo — just switch to the feed tab.
+      setTab("feed");
+      setMode("full");
+      return;
+    }
+    const id = await createConversation("New chat");
+    if (id) setActiveConv(id);
+    setInput("");
+    setLastInteract(Date.now());
+    setTab("feed");
+    setMode("full");
+    setHistRefresh(n => n + 1);
+  };
+  // loadConvo: jump to a past conversation. useMessages picks up the new
+  // activeConv and refetches automatically.
+  const loadConvo = (id: string) => {
+    setActiveConv(id);
+    setTab("feed");
+    setMode("full");
+    setLastInteract(Date.now());
+  };
+  // deleteConvo: stops event propagation so the row click doesn't also
+  // load the deleted conv. Messages are NOT cascade-deleted (no FK in the
+  // schema) — pre-existing limitation, orphaned rows are harmless.
+  const deleteConvo = async (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    try { await db.conversations.remove(id); } catch { /* no-op */ }
+    setHistoryConvs(h => h.filter(c => c.id !== id));
+    setHistRefresh(n => n + 1);
+  };
 
   useEffect(() => {
     if (pinnedAnno) {
@@ -1167,7 +1318,6 @@ export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceS
     void (async () => {
       try {
         await sendChatMessage(activeConv, t, model);
-        setTokens(n => n + Math.floor(80 + Math.random() * 200));
       } finally {
         setBusy(false);
         setLastInteract(Date.now());
@@ -1339,24 +1489,71 @@ export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceS
       <div className="float-body">
         {mode === "full" && (
           <div className="float-history-shell">
-            <div className="float-history" ref={historyRef}>
-              {msgs.length === 0 && (
-                <div style={{color:"var(--on-surface-muted)", fontSize:12, padding:"24px 8px", textAlign:"center", fontFamily:"var(--font-mono)"}}>
-                  No conversation yet — say something.
-                </div>
-              )}
-              {msgs.map((m) => (
-                <div key={String(m.id)} className={"fm " + (m.role === "user" ? "you" : "ai")}>
-                  {m.text ?? m.body ?? ""}
-                </div>
-              ))}
-            </div>
+            {tab === "feed" ? (
+              <div className="float-history" ref={historyRef}>
+                {msgs.length === 0 && (
+                  <div style={{color:"var(--on-surface-muted)", fontSize:12, padding:"24px 8px", textAlign:"center", fontFamily:"var(--font-mono)"}}>
+                    No conversation yet — say something.
+                  </div>
+                )}
+                {msgs.map((m) => (
+                  <div key={String(m.id)} className={"fm " + (m.role === "user" ? "you" : "ai")}>
+                    {m.text ?? m.body ?? ""}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="float-history-list">
+                {historyConvs.length === 0 ? (
+                  <div style={{color:"var(--on-surface-muted)", fontSize:12, padding:"24px 8px", textAlign:"center", fontFamily:"var(--font-mono)"}}>
+                    Pas encore d'historique.
+                  </div>
+                ) : (
+                  historyConvs.map((h) => (
+                    <div key={h.id} className="fhl-item" onClick={() => loadConvo(h.id)}>
+                      <div className="fhl-info">
+                        <span className="t">{h.title}</span>
+                        <span className="m">{fmtAgo(h.ts)}</span>
+                      </div>
+                      <button className="fhl-del" onClick={(e) => deleteConvo(h.id, e)} title="Supprimer">
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/>
+                        </svg>
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
           </div>
         )}
 
-        <div className="float-panel">
-          <div className="float-aot"><span className="pulse"></span> always-on-top · persistent</div>
+        {mode === "full" && (
+          <div className="float-tabs">
+            <button className={"float-tab" + (tab === "feed" ? " on" : "")} onClick={() => setTab("feed")} title="Chat">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+              </svg>
+              <span>Chat</span>
+              {msgs.length > 0 && <span className="float-tab-count">{msgs.length}</span>}
+            </button>
+            <button className="float-tab new" onClick={() => { void newConvo(); }} title="Nouvelle conversation">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+              </svg>
+              <span>Nouveau</span>
+            </button>
+            <button className={"float-tab" + (tab === "history" ? " on" : "")} onClick={() => setTab("history")} title="Historique">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+              </svg>
+              <span>Historique</span>
+              {historyConvs.length > 0 && <span className="float-tab-count">{historyConvs.length}</span>}
+            </button>
+          </div>
+        )}
 
+        <div className="float-panel cchrome-naked cstyle-pill csize-thin csend-kbd cfoot-hidden">
           {pinnedAnno && (
             <div className="float-pinned-note">
               pinned
@@ -1371,49 +1568,51 @@ export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceS
                 value={input}
                 onChange={e => setInput(e.target.value)}
                 onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
-                placeholder={busy ? "…" : "Ready. Message Space Agent…"}
+                placeholder={busy ? "…" : "Message Shugu…"}
                 rows={1}
               />
               {!input && !hasKey && (
-                <button className="float-api-badge" onClick={() => setHasKey(true)} title="Configure your LLM provider">
-                  Set LLM API key
+                <button
+                  className="float-api-badge"
+                  type="button"
+                  title="Aucun provider configuré — ouvre Settings → Connections dans la fenêtre principale"
+                  onClick={async () => {
+                    // Cross-window deep-link to Settings → Connections.
+                    // 1. Emit a generic navigate event the main window listens to.
+                    // 2. Show + unminimize + focus the main window so the user
+                    //    actually sees the page that just changed under their
+                    //    nose. Each step is independently best-effort: if Tauri
+                    //    is somehow unavailable (web mode, missing API) the
+                    //    button is just a no-op rather than crashing.
+                    try {
+                      const eventMod = await import("@tauri-apps/api/event");
+                      await eventMod.emit("app://navigate", { path: "/settings/connections" });
+                    } catch (err) {
+                      console.warn("[chibi] emit navigate failed", err);
+                    }
+                    try {
+                      const winMod = await import("@tauri-apps/api/webviewWindow");
+                      const main = await winMod.WebviewWindow.getByLabel("main");
+                      if (main) {
+                        await main.show();
+                        await main.unminimize();
+                        await main.setFocus();
+                      }
+                    } catch (err) {
+                      console.warn("[chibi] focus main window failed", err);
+                    }
+                  }}
+                >
+                  Set API key
                 </button>
               )}
             </div>
             <div className="float-actions-col">
-              <button className="float-icon-btn send" disabled={!input.trim() || !hasKey || busy} onClick={send} title="Send (Enter)">
-                <Icon name="up" size={15}/>
-              </button>
-              <button className="float-icon-btn" title="Attach a file or screenshot">
-                <Icon name="attach" size={14}/>
-              </button>
-            </div>
-          </div>
-
-          <div className="float-foot">
-            <button className={"float-foot-toggle" + (mode === "full" ? " on" : "")} onClick={() => setMode(m => m === "full" ? "compact" : "full")} title={mode === "full" ? "Collapse" : "Expand history"}>
-              <Icon name={mode === "full" ? "down" : "up"} size={12}/>
-            </button>
-            <ModelPicker model={model} onChange={setModel}/>
-            <span className="float-foot-tokens"><span className="v">{tokens.toLocaleString()}</span> tokens</span>
-            <div className="float-foot-icons">
-              <button className="b" title="Sampling parameters">
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <line x1="4" y1="6"  x2="4"  y2="14"/>
-                  <line x1="4" y1="18" x2="4"  y2="22"/>
-                  <line x1="12" y1="2" x2="12" y2="10"/>
-                  <line x1="12" y1="14" x2="12" y2="22"/>
-                  <line x1="20" y1="2" x2="20" y2="14"/>
-                  <line x1="20" y1="18" x2="20" y2="22"/>
-                  <circle cx="4" cy="16" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="20" cy="16" r="2"/>
-                </svg>
-              </button>
-              <button className="b" title="Conversation history">
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <line x1="3" y1="6"  x2="21" y2="6"/>
-                  <line x1="3" y1="12" x2="21" y2="12"/>
-                  <line x1="3" y1="18" x2="14" y2="18"/>
-                </svg>
+              <span className={"float-kbd-hint" + (input.trim() && hasKey && !busy ? " ready" : "")} onClick={send} title="Send (Enter)">
+                <span className="k">↵</span>
+              </span>
+              <button className="float-icon-btn attach" title="Attach a file or screenshot">
+                <Icon name="attach" size={13}/>
               </button>
             </div>
           </div>
@@ -1451,10 +1650,39 @@ export function AnnotationLayer({ annotations, onRemove }: any) {
 }
 
 // ─── Connections page (settings → connections) ──────────────
+// Storage key for the persisted list of user-added custom providers. JSON-encoded
+// array of ConnCardData rows (display metadata only — secrets/configs live in
+// their respective backends keyed by `provider.<id>.*`).
+const CUSTOM_PROVIDERS_KEY = "connections.customProviders.v1";
+
 export function ConnectionsView() {
   const [tab, setTab] = useState("models");
-  const [customModels, setCustomModels] = useState<any[]>([]);
+  const [customModels, setCustomModels] = useState<ConnCardData[]>([]);
   const [adding, setAdding] = useState(false);
+
+  // Restore persisted custom providers on mount. The list is metadata only —
+  // each provider's actual credentials are loaded by its ConnCard via the
+  // provider.<id>.* convention, so there's no race between this load and
+  // the card's own initial fetch.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const raw = await db.settings.get(CUSTOM_PROVIDERS_KEY);
+        if (cancelled || !raw) return;
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) setCustomModels(parsed as ConnCardData[]);
+      } catch (err) {
+        console.warn("[connections] failed to restore custom providers", err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const persistCustom = async (next: ConnCardData[]): Promise<void> => {
+    try { await db.settings.set(CUSTOM_PROVIDERS_KEY, JSON.stringify(next)); }
+    catch (err) { console.warn("[connections] failed to persist custom providers", err); }
+  };
   const tabs = [
     { v: "models",    l: "AI Providers" },
     { v: "tools",     l: "Dev tools" },
@@ -1462,30 +1690,71 @@ export function ConnectionsView() {
     { v: "storage",   l: "Storage" },
   ];
 
-  const cards: Record<string, any[]> = {
+  // Field shape note: each field is { label (human), key (stable id used by the
+  // credentials backend), placeholder, secret }. `key` MUST be stable across
+  // releases — it's the account suffix in the OS keychain (`provider.<id>.<key>`)
+  // and the column suffix in the SQLite `settings` table. The `label` is the
+  // only thing that's free to change for i18n / wording.
+  const cards: Record<string, ConnCardData[]> = {
     models: [
-      { id: "anthropic", name: "Anthropic", meta: "Claude / Shugu models", logo: "A", color: "#d97757", status: "connected", fields: [["API key", "sk-ant-…", true]] },
-      { id: "openai",    name: "OpenAI",    meta: "GPT-4o, o1, embeddings", logo: "O", color: "#10a37f", status: "disconnected", fields: [["API key", "sk-…", true], ["Org ID", "org-…", false]] },
-      { id: "ollama",    name: "Ollama",    meta: "Local model server",     logo: "O", color: "#000",    status: "warn",         fields: [["Endpoint", "http://localhost:11434", false]] },
-      { id: "mistral",   name: "Mistral",   meta: "European open-weights",  logo: "M", color: "#ff7000", status: "disconnected", fields: [["API key", "…", true]] },
-      { id: "groq",      name: "Groq",      meta: "Fast LPU inference",     logo: "G", color: "#f55036", status: "disconnected", fields: [["API key", "gsk_…", true]] },
+      { id: "anthropic", name: "Anthropic", meta: "Claude / Shugu models", logo: "A", color: "#d97757", fields: [
+        { label: "API key", key: "apiKey", placeholder: "sk-ant-…", secret: true },
+      ]},
+      { id: "openai", name: "OpenAI", meta: "GPT-4o, o1, embeddings", logo: "O", color: "#10a37f", fields: [
+        { label: "API key", key: "apiKey", placeholder: "sk-…", secret: true },
+        { label: "Org ID",  key: "orgId",  placeholder: "org-…", secret: false },
+      ]},
+      { id: "ollama", name: "Ollama", meta: "Local model server", logo: "O", color: "#000", fields: [
+        { label: "Endpoint", key: "baseUrl", placeholder: "http://localhost:11434", secret: false },
+      ]},
+      { id: "llamacpp", name: "llama.cpp", meta: "Local OpenAI-compatible server (gguf models)", logo: "L", color: "#7c3aed", fields: [
+        { label: "Endpoint", key: "baseUrl", placeholder: "http://localhost:8080", secret: false },
+        { label: "API key (optional)", key: "apiKey", placeholder: "leave empty unless --api-key was set", secret: true },
+      ]},
+      { id: "mistral", name: "Mistral", meta: "European open-weights", logo: "M", color: "#ff7000", fields: [
+        { label: "API key", key: "apiKey", placeholder: "…", secret: true },
+      ]},
+      { id: "groq", name: "Groq", meta: "Fast LPU inference", logo: "G", color: "#f55036", fields: [
+        { label: "API key", key: "apiKey", placeholder: "gsk_…", secret: true },
+      ]},
     ],
     tools: [
-      { id: "github",    name: "GitHub",    meta: "Repos, PRs, issues",         logo: "G", color: "#24292f", status: "connected", fields: [["Personal token", "ghp_…", true]] },
-      { id: "gitlab",    name: "GitLab",    meta: "Repos & CI",                 logo: "G", color: "#fc6d26", status: "disconnected", fields: [["Token", "glpat-…", true], ["Host", "https://gitlab.com", false]] },
-      { id: "linear",    name: "Linear",    meta: "Issues & projects",          logo: "L", color: "#5e6ad2", status: "disconnected", fields: [["API key", "lin_api_…", true]] },
-      { id: "vercel",    name: "Vercel",    meta: "Deploy from Forge",          logo: "▲", color: "#000",    status: "disconnected", fields: [["Token", "…", true]] },
-      { id: "docker",    name: "Docker",    meta: "Local daemon",               logo: "D", color: "#2496ed", status: "connected", fields: [["Socket", "/var/run/docker.sock", false]] },
+      { id: "github", name: "GitHub", meta: "Repos, PRs, issues", logo: "G", color: "#24292f", fields: [
+        { label: "Personal token", key: "apiKey", placeholder: "ghp_…", secret: true },
+      ]},
+      { id: "gitlab", name: "GitLab", meta: "Repos & CI", logo: "G", color: "#fc6d26", fields: [
+        { label: "Token", key: "apiKey", placeholder: "glpat-…", secret: true },
+        { label: "Host",  key: "baseUrl", placeholder: "https://gitlab.com", secret: false },
+      ]},
+      { id: "linear", name: "Linear", meta: "Issues & projects", logo: "L", color: "#5e6ad2", fields: [
+        { label: "API key", key: "apiKey", placeholder: "lin_api_…", secret: true },
+      ]},
+      { id: "vercel", name: "Vercel", meta: "Deploy from Forge", logo: "▲", color: "#000", fields: [
+        { label: "Token", key: "apiKey", placeholder: "…", secret: true },
+      ]},
+      { id: "docker", name: "Docker", meta: "Local daemon", logo: "D", color: "#2496ed", fields: [
+        { label: "Socket", key: "endpoint", placeholder: "/var/run/docker.sock", secret: false },
+      ]},
     ],
     image: [
-      { id: "replicate", name: "Replicate", meta: "flux.1, sdxl, hosted models", logo: "R", color: "#fff",  status: "connected", fields: [["API token", "r8_…", true]] },
-      { id: "stability", name: "Stability AI", meta: "SDXL turbo, SD3",          logo: "S", color: "#9b51e0", status: "disconnected", fields: [["Key", "sk-…", true]] },
-      { id: "modal",     name: "Modal",     meta: "Custom inference functions",   logo: "M", color: "#7ee787", status: "disconnected", fields: [["Token", "…", true]] },
+      { id: "replicate", name: "Replicate", meta: "flux.1, sdxl, hosted models", logo: "R", color: "#fff", fields: [
+        { label: "API token", key: "apiKey", placeholder: "r8_…", secret: true },
+      ]},
+      { id: "stability", name: "Stability AI", meta: "SDXL turbo, SD3", logo: "S", color: "#9b51e0", fields: [
+        { label: "Key", key: "apiKey", placeholder: "sk-…", secret: true },
+      ]},
+      { id: "modal", name: "Modal", meta: "Custom inference functions", logo: "M", color: "#7ee787", fields: [
+        { label: "Token", key: "apiKey", placeholder: "…", secret: true },
+      ]},
     ],
     storage: [
-      { id: "drive",  name: "Google Drive", meta: "Sync generations & projects", logo: "D", color: "#4285f4", status: "disconnected", fields: [] },
-      { id: "s3",     name: "S3-compatible", meta: "Self-hosted bucket",         logo: "S", color: "#ff9900", status: "disconnected", fields: [["Endpoint", "s3.example.com", false], ["Key ID", "AKIA…", false], ["Secret", "…", true]] },
-      { id: "icloud", name: "iCloud Drive", meta: "macOS only",                  logo: "i", color: "#007aff", status: "connected", fields: [] },
+      { id: "drive",  name: "Google Drive",  meta: "Sync generations & projects", logo: "D", color: "#4285f4", fields: [] },
+      { id: "s3", name: "S3-compatible", meta: "Self-hosted bucket", logo: "S", color: "#ff9900", fields: [
+        { label: "Endpoint", key: "endpoint", placeholder: "s3.example.com", secret: false },
+        { label: "Key ID",   key: "orgId",    placeholder: "AKIA…",         secret: false },
+        { label: "Secret",   key: "apiKey",   placeholder: "…",              secret: true  },
+      ]},
+      { id: "icloud", name: "iCloud Drive", meta: "macOS only", logo: "i", color: "#007aff", fields: [] },
     ],
   };
 
@@ -1494,7 +1763,7 @@ export function ConnectionsView() {
       <div className="settings-inner">
         <div className="setting-section">
           <h3>Connections</h3>
-          <p className="sub">Branche tes outils externes. Toutes les clés sont stockées chiffrées dans le keychain de l'OS via Tauri.</p>
+          <p className="sub">Branche tes outils externes. Les clés API sont stockées dans le keychain natif de l'OS (Windows Credential Manager, macOS Keychain, Linux Secret Service). Les endpoints et IDs non-secrets vont dans la base SQLite locale.</p>
           <div className="conn-tabs">
             {tabs.map(t => (
               <button key={t.v} className={"conn-tab-btn" + (tab === t.v ? " on" : "")} onClick={() => setTab(t.v)}>{t.l}</button>
@@ -1513,28 +1782,51 @@ export function ConnectionsView() {
           </div>
         </div>
       </div>
-      {adding && <AddProviderModal onClose={() => setAdding(false)} onAdd={(c: any) => { setCustomModels(p => [...p, c]); setAdding(false); }}/>}
+      {adding && <AddProviderModal onClose={() => setAdding(false)} onAdd={async (c: ConnCardData) => {
+        const next = [...customModels, c];
+        setCustomModels(next);
+        await persistCustom(next);
+        setAdding(false);
+      }}/>}
     </div>
   );
 }
 
-export function AddProviderModal({ onClose, onAdd }: any) {
+export function AddProviderModal({ onClose, onAdd }: { onClose: () => void; onAdd: (c: ConnCardData) => void | Promise<void> }) {
   const [name, setName] = useState("");
   const [endpoint, setEndpoint] = useState("https://");
   const [key, setKey] = useState("");
   const [model, setModel] = useState("");
+  // `kind` here doubles as the protocol the chat dispatcher will use. We keep
+  // anthropic/openai/ollama/custom in lockstep with the Rust `chat_send` match
+  // arms so a user-defined provider can immediately participate in chat.
   const [kind, setKind] = useState("openai");
-  const ok = name && endpoint && key;
-  const submit = () => {
+  // For OpenAI-compat and Ollama, leaving the API key empty is fine (local
+  // servers often don't require one). We only require name + endpoint.
+  const ok = name && endpoint;
+  const submit = async () => {
     if (!ok) return;
-    onAdd({
-      id: "custom-" + Date.now(),
-      name, meta: kind + " · " + (model || "auto"),
+    const id = "custom-" + Date.now();
+    // Persist credentials immediately so the ConnCard that's about to render
+    // finds them on its initial load instead of starting empty.
+    if (endpoint) await setProviderField(id, "baseUrl", endpoint, false);
+    if (key)      await setProviderField(id, "apiKey",  key,      true);
+    if (model)    await setProviderField(id, "defaultModel", model, false);
+    await setProviderField(id, "protocol", kind, false);
+    void invalidateDiscovery();
+    const card: ConnCardData = {
+      id,
+      name,
+      meta: kind + " · " + (model || "auto"),
       logo: name[0]?.toUpperCase() || "?",
       color: "#5063c5",
-      status: "disconnected",
-      fields: [["API key", "•••", true], ["Endpoint", endpoint, false], ["Default model", model || "auto", false]],
-    });
+      fields: [
+        { label: "Endpoint",      key: "baseUrl",      placeholder: endpoint,      secret: false },
+        { label: "API key",       key: "apiKey",       placeholder: "•••",         secret: true  },
+        { label: "Default model", key: "defaultModel", placeholder: model || "auto", secret: false },
+      ],
+    };
+    await onAdd(card);
   };
   return (
     <div className="palette-scrim" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
@@ -1589,47 +1881,228 @@ export function AddProviderModal({ onClose, onAdd }: any) {
   );
 }
 
-export function ConnCard({ c }: any) {
-  const [vals, setVals] = useState<Record<string, string>>(() => Object.fromEntries((c.fields || []).map(([l]: any) => [l, ""])));
+// Shape of a single editable field inside a connection card. `key` is the
+// stable identifier the credentials backend uses (NOT `label`, which is
+// allowed to drift for i18n). `secret: true` routes the value through the
+// OS keychain; `secret: false` routes it through the SQLite settings table.
+export interface ConnField {
+  label: string;
+  key: string;
+  placeholder: string;
+  secret: boolean;
+}
+
+export interface ConnCardData {
+  id: string;
+  name: string;
+  meta: string;
+  logo: string;
+  color: string;
+  fields: ConnField[];
+}
+
+type ConnStatus = "loading" | "connected" | "disconnected";
+
+export function ConnCard({ c }: { c: ConnCardData }) {
+  // `vals` is the live edited state. `saved` mirrors what's actually persisted
+  // and is used to drive the "dirty" indicator + decide whether the Save
+  // button has work to do. Both are keyed by `field.key`, not by label.
+  const [vals, setVals]   = useState<Record<string, string>>({});
+  const [saved, setSaved] = useState<Record<string, string>>({});
   const [reveal, setReveal] = useState<Record<string, boolean>>({});
+  const [status, setStatus] = useState<ConnStatus>("loading");
+  const [savingState, setSavingState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  // Subscribe to discovery errors so a 401 from "save invalid key" actually
+  // appears ON the card, not just hidden inside the picker popover.
+  const discoveryError = useDiscoveryStore((s) => s.errors[c.id] ?? null);
+  const discoveredCount = useDiscoveryStore((s) => s.models.filter((m) => m.providerId === c.id).length);
+
+  // ── Initial load: pull every known field for this provider from the
+  // appropriate backend (keychain for secrets, SQLite for the rest). A
+  // provider counts as "connected" if at least one field has a stored
+  // value — sufficient for v1 because every meaningful provider has at
+  // least one required field. Cards with `fields.length === 0` (e.g.
+  // Google Drive placeholder) stay "disconnected" until we wire OAuth.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const initial: Record<string, string> = {};
+      await Promise.all(
+        c.fields.map(async (f) => {
+          const v = await getProviderField(c.id, f.key, f.secret);
+          if (v != null && v !== "") initial[f.key] = v;
+        }),
+      );
+      if (cancelled) return;
+      setVals(initial);
+      setSaved(initial);
+      setStatus(Object.keys(initial).length > 0 ? "connected" : "disconnected");
+    })();
+    return () => { cancelled = true; };
+    // Intentionally NOT including c.fields — it's a fresh array reference on
+    // every parent render (the `cards` object is rebuilt inside ConnectionsView's
+    // function body) which would re-fire this load effect on any parent state
+    // change (e.g. opening the Add Provider modal) and wipe the user's
+    // in-progress typing. The field schema is stable for the lifetime of a card
+    // identified by c.id, so c.id alone is the correct trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [c.id]);
+
+  // ── Dirty check: any field whose current value differs from what we
+  // last fetched / wrote. Empty-vs-undefined is normalized so a never-set
+  // field with "" in the input doesn't flag as dirty against an absent row.
+  const isDirty = c.fields.some((f) => (vals[f.key] ?? "") !== (saved[f.key] ?? ""));
+
+  const onSave = async () => {
+    setSavingState("saving");
+    setErrorMsg(null);
+    try {
+      // Write only the dirty fields — saves a couple of keychain round-trips
+      // and avoids re-encrypting unchanged secrets.
+      const dirtyFields = c.fields.filter((f) => (vals[f.key] ?? "") !== (saved[f.key] ?? ""));
+      await Promise.all(
+        dirtyFields.map((f) => setProviderField(c.id, f.key, vals[f.key] ?? "", f.secret)),
+      );
+      // Mark the provider as explicitly enabled so the discovery layer treats
+      // it as user-confirmed (not just auto-probed). Symmetric to the "false"
+      // flag flipped by clearProviderConfig in onDisconnect.
+      await setProviderEnabled(c.id, true);
+      setSaved({ ...vals });
+      const anyValue = c.fields.some((f) => (vals[f.key] ?? "") !== "");
+      setStatus(anyValue ? "connected" : "disconnected");
+      setSavingState("saved");
+      // Tell every window that the set of usable providers may have changed
+      // so the ModelPicker / chibi mood / etc. pick up the new key on next
+      // render. Fire-and-forget — the user doesn't wait on this.
+      void invalidateDiscovery();
+      // Reset the "saved" pill after a short delay so the next edit feels
+      // responsive without lingering UI noise.
+      setTimeout(() => setSavingState((s) => (s === "saved" ? "idle" : s)), 1200);
+    } catch (err) {
+      setSavingState("error");
+      setErrorMsg(String(err));
+    }
+  };
+
+  const onDisconnect = async () => {
+    setSavingState("saving");
+    setErrorMsg(null);
+    try {
+      await clearProviderConfig(c.id);
+      const empty: Record<string, string> = {};
+      setVals(empty);
+      setSaved(empty);
+      setStatus("disconnected");
+      setSavingState("idle");
+      void invalidateDiscovery();
+    } catch (err) {
+      setSavingState("error");
+      setErrorMsg(String(err));
+    }
+  };
+
+  // The pill shows a more informative status when we have discovery data:
+  //   "connected · 4 models" when the discovery returned models for this provider,
+  //   "saved · ⚠ error"      when a config is saved but the discovery failed,
+  //   "connected"            when saved but discovery hasn't run yet,
+  //   "disconnected" / "loading…" otherwise.
+  const statusLabel: string = status === "loading"
+    ? "loading…"
+    : status === "connected"
+      ? (discoveryError
+          ? "saved · check error"
+          : discoveredCount > 0
+            ? `connected · ${discoveredCount} model${discoveredCount > 1 ? "s" : ""}`
+            : "saved")
+      : "disconnected";
+
   return (
-    <div className={"conn-card " + (c.status === "connected" ? "connected" : c.status === "warn" ? "warn" : "")}>
+    <div className={"conn-card " + (status === "connected" ? "connected" : "")}>
       <div className="conn-head">
         <div className="conn-logo" style={{background: c.color, color: c.color === "#000" || c.color === "#24292f" ? "white" : "rgba(0,0,0,0.7)"}}>{c.logo}</div>
         <div className="conn-info">
           <div className="conn-name">{c.name}</div>
           <div className="conn-meta">{c.meta}</div>
         </div>
-        <span className={"conn-status " + c.status}>{c.status}</span>
+        <span className={"conn-status " + status}>{statusLabel}</span>
       </div>
-      {c.fields && c.fields.length > 0 && c.fields.map(([label, ph, secret]: any) => (
-        <div key={label} className="conn-field">
-          <label>{label}</label>
-          <div className="input">
-            <input
-              type={secret && !reveal[label] ? "password" : "text"}
-              value={vals[label] || ""}
-              onChange={(e) => setVals(s => ({ ...s, [label]: e.target.value }))}
-              placeholder={ph}
-            />
-            {secret && (
-              <button onClick={() => setReveal(r => ({ ...r, [label]: !r[label] }))} title="Show/hide">
-                <Icon name={reveal[label] ? "x" : "search"} size={12}/>
-              </button>
-            )}
-            <button title="Paste">
-              <Icon name="copy" size={12}/>
-            </button>
+      {c.fields.length > 0 && c.fields.map((f) => {
+        // Has a real persisted value (different from the empty default)?
+        const isSaved = (saved[f.key] ?? "") !== "";
+        return (
+          <div key={f.key} className="conn-field">
+            <label>
+              {f.label}
+              {isSaved && (
+                <span style={{
+                  marginLeft: 8,
+                  fontSize: 10,
+                  fontWeight: 600,
+                  color: "var(--success, #4ade80)",
+                  letterSpacing: 0.5,
+                  textTransform: "uppercase",
+                }}>✓ saved</span>
+              )}
+            </label>
+            <div className="input">
+              <input
+                type={f.secret && !reveal[f.key] ? "password" : "text"}
+                value={vals[f.key] ?? ""}
+                onChange={(e) => setVals((s) => ({ ...s, [f.key]: e.target.value }))}
+                // When a secret is already persisted, the input still shows
+                // dots (type=password) for the current value, but if the
+                // user starts typing replacement they get a clear placeholder.
+                // We keep the original placeholder for not-yet-saved fields.
+                placeholder={isSaved && f.secret ? "•••••••• (stored — click Reveal to show)" : f.placeholder}
+                spellCheck={false}
+                autoComplete="off"
+              />
+              {f.secret && (
+                <button onClick={() => setReveal((r) => ({ ...r, [f.key]: !r[f.key] }))} title={reveal[f.key] ? "Hide" : "Show"}>
+                  <Icon name={reveal[f.key] ? "x" : "search"} size={12}/>
+                </button>
+              )}
+            </div>
           </div>
+        );
+      })}
+      {discoveryError && status === "connected" && (
+        // Surface the upstream error (most often 401 from a fake key, or
+        // connection refused from a server that's down) right on the card,
+        // not just hidden in the model picker.
+        <div style={{
+          margin: "6px 0",
+          padding: "8px 10px",
+          borderRadius: 6,
+          background: "rgba(255, 107, 107, 0.08)",
+          border: "1px solid rgba(255, 107, 107, 0.25)",
+          fontSize: 11,
+          color: "var(--error, #ff6b6b)",
+          lineHeight: 1.4,
+        }}>
+          ⚠ Le provider est saved mais la liste des modèles a échoué&nbsp;: <code style={{ background: "rgba(0,0,0,0.3)", padding: "1px 4px", borderRadius: 3 }}>{discoveryError}</code>
         </div>
-      ))}
+      )}
       <div className="conn-actions">
-        {c.status === "connected"
-          ? <><button className="lgb lgb-sm lgb-primary"><Icon name="thumbs" size={11}/> Test</button>
-              <button className="lgb lgb-sm">Disconnect</button></>
-          : <button className="lgb lgb-sm lgb-primary"><Icon name="sparkle" size={11}/> Connect</button>}
+        <button
+          className="lgb lgb-sm lgb-primary"
+          onClick={onSave}
+          disabled={!isDirty || savingState === "saving" || status === "loading"}
+          title={isDirty ? "Save changes" : "Nothing to save"}
+        >
+          <Icon name="sparkle" size={11}/> {savingState === "saving" ? "Saving…" : savingState === "saved" ? "Saved ✓" : "Save"}
+        </button>
+        {status === "connected" && (
+          <button className="lgb lgb-sm" onClick={onDisconnect} disabled={savingState === "saving"}>
+            Disconnect
+          </button>
+        )}
         <span style={{flex:1}}></span>
-        <button className="lgb lgb-sm"><Icon name="folder" size={11}/></button>
+        {savingState === "error" && (
+          <span style={{fontSize:11, color:"var(--error, #ff6b6b)"}} title={errorMsg ?? ""}>error · hover for details</span>
+        )}
       </div>
     </div>
   );

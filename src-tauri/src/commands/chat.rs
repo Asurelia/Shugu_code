@@ -1,30 +1,17 @@
 use futures_util::StreamExt;
-use serde::Deserialize;
 use tauri::Emitter;
 
-/// Arguments received from the JS `invoke("chat_send", {...})` call.
-/// JS uses camelCase, so we rename all fields accordingly.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ChatSendArgs {
-    pub prompt: String,
-    pub model: String,
-    /// "anthropic" | "openai" | "ollama" | "custom"
-    pub protocol: String,
-    /// Base URL for the provider, e.g. "https://api.anthropic.com"
-    ///
-    /// SECURITY NOTE: For the `custom` protocol this value is user-supplied and
-    /// is used directly in an outbound HTTP request — a known SSRF surface.
-    /// This is acceptable for a desktop app where the user configures their own
-    /// providers, but a future improvement should validate against an allowlist
-    /// of user-approved origins before sending.
-    pub base_url: String,
-    /// Optional API key. If `Some` and non-empty it takes precedence over the
-    /// corresponding environment variable.
-    pub api_key: Option<String>,
-    /// Reserved for future multi-turn conversation tracking; unused today.
-    pub conversation_id: Option<String>,
-}
+// Arguments arrive as individual command parameters (matching the pattern
+// used by every other command in this crate — fs_read_file, term_spawn, etc.).
+// Tauri 2 automatically maps camelCase JS keys (`baseUrl`, `apiKey`,
+// `conversationId`) onto snake_case Rust parameter names, so no rename
+// attribute is needed.
+//
+// SECURITY NOTE: For the `custom` protocol the `base_url` value is
+// user-supplied and is used directly in an outbound HTTP request — a known
+// SSRF surface. This is acceptable for a desktop app where the user configures
+// their own providers, but a future improvement should validate against an
+// allowlist of user-approved origins before sending.
 
 // ---------------------------------------------------------------------------
 // Streaming delta event emitted to the frontend via `chat://delta`.
@@ -44,7 +31,20 @@ struct ChatDelta {
 
 /// Returns the API key to use for the given protocol.
 ///
-/// Priority: explicit `api_key` arg → env var → `Ok("")` for Ollama.
+/// Priority: explicit `api_key` arg (non-empty) → env var (if set) → empty
+/// string for every protocol EXCEPT Anthropic.
+///
+/// Why empty is OK for openai/custom/ollama:
+///   - Ollama doesn't authenticate requests at all.
+///   - llama.cpp's `llama-server`, LM Studio, vLLM, and similar local
+///     OpenAI-compat servers either don't require a key or accept any value;
+///     when no key is provided we OMIT the `Authorization` header entirely
+///     downstream in `call_openai_compat`.
+///   - A remote OpenAI-compat endpoint that DOES require a key will reject
+///     with a clear HTTP 401 — surfacing that as the visible error is better
+///     UX than a pre-emptive "no API key" before we've even tried.
+///
+/// Anthropic always needs `x-api-key` to be set, so we still hard-fail there.
 fn resolve_key(protocol: &str, api_key: &Option<String>) -> Result<String, String> {
     if let Some(k) = api_key {
         if !k.is_empty() {
@@ -56,12 +56,8 @@ fn resolve_key(protocol: &str, api_key: &Option<String>) -> Result<String, Strin
         "anthropic" => std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
             "no API key for anthropic (set ANTHROPIC_API_KEY or pass apiKey)".to_string()
         }),
-        "openai" => std::env::var("OPENAI_API_KEY").map_err(|_| {
-            "no API key for openai (set OPENAI_API_KEY or pass apiKey)".to_string()
-        }),
-        "custom" => std::env::var("SHUGU_CUSTOM_API_KEY").map_err(|_| {
-            "no API key for custom (set SHUGU_CUSTOM_API_KEY or pass apiKey)".to_string()
-        }),
+        "openai" => Ok(std::env::var("OPENAI_API_KEY").unwrap_or_default()),
+        "custom" => Ok(std::env::var("SHUGU_CUSTOM_API_KEY").unwrap_or_default()),
         other => Err(format!("unsupported protocol: {}", other)),
     }
 }
@@ -193,14 +189,18 @@ async fn call_openai_compat(
         "messages": [{"role": "user", "content": prompt}]
     });
 
-    let response = client
+    // Local OpenAI-compat servers (llama.cpp, LM Studio, vLLM, …) often
+    // don't accept ANY `Authorization` header. Send the Bearer only when we
+    // actually have a key — remote endpoints that need one will still get
+    // it; local endpoints stay clean.
+    let mut req = client
         .post(&url)
-        .header("Authorization", format!("Bearer {}", api_key))
         .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+        .json(&body);
+    if !api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", api_key));
+    }
+    let response = req.send().await.map_err(|e| e.to_string())?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -298,27 +298,35 @@ async fn call_ollama(
 /// - Error mid-stream UX: emit a `done: true` delta with an `error` field so
 ///   the frontend can display partial text + an error indicator.
 #[tauri::command]
-pub async fn chat_send(app: tauri::AppHandle, args: ChatSendArgs) -> Result<String, String> {
-    let model = if args.model.is_empty() {
+pub async fn chat_send(
+    app: tauri::AppHandle,
+    prompt: String,
+    model: String,
+    protocol: String,
+    base_url: String,
+    api_key: Option<String>,
+    conversation_id: Option<String>,
+) -> Result<String, String> {
+    let model = if model.is_empty() {
         "claude-haiku-4-5".to_string()
     } else {
-        args.model.clone()
+        model
     };
 
     let client = reqwest::Client::new();
-    let protocol = args.protocol.as_str();
+    let protocol_str = protocol.as_str();
 
-    let result = match protocol {
+    let result = match protocol_str {
         "anthropic" => {
-            let key = resolve_key(protocol, &args.api_key)?;
-            call_anthropic(&app, &client, &args.base_url, &model, &args.prompt, &key, &args.conversation_id).await
+            let key = resolve_key(protocol_str, &api_key)?;
+            call_anthropic(&app, &client, &base_url, &model, &prompt, &key, &conversation_id).await
         }
         "openai" | "custom" => {
-            let key = resolve_key(protocol, &args.api_key)?;
-            call_openai_compat(&app, &client, &args.base_url, &model, &args.prompt, &key, protocol, &args.conversation_id).await
+            let key = resolve_key(protocol_str, &api_key)?;
+            call_openai_compat(&app, &client, &base_url, &model, &prompt, &key, protocol_str, &conversation_id).await
         }
         "ollama" => {
-            call_ollama(&app, &client, &args.base_url, &model, &args.prompt, &args.conversation_id).await
+            call_ollama(&app, &client, &base_url, &model, &prompt, &conversation_id).await
         }
         other => Err(format!("unsupported protocol: {}", other)),
     };
@@ -326,7 +334,7 @@ pub async fn chat_send(app: tauri::AppHandle, args: ChatSendArgs) -> Result<Stri
     // Emit a terminal `done` delta regardless of success/failure so the
     // frontend always receives a completion signal.
     let done_delta = ChatDelta {
-        conversation_id: args.conversation_id.clone(),
+        conversation_id: conversation_id.clone(),
         chunk: String::new(),
         done: true,
     };

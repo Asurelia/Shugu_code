@@ -57,6 +57,27 @@ if "%~1"=="" (
 )
 
 set "TAURI_EXIT=%errorlevel%"
+
+REM ─── Orphan cleanup ──────────────────────────────────────────
+REM On Windows, `pnpm tauri dev` spawns a sub-chain
+REM   pnpm.cmd → node (vite) → esbuild workers
+REM and the SIGTERM emitted when Tauri shuts down does NOT propagate
+REM cleanly through pnpm.cmd. Result: every `tauri-dev` cycle leaks
+REM the vite node process + its esbuild service workers, which keep
+REM port 5173 in use and bloat the process table.
+REM
+REM This block targets ONLY the process still holding port 5173 (the
+REM vite server) and kills its entire tree with /T. Esbuild workers
+REM are children of vite, so /T sweeps them too. We avoid blanket
+REM `taskkill /IM node.exe` because the user may have other node
+REM services running (vault CLI, MCP servers, etc.).
+REM
+REM We use PowerShell rather than `for /f` + `netstat` so the script
+REM never spawns a sub-cmd.exe (the user has cmd.exe AutoRun
+REM configured, see vcvars64 comment above).
+echo [tauri-dev.cmd] Sweeping port 5173 for orphaned vite...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$h = Get-NetTCPConnection -LocalPort 5173 -State Listen -ErrorAction SilentlyContinue; if ($h) { foreach ($c in $h) { $p = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue; if ($p) { Write-Host ('  killing ' + $p.Name + ' PID ' + $p.Id + ' (+ children)'); & taskkill /PID $p.Id /T /F | Out-Null } } } else { Write-Host '  port 5173 clean' }"
+
 echo.
 echo [tauri-dev.cmd] Tauri exited with code %TAURI_EXIT%.
 echo Press any key to close this window.

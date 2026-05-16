@@ -31,5 +31,20 @@ notify = "6"
 portable-pty = "0.8"
 which = "6"
 
+# keyring v3 has NO default features — without an explicit platform feature
+# it compiles but provides no real backend (a fall-through "sample" store
+# that silently accepts writes and reads but never persists across processes).
+# This was the root cause of "I saved a Mistral key, switched tab, came back,
+# the card was empty". Features must be declared per-OS so the same crate
+# resolves to the right native backend on each platform.
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["linux-native-sync-persistent"] }
+
 [features]
 custom-protocol = ["tauri/custom-protocol"]

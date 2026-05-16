@@ -33,16 +33,26 @@
 import { useCallback, useEffect, useState } from "react";
 import { db } from "@/lib/db";
 import { invoke } from "@/lib/tauri";
-import { resolveProvider } from "@/lib/providers";
+import { resolveProvider, type Protocol } from "@/lib/providers";
+import { loadProviderConfig, getConfig, getProviderEnabled } from "@/lib/credentials";
 import { parseAiReply } from "@/lib/markdown";
 import type { Message } from "@/lib/types";
 
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 // ─── Event names + storage keys (centralized to prevent drift) ─────────
-const EVT_MESSAGES = "chat://messages-changed";
-const EVT_ACTIVE   = "chat://active-changed";
-const KEY_ACTIVE   = "shugu.chat.activeConv.v1";
+const EVT_MESSAGES     = "chat://messages-changed";
+const EVT_ACTIVE       = "chat://active-changed";
+const EVT_ACTIVE_MODEL = "chat://active-model-changed";
+const KEY_ACTIVE       = "shugu.chat.activeConv.v1";
+const KEY_ACTIVE_MODEL = "shugu.chat.activeModel.v1";
+
+// Fallback when no model has ever been chosen. We default to llama.cpp local
+// because (a) it doesn't need an API key, (b) it's the smoke-test target, and
+// (c) anything cloud-shaped would fail silently without a configured key,
+// which is a worse first-run UX. If llama-server isn't running the user will
+// see a connection-refused error and can switch from the picker.
+const DEFAULT_ACTIVE_MODEL = "llamacpp/local";
 
 // ─── Web-mode in-memory cache ──────────────────────────────────────────
 // In pnpm dev (no Tauri), db.messages.append is a no-op. To keep the chat
@@ -237,7 +247,44 @@ export async function sendChatMessage(
 
   // Default to anthropic if the caller passed a bare model id (no prefix).
   const id = modelId?.includes("/") ? modelId : "anthropic/claude-haiku-4-5";
-  const { protocol, baseUrl, model: realModel } = resolveProvider(id);
+  const { providerId, protocol: defaultProtocol, baseUrl: defaultBaseUrl, model: realModel } = resolveProvider(id);
+
+  // STRICT MODE — a provider must be explicitly enabled by the user (i.e. a
+  // Save in Settings → Connections has happened) before chat can route to it.
+  // The previous "auto-probe local endpoints" behavior caused the bug where
+  // a llama.cpp marked DISCONNECTED in Settings still served chat requests
+  // because the registry's default baseUrl was reachable. Now: no Save → no
+  // chat, and the user gets a clear pointer to where to fix it.
+  const enabled = await getProviderEnabled(providerId);
+  if (enabled !== "true") {
+    const reason = enabled === "false"
+      ? `est désactivé (Disconnect dans Settings → Connections)`
+      : `n'est pas configuré`;
+    await appendMessage(convId, {
+      id: newMessageId("e"),
+      role: "ai",
+      body: `⚠ Le provider "${providerId}" ${reason}. Va dans Settings → Connections, ouvre la carte ${providerId}, renseigne ce qu'il faut puis clique Save — ou choisis un autre modèle dans le picker.`,
+      ts: nowHHMM(),
+    });
+    return;
+  }
+
+  // Pull persisted credentials + endpoint overrides for this providerId.
+  // For built-in providers, only `apiKey` + an optional `baseUrl` override
+  // are meaningful. For user-added "custom-*" providers, also pick up the
+  // stored `protocol` (set at creation time by AddProviderModal) since
+  // those are NOT in the registry and resolveProvider returns "custom" by
+  // default — which Rust would reject.
+  const cfg = await loadProviderConfig(providerId);
+  let protocol: Protocol = defaultProtocol;
+  if (defaultProtocol === "custom") {
+    const storedProtocol = await getConfig(providerId, "protocol");
+    if (storedProtocol === "anthropic" || storedProtocol === "openai" || storedProtocol === "ollama" || storedProtocol === "custom") {
+      protocol = storedProtocol;
+    }
+  }
+  const baseUrl: string = (cfg.baseUrl && cfg.baseUrl !== "") ? cfg.baseUrl : defaultBaseUrl;
+  const apiKey: string | undefined = (cfg.apiKey && cfg.apiKey !== "") ? cfg.apiKey : undefined;
 
   try {
     const reply = await invoke<string>("chat_send", {
@@ -245,6 +292,7 @@ export async function sendChatMessage(
       model: realModel,
       protocol,
       baseUrl,
+      apiKey,
     });
     // Parse fenced ```code blocks``` out of the reply so the UI gets the
     // structured Message.code shape (CodeBlock component highlights + the
@@ -348,6 +396,77 @@ export function useActiveConv(): [string, (id: string) => void] {
           await mod.emit(EVT_ACTIVE, { conversationId: id });
         } catch (err) {
           console.warn("[chat-sync] emit active failed:", err);
+        }
+      })();
+    }
+  }, []);
+
+  return [active, setActive];
+}
+
+// ─── Active model sync (same dual-channel pattern as useActiveConv) ────
+// Persisted so the selected model survives an app restart, and broadcast so
+// the main IDE composer and the mascot's FloatChat stay in sync when one
+// of them switches model. Same caveats as the active-conv hook: localStorage
+// is the fast path; the Tauri custom event guarantees cross-WebviewWindow
+// delivery (the `storage` browser event is best-effort across windows).
+function loadActiveModel(initial?: string): string {
+  try {
+    const raw = localStorage.getItem(KEY_ACTIVE_MODEL);
+    if (raw) return raw;
+  } catch {
+    // localStorage unavailable — fall through.
+  }
+  // If the caller supplied a sensible initial (e.g. a legacy ChatView prop),
+  // honor it on first load — but never persist it: subsequent renders will
+  // read from localStorage. This avoids a flash-of-default on first ever
+  // app start while still letting the picker's setActive overwrite later.
+  if (initial && initial.includes("/")) return initial;
+  return DEFAULT_ACTIVE_MODEL;
+}
+
+export function useActiveModel(initial?: string): [string, (m: string) => void] {
+  const [active, setActiveLocal] = useState<string>(() => loadActiveModel(initial));
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== KEY_ACTIVE_MODEL) return;
+      if (typeof e.newValue === "string" && e.newValue) setActiveLocal(e.newValue);
+    };
+    window.addEventListener("storage", onStorage);
+
+    if (inTauri) {
+      void (async () => {
+        try {
+          const mod = await import("@tauri-apps/api/event");
+          unlisten = await mod.listen<{ model: string }>(EVT_ACTIVE_MODEL, (e) => {
+            const m = e.payload?.model;
+            if (typeof m === "string" && m) setActiveLocal(m);
+          });
+        } catch (err) {
+          console.warn("[chat-sync] listen active-model failed:", err);
+        }
+      })();
+    }
+
+    return () => {
+      window.removeEventListener("storage", onStorage);
+      unlisten?.();
+    };
+  }, []);
+
+  const setActive = useCallback((m: string) => {
+    setActiveLocal(m);
+    try { localStorage.setItem(KEY_ACTIVE_MODEL, m); } catch { /* quota */ }
+    if (inTauri) {
+      void (async () => {
+        try {
+          const mod = await import("@tauri-apps/api/event");
+          await mod.emit(EVT_ACTIVE_MODEL, { model: m });
+        } catch (err) {
+          console.warn("[chat-sync] emit active-model failed:", err);
         }
       })();
     }

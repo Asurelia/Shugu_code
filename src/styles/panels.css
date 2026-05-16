@@ -1163,6 +1163,452 @@
 .float-pinned-note .x { cursor: pointer; opacity: 0.6; padding: 0 4px; }
 .float-pinned-note .x:hover { opacity: 1; }
 
+/* ─────────────────────────────────────────────────────────────
+   Chibi · chat composer — variants
+   Ported from design_handoff_chibi_chat/chibi-chat.css.
+   Append-only: these rules layer on top of the base .float-panel/
+   .float-composer above; the recommended combo applied by the
+   component is `cchrome-naked cstyle-pill csize-thin csend-kbd
+   cfoot-hidden`, which strips the panel chrome and turns the
+   composer into a thin pill with a `↵` keyboard hint.
+   ───────────────────────────────────────────────────────────── */
+
+/* "naked" chrome — strip the card so the composer floats free */
+.float-panel.cchrome-naked {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  backdrop-filter: none;
+  padding: 0;
+}
+
+/* Height variants — drive textarea + composer dimensions */
+.float-panel.csize-thin    { --ch-h: 32px; --ch-py: 6px;  --ch-fs: 13px;   --ch-radius: 999px; }
+.float-panel.csize-compact { --ch-h: 38px; --ch-py: 8px;  --ch-fs: 13.5px; --ch-radius: 14px; }
+.float-panel.csize-normal  { --ch-h: 46px; --ch-py: 11px; --ch-fs: 14px;   --ch-radius: 16px; }
+
+/* Common composer reset for all variants */
+.float-panel[class*="cstyle-"] .float-composer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: var(--ch-radius, 999px);
+  padding: 0;
+  position: relative;
+  transition: background 180ms ease, border-color 180ms ease, box-shadow 220ms ease;
+}
+.float-panel[class*="cstyle-"] .float-composer textarea {
+  min-height: var(--ch-h, 32px);
+  max-height: 120px;
+  padding: var(--ch-py, 6px) 12px;
+  font-size: var(--ch-fs, 13px);
+  line-height: 1.4;
+  resize: none;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--on-surface);
+  width: 100%;
+  font-family: var(--font-body);
+  scrollbar-width: thin;
+}
+.float-panel[class*="cstyle-"] .float-composer > div:first-of-type {
+  flex: 1;
+  min-width: 0;
+}
+.float-panel[class*="cstyle-"] .float-actions-col {
+  display: flex;
+  flex-direction: row;
+  gap: 4px;
+  align-items: center;
+  padding-right: 4px;
+}
+
+/* ── Style: PILL (default) — soft rounded, single line, ultra-clean */
+.float-panel.cstyle-pill .float-composer {
+  background: rgba(20,16,38,0.72);
+  border: 1px solid rgba(255,255,255,0.08);
+  backdrop-filter: blur(18px) saturate(160%);
+  box-shadow: 0 12px 28px -14px rgba(0,0,0,0.6);
+}
+.float-panel.cstyle-pill .float-composer:focus-within {
+  border-color: rgba(224,142,254,0.35);
+  box-shadow: 0 12px 28px -12px rgba(0,0,0,0.6), 0 0 0 3px rgba(224,142,254,0.10);
+}
+
+/* ── Style: UNDERLINE — invisible bg, just a hairline */
+.float-panel.cstyle-underline .float-composer {
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid rgba(255,255,255,0.16);
+  border-radius: 0;
+  padding-bottom: 2px;
+}
+.float-panel.cstyle-underline .float-composer:focus-within {
+  border-bottom-color: var(--primary);
+  box-shadow: 0 1px 0 0 var(--primary);
+}
+.float-panel.cstyle-underline .float-composer textarea { padding-left: 4px; }
+
+/* ── Style: FRAME — refined bordered card, sharper radius */
+.float-panel.cstyle-frame .float-composer {
+  background: rgba(14,11,28,0.85);
+  border: 1px solid rgba(255,255,255,0.10);
+  border-radius: 12px;
+  backdrop-filter: blur(20px) saturate(180%);
+}
+.float-panel.cstyle-frame.csize-thin    { --ch-radius: 10px; }
+.float-panel.cstyle-frame.csize-compact { --ch-radius: 12px; }
+.float-panel.cstyle-frame.csize-normal  { --ch-radius: 14px; }
+.float-panel.cstyle-frame .float-composer:focus-within {
+  border-color: rgba(129,236,255,0.30);
+  background: rgba(14,11,28,0.92);
+}
+
+/* ── Style: TERMINAL — mono, prompt-prefix, kbd hint feel */
+.float-panel.cstyle-terminal .float-composer {
+  background: rgba(8,6,16,0.82);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  padding-left: 8px;
+}
+.float-panel.cstyle-terminal.csize-thin    { --ch-radius: 6px; }
+.float-panel.cstyle-terminal.csize-compact { --ch-radius: 8px; }
+.float-panel.cstyle-terminal.csize-normal  { --ch-radius: 10px; }
+.float-panel.cstyle-terminal .float-composer textarea {
+  font-family: var(--font-mono);
+  font-size: calc(var(--ch-fs) - 1px);
+  letter-spacing: 0.01em;
+  padding-left: 4px;
+}
+.float-composer-prefix {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 14px;
+  color: var(--primary);
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 14px;
+  user-select: none;
+  flex-shrink: 0;
+}
+.float-panel.cstyle-terminal .float-composer:focus-within {
+  border-color: rgba(224,142,254,0.30);
+}
+
+/* ── Style: GHOST — no chrome at all, just text */
+.float-panel.cstyle-ghost .float-composer {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+}
+.float-panel.cstyle-ghost .float-composer textarea {
+  padding-left: 2px;
+  padding-right: 2px;
+}
+.float-panel.cstyle-ghost .float-composer::before {
+  content: '';
+  position: absolute;
+  left: 0; right: 0; bottom: -2px;
+  height: 1px;
+  background: rgba(255,255,255,0.04);
+  pointer-events: none;
+  transition: background 200ms ease;
+}
+.float-panel.cstyle-ghost .float-composer:focus-within::before {
+  background: rgba(224,142,254,0.45);
+}
+
+/* ── Style: GLOW — subtle accent halo on focus */
+.float-panel.cstyle-glow .float-composer {
+  background: rgba(20,16,38,0.55);
+  border: 1px solid rgba(224,142,254,0.18);
+  backdrop-filter: blur(18px) saturate(180%);
+}
+.float-panel.cstyle-glow .float-composer:focus-within {
+  border-color: rgba(224,142,254,0.55);
+  box-shadow:
+    0 0 0 4px rgba(224,142,254,0.10),
+    0 14px 32px -14px rgba(224,142,254,0.45);
+}
+
+/* ── Send button variants ── */
+.float-panel[class*="cstyle-"] .float-icon-btn.send {
+  width: calc(var(--ch-h) - 6px);
+  height: calc(var(--ch-h) - 6px);
+  min-width: 26px;
+  min-height: 26px;
+  border-radius: 999px;
+  background: transparent;
+  border: 0;
+  color: var(--on-surface-variant);
+  transition: background 160ms ease, color 160ms ease, transform 140ms ease, box-shadow 200ms ease;
+}
+.float-panel[class*="cstyle-"] .float-icon-btn.send:not(:disabled):hover {
+  color: var(--on-surface);
+  background: rgba(255,255,255,0.06);
+}
+.float-panel[class*="cstyle-"] .float-icon-btn.send:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* Send: ARROW — inline chevron, no bg */
+.float-panel.csend-arrow .float-icon-btn.send-arrow:not(:disabled) {
+  color: var(--primary);
+}
+.float-panel.csend-arrow .float-icon-btn.send-arrow:not(:disabled):hover {
+  transform: translateX(2px);
+  background: rgba(224,142,254,0.08);
+}
+
+/* Send: PILL — gradient pill, more prominent */
+.float-panel.csend-pill .float-icon-btn.send-pill {
+  width: auto;
+  padding: 0 12px;
+  height: calc(var(--ch-h) - 8px);
+  background: linear-gradient(135deg, var(--primary), var(--secondary));
+  color: #1a0a24;
+  font-weight: 600;
+  box-shadow: 0 6px 14px -6px rgba(224,142,254,0.7);
+}
+.float-panel.csend-pill .float-icon-btn.send-pill:not(:disabled):hover {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 20px -8px rgba(224,142,254,0.9);
+  background: linear-gradient(135deg, var(--primary), var(--secondary));
+}
+
+/* Send: CIRCLE — filled circle */
+.float-panel.csend-circle .float-icon-btn.send-circle {
+  background: linear-gradient(135deg, var(--primary), var(--secondary));
+  color: #1a0a24;
+  box-shadow: 0 6px 14px -6px rgba(224,142,254,0.65), inset 0 1px 0 rgba(255,255,255,0.4);
+}
+.float-panel.csend-circle .float-icon-btn.send-circle:not(:disabled):hover {
+  transform: scale(1.06);
+}
+
+/* Send: KBD — keyboard hint instead of button */
+.float-kbd-hint {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 8px;
+  height: calc(var(--ch-h, 32px) - 10px);
+  border-radius: 6px;
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(255,255,255,0.02);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--on-surface-muted);
+  opacity: 0.55;
+  transition: all 180ms ease;
+  cursor: default;
+  user-select: none;
+}
+.float-kbd-hint.ready {
+  opacity: 1;
+  color: var(--primary);
+  border-color: rgba(224,142,254,0.40);
+  background: rgba(224,142,254,0.08);
+  cursor: pointer;
+}
+.float-kbd-hint.ready:hover {
+  background: rgba(224,142,254,0.16);
+}
+.float-kbd-hint .k {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* Attach button — subtle, inline */
+.float-panel[class*="cstyle-"] .float-icon-btn.attach {
+  width: calc(var(--ch-h) - 10px);
+  height: calc(var(--ch-h) - 10px);
+  min-width: 22px;
+  min-height: 22px;
+  border-radius: 6px;
+  background: transparent;
+  border: 0;
+  color: var(--on-surface-muted);
+}
+.float-panel[class*="cstyle-"] .float-icon-btn.attach:hover {
+  background: rgba(255,255,255,0.06);
+  color: var(--on-surface);
+}
+
+/* Footer variants */
+.float-panel.cfoot-minimal .float-foot {
+  padding: 4px 6px 0;
+  margin-top: 6px;
+  border-top: 1px dashed rgba(255,255,255,0.04);
+  gap: 6px;
+}
+.float-panel.cfoot-minimal .float-foot-icons,
+.float-panel.cfoot-minimal .float-foot-toggle { display: none; }
+.float-panel.cfoot-minimal .float-foot-tokens {
+  font-size: 10px;
+  opacity: 0.6;
+  margin-left: auto;
+}
+
+.float-panel.cfoot-icons .float-foot {
+  padding: 6px 4px 0;
+  margin-top: 8px;
+}
+
+/* When chrome is "naked", lift the AOT badge slightly so it doesn't
+   look like it's floating in the void. */
+.float-panel.cchrome-naked .float-aot {
+  top: -22px;
+  left: 4px;
+}
+
+/* "Set API key" badge — keep it visually consistent with new variants */
+.float-panel[class*="cstyle-"] .float-api-badge {
+  top: 50%;
+  transform: translate(-50%, -50%);
+  padding: 3px 10px;
+  font-size: 10px;
+  border-radius: 999px;
+}
+
+/* ── Chibi tabs strip (between feed and composer) ──
+   Tabs sit inside their own bubble that visually attaches to the
+   composer below: rounded top, flat bottom, slight overlap so the
+   two shapes read as a single grouped surface. */
+.float-tabs {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 5px 16px 8px;
+  margin: 0 auto -6px;
+  width: fit-content;
+  background: rgba(20,16,38,0.72);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-bottom: 0;
+  backdrop-filter: blur(18px) saturate(160%);
+  border-radius: 14px 14px 0 0;
+  position: relative;
+  z-index: 0;
+  box-shadow: 0 -2px 12px -8px rgba(0,0,0,0.4);
+}
+/* Lift the composer slightly so its shadow doesn't cut the tabs bubble */
+.float-panel.cstyle-pill .float-composer,
+.float-panel.cstyle-glow .float-composer,
+.float-panel.cstyle-frame .float-composer,
+.float-panel.cstyle-terminal .float-composer {
+  position: relative;
+  z-index: 1;
+}
+
+.float-tab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--on-surface-muted);
+  cursor: pointer;
+  transition: color 140ms ease, background 140ms ease;
+  flex-shrink: 0;
+  position: relative;
+}
+.float-tab span:not(.float-tab-count) { display: none; }
+.float-tab:hover {
+  color: var(--on-surface);
+  background: rgba(255,255,255,0.05);
+}
+.float-tab.on { color: var(--primary); }
+.float-tab.new { color: var(--on-surface-muted); }
+.float-tab.new:hover { color: var(--primary); }
+.float-tab svg { flex-shrink: 0; }
+.float-tab-count {
+  position: absolute;
+  top: 0;
+  right: -2px;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  font-weight: 700;
+  color: var(--on-surface-muted);
+  background: transparent;
+  padding: 0;
+  line-height: 1;
+}
+.float-tab.on .float-tab-count { color: var(--primary); }
+
+/* History list view (replaces feed when tab=history) */
+.float-history-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.fhl-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 8px 8px 10px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease;
+  min-width: 0;
+}
+.fhl-item:hover {
+  background: rgba(224,142,254,0.06);
+  border-color: rgba(224,142,254,0.14);
+}
+.fhl-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.fhl-info .t {
+  font-size: 12.5px;
+  color: var(--on-surface);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fhl-info .m {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--on-surface-muted);
+  letter-spacing: 0.04em;
+}
+.fhl-del {
+  flex-shrink: 0;
+  width: 26px; height: 26px;
+  display: inline-grid;
+  place-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  color: var(--on-surface-muted);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 140ms ease, background 140ms ease, color 140ms ease;
+}
+.fhl-item:hover .fhl-del { opacity: 1; }
+.fhl-del:hover {
+  color: var(--danger, #ff6a8a);
+  background: rgba(255,106,138,0.10);
+}
+
 /* Model picker popover */
 .model-pop {
   position: absolute;

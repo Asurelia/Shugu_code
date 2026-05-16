@@ -22,6 +22,21 @@ const mocks: Record<string, (args?: any) => any> = {
   term_resize: () => undefined,
   term_kill: () => undefined,
   term_snapshot: () => "",
+  // Credentials backend — in Tauri these hit the OS keychain; in web mode we
+  // mirror to a sessionStorage map so the in-app config flow still works for
+  // demos. NEVER use this storage for anything that matters; it is plainly
+  // visible in DevTools and survives only as long as the tab.
+  cred_set: ({ account, secret }: { account: string; secret: string }) => {
+    try { sessionStorage.setItem("shugu.cred.web::" + account, secret); } catch { /* quota */ }
+    return null;
+  },
+  cred_get: ({ account }: { account: string }) => {
+    try { return sessionStorage.getItem("shugu.cred.web::" + account); } catch { return null; }
+  },
+  cred_delete: ({ account }: { account: string }) => {
+    try { sessionStorage.removeItem("shugu.cred.web::" + account); } catch { /* noop */ }
+    return null;
+  },
   chat_send: ({ prompt, model, protocol, baseUrl }: { prompt: string; model: string; protocol: string; baseUrl: string }) => {
     void baseUrl;
     const keyHint = protocol === "anthropic"

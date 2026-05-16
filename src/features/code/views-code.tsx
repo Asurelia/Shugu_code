@@ -6,6 +6,7 @@ import { Icon } from "@/components/components";
 import { CodeMirrorEditor } from "./CodeMirrorEditor";
 import { ShortcutsSettings, InterfaceSettings } from "@/features/settings/settings-extras";
 import { MascotCalibration } from "@/features/settings/MascotCalibration";
+import { ConnectionsView, ProfileView } from "@/features/panels/panels";
 
 // ─── Code view (editor + tabs + statusbar) ──────────────────
 export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, fileContents, setFileContents }: any) {
@@ -335,6 +336,11 @@ export function SettingsView({ section }: { section: string }) {
   if (section === 'mascot') return <MascotCalibration/>;
   if (section === 'privacy') return <SettingsPrivacy/>;
   if (section === 'about') return <SettingsAbout/>;
+  // Connections + Profile previously fell through to <SettingsGeneral/> here,
+  // which is why the sidebar would highlight the entry but the panel showed
+  // unrelated content. Each section now resolves to its actual component.
+  if (section === 'connections') return <ConnectionsView/>;
+  if (section === 'profile') return <ProfileView/>;
   return <SettingsGeneral/>;
 }
 

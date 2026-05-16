@@ -14,7 +14,6 @@ export default function ChatRouteComponent() {
   return (
     <ChatView
       activeConv={activeConv}
-      model="shugu-haiku-4-5"
       onOpenSnippet={openSnippetInEditor}
     />
   );

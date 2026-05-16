@@ -5,7 +5,8 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 import { Icon } from "@/components/components";
 import { invoke } from "@/lib/tauri";
 import { useChatStream } from "./useChatStream";
-import { useMessages, sendChatMessage } from "./chat-sync";
+import { useMessages, sendChatMessage, useActiveModel } from "./chat-sync";
+import { ModelPicker } from "@/features/panels/panels";
 import { resolveImageProvider } from "@/lib/imageProviders";
 
 type ImageResult = {
@@ -32,11 +33,15 @@ type ImageResult = {
 // SQLite truth.
 export function ChatView({
   activeConv,
-  model,
+  model: modelProp,
   onOpenSnippet,
 }: {
   activeConv: string;
-  model: string;
+  // Legacy prop — accepted as the FIRST-EVER default if nothing has been
+  // persisted yet, but never authoritative. The real source of truth is
+  // useActiveModel() which mirrors localStorage and syncs cross-window.
+  // Routes are encouraged to omit this and let the hook decide.
+  model?: string;
   onOpenSnippet?: (code: string, lang: string) => void;
 }) {
   const [input, setInput] = useState("");
@@ -46,6 +51,11 @@ export function ChatView({
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const chatStream = useChatStream();
   const { data: messages } = useMessages(activeConv);
+  // The model the user has actually picked. Defaults to llamacpp/local on
+  // a brand-new install, or to `modelProp` if a legacy route still passes
+  // one with a "/" in it. Switching from the composer's ModelPicker writes
+  // here and broadcasts to the mascot window so both stay in sync.
+  const [model, setModel] = useActiveModel(modelProp);
 
   useEffect(() => {
     if (feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
@@ -111,11 +121,7 @@ export function ChatView({
               <button className="composer-tool" title="Voice"><Icon name="mic" size={15}/></button>
             </div>
             <div className="composer-spacer"></div>
-            <button className="composer-model" title="Choose model">
-              <span className="ind"></span>
-              {model}
-              <Icon name="down" size={11}/>
-            </button>
+            <ModelPicker model={model} onChange={setModel} className="composer-model"/>
             <button className="composer-send" onClick={send} disabled={!input.trim()} title="Send">
               <Icon name="send" size={15}/>
             </button>
