@@ -53,6 +53,15 @@ const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window
 const DISCOVERY_EVENT  = "discovery://invalidated";
 const DISCOVERY_TTL_MS = 60_000;
 
+// Per-window-session flag. The persisted cache survives app close, so a
+// quick relaunch within the TTL would otherwise leave a stale picture (e.g.
+// llama-server killed between sessions but the picker still shows its
+// models). This flag flips to true on the first useDiscoveredModels mount
+// in this window and triggers a fresh discovery regardless of TTL. It's
+// module-scope (not a Zustand field) so the value doesn't persist across
+// page loads — every fresh window context starts with false.
+let sessionDiscoveryDone = false;
+
 interface DiscoveryState {
   models: DiscoveredModel[];
   errors: Record<string, string>;
@@ -399,10 +408,21 @@ export function useDiscoveredModels(): UseDiscoveredModels {
       })();
     }
 
-    // 2) If the cache is stale (or empty), trigger a fresh discovery. The
-    //    result is broadcast via refreshDiscovery → other windows adopt.
+    // 2) Refresh trigger. Two paths:
+    //    a) First mount in this WINDOW SESSION → force refresh regardless
+    //       of TTL. Without this, a quick close-and-relaunch (< TTL) loads
+    //       the persisted cache from the previous session and never re-
+    //       probes — so e.g. llama-server going down between sessions
+    //       leaves the picker showing its models like nothing changed.
+    //       Module-scope flag resets per page load (each window has its
+    //       own JS context), so it naturally fires once per app start per
+    //       window.
+    //    b) Subsequent mounts (route nav) → only refresh if stale.
+    //    The result is broadcast via refreshDiscovery → other windows adopt.
     const stale = Date.now() - lastFetched > DISCOVERY_TTL_MS;
-    if (stale && !useDiscoveryStore.getState().isLoading) {
+    const isFirstSessionMount = !sessionDiscoveryDone;
+    if ((isFirstSessionMount || stale) && !useDiscoveryStore.getState().isLoading) {
+      sessionDiscoveryDone = true;
       void refreshDiscovery();
     }
 
