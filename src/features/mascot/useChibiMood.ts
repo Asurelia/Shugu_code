@@ -17,12 +17,18 @@
 // Manual override (alt+click cycles through {neutral, smile, joy, sad, cry})
 // wins over the derived value EXCEPT when edge-tucked — the peek pose is
 // geometry, not expression, and must always reflect the panel position.
+//
+// Idle tracking lives in `@/features/mascot/idleStore` (module-scope) so any
+// number of bump-sites (FloatShell, ChatPanel, future panels) share a single
+// clock without prop drilling. `bumpInteract` exposed by this hook is just
+// a re-export of the store's function — kept on the result for backwards-
+// compatibility with the original API.
 
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useMemo, useState, useCallback } from "react";
 import type { ChibiMood } from "@/features/mascot/Chibi";
+import { bumpInteract as bumpInteractStore, useIdleMs } from "@/features/mascot/idleStore";
 
 const MOOD_CYCLE: ChibiMood[] = ["neutral", "smile", "joy", "sad", "cry"];
-const TICK_MS = 5_000;
 const LONELY_MS = 60_000;
 const FRESH_MS = 10_000;
 
@@ -54,16 +60,7 @@ export interface UseChibiMoodResult {
 
 export function useChibiMood(input: UseChibiMoodInput): UseChibiMoodResult {
   const [override, setOverride] = useState<ChibiMood | null>(null);
-  const [lastInteract, setLastInteract] = useState(() => Date.now());
-  const [now, setNow] = useState(() => Date.now());
-
-  // Ticking clock so the idle-derived mood updates as time passes.
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), TICK_MS);
-    return () => clearInterval(t);
-  }, []);
-
-  const idleMs = now - lastInteract;
+  const idleMs = useIdleMs();
 
   const derivedMood: ChibiMood = useMemo(() => {
     if (input.edge) return input.hasUnread ? "peek_open" : "peek_closed";
@@ -89,7 +86,5 @@ export function useChibiMood(input: UseChibiMoodInput): UseChibiMoodResult {
 
   const resetMood = useCallback(() => setOverride(null), []);
 
-  const bumpInteract = useCallback(() => setLastInteract(Date.now()), []);
-
-  return { mood, cycleMood, resetMood, bumpInteract };
+  return { mood, cycleMood, resetMood, bumpInteract: bumpInteractStore };
 }

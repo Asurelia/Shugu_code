@@ -7,12 +7,12 @@
 // communicates with the main window via Tauri events (M4 — not yet wired),
 // not via React context.
 //
-// M2 — port the chibi + chat panel into the mascot window:
-//   Reuse the existing FloatChat component as-is. It has no React-context
-//   dependencies (just local state + Tauri invoke for chat_send later), so
-//   it works in this standalone root without modification. pinnedAnno/
-//   clearPinned will arrive via Tauri events at M4 — for now we pass
-//   inert defaults so the pinned-annotation UI stays hidden.
+// Phase 5 — compose the mascot window content from the FloatShell compound
+// pattern. The shell is content-agnostic; the anchor + panel are pluggable.
+// Today: <ChibiWithMood/> + <ChatPanel/>. Tomorrow: swap the panel for any
+// other surface (TaskPanel, AgentLog, NotifPanel) without touching the
+// drag/snap/edge machinery in FloatShell. The "swap <ChatPanel/> for a
+// <div>Hello</div>" smoke test in this file is the proof of decoupling.
 
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
@@ -20,7 +20,9 @@ import "./styles/styles.css";
 import "./styles/panels.css";
 import "./styles/chat-sidebar.css";
 import "./styles/settings-extras.css";
-import { FloatChat } from "@/features/panels/panels";
+import { FloatShell } from "@/features/floating/FloatShell";
+import { ChibiWithMood } from "@/features/mascot/ChibiWithMood";
+import { ChatPanel } from "@/features/chat/ChatPanel";
 import { ThemeBootstrap } from "@/lib/ThemeBootstrap";
 import {
   loadCalibration,
@@ -456,14 +458,15 @@ function MascotApp() {
   return (
     <>
       <ThemeBootstrap />
-      <FloatChat
-        pinnedAnno={null}
-        clearPinned={() => {}}
+      <FloatShell
+        anchor={<ChibiWithMood />}
         disableInternalDrag
         freezePos
         forceSide={forcedSide ?? undefined}
         forceEdge={forceEdge}
-      />
+      >
+        <ChatPanel />
+      </FloatShell>
     </>
   );
 }
