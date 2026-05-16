@@ -40,3 +40,13 @@ CLAUDE.md
 
 # design handoff archive — extracted to docs/design-kit/, the zip stays local
 Shugu_Dev.zip
+
+# Claude Code worktrees + plugin state (local tooling, per-developer)
+.claude/
+
+# pcc plugin state (local memory snapshots)
+.pcc/
+
+# Tauri icon auto-backup folders (created by icon regen scripts; the live
+# src-tauri/icons/ directory is what matters)
+src-tauri/icons.backup-*/
