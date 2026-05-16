@@ -4,16 +4,12 @@
 
 import { seedFileTree } from "@/mocks/seedFileTree";
 import { seedFileContents } from "@/mocks/seedFileContents";
+import { mockModelsList } from "@/lib/providers";
 
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 const mocks: Record<string, (args?: any) => any> = {
-  models_list: () => ([
-    { id: "anthropic/claude-haiku-4-5", label: "claude-haiku-4-5", protocol: "anthropic" },
-    { id: "anthropic/claude-sonnet-5",  label: "claude-sonnet-5",  protocol: "anthropic" },
-    { id: "openai/gpt-4o-mini",         label: "gpt-4o-mini",      protocol: "openai" },
-    { id: "ollama/qwen2.5:32b",         label: "qwen2.5:32b",      protocol: "ollama" },
-  ]),
+  models_list: () => mockModelsList(),
   fs_read_dir: () => seedFileTree,
   fs_read_file: ({ path }: { path: string }) => (seedFileContents as any)[path]?.text ?? "",
   fs_write_file: () => ({ ok: true }),

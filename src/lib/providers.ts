@@ -77,3 +77,60 @@ export function resolveProvider(modelId: string): {
 
   return { providerId: prefix, protocol: entry.protocol, baseUrl: entry.baseUrl, model };
 }
+
+// ─── Model catalog ─────────────────────────────────────────────
+// Single source of truth for the list of LLM models the UI can offer.
+//
+// Used by:
+//   - lib/tauri.ts (web/dev mock of the `models_list` Tauri command)
+//   - any future ModelPicker that wants to render grouped dropdowns
+//
+// Kept in sync MANUALLY with src-tauri/src/commands/models.rs (Rust returns
+// a subset that powers the in-Tauri `models_list` invoke). When adding a
+// model here, also add it to models.rs if it should be reachable from the
+// real Tauri command — otherwise the model only shows in the web/dev mock.
+// (TS ↔ Rust sharing without a JSON build step is not worth the friction
+// while the list is < 20 entries.)
+
+export type ModelGroup = "Anthropic" | "OpenAI" | "Local" | "Other";
+
+export interface ModelDescriptor {
+  /** "{provider-prefix}/{model-name}" — prefix MUST match PROVIDER_REGISTRY. */
+  id: string;
+  /** Short label for dropdowns. */
+  label: string;
+  group: ModelGroup;
+  /** Free-form tag shown next to the label ("fast · default", "local · 32B", …). */
+  meta: string;
+}
+
+export const MODEL_CATALOG: ModelDescriptor[] = [
+  // Anthropic
+  { id: "anthropic/claude-haiku-4-5", label: "claude-haiku-4-5", group: "Anthropic", meta: "fast · default" },
+  { id: "anthropic/claude-sonnet-5",  label: "claude-sonnet-5",  group: "Anthropic", meta: "balanced · 200k" },
+  // OpenAI
+  { id: "openai/gpt-4o-mini",         label: "gpt-4o-mini",      group: "OpenAI",    meta: "cheap" },
+  // Local (Ollama; llamacpp models discovered dynamically via the running server)
+  { id: "ollama/qwen2.5:32b",         label: "qwen2.5:32b",      group: "Local",     meta: "local · 32B" },
+];
+
+/** Models grouped for display in dropdowns. Empty groups are dropped. */
+export function groupedModels(): { group: ModelGroup; items: ModelDescriptor[] }[] {
+  const order: ModelGroup[] = ["Anthropic", "OpenAI", "Local", "Other"];
+  return order
+    .map((group) => ({ group, items: MODEL_CATALOG.filter((m) => m.group === group) }))
+    .filter((g) => g.items.length > 0);
+}
+
+/**
+ * Returns the catalog shaped for the web/dev mock of the `models_list`
+ * Tauri command. Protocol is derived from PROVIDER_REGISTRY — the `!`
+ * assertion will throw at mock-time if a catalog entry references a prefix
+ * not declared in the registry, which is the invariant we want.
+ */
+export function mockModelsList(): { id: string; label: string; protocol: Protocol }[] {
+  return MODEL_CATALOG.map((m) => {
+    const prefix = m.id.slice(0, m.id.indexOf("/"));
+    return { id: m.id, label: m.label, protocol: PROVIDER_REGISTRY[prefix]!.protocol };
+  });
+}

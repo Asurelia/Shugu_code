@@ -1,5 +1,13 @@
 use serde::Serialize;
 
+// Minimal Rust-side model list returned by the `models_list` Tauri command.
+// The extended catalog (with groups + meta tags for the UI) lives in
+// `src/lib/providers.ts` (MODEL_CATALOG). Keep the entries below as a
+// subset of that catalog — when adding a model here, mirror it in the TS
+// catalog so the web/dev mock and the Tauri command stay aligned.
+// TS ↔ Rust sharing without a JSON build step isn't worth the friction
+// while the list is < 20 entries.
+
 #[derive(Serialize)]
 pub struct Provider {
     pub id: String,
