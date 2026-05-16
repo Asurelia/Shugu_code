@@ -589,6 +589,25 @@ function LlamaServerControls({ savedHfModel, savedBinary }: { savedHfModel: stri
     }
   };
 
+  // Used when llama_status reports running with pid==null — there's a
+  // server we don't own (orphan from a previous session, another tool…).
+  // The Rust side runs `taskkill /F /IM llama-server.exe` (Windows) /
+  // `pkill -f llama-server` (Unix) which is blunt by design: we trade
+  // collateral risk for a one-button cleanup.
+  const forceStopExternal = async () => {
+    setBusy("stopping");
+    setError(null);
+    try {
+      const s = await invoke<LlamaStatus>("llama_force_stop_external");
+      setStatus(s);
+      await invalidateDiscovery();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy("idle");
+    }
+  };
+
   // running + no pid = HTTP probe found a server we didn't spawn (terminal,
   // leftover from previous session, other tool). We can't kill it, and
   // Restart would conflict on port 8080 — guard the UI accordingly.
@@ -640,6 +659,16 @@ function LlamaServerControls({ savedHfModel, savedBinary }: { savedHfModel: stri
         {status.running && status.pid != null && (
           <button className="lgb lgb-sm" onClick={stop} disabled={busy !== "idle"}>
             {busy === "stopping" ? "Stopping…" : "Stop"}
+          </button>
+        )}
+        {isDetached && (
+          <button
+            className="lgb lgb-sm"
+            onClick={forceStopExternal}
+            disabled={busy !== "idle"}
+            title="Force-kills every llama-server.exe on the system (taskkill /F /IM). Use this to clear an orphan from a previous Shugu session whose cleanup hook didn't fire."
+          >
+            {busy === "stopping" ? "Stopping…" : "Force stop external"}
           </button>
         )}
         <span style={{ flex: 1 }}/>

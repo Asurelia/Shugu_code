@@ -220,6 +220,7 @@ pub fn run() {
             commands::llama::llama_start,
             commands::llama::llama_stop,
             commands::llama::llama_status,
+            commands::llama::llama_force_stop_external,
             commands::fs::fs_open_folder,
             commands::fs::fs_read_dir,
             commands::fs::fs_read_file,

@@ -203,6 +203,51 @@ pub fn llama_stop(state: State<'_, LlamaServerState>) -> Result<LlamaStatus, Str
     Ok(LlamaStatus { running: false, pid: None, binary: None })
 }
 
+/// Hard-kill ALL `llama-server.exe` processes on the system (Windows-only).
+/// Surfaces in the UI as the "Force stop external" button — used when
+/// `llama_status` reports `running:true` with `pid:None`, meaning the HTTP
+/// probe found a server we don't own (orphan from a prior session whose
+/// cleanup hook didn't fire, or another tool's instance). Bluntly kills by
+/// image name; the trade-off is "may also kill an unrelated llama-server
+/// the user wanted alive" — acceptable for the one-button UX vs the
+/// alternative of parsing `netstat -ano` for the port-8080 PID.
+#[tauri::command]
+pub async fn llama_force_stop_external(app: tauri::AppHandle) -> Result<LlamaStatus, String> {
+    #[cfg(target_os = "windows")]
+    {
+        // Use the shell plugin so we go through the same Tauri process
+        // tracking infrastructure as llama_start. Async output to keep the
+        // UI responsive even if taskkill takes a moment.
+        let output = app
+            .shell()
+            .command("taskkill")
+            .args(["/F", "/IM", "llama-server.exe"])
+            .output()
+            .await
+            .map_err(|e| format!("taskkill spawn failed: {e}"))?;
+        // taskkill exits 128 ("process not found") when nothing matched —
+        // that's a SUCCESS from our point of view ("ensure none running").
+        if !output.status.success() && !matches!(output.status.code(), Some(128)) {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("taskkill failed: {}", stderr.trim()));
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = app
+            .shell()
+            .command("pkill")
+            .args(["-f", "llama-server"])
+            .output()
+            .await;
+    }
+    // Give the OS a beat to release the port, then re-probe so the UI
+    // reflects reality immediately instead of waiting for the next 2s poll.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let still_running = probe_llama_endpoint().await;
+    Ok(LlamaStatus { running: still_running, pid: None, binary: None })
+}
+
 /// Snapshot current llama-server status. Two-tier detection:
 ///
 ///   1. Owned child handle — if the app spawned llama-server itself, the
