@@ -239,6 +239,38 @@ pub fn run() {
             commands::vector::vec_search,
             commands::vector::vec_delete,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // RunEvent::Exit fires AFTER the exit decision is finalized (tray
+            // "Fermer Shugu Forge" → app.exit(0), or process signal). This is
+            // where we tear down any side-band children we spawned, because
+            // tauri-plugin-shell's CommandChild does NOT kill on drop — the
+            // claim in the older llama.rs header comment was wrong.
+            //
+            // Skipping this leaves llama-server alive after Shugu closes and
+            // it reappears as a port-8080 zombie on next launch (which the
+            // HTTP-probe path in llama_status now exposes as "external").
+            //
+            // Abnormal exits (process kill, panic before this fires) still
+            // leak the child — Windows doesn't kill descendants automatically
+            // and we don't (yet) put children in a Job Object with
+            // KILL_ON_JOB_CLOSE. The probe-based detection on next launch is
+            // the safety net for that case.
+            if let tauri::RunEvent::Exit = event {
+                // .inner() pins the &LlamaServerState borrow to a named
+                // binding so the deref doesn't get dropped before the
+                // MutexGuard tries to extend its lifetime — without this
+                // explicit reference, rustc rejects `state.0.lock()` as
+                // "borrowed value does not live long enough" in the run-
+                // event closure context.
+                let state = app_handle.state::<commands::llama::LlamaServerState>();
+                let llama: &commands::llama::LlamaServerState = state.inner();
+                if let Ok(mut guard) = llama.0.lock() {
+                    if let Some(child) = guard.take() {
+                        let _ = child.kill();
+                    }
+                }
+            }
+        });
 }

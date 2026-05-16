@@ -7,11 +7,14 @@
 //
 // Design choices:
 //
-// * We use `tauri_plugin_shell::ShellExt` (NOT `std::process::Command`) so
-//   we benefit from Tauri's process tracking — when the app exits, the
-//   plugin can drop CommandChild handles cleanly. The plugin's `.spawn()`
-//   gives us an async event stream we can listen to for terminate / stderr
-//   surface, plus a `CommandChild` handle with a clean `.kill()`.
+// * We use `tauri_plugin_shell::ShellExt` (NOT `std::process::Command`)
+//   because its `.spawn()` gives us an async event stream we can listen to
+//   for terminate / stderr surface, plus a `CommandChild` handle with a
+//   clean `.kill()`. Note: dropping a CommandChild does NOT kill the child
+//   — we MUST call `.kill()` explicitly. The app's RunEvent::Exit hook in
+//   `lib.rs` takes care of this on shutdown; abnormal exits (panic,
+//   process-kill) still leak the child and the probe-fallback in
+//   `llama_status` is what surfaces leftover servers on next launch.
 //
 // * The Tauri shell plugin permissions in the capabilities file gate
 //   webview-initiated spawns. We call from Rust directly, so no scope is
