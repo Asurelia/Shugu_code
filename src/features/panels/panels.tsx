@@ -14,6 +14,7 @@ import { useMessages, useActiveConv, useActiveModel, sendChatMessage, createConv
 import { db } from "@/lib/db";
 import { getProviderField, setProviderField, clearProviderConfig, setProviderEnabled } from "@/lib/credentials";
 import { useDiscoveredModels, invalidateDiscovery, useDiscoveryStore } from "@/lib/modelDiscovery";
+import { useChibiMood } from "@/features/mascot/useChibiMood";
 // Reuse import for FloatChat — same hook, single source of truth for the
 // "are any providers actually configured?" question used by both the
 // ModelPicker popover and the chibi's mood/send-enabled gating.
@@ -1109,16 +1110,10 @@ export function Chibi({ size = 92, mood = "neutral" }: { size?: number; mood?: C
 // the chibi's pose change.
 export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceSide, freezePos, forceEdge }: any) {
   const [mode, setMode] = useState<"closed" | "compact" | "full">("compact");
-  // moodOverride: null = derived from state; otherwise forces a mood (alt+click cycle).
-  const [moodOverride, setMoodOverride] = useState<ChibiMood | null>(null);
-  // Last user-interaction timestamp — drives the "lonely" sad face after long idle.
-  const [lastInteract, setLastInteract] = useState(Date.now());
-  // Ticking clock so we re-derive mood as time passes.
-  const [now, setNow] = useState(Date.now());
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 5000);
-    return () => clearInterval(t);
-  }, []);
+  // Mood state + derivation + idle ticker are encapsulated in useChibiMood
+  // (src/features/mascot/useChibiMood.ts). The hook owns moodOverride,
+  // lastInteract, and the 5s ticker — FloatChat only feeds it inputs and
+  // calls bumpInteract() from user-interaction handlers.
   const [pos, setPos] = useState(() => {
     // Default: CENTER of viewport, both axes. With FloatChat now only used
     // in the mascot window (M2), the wide-enough mascot frame (≥ 844 px)
@@ -1250,7 +1245,7 @@ export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceS
     const id = await createConversation("New chat");
     if (id) setActiveConv(id);
     setInput("");
-    setLastInteract(Date.now());
+    bumpInteract();
     setTab("feed");
     setMode("full");
     setHistRefresh(n => n + 1);
@@ -1261,7 +1256,7 @@ export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceS
     setActiveConv(id);
     setTab("feed");
     setMode("full");
-    setLastInteract(Date.now());
+    bumpInteract();
   };
   // deleteConvo: stops event propagation so the row click doesn't also
   // load the deleted conv. Messages are NOT cascade-deleted (no FK in the
@@ -1310,7 +1305,7 @@ export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceS
     setInput("");
     setBusy(true);
     setMode("full");
-    setLastInteract(Date.now());
+    bumpInteract();
     // sendChatMessage handles both user + AI message persistence in SQLite
     // and broadcasts chat://messages-changed — useMessages above picks up
     // both events and re-renders the history feed. The main IDE's ChatView
@@ -1320,7 +1315,7 @@ export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceS
         await sendChatMessage(activeConv, t, model);
       } finally {
         setBusy(false);
-        setLastInteract(Date.now());
+        bumpInteract();
       }
     })();
   };
@@ -1334,33 +1329,16 @@ export function FloatChat({ pinnedAnno, clearPinned, disableInternalDrag, forceS
     if (input && hasUnread) setHasUnread(false);
   }, [input, hasUnread]);
 
-  // Alt+click cycles the mood override; null → first → … → last → null (auto).
-  const MOOD_CYCLE: ChibiMood[] = ["neutral", "smile", "joy", "sad", "cry"];
-  const cycleMood = () => {
-    setMoodOverride(curr => {
-      if (curr === null) return MOOD_CYCLE[0];
-      const i = MOOD_CYCLE.indexOf(curr);
-      if (i === MOOD_CYCLE.length - 1) return null;
-      return MOOD_CYCLE[i + 1];
-    });
-  };
-
-  // ── Mood derivation ──
-  // Priority: edge-tucked (peek pose) → manual override → busy (joy) →
-  // no key (cry) → pinned annotation (smile) → long idle (sad) →
-  // recent interaction (smile) → neutral default.
-  const idleMs = now - lastInteract;
-  const derivedMood: ChibiMood = (() => {
-    if (edge) return hasUnread ? "peek_open" : "peek_closed";
-    if (busy) return "joy";
-    if (!hasKey) return "cry";
-    if (pinnedAnno) return "smile";
-    if (idleMs > 60_000) return "sad";
-    if (idleMs < 10_000 && msgs.length > 0) return "smile";
-    return "neutral";
-  })();
-  // Manual override doesn't apply when tucked — the peek pose is geometry, not expression.
-  const mood: ChibiMood = edge ? derivedMood : (moodOverride || derivedMood);
+  // Mood derivation, manual override + idle ticker are owned by useChibiMood.
+  // See src/features/mascot/useChibiMood.ts for the priority table.
+  const { mood, cycleMood, bumpInteract } = useChibiMood({
+    edge,
+    hasUnread,
+    busy,
+    hasKey,
+    pinnedAnno,
+    hasMessages: msgs.length > 0,
+  });
 
   const onAvatarMouseDown = (e: React.MouseEvent) => {
     // When the host (mascot window) drives drag at the OS level, bail
