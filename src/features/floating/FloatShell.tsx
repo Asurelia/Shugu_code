@@ -33,7 +33,6 @@ import {
   type FloatSide,
 } from "@/features/floating/useFloatPosition";
 import { useFloatMode, type FloatMode } from "@/features/floating/useFloatMode";
-import { bumpInteract } from "@/features/mascot/idleStore";
 
 export interface FloatShellContextValue {
   mode: FloatMode;
@@ -86,9 +85,12 @@ export function FloatShell({
 
   const { mode, setMode, toggleClosed, toggleFull } = useFloatMode("compact");
 
+  // Click / double-click behavior preserved 1:1 from the original FloatChat:
+  // no implicit bumpInteract() here. Idle clock is bumped explicitly by the
+  // panels on their own interactions (chat send / loadConvo / newConvo) and
+  // by ChibiWithMood's mood-cycle path.
   const onAvatarClick = () => {
     if (movedRef.current) return;
-    bumpInteract();
     if (edge) {
       clearEdge();
       if (mode === "closed") setMode("compact");
@@ -98,7 +100,6 @@ export function FloatShell({
   };
 
   const onAvatarDouble = () => {
-    bumpInteract();
     toggleFull();
   };
 
