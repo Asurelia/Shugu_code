@@ -589,6 +589,11 @@ function LlamaServerControls({ savedHfModel, savedBinary }: { savedHfModel: stri
     }
   };
 
+  // running + no pid = HTTP probe found a server we didn't spawn (terminal,
+  // leftover from previous session, other tool). We can't kill it, and
+  // Restart would conflict on port 8080 — guard the UI accordingly.
+  const isDetached = status.running && status.pid == null;
+
   return (
     <div style={{
       margin: "8px 0",
@@ -613,17 +618,26 @@ function LlamaServerControls({ savedHfModel, savedBinary }: { savedHfModel: stri
         {status.running && status.pid != null && (
           <span style={{ fontSize: 10, color: "var(--on-surface-muted)" }}>pid {status.pid}</span>
         )}
+        {isDetached && (
+          <span style={{ fontSize: 10, color: "var(--on-surface-muted)" }} title="Detected via HTTP probe — not spawned by Shugu">
+            external
+          </span>
+        )}
       </div>
       <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
         <button
           className="lgb lgb-sm lgb-primary"
           onClick={start}
-          disabled={busy !== "idle"}
-          title={status.running ? "Restart with the currently-saved model" : "Start llama-server with the saved model"}
+          disabled={busy !== "idle" || isDetached}
+          title={
+            isDetached
+              ? "Another llama-server is already on port 8080 — stop it from where you started it before restarting from here"
+              : (status.running ? "Restart with the currently-saved model" : "Start llama-server with the saved model")
+          }
         >
           {busy === "starting" ? "Starting…" : status.running ? "Restart" : "Start server"}
         </button>
-        {status.running && (
+        {status.running && status.pid != null && (
           <button className="lgb lgb-sm" onClick={stop} disabled={busy !== "idle"}>
             {busy === "stopping" ? "Stopping…" : "Stop"}
           </button>

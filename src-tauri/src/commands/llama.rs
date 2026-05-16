@@ -200,18 +200,57 @@ pub fn llama_stop(state: State<'_, LlamaServerState>) -> Result<LlamaStatus, Str
     Ok(LlamaStatus { running: false, pid: None, binary: None })
 }
 
-/// Snapshot current child status without side effects (other than reaping
-/// a dead child if it has exited since we last checked).
+/// Snapshot current llama-server status. Two-tier detection:
+///
+///   1. Owned child handle — if the app spawned llama-server itself, the
+///      CommandChild is in `state.0`. This is the fast path (no IO).
+///   2. HTTP probe on 127.0.0.1:8080/v1/models — when there's no owned
+///      handle, the server may still be running EXTERNALLY: started from a
+///      terminal, left over from a previous app session whose state we lost
+///      on relaunch, or spawned by another tool. The previous one-tier
+///      implementation would report `stopped` in those cases even though
+///      chat requests against the same endpoint were succeeding, which is
+///      exactly what just confused a user staring at "Server stopped" while
+///      the chibi happily replied.
+///
+/// When we detect a detached server (HTTP probe ok, no owned child) we
+/// return `running: true` with `pid: None` — the UI uses the missing pid
+/// as a signal to hide the Stop button (we can't kill what we don't own)
+/// and to grey out Restart.
+///
+/// 250 ms timeout keeps the 2s UI polling responsive even when nothing
+/// is on the port.
 #[tauri::command]
-pub fn llama_status(state: State<'_, LlamaServerState>) -> Result<LlamaStatus, String> {
-    let guard = state.0.lock().map_err(|e| e.to_string())?;
-    if let Some(child) = guard.as_ref() {
-        Ok(LlamaStatus {
-            running: true,
-            pid: Some(child.pid()),
-            binary: None,
-        })
-    } else {
-        Ok(LlamaStatus { running: false, pid: None, binary: None })
+pub async fn llama_status(state: State<'_, LlamaServerState>) -> Result<LlamaStatus, String> {
+    // Scope the mutex lock so the guard is dropped BEFORE any await — std's
+    // Mutex isn't Send-safe across await points and we don't need it held
+    // while we do IO anyway.
+    let owned_pid: Option<u32> = {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        guard.as_ref().map(|c| c.pid())
+    };
+
+    if let Some(pid) = owned_pid {
+        return Ok(LlamaStatus { running: true, pid: Some(pid), binary: None });
+    }
+
+    let detached_running = probe_llama_endpoint().await;
+    Ok(LlamaStatus { running: detached_running, pid: None, binary: None })
+}
+
+/// Best-effort GET against the standard llama-server endpoint. Returns true
+/// iff the server responds with a 2xx within 250 ms. Any error (DNS,
+/// connection refused, timeout, non-2xx) counts as "not running".
+async fn probe_llama_endpoint() -> bool {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(250))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    match client.get("http://127.0.0.1:8080/v1/models").send().await {
+        Ok(r) => r.status().is_success(),
+        Err(_) => false,
     }
 }
