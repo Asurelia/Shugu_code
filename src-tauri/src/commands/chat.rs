@@ -1,5 +1,16 @@
 use futures_util::StreamExt;
+use serde::Deserialize;
 use tauri::Emitter;
+
+/// One message in a chat conversation history, mirroring the OpenAI/Anthropic
+/// JSON shape `{role, content}`. Role values accepted: "user", "assistant",
+/// "system". The frontend maps its internal "ai" → "assistant" before sending.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
 
 // Arguments arrive as individual command parameters (matching the pattern
 // used by every other command in this crate — fs_read_file, term_spawn, etc.).
@@ -115,17 +126,31 @@ async fn call_anthropic(
     client: &reqwest::Client,
     base_url: &str,
     model: &str,
-    prompt: &str,
+    messages: &[ChatMessage],
     api_key: &str,
     conversation_id: &Option<String>,
 ) -> Result<String, String> {
     let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
-    let body = serde_json::json!({
+    // Anthropic requires a `system` field separate from `messages` and only
+    // accepts roles user/assistant in `messages`. We split here.
+    let mut system_parts: Vec<String> = Vec::new();
+    let mut convo: Vec<serde_json::Value> = Vec::new();
+    for m in messages {
+        if m.role == "system" {
+            system_parts.push(m.content.clone());
+        } else {
+            convo.push(serde_json::json!({ "role": m.role, "content": m.content }));
+        }
+    }
+    let mut body = serde_json::json!({
         "model": model,
         "max_tokens": 1024,
         "stream": true,
-        "messages": [{"role": "user", "content": prompt}]
+        "messages": convo,
     });
+    if !system_parts.is_empty() {
+        body["system"] = serde_json::Value::String(system_parts.join("\n\n"));
+    }
 
     let response = client
         .post(&url)
@@ -170,7 +195,7 @@ async fn call_openai_compat(
     client: &reqwest::Client,
     base_url: &str,
     model: &str,
-    prompt: &str,
+    messages: &[ChatMessage],
     api_key: &str,
     protocol: &str,
     conversation_id: &Option<String>,
@@ -183,10 +208,14 @@ async fn call_openai_compat(
         format!("{}/v1/chat/completions", base)
     };
 
+    let messages_json: Vec<_> = messages
+        .iter()
+        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .collect();
     let body = serde_json::json!({
         "model": model,
         "stream": true,
-        "messages": [{"role": "user", "content": prompt}]
+        "messages": messages_json,
     });
 
     // Local OpenAI-compat servers (llama.cpp, LM Studio, vLLM, …) often
@@ -235,14 +264,18 @@ async fn call_ollama(
     client: &reqwest::Client,
     base_url: &str,
     model: &str,
-    prompt: &str,
+    messages: &[ChatMessage],
     conversation_id: &Option<String>,
 ) -> Result<String, String> {
     let url = format!("{}/api/chat", base_url.trim_end_matches('/'));
+    let messages_json: Vec<_> = messages
+        .iter()
+        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .collect();
     let body = serde_json::json!({
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": true
+        "messages": messages_json,
+        "stream": true,
     });
 
     let response = client
@@ -300,7 +333,7 @@ async fn call_ollama(
 #[tauri::command]
 pub async fn chat_send(
     app: tauri::AppHandle,
-    prompt: String,
+    messages: Vec<ChatMessage>,
     model: String,
     protocol: String,
     base_url: String,
@@ -313,20 +346,24 @@ pub async fn chat_send(
         model
     };
 
+    if messages.is_empty() {
+        return Err("messages array is empty".into());
+    }
+
     let client = reqwest::Client::new();
     let protocol_str = protocol.as_str();
 
     let result = match protocol_str {
         "anthropic" => {
             let key = resolve_key(protocol_str, &api_key)?;
-            call_anthropic(&app, &client, &base_url, &model, &prompt, &key, &conversation_id).await
+            call_anthropic(&app, &client, &base_url, &model, &messages, &key, &conversation_id).await
         }
         "openai" | "custom" => {
             let key = resolve_key(protocol_str, &api_key)?;
-            call_openai_compat(&app, &client, &base_url, &model, &prompt, &key, protocol_str, &conversation_id).await
+            call_openai_compat(&app, &client, &base_url, &model, &messages, &key, protocol_str, &conversation_id).await
         }
         "ollama" => {
-            call_ollama(&app, &client, &base_url, &model, &prompt, &conversation_id).await
+            call_ollama(&app, &client, &base_url, &model, &messages, &conversation_id).await
         }
         other => Err(format!("unsupported protocol: {}", other)),
     };

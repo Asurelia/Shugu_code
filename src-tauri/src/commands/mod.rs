@@ -1,6 +1,7 @@
 pub mod chat;
 pub mod credentials;
 pub mod fs;
+pub mod llama;
 pub mod terminal;
 pub mod image;
 pub mod models;

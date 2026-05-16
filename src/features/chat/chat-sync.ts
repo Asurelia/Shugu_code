@@ -286,9 +286,39 @@ export async function sendChatMessage(
   const baseUrl: string = (cfg.baseUrl && cfg.baseUrl !== "") ? cfg.baseUrl : defaultBaseUrl;
   const apiKey: string | undefined = (cfg.apiKey && cfg.apiKey !== "") ? cfg.apiKey : undefined;
 
+  // Build the full conversation history from SQLite so the LLM has context
+  // for follow-up questions. Without this, every message was treated as a
+  // fresh conversation — Gemma even confidently claimed it had "memory of
+  // our conversation" while having literally none.
+  //
+  // The user message we just appendMessage'd above is already in the table,
+  // so iterating the rows gives us [...prior turns, this fresh user turn]
+  // in the exact order the API expects. Empty / image-only rows are skipped
+  // because the OpenAI / Anthropic / Ollama APIs all reject empty content.
+  const rows = inTauri ? await db.messages.listByConversation(convId) : (webCache.get(convId) ?? []).map((m) => messageToRow(m, convId));
+  const apiMessages = rows
+    .map((r) => {
+      // SQLite row: role is "user" / "ai"; map to API expectation "assistant".
+      const role = r.role === "ai" ? "assistant" : r.role;
+      // Prefer `text` (user), fall back to `body` (AI prose), then to nothing.
+      // If a row only has a `code` block we still send its text content so
+      // the LLM can reason about its own prior code suggestions.
+      const text = (r.text ?? "").trim()
+        || (r.body ?? "").trim()
+        || (r.code_text ?? "").trim();
+      return { role, content: text };
+    })
+    .filter((m) => m.content !== "");
+
+  // Defensive: if the SQLite read returned nothing (which shouldn't happen
+  // since we just inserted the user message), at least send the current prompt.
+  if (apiMessages.length === 0) {
+    apiMessages.push({ role: "user", content: trimmed });
+  }
+
   try {
     const reply = await invoke<string>("chat_send", {
-      prompt: trimmed,
+      messages: apiMessages,
       model: realModel,
       protocol,
       baseUrl,

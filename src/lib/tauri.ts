@@ -37,7 +37,7 @@ const mocks: Record<string, (args?: any) => any> = {
     try { sessionStorage.removeItem("shugu.cred.web::" + account); } catch { /* noop */ }
     return null;
   },
-  chat_send: ({ prompt, model, protocol, baseUrl }: { prompt: string; model: string; protocol: string; baseUrl: string }) => {
+  chat_send: ({ messages, model, protocol, baseUrl }: { messages: Array<{role: string; content: string}>; model: string; protocol: string; baseUrl: string }) => {
     void baseUrl;
     const keyHint = protocol === "anthropic"
       ? "ANTHROPIC_API_KEY"
@@ -46,7 +46,9 @@ const mocks: Record<string, (args?: any) => any> = {
         : protocol === "ollama"
           ? "a running Ollama daemon"
           : "the provider key";
-    return `(${protocol} · ${model}) mock reply — set ${keyHint} and run in Tauri for a real response. You said: "${prompt.slice(0, 80)}"`;
+    const lastUser = [...messages].reverse().find((m) => m.role === "user");
+    const prompt = lastUser?.content ?? "";
+    return `(${protocol} · ${model}, ${messages.length} msgs in history) mock reply — set ${keyHint} and run in Tauri for a real response. You said: "${prompt.slice(0, 80)}"`;
   },
   image_generate: ({ prompt, ratio, model, protocol, baseUrl, seed, steps, guidance, style }: { prompt: string; ratio: string; model: string; protocol: string; baseUrl: string; seed: number; steps: number; guidance: number; style: string }) => {
     void baseUrl;

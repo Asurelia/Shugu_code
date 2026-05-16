@@ -1709,6 +1709,12 @@ export function ConnectionsView() {
       ]},
       { id: "llamacpp", name: "llama.cpp", meta: "Local OpenAI-compatible server (gguf models)", logo: "L", color: "#7c3aed", fields: [
         { label: "Endpoint", key: "baseUrl", placeholder: "http://localhost:8080", secret: false },
+        // HF repo:quant fed to `llama-server -hf …`. Ex: HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive:Q5_K_P
+        { label: "Modèle HuggingFace (repo:quant)", key: "hfModel", placeholder: "user/repo:Q5_K_P", secret: false },
+        // Optional path to llama-server.exe. If empty we resolve from PATH
+        // (winget install puts it there) then fall back to Docker Desktop's
+        // bundled binary at ~/.docker/bin/inference/llama-server.exe.
+        { label: "Binary (optionnel)", key: "binary", placeholder: "auto-détecté depuis le PATH", secret: false },
         { label: "API key (optional)", key: "apiKey", placeholder: "leave empty unless --api-key was set", secret: true },
       ]},
       { id: "mistral", name: "Mistral", meta: "European open-weights", logo: "M", color: "#ff7000", fields: [
@@ -2085,6 +2091,9 @@ export function ConnCard({ c }: { c: ConnCardData }) {
           ⚠ Le provider est saved mais la liste des modèles a échoué&nbsp;: <code style={{ background: "rgba(0,0,0,0.3)", padding: "1px 4px", borderRadius: 3 }}>{discoveryError}</code>
         </div>
       )}
+      {c.id === "llamacpp" && (
+        <LlamaServerControls savedHfModel={saved.hfModel ?? ""} savedBinary={saved.binary ?? ""}/>
+      )}
       <div className="conn-actions">
         <button
           className="lgb lgb-sm lgb-primary"
@@ -2104,6 +2113,171 @@ export function ConnCard({ c }: { c: ConnCardData }) {
           <span style={{fontSize:11, color:"var(--error, #ff6b6b)"}} title={errorMsg ?? ""}>error · hover for details</span>
         )}
       </div>
+    </div>
+  );
+}
+
+// ─── llama-server lifecycle controls (rendered inside the llama.cpp ConnCard) ──
+//
+// Reads the SAVED hfModel + binary fields (not the live edited drafts) so the
+// Start button does what the user actually committed in Settings. Polls the
+// Rust llama_status command every 2s to keep its "running / stopped" pill in
+// sync with reality — that way if llama-server crashes externally or the user
+// killed it from a terminal, the UI catches up within a couple of seconds.
+//
+// Restart is implicit in Start: the Rust command always kills any previous
+// child before spawning a new one, so the user just changes hfModel in the
+// inputs, hits Save, then hits Start and the new model is what's running.
+
+interface LlamaStatus {
+  running: boolean;
+  pid: number | null;
+  binary: string | null;
+}
+
+// Poll a local llama-server's /v1/models endpoint until it responds 200 (or
+// until we run out of patience). llama-server's HTTP listener comes up
+// before the model is actually loaded — and chat requests against a
+// not-yet-loaded server hang — so /v1/models is the better readiness
+// probe than mere TCP connectivity.
+async function waitForLlamaReady(baseUrl: string, timeoutMs = 90_000, intervalMs = 1500): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const r = await fetch(baseUrl.replace(/\/+$/, "") + "/v1/models");
+      if (r.ok) return;
+    } catch {
+      // Network unreachable / connection refused → server still booting.
+    }
+    await new Promise<void>((resolve) => window.setTimeout(resolve, intervalMs));
+  }
+  throw new Error(`llama-server didn't become ready within ${Math.round(timeoutMs / 1000)}s`);
+}
+
+function LlamaServerControls({ savedHfModel, savedBinary }: { savedHfModel: string; savedBinary: string }) {
+  const [status, setStatus] = useState<LlamaStatus>({ running: false, pid: null, binary: null });
+  const [busy, setBusy] = useState<"idle" | "starting" | "stopping">("idle");
+  const [error, setError] = useState<string | null>(null);
+
+  // Initial fetch + 2s polling so the pill reflects reality even if
+  // llama-server crashed or was killed externally.
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const s = await invoke<LlamaStatus>("llama_status");
+        if (!cancelled) setStatus(s);
+      } catch (err) {
+        if (!cancelled) console.warn("[llama] status failed", err);
+      }
+    };
+    void tick();
+    const id = window.setInterval(tick, 2000);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, []);
+
+  const start = async () => {
+    if (!savedHfModel) {
+      setError("Renseigne d'abord le champ 'Modèle HuggingFace' puis clique Save.");
+      return;
+    }
+    setBusy("starting");
+    setError(null);
+    try {
+      const s = await invoke<LlamaStatus>("llama_start", {
+        binary: savedBinary || null,
+        hfModel: savedHfModel,
+      });
+      setStatus(s);
+      // Boot can take 15–60s (model download on first run, weight load on
+      // subsequent runs). Poll the server's /v1/models until it returns 200
+      // then invalidate discovery so every window (main + chibi) picks up
+      // the new model instantly. Stays in "starting" UI state until the
+      // server is actually serving — much closer to the real readiness
+      // than the immediate `running:true` from the spawn return value.
+      await waitForLlamaReady("http://127.0.0.1:8080");
+      await invalidateDiscovery();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy("idle");
+    }
+  };
+
+  const stop = async () => {
+    setBusy("stopping");
+    setError(null);
+    try {
+      const s = await invoke<LlamaStatus>("llama_stop");
+      setStatus(s);
+      // Trigger a discovery refresh so the picker drops the now-unreachable
+      // llama.cpp models. Without this, the picker would keep showing them
+      // until the next 60s TTL roll.
+      await invalidateDiscovery();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy("idle");
+    }
+  };
+
+  return (
+    <div style={{
+      margin: "8px 0",
+      padding: 10,
+      borderRadius: 8,
+      background: "rgba(124, 58, 237, 0.06)",
+      border: "1px solid rgba(124, 58, 237, 0.22)",
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+        <span style={{
+          fontSize: 10,
+          fontWeight: 700,
+          letterSpacing: 0.5,
+          textTransform: "uppercase",
+          padding: "2px 8px",
+          borderRadius: 99,
+          background: status.running ? "rgba(74, 222, 128, 0.18)" : "rgba(150, 150, 150, 0.18)",
+          color: status.running ? "var(--success, #4ade80)" : "var(--on-surface-muted, #999)",
+        }}>
+          {status.running ? "● Server running" : "○ Server stopped"}
+        </span>
+        {status.running && status.pid != null && (
+          <span style={{ fontSize: 10, color: "var(--on-surface-muted)" }}>pid {status.pid}</span>
+        )}
+      </div>
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <button
+          className="lgb lgb-sm lgb-primary"
+          onClick={start}
+          disabled={busy !== "idle"}
+          title={status.running ? "Restart with the currently-saved model" : "Start llama-server with the saved model"}
+        >
+          {busy === "starting" ? "Starting…" : status.running ? "Restart" : "Start server"}
+        </button>
+        {status.running && (
+          <button className="lgb lgb-sm" onClick={stop} disabled={busy !== "idle"}>
+            {busy === "stopping" ? "Stopping…" : "Stop"}
+          </button>
+        )}
+        <span style={{ flex: 1 }}/>
+        <span style={{ fontSize: 10, color: "var(--on-surface-muted)" }}>
+          flags: -hf … -c 32768 --host 127.0.0.1 --port 8080
+        </span>
+      </div>
+      {error && (
+        <div style={{
+          marginTop: 8,
+          padding: "6px 8px",
+          borderRadius: 6,
+          background: "rgba(255, 107, 107, 0.08)",
+          border: "1px solid rgba(255, 107, 107, 0.25)",
+          fontSize: 11,
+          color: "var(--error, #ff6b6b)",
+        }}>
+          ⚠ {error}
+        </div>
+      )}
     </div>
   );
 }

@@ -109,6 +109,7 @@ pub fn run() {
         // Workspace root — set by fs_open_folder, read by all other fs commands.
         .manage(Mutex::new(None::<std::path::PathBuf>))
         .manage(commands::terminal::PtyRegistry::default())
+        .manage(commands::llama::LlamaServerState::default())
         .setup(|app| {
             // Spawn the filesystem watcher before restoring the workspace root
             // so the watcher is ready to receive the seed path below.
@@ -216,6 +217,9 @@ pub fn run() {
             commands::credentials::cred_set,
             commands::credentials::cred_get,
             commands::credentials::cred_delete,
+            commands::llama::llama_start,
+            commands::llama::llama_stop,
+            commands::llama::llama_status,
             commands::fs::fs_open_folder,
             commands::fs::fs_read_dir,
             commands::fs::fs_read_file,
