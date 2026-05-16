@@ -268,7 +268,6 @@ function useMascotWindowDrag(
         const target = e.target as Element | null;
         if (!target) return;
         if (!target.closest(".float-cluster")) return;
-        if (target.closest(".float-speech")) return;
         if (e.button !== 0) return;
 
         const startScreenX = e.screenX;

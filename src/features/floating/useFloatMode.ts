@@ -1,7 +1,7 @@
 // Shugu Forge — useFloatMode hook
 //
 // Tiny state machine for the float panel's visibility:
-//   - "closed"   → only the chibi is visible (no panel, no speech)
+//   - "closed"   → only the chibi is visible (no panel)
 //   - "compact"  → chibi + composer (no history)
 //   - "full"     → chibi + history + tabs + composer
 //
