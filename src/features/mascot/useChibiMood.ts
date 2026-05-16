@@ -19,7 +19,7 @@
 // geometry, not expression, and must always reflect the panel position.
 
 import { useEffect, useMemo, useState, useCallback } from "react";
-import type { ChibiMood } from "@/features/panels/panels";
+import type { ChibiMood } from "@/features/mascot/Chibi";
 
 const MOOD_CYCLE: ChibiMood[] = ["neutral", "smile", "joy", "sad", "cry"];
 const TICK_MS = 5_000;
