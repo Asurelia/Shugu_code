@@ -389,9 +389,12 @@ export async function sendChatMessage(
   }
 
   try {
-    // imageDataUrl is persisted in the SQLite row (r.body, r.image=1) and the
-    // apiMessages map above already produces "[image attached]" as the content
-    // for those rows — no post-hoc injection needed here.
+    // imageDataUrl is persisted in the SQLite row (r.body, r.image=1) but
+    // apiMessages strips it to "[image attached]" placeholder to avoid token
+    // bloat in conversation history. We pass the CURRENT message's image
+    // separately via `attachedImage`: Rust injects it as a multimodal content
+    // block on the LAST user message so vision-capable models (Claude 3.5+,
+    // GPT-4o) actually see it.
     const reply = await invoke<string>("chat_send", {
       messages: apiMessages,
       model: realModel,
@@ -400,6 +403,7 @@ export async function sendChatMessage(
       apiKey,
       conversationId: convId,
       chatTemplateKwargs,
+      attachedImage: imageDataUrl,
     });
     // Parse fenced ```code blocks``` out of the reply so the UI gets the
     // structured Message.code shape (CodeBlock component highlights + the

@@ -48,6 +48,25 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// Parse a data URL like `data:image/png;base64,iVBORw0KG...` into
+/// `(media_type, base64_payload)`. Returns `None` for malformed input or
+/// non-base64 encodings (we only support base64 for image attachments —
+/// the only format Anthropic/OpenAI accept for vision).
+fn parse_data_url(s: &str) -> Option<(String, String)> {
+    let rest = s.strip_prefix("data:")?;
+    let comma = rest.find(',')?;
+    let header = &rest[..comma];
+    let payload = &rest[comma + 1..];
+    if !header.contains(";base64") {
+        return None;
+    }
+    let media_type = header.split(';').next()?.to_string();
+    if media_type.is_empty() {
+        return None;
+    }
+    Some((media_type, payload.to_string()))
+}
+
 // Arguments arrive as individual command parameters (matching the pattern
 // used by every other command in this crate — fs_read_file, term_spawn, etc.).
 // Tauri 2 automatically maps camelCase JS keys (`baseUrl`, `apiKey`,
@@ -207,18 +226,38 @@ pub(crate) async fn call_anthropic(
     messages: &[ChatMessage],
     api_key: &str,
     with_tools: bool,
+    attached_image: Option<&str>,
     abort: Option<Arc<AtomicBool>>,
     on_chunk: &mut (dyn FnMut(&str, &str) + Send),
 ) -> Result<AssistantTurn, String> {
     let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
     let mut system_parts: Vec<String> = Vec::new();
     let mut convo: Vec<serde_json::Value> = Vec::new();
-    for m in messages {
+    // For vision: the image (if any) attaches to the LAST user message. We
+    // identify that index up front so we can build multimodal content blocks
+    // only for that single message.
+    let last_user_idx = messages.iter().rposition(|m| m.role == "user");
+    for (i, m) in messages.iter().enumerate() {
         if m.role == "system" {
             system_parts.push(m.content.clone());
-        } else {
-            convo.push(serde_json::json!({ "role": m.role, "content": m.content }));
+            continue;
         }
+        let is_last_user = Some(i) == last_user_idx;
+        if is_last_user {
+            if let Some(dataurl) = attached_image {
+                if let Some((media_type, b64)) = parse_data_url(dataurl) {
+                    convo.push(serde_json::json!({
+                        "role": "user",
+                        "content": [
+                            { "type": "text", "text": m.content },
+                            { "type": "image", "source": { "type": "base64", "media_type": media_type, "data": b64 } }
+                        ]
+                    }));
+                    continue;
+                }
+            }
+        }
+        convo.push(serde_json::json!({ "role": m.role, "content": m.content }));
     }
     // Tool-use turns produce more output (tool_call JSON + commentary);
     // bump the cap. Non-tool turns keep the 1024 default to preserve
@@ -363,6 +402,7 @@ pub(crate) async fn call_openai_compat(
     protocol: &str,
     chat_template_kwargs: &Option<serde_json::Value>,
     with_tools: bool,
+    attached_image: Option<&str>,
     abort: Option<Arc<AtomicBool>>,
     on_chunk: &mut (dyn FnMut(&str, &str) + Send),
 ) -> Result<AssistantTurn, String> {
@@ -374,9 +414,31 @@ pub(crate) async fn call_openai_compat(
         format!("{}/v1/chat/completions", base)
     };
 
-    let messages_json: Vec<_> = messages
+    // For vision: image attaches to the LAST user message. Pre-locate its
+    // index so we can branch into the multimodal content shape only there.
+    let last_user_idx = messages.iter().rposition(|m| m.role == "user");
+    let messages_json: Vec<serde_json::Value> = messages
         .iter()
-        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .enumerate()
+        .map(|(i, m)| {
+            let is_last_user = Some(i) == last_user_idx;
+            if is_last_user {
+                if let Some(dataurl) = attached_image {
+                    // OpenAI accepts the full data URL directly in image_url.
+                    // No need to split media_type / base64 like Anthropic.
+                    if dataurl.starts_with("data:image/") {
+                        return serde_json::json!({
+                            "role": "user",
+                            "content": [
+                                { "type": "text", "text": m.content },
+                                { "type": "image_url", "image_url": { "url": dataurl } }
+                            ]
+                        });
+                    }
+                }
+            }
+            serde_json::json!({ "role": m.role, "content": m.content })
+        })
         .collect();
     let mut body = serde_json::json!({
         "model": model,
@@ -569,6 +631,12 @@ pub async fn chat_send(
     api_key: Option<String>,
     conversation_id: Option<String>,
     chat_template_kwargs: Option<serde_json::Value>,
+    // Optional `data:image/...;base64,...` URL for vision-enabled models.
+    // When provided, it's injected into the LAST user message as a
+    // multimodal content block (Anthropic `type:image` / OpenAI `image_url`).
+    // Ignored by the ollama path (Ollama vision uses a different payload
+    // shape that's out of MVP scope).
+    attached_image: Option<String>,
     abort_registry: tauri::State<'_, ChatAbortRegistry>,
 ) -> Result<String, String> {
     let model = if model.is_empty() {
@@ -619,16 +687,20 @@ pub async fn chat_send(
     // so the body stays exactly as Phase 1 had it. The new AssistantTurn
     // return type carries `content` + `tool_calls`; we use only `content`
     // here (the `tool_calls` field will be empty since with_tools is false).
+    let img_ref = attached_image.as_deref();
     let result: Result<AssistantTurn, String> = match protocol_str {
         "anthropic" => {
             let key = resolve_key(protocol_str, &api_key)?;
-            call_anthropic(&client, &base_url, &model, &messages, &key, /* with_tools */ false, abort_flag.clone(), &mut on_chunk).await
+            call_anthropic(&client, &base_url, &model, &messages, &key, /* with_tools */ false, img_ref, abort_flag.clone(), &mut on_chunk).await
         }
         "openai" | "custom" => {
             let key = resolve_key(protocol_str, &api_key)?;
-            call_openai_compat(&client, &base_url, &model, &messages, &key, protocol_str, &chat_template_kwargs, /* with_tools */ false, abort_flag.clone(), &mut on_chunk).await
+            call_openai_compat(&client, &base_url, &model, &messages, &key, protocol_str, &chat_template_kwargs, /* with_tools */ false, img_ref, abort_flag.clone(), &mut on_chunk).await
         }
         "ollama" => {
+            // Ollama vision uses a different shape (a top-level `images` field
+            // of base64 strings, not multimodal content blocks). Out of MVP
+            // scope — image is silently ignored for the ollama path.
             call_ollama(&client, &base_url, &model, &messages, abort_flag.clone(), &mut on_chunk).await
         }
         other => Err(format!("unsupported protocol: {}", other)),
