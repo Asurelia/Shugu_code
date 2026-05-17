@@ -1,22 +1,17 @@
 // Real filesystem wrapper for Shugu Forge.
 //
-// In Tauri mode: delegates to Rust commands (fs_open_folder, fs_read_dir,
-// fs_read_file, fs_write_file) via IPC.
+// Delegates to Rust commands (fs_open_folder, fs_read_dir, fs_read_file,
+// fs_write_file, fs_create_file, fs_create_dir, fs_rename, fs_delete) via
+// IPC. The Rust layer uses a workspace-relative path contract: all paths
+// crossing the IPC boundary are forward-slash-normalised strings relative
+// to the workspace root (e.g. "src/lib/fs.ts", never the absolute path).
 //
-// In web mode (pnpm dev): falls back to seed mock data so the UI works without
-// a Tauri runtime.  fs_write_file is a silent no-op.
-//
-// The Rust layer uses a workspace-relative path contract: all paths crossing
-// the IPC boundary are forward-slash-normalised strings relative to the
-// workspace root (e.g. "src/lib/fs.ts", never "/home/user/project/src/lib/fs.ts").
+// Shugu is Tauri-only — the previous `pnpm dev` web fallback (seedFileTree
+// for read, no-op for write) was removed so each function maps 1:1 to a
+// Rust command without a degraded-mode branch.
 
-import { invoke, listen } from "@/lib/tauri";
+import { invoke } from "@/lib/tauri";
 import type { FileNode, FileContent } from "@/lib/types";
-import { seedFileTree } from "@/mocks/seedFileTree";
-import { seedFileContents } from "@/mocks/seedFileContents";
-
-export const inTauri =
-  typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 // ---------------------------------------------------------------------------
 // Language detection (frontend responsibility — Rust stays stateless)
@@ -112,10 +107,6 @@ interface FsEntry {
   children: FsEntry[];
 }
 
-// ---------------------------------------------------------------------------
-// FsEntry → FileNode translation
-// ---------------------------------------------------------------------------
-
 function fsEntryToFileNode(entry: FsEntry): FileNode {
   const node: FileNode = {
     name: entry.name,
@@ -131,109 +122,54 @@ function fsEntryToFileNode(entry: FsEntry): FileNode {
 // Public API
 // ---------------------------------------------------------------------------
 
-/**
- * Open a native folder picker and set the workspace root.
- *
- * Returns the absolute path of the chosen folder, or null if the user
- * cancelled.  Always returns null in web mode (no file picker available).
- */
+/** Open a native folder picker; returns the absolute path or null on cancel. */
 export async function fsOpenFolder(): Promise<string | null> {
-  if (!inTauri) return null;
   return invoke<string | null>("fs_open_folder");
 }
 
-/**
- * Read the recursive directory tree rooted at the current workspace.
- *
- * In web mode returns seedFileTree (prototype data) so the UI renders without
- * a Tauri runtime.
- */
+/** Read the recursive directory tree rooted at the current workspace. */
 export async function fsReadDir(): Promise<FileNode[]> {
-  if (!inTauri) return seedFileTree;
   const entries = await invoke<FsEntry[]>("fs_read_dir");
   return entries.map(fsEntryToFileNode);
 }
 
-/**
- * Read a workspace-relative file and return its content wrapped in FileContent.
- *
- * In web mode looks up seedFileContents, falling back to an empty FileContent
- * if the path is unknown.  Never throws.
- */
+/** Read a workspace-relative file and return its content wrapped in FileContent. */
 export async function fsReadFile(path: string): Promise<FileContent> {
-  if (!inTauri) {
-    return (
-      (seedFileContents as Record<string, FileContent>)[path] ?? {
-        lang: langFromPath(path),
-        text: "",
-      }
-    );
-  }
   const text = await invoke<string>("fs_read_file", { path });
   return { lang: langFromPath(path), text };
 }
 
-/**
- * Write content to a workspace-relative file path.
- *
- * Uses atomic write (temp-file + rename) on the Rust side.
- * Silent no-op in web mode — the caller's dirty-flag handling is unaffected.
- */
+/** Atomic write (temp-file + rename on the Rust side) of a workspace-relative path. */
 export async function fsWriteFile(path: string, content: string): Promise<void> {
-  if (!inTauri) return;
   await invoke<void>("fs_write_file", { path, content });
 }
 
 /**
  * Create a new file at a workspace-relative path with optional initial content.
- *
- * Errors (rejected promise with a string message) if the file already exists
- * or if `path` escapes the workspace root.  Parent directories are created
- * automatically if missing.  Silent no-op in web mode.
+ * Rejects if the file already exists or if `path` escapes the workspace root.
+ * Parent directories are created automatically if missing.
  */
 export async function fsCreateFile(path: string, content?: string): Promise<void> {
-  if (!inTauri) return;
   await invoke<void>("fs_create_file", { path, content });
 }
 
-/**
- * Create a directory (and any missing parents) at a workspace-relative path.
- * Idempotent — succeeds if the directory already exists.  Silent no-op in web mode.
- */
+/** Create a directory (and any missing parents). Idempotent. */
 export async function fsCreateDir(path: string): Promise<void> {
-  if (!inTauri) return;
   await invoke<void>("fs_create_dir", { path });
 }
 
-/**
- * Rename / move a workspace-relative path.
- *
- * `from` must exist; `to` must NOT exist (no silent overwrite).  Both must
- * remain inside the workspace.  Silent no-op in web mode.
- */
+/** Rename / move a workspace-relative path. `to` must NOT exist (no silent overwrite). */
 export async function fsRename(from: string, to: string): Promise<void> {
-  if (!inTauri) return;
   await invoke<void>("fs_rename", { from, to });
 }
 
-/**
- * Delete a workspace-relative path.  Files are removed directly; directories
- * are deleted recursively without following symlinks.  Silent no-op in web mode.
- */
+/** Delete a workspace-relative path. Files removed directly; directories recursively (no symlink follow). */
 export async function fsDelete(path: string): Promise<void> {
-  if (!inTauri) return;
   await invoke<void>("fs_delete", { path });
 }
 
-/**
- * Subscribe to filesystem-change events emitted by the Rust watcher.
- *
- * The handler is invoked once per debounced burst (≈200 ms quiet window)
- * whenever any file under the workspace changes.  The payload is empty —
- * callers should re-fetch the tree via `fsReadDir()` when notified.
- *
- * Returns an unlisten function.  Always returns a no-op unlisten in web mode.
- */
-export async function onFsChanged(handler: () => void): Promise<() => void> {
-  return listen<void>("fs://changed", () => handler());
-}
+// Note : l'ancien `onFsChanged(handler)` helper a été retiré dans la
+// Phase G de la migration TanStack. Le listener `fs://changed` est
+// maintenant centralisé dans `src/features/fs/useEvents.ts::useFsEvents`
+// qui invalide le cache `fsKeys.tree()` automatiquement. Les consumers
+// se branchent via `useFileTree()` au lieu d'attacher un listener.

@@ -6,7 +6,7 @@
 // available. No more hardcoded display lists pretending Claude/GPT/Mistral
 // exist when the user has never set a key for them.
 //
-// Endpoints by protocol:
+// Endpoints by protocol (all dispatched by the Rust-side `models_discover_external`):
 //   anthropic  → GET /v1/models       (header `x-api-key`)
 //   openai     → GET /v1/models       (header `Authorization: Bearer …`)
 //   ollama     → GET /api/tags        (no key)
@@ -18,19 +18,22 @@
 //   - protocol anthropic/openai: has an apiKey
 //   - protocol custom: has a baseUrl (key optional)
 //
-// We are inside a Tauri webview, so CORS restrictions that would block a
-// browser do not apply. The apiKey is read fresh from the OS keychain each
-// time discovery runs; it never leaves this process beyond the outbound
-// HTTPS request to the upstream provider.
+// CORS: discovery used to call `fetch(url)` directly from the webview, which
+// IS subject to CORS even inside Tauri (the "Tauri webview ⇒ no CORS" claim
+// in the legacy comment was wrong — Anthropic/OpenAI happened to ship
+// `Access-Control-Allow-Origin: *` so it survived; OpenCode Go doesn't, which
+// surfaced as `TypeError: Failed to fetch`). Now the probe runs through the
+// Rust `models_discover_external` command (reqwest, no browser sandbox),
+// which also gives us real HTTP status + body excerpts on failure.
 
 import { useCallback, useEffect } from "react";
-import { create } from "zustand";
-import { persist } from "zustand/middleware";
+import { useQuery } from "@tanstack/react-query";
 import { PROVIDER_REGISTRY, type Protocol } from "@/lib/providers";
 import { loadProviderConfig, getConfig, getProviderEnabled } from "@/lib/credentials";
 import { db } from "@/lib/db";
-
-const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+import { getInstalledIds as getBundleInstalledIds } from "@/lib/modelBundle";
+import { invoke } from "@/lib/tauri";
+import { queryClient } from "@/lib/queryClient";
 
 // ─── Cross-window cache (Zustand persist + Tauri event) ───────────────
 //
@@ -62,47 +65,74 @@ const DISCOVERY_TTL_MS = 60_000;
 // page loads — every fresh window context starts with false.
 let sessionDiscoveryDone = false;
 
+// ─── TanStack-backed discovery state ──────────────────────────────────
+//
+// Refactor 2026-05-17 : Zustand store + persist middleware → état stocké
+// dans le QueryClient (queryKey = DISCOVERY_KEY). La persistance se fait
+// automatiquement via le PersistQueryClientProvider configuré dans main.tsx
+// (localStorage backend). Plus de Zustand, plus de double-source-of-truth.
+
 interface DiscoveryState {
   models: DiscoveredModel[];
   errors: Record<string, string>;
   unconfigured: string[];
   /** Unix-ms timestamp of the last successful discovery. 0 = never. */
   lastFetched: number;
-  /** True while a discovery is in flight. Volatile (not persisted). */
+  /** True while a discovery is in flight. */
   isLoading: boolean;
 }
 
-interface DiscoveryActions {
-  applyResult: (r: DiscoveryResult) => void;
-  setLoading: (b: boolean) => void;
-  invalidate: () => void;
+const DISCOVERY_KEY = ["discovery", "result"] as const;
+
+const INITIAL_DISCOVERY: DiscoveryState = {
+  models: [],
+  errors: {},
+  unconfigured: [],
+  lastFetched: 0,
+  isLoading: false,
+};
+
+function getDiscoveryState(): DiscoveryState {
+  return queryClient.getQueryData<DiscoveryState>(DISCOVERY_KEY) ?? INITIAL_DISCOVERY;
 }
 
-export const useDiscoveryStore = create<DiscoveryState & DiscoveryActions>()(
-  persist(
-    (set) => ({
-      models: [],
-      errors: {},
-      unconfigured: [],
-      lastFetched: 0,
-      isLoading: false,
-      applyResult: (r) => set({ ...r, lastFetched: Date.now(), isLoading: false }),
-      setLoading: (b) => set({ isLoading: b }),
-      invalidate: () => set({ lastFetched: 0 }),
-    }),
-    {
-      name: "shugu.modelDiscovery.v1",
-      // Don't persist `isLoading` — it would deserialize as `true` and freeze
-      // the UI on startup. Only the data + freshness timestamp survive.
-      partialize: (state) => ({
-        models: state.models,
-        errors: state.errors,
-        unconfigured: state.unconfigured,
-        lastFetched: state.lastFetched,
-      }),
-    },
-  ),
-);
+function setDiscoveryState(updater: (s: DiscoveryState) => DiscoveryState): void {
+  queryClient.setQueryData<DiscoveryState>(DISCOVERY_KEY, (prev) =>
+    updater(prev ?? INITIAL_DISCOVERY),
+  );
+}
+
+/** Apply a fresh discovery result + clear isLoading. */
+function applyDiscoveryResult(r: DiscoveryResult): void {
+  setDiscoveryState((s) => ({
+    ...s,
+    models: r.models,
+    errors: r.errors,
+    unconfigured: r.unconfigured,
+    lastFetched: Date.now(),
+    isLoading: false,
+  }));
+}
+
+/** Mark a discovery as in-flight (or done). */
+function setDiscoveryLoading(b: boolean): void {
+  setDiscoveryState((s) => ({ ...s, isLoading: b }));
+}
+
+/**
+ * Backwards-compatible facade for old call sites that used the Zustand
+ * `useDiscoveryStore.getState()` API. Reads pass through to the TanStack
+ * cache; writes go through the helpers above. Kept to avoid changing
+ * Connections.tsx + every consumer in one go.
+ */
+export const useDiscoveryStore = {
+  getState: () => ({
+    ...getDiscoveryState(),
+    applyResult: applyDiscoveryResult,
+    setLoading: setDiscoveryLoading,
+    invalidate: () => setDiscoveryState((s) => ({ ...s, lastFetched: 0 })),
+  }),
+} as const;
 
 /**
  * Run a discovery NOW, write the result to the shared store, and broadcast
@@ -116,20 +146,17 @@ export const useDiscoveryStore = create<DiscoveryState & DiscoveryActions>()(
  * (including the caller's React tree) will see it.
  */
 export async function refreshDiscovery(): Promise<void> {
-  const state = useDiscoveryStore.getState();
-  if (state.isLoading) return;
-  state.setLoading(true);
+  if (getDiscoveryState().isLoading) return;
+  setDiscoveryLoading(true);
   let r: DiscoveryResult;
   try {
     r = await discoverAllModels();
   } catch (err) {
     r = { models: [], errors: { __global: String(err) }, unconfigured: [] };
   }
-  // Apply to local store first — observers in THIS window re-render
-  // synchronously; that's the bit ConnCard / FloatChat were missing before
-  // (the event-based path arrived too late or not at all in some cases).
-  useDiscoveryStore.getState().applyResult(r);
-  if (!inTauri) return;
+  // Apply to local TanStack cache first — observers in THIS window
+  // re-render via useQuery subscription.
+  applyDiscoveryResult(r);
   try {
     const mod = await import("@tauri-apps/api/event");
     // Broadcast the result so other windows adopt without re-fetching.
@@ -180,41 +207,27 @@ const PROVIDER_LABELS: Record<string, string> = {
   groq:      "Groq",
 };
 
-// ─── Per-protocol fetchers ────────────────────────────────────────────
+// ─── Per-protocol probe (delegated to Rust) ───────────────────────────
+//
+// One thin TS shim that hands off to the Rust `models_discover_external`
+// command — Rust handles protocol routing, headers, the `/v1` smart
+// bascule, JSON shape parsing, and surfaces real HTTP errors with body
+// excerpts. We just translate the high-level "this provider, this
+// protocol, this URL, this key" into one IPC call.
 
-async function fetchOpenAICompatModels(baseUrl: string, apiKey: string | null): Promise<string[]> {
-  const base = baseUrl.replace(/\/+$/, "");
-  const url = base.endsWith("/v1") ? `${base}/models` : `${base}/v1/models`;
-  const headers: Record<string, string> = { "content-type": "application/json" };
-  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
-  const r = await fetch(url, { headers });
-  if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText}`);
-  const json = await r.json();
-  const list: unknown = Array.isArray(json?.data) ? json.data : [];
-  return (list as Array<{ id?: unknown }>).map((m) => String(m.id ?? "")).filter(Boolean);
-}
-
-async function fetchOllamaModels(baseUrl: string): Promise<string[]> {
-  const base = baseUrl.replace(/\/+$/, "");
-  const r = await fetch(`${base}/api/tags`);
-  if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText}`);
-  const json = await r.json();
-  const list: unknown = Array.isArray(json?.models) ? json.models : [];
-  return (list as Array<{ name?: unknown }>).map((m) => String(m.name ?? "")).filter(Boolean);
-}
-
-async function fetchAnthropicModels(apiKey: string): Promise<string[]> {
-  const r = await fetch("https://api.anthropic.com/v1/models", {
-    headers: {
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json",
-    },
+async function probeProviderModels(
+  protocol: Protocol,
+  baseUrl: string,
+  apiKey: string | null,
+): Promise<string[]> {
+  // The Rust side mirrors chat.rs's dispatcher exactly — `anthropic`,
+  // `openai`, `ollama`, `custom`. Pass the user-stored protocol through
+  // verbatim so a `custom` openai-compat ends up on the right arm.
+  return await invoke<string[]>("models_discover_external", {
+    protocol,
+    baseUrl,
+    apiKey: apiKey ?? null,
   });
-  if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText}`);
-  const json = await r.json();
-  const list: unknown = Array.isArray(json?.data) ? json.data : [];
-  return (list as Array<{ id?: unknown }>).map((m) => String(m.id ?? "")).filter(Boolean);
 }
 
 // ─── Provider config resolution ───────────────────────────────────────
@@ -278,6 +291,28 @@ export async function discoverAllModels(): Promise<DiscoveryResult> {
   // Built-in providers from the static registry…
   const builtInIds = Object.keys(PROVIDER_REGISTRY);
 
+  // Zero-config affordance: if the user has the bundled Qwen GGUF
+  // installed (Phase 2 onboarding), treat `llamacpp` as implicitly
+  // enabled even when they've never clicked Save in Settings →
+  // Connections. The local server is auto-started at boot by
+  // `llama_autostart` in Rust, so requiring an explicit enable here
+  // would be busywork that defeats the "zero-config" promise.
+  //
+  // IMPORTANT: this used to call `getStatus()` which hashes a 1+ GB
+  // GGUF (~3-5 s of synchronous IO per call). Discovery fires on every
+  // window mount + every save/disconnect, so the hash was stalling the
+  // webview every boot and on every Connections action — surfacing as
+  // the "Not Responding" Windows freeze. `getInstalledIds()` only stats
+  // the file (microseconds) and returns the same answer the boolean
+  // below needs.
+  let bundleAutoEnable = false;
+  try {
+    const installedIds = await getBundleInstalledIds();
+    bundleAutoEnable = installedIds.length > 0;
+  } catch {
+    // Tauri command unavailable (boot race) — fine.
+  }
+
   // …plus any user-added custom providers persisted by AddProviderModal.
   const customsRaw = await db.settings.get("connections.customProviders.v1");
   let customs: Array<{ id: string; name: string }> = [];
@@ -311,7 +346,11 @@ export async function discoverAllModels(): Promise<DiscoveryResult> {
       // Explicitly disabled — hide entirely.
       return;
     }
-    if (enabled !== "true") {
+    // Auto-enable llamacpp when the bundle is on disk, EVEN if the user
+    // never visited Connections. The local server is alive (auto-started
+    // at boot), the chat picker should see it without ceremony.
+    const autoEnabled = id === "llamacpp" && bundleAutoEnable;
+    if (enabled !== "true" && !autoEnabled) {
       // Never touched — surface as unconfigured (drives the "Non configurés"
       // hint in the picker without firing any HTTP roundtrips).
       result.unconfigured.push(id);
@@ -332,16 +371,18 @@ export async function discoverAllModels(): Promise<DiscoveryResult> {
     }
 
     try {
-      let ids: string[];
-      if (cfg.protocol === "anthropic") {
-        if (!cfg.apiKey) { result.unconfigured.push(id); return; }
-        ids = await fetchAnthropicModels(cfg.apiKey);
-      } else if (cfg.protocol === "ollama") {
-        ids = await fetchOllamaModels(cfg.baseUrl);
-      } else {
-        // openai-compat (openai, mistral, groq, llamacpp, custom-openai)
-        ids = await fetchOpenAICompatModels(cfg.baseUrl, cfg.apiKey);
+      // Built-in Anthropic doesn't carry a baseUrl in its stored config (the
+      // registry default lives in PROVIDER_REGISTRY) — fall back to the
+      // canonical host the Rust side expects.
+      const baseForProbe =
+        cfg.protocol === "anthropic" && !cfg.baseUrl
+          ? "https://api.anthropic.com"
+          : cfg.baseUrl;
+      if (cfg.protocol === "anthropic" && !cfg.apiKey) {
+        result.unconfigured.push(id);
+        return;
       }
+      const ids = await probeProviderModels(cfg.protocol, baseForProbe, cfg.apiKey);
 
       for (const modelId of ids) {
         result.models.push({
@@ -376,60 +417,49 @@ export interface UseDiscoveredModels {
 }
 
 export function useDiscoveredModels(): UseDiscoveredModels {
-  // Subscribe to the shared store. Every WebviewWindow that calls this hook
-  // sees the same data; persistence (localStorage) survives reloads.
-  const models       = useDiscoveryStore((s) => s.models);
-  const errors       = useDiscoveryStore((s) => s.errors);
-  const unconfigured = useDiscoveryStore((s) => s.unconfigured);
-  const lastFetched  = useDiscoveryStore((s) => s.lastFetched);
-  const isLoading    = useDiscoveryStore((s) => s.isLoading);
-  const applyResult  = useDiscoveryStore((s) => s.applyResult);
+  // Subscribe to la query TanStack qui contient le DiscoveryState complet.
+  // Une seule subscription → un seul re-render par change.
+  const { data = INITIAL_DISCOVERY } = useQuery<DiscoveryState>({
+    queryKey: DISCOVERY_KEY,
+    queryFn: () => getDiscoveryState(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
 
-  // Delegate to the module-scope refreshDiscovery so we have a single source
-  // of truth for "do the work + broadcast". Callers from event handlers
-  // (e.g. ConnCard.onSave) can use the same function.
+  const { models, errors, unconfigured, lastFetched, isLoading } = data;
   const refresh = useCallback(refreshDiscovery, []);
 
   useEffect(() => {
-    // 1) Listen for result broadcasts from OTHER windows so we adopt their
-    //    discovery without re-fetching here.
-    let unlisten: (() => void) | null = null;
-    if (inTauri) {
-      void (async () => {
-        try {
-          const mod = await import("@tauri-apps/api/event");
-          unlisten = await mod.listen<{ result?: DiscoveryResult }>(DISCOVERY_EVENT, (e) => {
-            const p = e.payload;
-            if (p?.result) applyResult(p.result);
-          });
-        } catch (err) {
-          console.warn("[modelDiscovery] listen failed", err);
-        }
-      })();
-    }
+    // 1) Listen for result broadcasts from OTHER windows + llama ready.
+    let unlistenDiscovery: (() => void) | null = null;
+    let unlistenLlamaReady: (() => void) | null = null;
+    void (async () => {
+      try {
+        const mod = await import("@tauri-apps/api/event");
+        unlistenDiscovery = await mod.listen<{ result?: DiscoveryResult }>(DISCOVERY_EVENT, (e) => {
+          const p = e.payload;
+          if (p?.result) applyDiscoveryResult(p.result);
+        });
+        unlistenLlamaReady = await mod.listen("llama://ready", () => {
+          void refreshDiscovery();
+        });
+      } catch (err) {
+        console.warn("[modelDiscovery] listen failed", err);
+      }
+    })();
 
-    // 2) Refresh trigger. Two paths:
-    //    a) First mount in this WINDOW SESSION → force refresh regardless
-    //       of TTL. Without this, a quick close-and-relaunch (< TTL) loads
-    //       the persisted cache from the previous session and never re-
-    //       probes — so e.g. llama-server going down between sessions
-    //       leaves the picker showing its models like nothing changed.
-    //       Module-scope flag resets per page load (each window has its
-    //       own JS context), so it naturally fires once per app start per
-    //       window.
-    //    b) Subsequent mounts (route nav) → only refresh if stale.
-    //    The result is broadcast via refreshDiscovery → other windows adopt.
+    // 2) Refresh trigger : first-session-mount OR stale TTL.
     const stale = Date.now() - lastFetched > DISCOVERY_TTL_MS;
     const isFirstSessionMount = !sessionDiscoveryDone;
-    if ((isFirstSessionMount || stale) && !useDiscoveryStore.getState().isLoading) {
+    if ((isFirstSessionMount || stale) && !getDiscoveryState().isLoading) {
       sessionDiscoveryDone = true;
       void refreshDiscovery();
     }
 
-    return () => { unlisten?.(); };
-    // We intentionally don't depend on `lastFetched` here — the store updates
-    // it itself after applyResult, and re-running this effect on every
-    // timestamp change would re-subscribe to the listener.
+    return () => {
+      unlistenDiscovery?.();
+      unlistenLlamaReady?.();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

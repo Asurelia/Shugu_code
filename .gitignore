@@ -54,10 +54,10 @@ src-tauri/icons.backup-*/
 # Sidecar binaries — fetched per-machine via scripts/fetch-llama-binary.ps1,
 # never committed (they are large, target-triple-specific, and version-
 # bound). The directory itself, its README.md and checksum.txt ARE
-# committed; only the actual binary artefacts are excluded.
-src-tauri/binaries/*.exe
-src-tauri/binaries/*.dll
-src-tauri/binaries/runtime/*.dll
-src-tauri/binaries/runtime/*.so
-src-tauri/binaries/runtime/*.dylib
-src-tauri/binaries/llama-server-*
+# committed; only the actual binary artefacts are excluded. Recursive
+# globs cover nested runtime/ subdirs (e.g. binaries/vulkan/runtime/*.dll).
+src-tauri/binaries/**/*.exe
+src-tauri/binaries/**/*.dll
+src-tauri/binaries/**/*.so
+src-tauri/binaries/**/*.dylib
+src-tauri/binaries/**/llama-server-*
