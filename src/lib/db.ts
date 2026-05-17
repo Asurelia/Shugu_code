@@ -611,6 +611,29 @@ export const db = {
   jobs,
   logs,
   settings,
+
+  /**
+   * Wipe all user-generated data from the local SQLite database.
+   * Clears: messages, conversations, projects, generations, jobs, logs,
+   *         agents, agent_events.
+   * Settings are intentionally preserved (provider keys, preferences, etc.)
+   * so the user's configuration survives a data reset.
+   *
+   * After this call, callers must invalidate all relevant TanStack queries so
+   * the UI reflects the empty state — see the "Effacer" button in views-code.tsx.
+   */
+  async clearAll(): Promise<void> {
+    const database = await getDb();
+    // Delete in FK-safe order: children before parents.
+    await database.execute("DELETE FROM agent_events");
+    await database.execute("DELETE FROM agents");
+    await database.execute("DELETE FROM messages");
+    await database.execute("DELETE FROM conversations");
+    await database.execute("DELETE FROM projects");
+    await database.execute("DELETE FROM generations");
+    await database.execute("DELETE FROM jobs");
+    await database.execute("DELETE FROM logs");
+  },
 };
 
 // ---------------------------------------------------------------------------

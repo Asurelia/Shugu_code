@@ -11,7 +11,8 @@
 // for RootLayout.tsx.
 
 import { createContext, useContext } from "react";
-import type { Dispatch, SetStateAction } from "react";
+import type { Dispatch, SetStateAction, RefObject } from "react";
+import type { CodeMirrorEditorHandle } from "@/features/code/CodeMirrorEditor";
 
 // ─── Shape ────────────────────────────────────────────────────
 
@@ -32,6 +33,12 @@ export interface ShellContextValue {
    * to /code. The file is real on disk so the user can edit + save normally.
    */
   openSnippetInEditor: (code: string, lang: string) => Promise<void>;
+  /**
+   * Ref to the active CodeMirror editor. Only populated while the /code route
+   * is mounted. Used by find-in-file / replace-in-file commands to open the
+   * search panel programmatically.
+   */
+  editorViewRef?: RefObject<CodeMirrorEditorHandle>;
 }
 
 // ─── Context ──────────────────────────────────────────────────

@@ -427,6 +427,11 @@ export function RootLayout() {
   const [agents] = useState(seedAgents);
   const [activeAgent, setActiveAgent] = useState("a1");
 
+  // Editor ref — forwarded from CodeMirrorEditor via ShellContext + CommandContext
+  // so that find-in-file / replace-in-file commands can open the search panel.
+  // The ref is null while any route other than /code is mounted.
+  const editorViewRef = useRef<import("@/features/code/CodeMirrorEditor").CodeMirrorEditorHandle>(null);
+
   // Side panel
   const [sideCollapsed, setSideCollapsed] = useState(false);
   const [sideWidth, setSideWidth] = useState(248);
@@ -701,6 +706,8 @@ export function RootLayout() {
     generations,
     agents,
     onAnnotate,
+    // Editor
+    editorViewRef,
   }), [
     navigateTo, view, setPaletteOpen,
     sideCollapsed, setSideCollapsed,
@@ -714,6 +721,8 @@ export function RootLayout() {
     // Gallery / Agents
     generations, agents,
     onAnnotate,
+    // Editor (stable ref object — inclusion is defensive/explicit)
+    editorViewRef,
   ]);
 
   // Global keybinding dispatcher — replaces the hardcoded Cmd+K useEffect.
@@ -810,10 +819,13 @@ export function RootLayout() {
     generations, setGenerations: setGenerationsPersisted,
     agents,
     openSnippetInEditor,
+    editorViewRef,
   }), [
     openFiles, activeFile, fileContents, generations, agents,
     setOpenFiles, setActiveFile, setFileContents, setGenerationsPersisted,
     openSnippetInEditor,
+    // editorViewRef is a stable ref object; included for explicit dependency tracking
+    editorViewRef,
   ]);
 
   // The per-view content (the routed <Outlet/> + the absolute annotation layer).

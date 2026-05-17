@@ -7,9 +7,11 @@ import { CodeMirrorEditor } from "./CodeMirrorEditor";
 import { ShortcutsSettings, InterfaceSettings } from "@/features/settings/settings-extras";
 import { MascotCalibration } from "@/features/settings/MascotCalibration";
 import { ConnectionsView, ProfileView } from "@/features/panels/panels";
+import { db } from "@/lib/db";
+import { queryClient } from "@/lib/queryClient";
 
 // ─── Code view (editor + tabs + statusbar) ──────────────────
-export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, fileContents, setFileContents }: any) {
+export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, fileContents, setFileContents, editorViewRef }: any) {
   const [savedFlash, setSavedFlash] = useState(false);
   // Track previous dirty state for the active file to detect true→false transitions.
   // Reset the ref when the active file changes to avoid cross-tab false positives.
@@ -72,7 +74,7 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
       <div className="ide-body">
         <div className="ide-editor">
           {activeFile && fileContents[activeFile]
-            ? <CodeMirrorEditor key={activeFile} value={fileContents[activeFile].text} onChange={onChange} language={fileContents[activeFile].lang}/>
+            ? <CodeMirrorEditor ref={editorViewRef} key={activeFile} path={activeFile} value={fileContents[activeFile].text} onChange={onChange} language={fileContents[activeFile].lang}/>
             : <div style={{position:"absolute", inset:0, display:"flex", alignItems:"center", justifyContent:"center", color:"var(--on-surface-muted)", fontFamily:"var(--font-mono)", fontSize:12}}>No file open. Pick one from the explorer.</div>
           }
         </div>
@@ -140,7 +142,7 @@ export function FilesView({ activeFile, fileContents }: any) {
       <div className="ide-body">
         {showDiff
           ? <DiffView original={f.original || f.text} modified={f.text}/>
-          : <div className="ide-editor"><CodeMirrorEditor key={activeFile} value={f.text} language={f.lang}/></div>}
+          : <div className="ide-editor"><CodeMirrorEditor key={activeFile} path={activeFile} value={f.text} language={f.lang}/></div>}
         <div className="statusbar">
           <span className="item branch">main</span>
           <span className="item">{f.dirty ? "● unsaved" : "saved"}</span>
@@ -393,6 +395,26 @@ export function SettingsEditor() {
 }
 
 export function SettingsPrivacy() {
+  const [clearing, setClearing] = useState(false);
+
+  const handleClearAll = async () => {
+    const confirmed = window.confirm(
+      "Effacer TOUTES les données ?\n\n" +
+      "Conversations, messages, projets, générations, jobs, logs et agents " +
+      "seront supprimés définitivement.\n\n" +
+      "Vos paramètres (clés API, préférences) seront conservés."
+    );
+    if (!confirmed) return;
+    setClearing(true);
+    try {
+      await db.clearAll();
+      // Invalidate all TanStack queries so the UI reflects the empty state.
+      await queryClient.invalidateQueries();
+    } finally {
+      setClearing(false);
+    }
+  };
+
   return (
     <div className="settings-shell scroll">
       <div className="settings-inner">
@@ -401,7 +423,16 @@ export function SettingsPrivacy() {
           <p className="sub">Shugu Forge ne transmet rien à un serveur tiers en dehors des appels API explicites.</p>
           <SettingRow label="Telemetry" desc="Crash reports anonymes."><Switch on={false} onChange={() => {}}/></SettingRow>
           <SettingRow label="Conversation history" desc="Stockée localement, chiffrée au repos."><span className="chip success">local · AES-256</span></SettingRow>
-          <SettingRow label="Effacer toutes les données" desc="Conversations, générations, projets, caches."><button className="lgb" style={{color:"var(--danger)", borderColor:"rgba(255,106,138,0.4)"}}>Effacer</button></SettingRow>
+          <SettingRow label="Effacer toutes les données" desc="Conversations, générations, projets, caches.">
+            <button
+              className="lgb"
+              style={{color:"var(--danger)", borderColor:"rgba(255,106,138,0.4)"}}
+              disabled={clearing}
+              onClick={handleClearAll}
+            >
+              {clearing ? "Effacement…" : "Effacer"}
+            </button>
+          </SettingRow>
         </div>
       </div>
     </div>

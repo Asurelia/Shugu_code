@@ -1,7 +1,7 @@
 // Shugu Forge — CodeMirror 6 React host (ESM imports, no CDN, no window globals).
 // Replaces the proto's window.mountCodeMirror bootstrap.
 
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef, forwardRef, useImperativeHandle } from "react";
 import { EditorState } from "@codemirror/state";
 import {
   EditorView,
@@ -18,7 +18,11 @@ import {
   indentOnInput,
   foldGutter,
 } from "@codemirror/language";
+import { search, searchKeymap, openSearchPanel } from "@codemirror/search";
 import { javascript } from "@codemirror/lang-javascript";
+import { json } from "@codemirror/lang-json";
+import { markdown } from "@codemirror/lang-markdown";
+import { python } from "@codemirror/lang-python";
 import { tags } from "@lezer/highlight";
 
 const veilHighlight = HighlightStyle.define([
@@ -59,19 +63,56 @@ const veilTheme = EditorView.theme({
   ".cm-cursor": { borderLeft: "2px solid #e08efe" },
 }, { dark: true });
 
-export function CodeMirrorEditor({
-  value,
-  onChange,
-  language = "typescript",
-}: {
+/** Derive the CodeMirror language extension from the file path extension. */
+function langExtForPath(path?: string): ReturnType<typeof javascript> | ReturnType<typeof json> | ReturnType<typeof markdown> | ReturnType<typeof python> {
+  const ext = path ? path.split(".").pop()?.toLowerCase() : undefined;
+  switch (ext) {
+    case "json":  return json();
+    case "md":    return markdown();
+    case "py":    return python();
+    default:      return javascript({ typescript: true, jsx: true });
+  }
+}
+
+/** Handle type exposed to parents via forwardRef / useImperativeHandle. */
+export interface CodeMirrorEditorHandle {
+  getView(): EditorView | null;
+  openSearch(): void;
+}
+
+export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
   value: string;
   onChange?: (v: string) => void;
+  /** Full file path (used to pick the language extension). Fallback: typescript. */
+  path?: string;
+  /** @deprecated Pass `path` instead — kept for callers not yet sending a path. */
   language?: string;
-}) {
+}>(function CodeMirrorEditor({ value, onChange, path, language = "typescript" }, ref) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
+
+  // Re-compute language extension only when path (or legacy language) changes.
+  const langExt = useMemo(() => {
+    // If a full path is available, prefer path-based dispatch.
+    if (path) return langExtForPath(path);
+    // Fallback: honour the legacy `language` prop.
+    switch (language) {
+      case "json":     return json();
+      case "markdown": return markdown();
+      case "python":   return python();
+      default:         return javascript({ typescript: language === "typescript", jsx: true });
+    }
+  }, [path, language]);
+
+  // Expose getView() and openSearch() to parent refs.
+  useImperativeHandle(ref, () => ({
+    getView() { return viewRef.current; },
+    openSearch() {
+      if (viewRef.current) openSearchPanel(viewRef.current);
+    },
+  }), []);
 
   useEffect(() => {
     if (!hostRef.current) return;
@@ -91,8 +132,9 @@ export function CodeMirrorEditor({
         bracketMatching(),
         indentOnInput(),
         syntaxHighlighting(veilHighlight),
-        javascript({ typescript: language === "typescript", jsx: true }),
-        keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
+        search(),
+        langExt,
+        keymap.of([...searchKeymap, ...defaultKeymap, ...historyKeymap, indentWithTab]),
         veilTheme,
         updateListener,
       ],
@@ -103,9 +145,9 @@ export function CodeMirrorEditor({
       view.destroy();
       viewRef.current = null;
     };
-    // Re-mount only when value identity changes (open a different file).
+    // Re-mount only when language extension changes (new file type or new file).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [language]);
+  }, [langExt]);
 
   // Sync external value updates without re-mounting (e.g. setFileContents).
   useEffect(() => {
@@ -118,4 +160,4 @@ export function CodeMirrorEditor({
   }, [value]);
 
   return <div ref={hostRef} className="cm-host" />;
-}
+});

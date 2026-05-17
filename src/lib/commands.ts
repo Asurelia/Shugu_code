@@ -3,6 +3,8 @@
 // Pass 1: flat COMMANDS array with default keybindings, categories, run/when predicates.
 
 import { fsOpenFolder } from "@/lib/fs";
+import { openSearchPanel } from "@codemirror/search";
+import type { CodeMirrorEditorHandle } from "@/features/code/CodeMirrorEditor";
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -67,6 +69,9 @@ export interface CommandContext {
 
   // Model selection
   setActiveModel?: (id: string) => void;
+
+  // Editor (CodeMirror) — optional; only present when /code view is active.
+  editorViewRef?: React.RefObject<CodeMirrorEditorHandle>;
 }
 
 // ─── Command interface ─────────────────────────────────────────
@@ -313,14 +318,11 @@ export const COMMANDS: Command[] = [
     title: "Find in file",
     category: "Edit",
     keybinding: ["Cmd", "F"],
-    // DISABLED until @codemirror/search is wired. The dispatcher no longer
-    // skips events originating inside .cm-editor, so an enabled find-in-file
-    // would preventDefault ⌘F and run an empty handler — i.e. swallow both
-    // CM6's native find AND the browser's. `when:() => false` lets ⌘F fall
-    // through to CM6 untouched. Flip to `currentView === "code"` once a real
-    // search panel exists.
-    when: () => false,
-    run: () => { /* TODO: open @codemirror/search find panel */ },
+    when: (ctx) => ctx.currentView === "code",
+    run: (ctx) => {
+      const view = ctx.editorViewRef?.current?.getView();
+      if (view) openSearchPanel(view);
+    },
   },
   {
     // Renamed from `replace` per mapping doc.
@@ -328,9 +330,12 @@ export const COMMANDS: Command[] = [
     title: "Replace",
     category: "Edit",
     keybinding: ["Cmd", "Alt", "F"],
-    // DISABLED for the same reason as find-in-file — see note above.
-    when: () => false,
-    run: () => { /* TODO: open @codemirror/search replace panel */ },
+    when: (ctx) => ctx.currentView === "code",
+    run: (ctx) => {
+      // openSearchPanel also exposes the replace UI when called from a replace keybinding.
+      const view = ctx.editorViewRef?.current?.getView();
+      if (view) openSearchPanel(view);
+    },
   },
   {
     id: "regenerate",
@@ -414,7 +419,7 @@ export const COMMANDS: Command[] = [
     category: "Go",
     // Pass 2: ["Ctrl","Tab"] collides with the primary modifier on Win/Linux now that Ctrl→Cmd in eventToKey; rebind to a non-Ctrl chord.
     keybinding: ["Ctrl", "Tab"],
-    when: () => false,
+    when: (ctx) => (ctx.openFiles?.length ?? 0) > 1,
     run: (ctx) => {
       if (!ctx.openFiles || ctx.openFiles.length <= 1) return;
       const i = ctx.openFiles.indexOf(ctx.activeFile);
@@ -428,7 +433,7 @@ export const COMMANDS: Command[] = [
     category: "Go",
     // Pass 2: ["Ctrl","Shift","Tab"] collides with the primary modifier on Win/Linux now that Ctrl→Cmd in eventToKey; rebind to a non-Ctrl chord.
     keybinding: ["Ctrl", "Shift", "Tab"],
-    when: () => false,
+    when: (ctx) => (ctx.openFiles?.length ?? 0) > 1,
     run: (ctx) => {
       if (!ctx.openFiles || ctx.openFiles.length <= 1) return;
       const i = ctx.openFiles.indexOf(ctx.activeFile);

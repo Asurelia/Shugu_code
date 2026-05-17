@@ -10,6 +10,7 @@ export default function CodeRouteComponent() {
     setActiveFile,
     fileContents,
     setFileContents,
+    editorViewRef,
   } = useShell();
   return (
     <CodeView
@@ -19,6 +20,7 @@ export default function CodeRouteComponent() {
       setActiveFile={setActiveFile}
       fileContents={fileContents}
       setFileContents={setFileContents}
+      editorViewRef={editorViewRef}
     />
   );
 }
