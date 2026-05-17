@@ -50,6 +50,7 @@ import { loadOpenFiles, saveOpenFiles } from "@/lib/ide-state";
 import { fsReadFile, fsWriteFile, fsCreateDir, fsCreateFile, langToExt } from "@/lib/fs";
 import { useFileTree, invalidateFileTree } from "@/features/fs/queries";
 import { useFsEvents } from "@/features/fs/useEvents";
+import { indexWorkspace } from "@/features/fs/workspaceIndexer";
 import { AgentsPanel } from "@/features/agents/AgentsPanel";
 import { useAgentEvents } from "@/features/agents/useEvents";
 import { useActiveAgents, setSelectedAgentId } from "@/features/agents/queries";
@@ -488,6 +489,13 @@ export function RootLayout() {
   // useFsEvents (Phase G migration TanStack). Le hook fetch au mount,
   // le listener invalide sur fs://changed.
   useFsEvents();
+
+  // VEC3 — best-effort workspace indexer. Fires whenever the file tree changes
+  // (workspace opened or files added/removed). Gated by a 24-h TTL in
+  // db.settings so it does NOT re-index on every fs://changed event.
+  useEffect(() => {
+    void indexWorkspace();
+  }, [fileTree]);
 
   // Restore the previously open tabs + active file from SQLite.
   //

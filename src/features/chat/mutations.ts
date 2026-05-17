@@ -12,6 +12,7 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { emit } from "@tauri-apps/api/event";
 import { db } from "@/lib/db";
+import { vecDelete } from "@/lib/vector";
 import { sendChatMessage } from "./chat-sync";
 import { chatKeys } from "./keys";
 
@@ -55,6 +56,12 @@ export function useDeleteMessage(convId: string) {
   return useMutation({
     mutationFn: async ({ messageId }: { messageId: string }) => {
       await db.messages.softDelete(messageId);
+      // VEC1 — best-effort remove from semantic index on soft-delete.
+      try {
+        await vecDelete("messages", messageId);
+      } catch (err) {
+        console.warn("[mutations] vecDelete messages failed:", err);
+      }
     },
     onSuccess: async () => {
       await qc.invalidateQueries({ queryKey: chatKeys.messagesByConv(convId) });

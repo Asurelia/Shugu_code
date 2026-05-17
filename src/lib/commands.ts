@@ -442,14 +442,34 @@ export const COMMANDS: Command[] = [
     },
   },
   {
-    // New command per decision 9. Disabled: search backend does not exist yet.
+    // VEC3 — semantic file search via the "code" vector collection.
     // NOTE: ⌘⇧F is also claimed by anno-flag (both disabled in Pass 1 — no conflict fires).
     id: "search-in-files",
     title: "Search in files",
     category: "Go",
     keybinding: ["Cmd", "Shift", "F"],
-    when: () => false,
-    run: () => { /* TODO: global text search across project files */ },
+    when: () => true,
+    run: async (ctx) => {
+      const query = window.prompt("Semantic file search:");
+      if (!query?.trim()) return;
+      try {
+        const { vecSearch } = await import("@/lib/vector");
+        const hits = await vecSearch("code", query.trim(), 10);
+        if (hits.length === 0) {
+          window.alert("No matching files found.");
+          return;
+        }
+        // Open the top hit in the editor.
+        const topHit = hits[0];
+        ctx.navigateTo("code");
+        ctx.setActiveFile(topHit.id);
+        if (!ctx.openFiles.includes(topHit.id)) {
+          ctx.setOpenFiles([...ctx.openFiles, topHit.id]);
+        }
+      } catch (err) {
+        console.warn("[search-in-files] vecSearch code failed:", err);
+      }
+    },
   },
 
   // ── Image ─────────────────────────────────────────────────

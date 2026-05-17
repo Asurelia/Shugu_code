@@ -2,9 +2,11 @@
 // Ported from chat-sidebar.jsx.
 
 import { useState, useEffect, useRef, useMemo } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { Icon } from "@/components/components";
 import { db, convoToRow } from "@/lib/db";
 import { seedIfEmpty } from "@/lib/db";
+import { vecSearch } from "@/lib/vector";
 
 export const SEED_GROUPS = [
   { id: "pinned",    label: "Pinned",    pinnedSection: true },
@@ -43,6 +45,19 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
   const [groups, setGroups]   = useState<any[]>(SEED_GROUPS);
   const [convos, setConvos]   = useState<any[]>(SEED_CONVOS);
   const [filtersOpen, setFiltersOpen] = useState(false);
+
+  // ─────────────────────────────────────────────────────────────────
+  // NOT TanStack because:
+  //   1. searchQuery is ephemeral local UI state (input value for a single
+  //      component), not shared across windows or routes.
+  //   2. searchMode is a toggle that only affects which list to display
+  //      in this component — no other consumer needs it.
+  // SI un jour searchQuery doit être synced cross-window ou persisted,
+  // on basculerait vers une synthetic query + setQueryData pattern.
+  // ─────────────────────────────────────────────────────────────────
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchMode, setSearchMode] = useState<"text" | "semantic">("text");
+
   const [filters, setFilters] = useState({
     status: "active",
     project: "all",
@@ -98,11 +113,50 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
     });
   }, [convos, filters]);
 
+  // VEC2 — TanStack semantic search query.
+  // staleTime: Infinity + refetchOnMount: false because the query is driven
+  // entirely by the searchQuery key change — no background refetch needed.
+  const trimmedQuery = searchQuery.trim();
+  const { data: semanticHits = [] } = useQuery<{ convId: string; messageId: string }[]>({
+    queryKey: ["chat-sidebar", "semantic-search", trimmedQuery],
+    queryFn: async () => {
+      if (!trimmedQuery) return [];
+      const hits = await vecSearch("messages", trimmedQuery, 10);
+      const results: { convId: string; messageId: string }[] = [];
+      for (const hit of hits) {
+        const row = await db.messages.get(hit.id);
+        if (row?.conversation_id) {
+          results.push({ convId: row.conversation_id, messageId: hit.id });
+        }
+      }
+      return results;
+    },
+    enabled: searchMode === "semantic" && trimmedQuery.length > 0,
+    staleTime: Infinity,
+    refetchOnMount: false,
+    refetchOnWindowFocus: false,
+  });
+
+  // Build a set of convId matches from semantic hits for fast lookup.
+  const semanticConvIds = useMemo(
+    () => new Set(semanticHits.map((h) => h.convId)),
+    [semanticHits],
+  );
+
   const groupsForRender = useMemo(() => {
-    if (filters.groupBy === "none") return [{ id: "_all", label: null, items: visible } as any];
+    // When a search is active, apply the appropriate filter before grouping.
+    let source = visible;
+    if (trimmedQuery && searchMode === "text") {
+      const q = trimmedQuery.toLowerCase();
+      source = visible.filter((c: any) => c.title?.toLowerCase().includes(q));
+    } else if (trimmedQuery && searchMode === "semantic") {
+      source = visible.filter((c: any) => semanticConvIds.has(c.id));
+    }
+
+    if (filters.groupBy === "none") return [{ id: "_all", label: null, items: source } as any];
     if (filters.groupBy === "env") {
       const m = new Map<string, any[]>();
-      visible.forEach((c: any) => {
+      source.forEach((c: any) => {
         const k = c.env || "—";
         if (!m.has(k)) m.set(k, []);
         m.get(k)!.push(c);
@@ -118,14 +172,14 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
       const used = new Set<string>();
       return buckets.map(b => ({
         id: b.id, label: b.label,
-        items: visible.filter((c: any) => !used.has(c.id) && b.test(c) && used.add(c.id))
+        items: source.filter((c: any) => !used.has(c.id) && b.test(c) && used.add(c.id))
       })).filter(g => g.items.length);
     }
     return groups.map((g: any) => ({
       id: g.id, label: g.label, pinnedSection: g.pinnedSection,
-      items: visible.filter((c: any) => g.pinnedSection ? c.pinned : (!c.pinned && c.group === g.id))
+      items: source.filter((c: any) => g.pinnedSection ? c.pinned : (!c.pinned && c.group === g.id))
     })).filter((g: any) => g.items.length || !g.pinnedSection);
-  }, [visible, filters.groupBy, groups]);
+  }, [visible, filters.groupBy, groups, trimmedQuery, searchMode, semanticConvIds]);
 
   const patch = (id: string, p: any) => setConvos(cs => cs.map((c: any) => c.id === id ? { ...c, ...p, updated: p.updated ?? c.updated } : c));
   const remove = (id: string) => {
@@ -268,6 +322,36 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
             <line x1="18" y1="13" x2="18" y2="20"/>
             <circle cx="6" cy="13" r="2"/><circle cx="18" cy="11" r="2"/>
           </svg>
+        </button>
+      </div>
+
+      {/* VEC2 — Search bar with text / semantic toggle */}
+      <div className="side-search">
+        <input
+          className="side-search-input"
+          type="text"
+          placeholder={searchMode === "semantic" ? "Semantic search…" : "Filter conversations…"}
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          aria-label="Search conversations"
+        />
+        <button
+          className={"side-search-mode-btn" + (searchMode === "semantic" ? " on" : "")}
+          title={searchMode === "semantic" ? "Switch to text search" : "Switch to semantic search"}
+          onClick={() => setSearchMode(m => m === "text" ? "semantic" : "text")}
+          aria-pressed={searchMode === "semantic"}
+        >
+          {searchMode === "semantic" ? (
+            /* Neural/wave icon for semantic mode */
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M2 12 Q6 4 10 12 Q14 20 18 12 Q22 4 24 12"/>
+            </svg>
+          ) : (
+            /* ABC icon for text mode */
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <text x="2" y="17" fontSize="13" fontFamily="sans-serif" fill="currentColor" stroke="none">abc</text>
+            </svg>
+          )}
         </button>
       </div>
 

@@ -332,6 +332,15 @@ const messages = {
     );
   },
 
+  /** Fetch a single message row by id, or null if not found. */
+  async get(id: string): Promise<MessageRow | null> {
+    const db = await getDb();
+    const rows: MessageRow[] = await db.select(
+      "SELECT * FROM messages WHERE id = $1 LIMIT 1", [id]
+    );
+    return rows[0] ?? null;
+  },
+
   /** Soft-delete a single message: sets deleted_at to now. */
   async softDelete(id: string): Promise<void> {
     const db = await getDb();

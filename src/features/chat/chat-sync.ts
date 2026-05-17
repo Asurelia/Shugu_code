@@ -178,6 +178,19 @@ export function useMessages(convId: string | null): MessagesResult {
 // ─── appendMessage — single-message write + broadcast ──────────────────
 export async function appendMessage(convId: string, msg: Message): Promise<void> {
   await db.messages.append(messageToRow(msg, convId));
+
+  // VEC1 — best-effort index for semantic search. Never blocks the user flow.
+  // Skip image-only messages (data URLs) and empty messages.
+  const indexText = (msg.text ?? msg.body ?? "").trim();
+  if (indexText && !indexText.startsWith("data:image")) {
+    try {
+      const { vecIndex } = await import("@/lib/vector");
+      await vecIndex("messages", String(msg.id), indexText);
+    } catch (err) {
+      console.warn("[chat-sync] vecIndex messages failed:", err);
+    }
+  }
+
   try {
     const mod = await import("@tauri-apps/api/event");
     await mod.emit(EVT_MESSAGES, { conversationId: convId });
