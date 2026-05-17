@@ -25,8 +25,18 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures-util = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
+# UUID v4 for agent identifiers — agents.rs uses Uuid::new_v4() to mint
+# stable IDs that the frontend can dedupe events against. v4 is random
+# (no MAC leak), 128-bit collision-free for our scale, and matches the
+# format the Tauri event bus already serializes through serde transparently.
+uuid = { version = "1", features = ["v4"] }
 sqlite-vec = "0.1"
 fastembed = "4"
+# SHA256 streaming for model_bundle.rs (download verification).
+# RustCrypto family — pure-Rust, no system OpenSSL dep, identical wire
+# output to coreutils' `sha256sum` for cross-checking against HuggingFace
+# release pages.
+sha2 = "0.10"
 notify = "6"
 portable-pty = "0.8"
 which = "6"

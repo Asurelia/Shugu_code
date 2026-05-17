@@ -2,6 +2,23 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use tauri::Emitter;
 
+use crate::commands::agents::{tools_json_anthropic, tools_json_openai, ToolCall, ToolCallAccumulator};
+
+// ────────────────────────────────────────────────────────────────────────
+// AssistantTurn — Phase 2 return shape for the streaming helpers.
+//
+// One assistant turn may include BOTH text content AND tool_calls (a model
+// can comment on what it's about to do while emitting tool invocations).
+// The runner consumes both fields; `chat_send` ignores `tool_calls` (the
+// chat surface never sets `with_tools: true`).
+// ────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub(crate) struct AssistantTurn {
+    pub content: String,
+    pub tool_calls: Vec<ToolCall>,
+}
+
 /// One message in a chat conversation history, mirroring the OpenAI/Anthropic
 /// JSON shape `{role, content}`. Role values accepted: "user", "assistant",
 /// "system". The frontend maps its internal "ai" → "assistant" before sending.
@@ -28,11 +45,27 @@ pub struct ChatMessage {
 // Streaming delta event emitted to the frontend via `chat://delta`.
 // ---------------------------------------------------------------------------
 
+/// Streamed chunk from the provider, broadcast to the frontend as a
+/// `chat://delta` event.
+///
+/// `kind` distinguishes the regular visible answer from a model's
+/// "reasoning trace" (Qwen 3.5 / DeepSeek-style `<think>...</think>` blocks,
+/// returned by modern llama-server in `delta.reasoning_content`). The
+/// frontend renders the two streams in distinct UI regions: reasoning in
+/// a collapsed/dimmed panel above the visible answer. Without this split
+/// the reasoning chunks were silently dropped — the user saw the typing
+/// indicator while reasoning happened (often 80% of the generation time
+/// for thinking models), then the visible answer arrived "as a block",
+/// which read like "no streaming at all".
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatDelta {
     conversation_id: Option<String>,
     chunk: String,
+    /// `"content"` for the visible answer, `"reasoning"` for `<think>`
+    /// content. The `done` event carries `"content"` purely as a default;
+    /// consumers should branch on `done` first.
+    kind: &'static str,
     done: bool,
 }
 
@@ -56,7 +89,7 @@ struct ChatDelta {
 ///     UX than a pre-emptive "no API key" before we've even tried.
 ///
 /// Anthropic always needs `x-api-key` to be set, so we still hard-fail there.
-fn resolve_key(protocol: &str, api_key: &Option<String>) -> Result<String, String> {
+pub(crate) fn resolve_key(protocol: &str, api_key: &Option<String>) -> Result<String, String> {
     if let Some(k) = api_key {
         if !k.is_empty() {
             return Ok(k.clone());
@@ -81,7 +114,7 @@ fn resolve_key(protocol: &str, api_key: &Option<String>) -> Result<String, Strin
 /// byte-level buffer.  Handles arbitrary chunk boundaries (including chunks
 /// that split multi-byte UTF-8 sequences mid-codepoint) by accumulating raw
 /// bytes and slicing only at `\n` boundaries.
-async fn collect_lines<F>(
+pub(crate) async fn collect_lines<F>(
     response: reqwest::Response,
     mut on_line: F,
 ) -> Result<(), String>
@@ -118,21 +151,32 @@ where
 
 /// Anthropic SSE streaming (`event: content_block_delta` / `data: {...}`).
 ///
-/// Requests `"stream": true`.  For each `data:` line whose JSON has
-/// `type == "content_block_delta"`, emits `delta.text`.  Unknown/keep-alive
-/// lines are silently skipped.
-async fn call_anthropic(
-    app: &tauri::AppHandle,
+/// Phase 2: handles BOTH text content (`content_block_delta` with
+/// `delta.type == "text_delta"`) AND tool_use blocks (`content_block_start`
+/// with `content_block.type == "tool_use"` + subsequent `input_json_delta`
+/// fragments). The tool_use input JSON is accumulated per-block-index and
+/// drained into `AssistantTurn.tool_calls` at stream end.
+///
+/// `with_tools` toggles two things:
+///   * adds the `tools` body field with [`tools_json_anthropic`] entries
+///   * bumps `max_tokens` from 1024 → 4096 (tool-use turns include a
+///     full tool_call JSON payload + text commentary; 1024 truncates in
+///     practice)
+///
+/// The `on_chunk` callback is the SOLE side-effect destination for text
+/// content. For tool_use block accumulation we keep state inside this
+/// function (a `HashMap<usize, BlockState>`) — the runner sees the
+/// completed tool_calls via the return value, not via the callback.
+pub(crate) async fn call_anthropic(
     client: &reqwest::Client,
     base_url: &str,
     model: &str,
     messages: &[ChatMessage],
     api_key: &str,
-    conversation_id: &Option<String>,
-) -> Result<String, String> {
+    with_tools: bool,
+    on_chunk: &mut (dyn FnMut(&str, &str) + Send),
+) -> Result<AssistantTurn, String> {
     let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
-    // Anthropic requires a `system` field separate from `messages` and only
-    // accepts roles user/assistant in `messages`. We split here.
     let mut system_parts: Vec<String> = Vec::new();
     let mut convo: Vec<serde_json::Value> = Vec::new();
     for m in messages {
@@ -142,14 +186,23 @@ async fn call_anthropic(
             convo.push(serde_json::json!({ "role": m.role, "content": m.content }));
         }
     }
+    // Tool-use turns produce more output (tool_call JSON + commentary);
+    // bump the cap. Non-tool turns keep the 1024 default to preserve
+    // chat_send's existing latency profile.
+    let max_tokens: u32 = if with_tools { 4096 } else { 1024 };
     let mut body = serde_json::json!({
         "model": model,
-        "max_tokens": 1024,
+        "max_tokens": max_tokens,
         "stream": true,
         "messages": convo,
     });
     if !system_parts.is_empty() {
         body["system"] = serde_json::Value::String(system_parts.join("\n\n"));
+    }
+    if with_tools {
+        body["tools"] = tools_json_anthropic();
+        // Anthropic auto-selects when tools are present — no tool_choice
+        // field needed (default behavior is "auto").
     }
 
     let response = client
@@ -168,38 +221,116 @@ async fn call_anthropic(
         return Err(format!("anthropic API error {}: {}", status, text));
     }
 
-    let mut acc = String::new();
-    let conv_id = conversation_id.clone();
-    let app_ref = app.clone();
+    // ── Streaming state machine ──────────────────────────────────────
+    //
+    // Anthropic emits content blocks of two types we care about: "text"
+    // and "tool_use". Each is identified by an `index` field. We track
+    // the kind + accumulated content per block so we can drain them at
+    // stream-end into the appropriate field of the AssistantTurn.
+
+    #[derive(Default)]
+    struct BlockState {
+        kind: String,
+        tool_id: String,
+        tool_name: String,
+        tool_input_acc: String,
+    }
+    let mut blocks: std::collections::HashMap<usize, BlockState> = std::collections::HashMap::new();
+    let mut text_acc = String::new();
 
     collect_lines(response, |line| {
-        // SSE data lines start with "data: "; skip all others.
         let Some(payload) = line.strip_prefix("data: ") else { return };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else { return };
-        if v["type"].as_str() != Some("content_block_delta") { return }
-        let Some(text) = v["delta"]["text"].as_str() else { return };
-        acc.push_str(text);
-        let delta = ChatDelta { conversation_id: conv_id.clone(), chunk: text.to_string(), done: false };
-        let _ = app_ref.emit("chat://delta", delta);
-    }).await?;
 
-    Ok(acc)
+        match v["type"].as_str() {
+            Some("content_block_start") => {
+                let idx = v["index"].as_u64().unwrap_or(0) as usize;
+                let cb = &v["content_block"];
+                let kind = cb["type"].as_str().unwrap_or("text").to_string();
+                let entry = blocks.entry(idx).or_default();
+                entry.kind = kind.clone();
+                if kind == "tool_use" {
+                    entry.tool_id = cb["id"].as_str().unwrap_or("").to_string();
+                    entry.tool_name = cb["name"].as_str().unwrap_or("").to_string();
+                }
+            }
+            Some("content_block_delta") => {
+                let idx = v["index"].as_u64().unwrap_or(0) as usize;
+                let delta = &v["delta"];
+                match delta["type"].as_str() {
+                    Some("text_delta") => {
+                        if let Some(text) = delta["text"].as_str() {
+                            text_acc.push_str(text);
+                            on_chunk("content", text);
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let Some(partial) = delta["partial_json"].as_str() {
+                            if let Some(b) = blocks.get_mut(&idx) {
+                                b.tool_input_acc.push_str(partial);
+                            }
+                            // Signal — the agent runner will use this to
+                            // update the UI "tool args streaming" indicator
+                            // in the future. For now the runner ignores
+                            // kind="tool_use_block" deltas (silent).
+                            on_chunk("tool_use_block", "");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    })
+    .await?;
+
+    // Drain tool_use blocks into ToolCall values.
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    // Iterate in index order so multi-tool turns preserve a stable order.
+    let mut idxs: Vec<usize> = blocks.keys().copied().collect();
+    idxs.sort();
+    for idx in idxs {
+        if let Some(b) = blocks.remove(&idx) {
+            if b.kind == "tool_use" && !b.tool_id.is_empty() {
+                tool_calls.push(ToolCall {
+                    id: b.tool_id,
+                    name: b.tool_name,
+                    arguments: b.tool_input_acc,
+                });
+            }
+        }
+    }
+
+    Ok(AssistantTurn {
+        content: text_acc,
+        tool_calls,
+    })
 }
 
 /// OpenAI-compatible SSE streaming (`data: {...}` / `data: [DONE]`).
 ///
-/// Requests `"stream": true`.  Picks `choices[0].delta.content` when present;
-/// ignores role-only or null-content frames; stops on literal `[DONE]`.
-async fn call_openai_compat(
-    app: &tauri::AppHandle,
+/// Requests `"stream": true`. Surfaces both `choices[0].delta.content`
+/// (kind="content") and `choices[0].delta.reasoning_content` (kind=
+/// "reasoning") to the `on_chunk` callback. Stops on literal `[DONE]`.
+///
+/// `chat_template_kwargs` (when Some) is forwarded as a top-level body
+/// field — llama-server's OpenAI-compat extension forwards this to the
+/// Jinja chat template renderer. Today's main use is `{"enable_thinking":
+/// false}` to suppress the Qwen 3.5 / DeepSeek `<think>` prefix on
+/// per-request basis (the model still SUPPORTS thinking; we just don't
+/// ask the template to inject the trigger). Other providers ignore the
+/// field if they don't recognise it.
+pub(crate) async fn call_openai_compat(
     client: &reqwest::Client,
     base_url: &str,
     model: &str,
     messages: &[ChatMessage],
     api_key: &str,
     protocol: &str,
-    conversation_id: &Option<String>,
-) -> Result<String, String> {
+    chat_template_kwargs: &Option<serde_json::Value>,
+    with_tools: bool,
+    on_chunk: &mut (dyn FnMut(&str, &str) + Send),
+) -> Result<AssistantTurn, String> {
     // Normalise: strip trailing slash, then decide whether to append /v1.
     let base = base_url.trim_end_matches('/');
     let url = if base.ends_with("/v1") {
@@ -212,11 +343,23 @@ async fn call_openai_compat(
         .iter()
         .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
         .collect();
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "stream": true,
         "messages": messages_json,
     });
+    if let Some(kwargs) = chat_template_kwargs {
+        body["chat_template_kwargs"] = kwargs.clone();
+    }
+    if with_tools {
+        // OpenAI tool-use wire format. `tool_choice: "auto"` lets the
+        // model decide whether to call a tool or answer directly —
+        // alternatives are "none" (text-only) or `{type:"function",
+        // function:{name:"X"}}` (force a specific tool). Auto matches
+        // the agent runtime contract where the orchestrator decides.
+        body["tools"] = tools_json_openai();
+        body["tool_choice"] = serde_json::json!("auto");
+    }
 
     // Local OpenAI-compat servers (llama.cpp, LM Studio, vLLM, …) often
     // don't accept ANY `Authorization` header. Send the Bearer only when we
@@ -238,35 +381,77 @@ async fn call_openai_compat(
     }
 
     let mut acc = String::new();
-    let conv_id = conversation_id.clone();
-    let app_ref = app.clone();
+    let mut tc_acc = ToolCallAccumulator::default();
+    let mut content_chunks = 0u32;
+    let mut reasoning_chunks = 0u32;
+    let mut tool_chunks = 0u32;
+
+    eprintln!("[chat:{protocol}] streaming model={model} url={url} with_tools={with_tools}");
 
     collect_lines(response, |line| {
         let Some(payload) = line.strip_prefix("data: ") else { return };
         // Terminal sentinel — not JSON; just stop accumulating.
         if payload.trim() == "[DONE]" { return }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else { return };
-        let Some(text) = v["choices"][0]["delta"]["content"].as_str() else { return };
-        acc.push_str(text);
-        let delta = ChatDelta { conversation_id: conv_id.clone(), chunk: text.to_string(), done: false };
-        let _ = app_ref.emit("chat://delta", delta);
+        // Visible answer chunk (the standard OpenAI field).
+        if let Some(text) = v["choices"][0]["delta"]["content"].as_str() {
+            if !text.is_empty() {
+                acc.push_str(text);
+                content_chunks += 1;
+                on_chunk("content", text);
+            }
+        }
+        // Reasoning chunk — modern llama-server (and DeepSeek's API)
+        // surface `<think>...</think>` content in `delta.reasoning_content`
+        // when the model's chat template has thinking enabled (Qwen 3.5,
+        // DeepSeek-R1, Llama-3.3-Reasoning, …). We forward it to the
+        // callback with kind="reasoning". We do NOT push reasoning into
+        // `acc` (the final reply): the persisted message should only
+        // contain the visible answer; the reasoning is ephemeral.
+        if let Some(text) = v["choices"][0]["delta"]["reasoning_content"].as_str() {
+            if !text.is_empty() {
+                reasoning_chunks += 1;
+                on_chunk("reasoning", text);
+            }
+        }
+        // Phase 2: tool_call fragments. OpenAI streams partial
+        // function.arguments JSON across multiple chunks keyed by
+        // `index`. The accumulator assembles them; we drain at the
+        // end of the stream into AssistantTurn.tool_calls.
+        if v["choices"][0]["delta"]["tool_calls"].is_array() {
+            tc_acc.ingest(&v);
+            tool_chunks += 1;
+            // Signal the runner that a tool_call is being streamed.
+            // The agent UI today drops these (the ToolCall event is
+            // emitted post-execution as the authoritative entry).
+            on_chunk("tool_call_delta", "");
+        }
     }).await?;
 
-    Ok(acc)
+    let tool_calls = tc_acc.finish();
+
+    eprintln!(
+        "[chat:{protocol}] stream complete — {content_chunks} content + {reasoning_chunks} reasoning + {tool_chunks} tool-call chunks ({} tool_calls assembled)",
+        tool_calls.len()
+    );
+
+    Ok(AssistantTurn { content: acc, tool_calls })
 }
 
 /// Ollama newline-delimited JSON streaming (`/api/chat` with `"stream": true`).
 ///
 /// Each line is a JSON object with `message.content` and a `done` bool.
-/// Emits each `message.content`; stops when `done` is `true`.
-async fn call_ollama(
-    app: &tauri::AppHandle,
+/// Forwards each `message.content` to the callback as `(kind="content",
+/// text)`; stops when `done` is `true`. Ollama doesn't have a separate
+/// reasoning channel today — if/when it does, add a `reasoning_content`
+/// branch identical to call_openai_compat.
+pub(crate) async fn call_ollama(
     client: &reqwest::Client,
     base_url: &str,
     model: &str,
     messages: &[ChatMessage],
-    conversation_id: &Option<String>,
-) -> Result<String, String> {
+    on_chunk: &mut (dyn FnMut(&str, &str) + Send),
+) -> Result<AssistantTurn, String> {
     let url = format!("{}/api/chat", base_url.trim_end_matches('/'));
     let messages_json: Vec<_> = messages
         .iter()
@@ -293,8 +478,6 @@ async fn call_ollama(
     }
 
     let mut acc = String::new();
-    let conv_id = conversation_id.clone();
-    let app_ref = app.clone();
 
     collect_lines(response, |line| {
         if line.is_empty() { return }
@@ -302,12 +485,16 @@ async fn call_ollama(
         let Some(text) = v["message"]["content"].as_str() else { return };
         if !text.is_empty() {
             acc.push_str(text);
-            let delta = ChatDelta { conversation_id: conv_id.clone(), chunk: text.to_string(), done: false };
-            let _ = app_ref.emit("chat://delta", delta);
+            on_chunk("content", text);
         }
     }).await?;
 
-    Ok(acc)
+    // Phase 2: Ollama tool_use is model-specific and not handled here.
+    // We return an empty tool_calls vec so the runner gracefully treats
+    // Ollama agents as "text-only" — they can still answer but won't
+    // exercise the fs tools. Phase 3 can route specific Ollama models
+    // (mistral-nemo, llama3.1) through the OpenAI-compat tool path.
+    Ok(AssistantTurn { content: acc, tool_calls: Vec::new() })
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +526,7 @@ pub async fn chat_send(
     base_url: String,
     api_key: Option<String>,
     conversation_id: Option<String>,
+    chat_template_kwargs: Option<serde_json::Value>,
 ) -> Result<String, String> {
     let model = if model.is_empty() {
         "claude-haiku-4-5".to_string()
@@ -353,26 +541,53 @@ pub async fn chat_send(
     let client = reqwest::Client::new();
     let protocol_str = protocol.as_str();
 
-    let result = match protocol_str {
+    // Build the chat-channel emit callback. The streaming helpers no
+    // longer emit Tauri events themselves — instead they call this
+    // closure once per chunk with `(kind, chunk)` where kind ∈ {"content",
+    // "reasoning"}. We wrap each call into a ChatDelta and broadcast on
+    // `chat://delta` so the existing useChatStream / chat-sync listener
+    // path stays unchanged.
+    let app_ref = app.clone();
+    let conv_id = conversation_id.clone();
+    let mut on_chunk = move |kind: &str, chunk: &str| {
+        // We only send "content" and "reasoning" through here; map both
+        // to the static-str variants the existing ChatDelta type expects.
+        let delta_kind: &'static str = if kind == "reasoning" { "reasoning" } else { "content" };
+        let delta = ChatDelta {
+            conversation_id: conv_id.clone(),
+            chunk: chunk.to_string(),
+            kind: delta_kind,
+            done: false,
+        };
+        let _ = app_ref.emit("chat://delta", delta);
+    };
+
+    // The chat surface never issues tool calls — always pass with_tools:false
+    // so the body stays exactly as Phase 1 had it. The new AssistantTurn
+    // return type carries `content` + `tool_calls`; we use only `content`
+    // here (the `tool_calls` field will be empty since with_tools is false).
+    let result: Result<AssistantTurn, String> = match protocol_str {
         "anthropic" => {
             let key = resolve_key(protocol_str, &api_key)?;
-            call_anthropic(&app, &client, &base_url, &model, &messages, &key, &conversation_id).await
+            call_anthropic(&client, &base_url, &model, &messages, &key, /* with_tools */ false, &mut on_chunk).await
         }
         "openai" | "custom" => {
             let key = resolve_key(protocol_str, &api_key)?;
-            call_openai_compat(&app, &client, &base_url, &model, &messages, &key, protocol_str, &conversation_id).await
+            call_openai_compat(&client, &base_url, &model, &messages, &key, protocol_str, &chat_template_kwargs, /* with_tools */ false, &mut on_chunk).await
         }
         "ollama" => {
-            call_ollama(&app, &client, &base_url, &model, &messages, &conversation_id).await
+            call_ollama(&client, &base_url, &model, &messages, &mut on_chunk).await
         }
         other => Err(format!("unsupported protocol: {}", other)),
     };
+    let result: Result<String, String> = result.map(|turn| turn.content);
 
     // Emit a terminal `done` delta regardless of success/failure so the
     // frontend always receives a completion signal.
     let done_delta = ChatDelta {
         conversation_id: conversation_id.clone(),
         chunk: String::new(),
+        kind: "content",
         done: true,
     };
     let _ = app.emit("chat://delta", done_delta);
