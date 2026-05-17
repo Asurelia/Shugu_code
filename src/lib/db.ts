@@ -1,26 +1,21 @@
 /**
  * Local SQLite persistence layer — source of truth (not a cache).
  *
- * In Tauri: lazy-loads Database and runs against sqlite:shugu.db
- *           (migrations run at startup via Rust side).
- * In web mode (plain browser): all methods no-op / return empty arrays /
- *           return null so the app still runs under `pnpm dev`.
- *
- * Do NOT import Database statically — dynamic import only so the web bundle
- * never tries to resolve the native Tauri plugin module.
+ * Lazy-loads the `@tauri-apps/plugin-sql` Database against `sqlite:shugu.db`;
+ * migrations run at startup via the Rust side. Shugu Forge is Tauri-only,
+ * so this module assumes the plugin is always present — no null-fallback,
+ * no degraded-mode branch. Dynamic import is kept so Vite can defer the
+ * plugin module load until the first DB call.
  */
 
 import type { Generation } from "@/lib/types";
-
-const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Database = any;
 
 let _dbPromise: Promise<Database> | null = null;
 
-export async function getDb(): Promise<Database | null> {
-  if (!inTauri) return null;
+export async function getDb(): Promise<Database> {
   if (!_dbPromise) {
     _dbPromise = import("@tauri-apps/plugin-sql").then((mod) =>
       mod.default.load("sqlite:shugu.db")
@@ -53,8 +48,16 @@ export interface MessageRow {
   body: string | null;
   code_lang: string | null;
   code_text: string | null;
+  /** `<think>` trace captured from thinking-enabled models (V3 schema). */
+  reasoning: string | null;
   image: number;        // 0 | 1
   ts: number;
+  /** UUID of the agent whose output this message relays (V5 schema).
+   *  NULL for regular chat messages. Matches `agents.id`. */
+  agent_id: string | null;
+  /** 1 when this message is a verbatim orchestrator relay (V5 schema);
+   *  0 for user + direct-chat AI messages. */
+  via_agent: number;    // 0 | 1
 }
 
 export interface ProjectRow {
@@ -182,13 +185,11 @@ export function toGenerationRow(g: Generation): GenerationRow {
 const conversations = {
   async list(): Promise<ConversationRow[]> {
     const db = await getDb();
-    if (!db) return [];
     return db.select("SELECT * FROM conversations ORDER BY updated_at DESC") as Promise<ConversationRow[]>;
   },
 
   async get(id: string): Promise<ConversationRow | null> {
     const db = await getDb();
-    if (!db) return null;
     const rows: ConversationRow[] = await db.select(
       "SELECT * FROM conversations WHERE id = $1 LIMIT 1", [id]
     );
@@ -197,7 +198,6 @@ const conversations = {
 
   async create(row: ConversationRow): Promise<void> {
     const db = await getDb();
-    if (!db) return;
     await db.execute(
       `INSERT OR IGNORE INTO conversations
          (id, title, project_id, pinned, archived, unread, env, parent_id, updated_at)
@@ -209,7 +209,6 @@ const conversations = {
 
   async rename(id: string, title: string): Promise<void> {
     const db = await getDb();
-    if (!db) return;
     await db.execute(
       "UPDATE conversations SET title = $1, updated_at = $2 WHERE id = $3",
       [title, Date.now(), id]
@@ -218,7 +217,6 @@ const conversations = {
 
   async setPinned(id: string, pinned: boolean): Promise<void> {
     const db = await getDb();
-    if (!db) return;
     await db.execute(
       "UPDATE conversations SET pinned = $1, updated_at = $2 WHERE id = $3",
       [pinned ? 1 : 0, Date.now(), id]
@@ -227,7 +225,6 @@ const conversations = {
 
   async setArchived(id: string, archived: boolean): Promise<void> {
     const db = await getDb();
-    if (!db) return;
     await db.execute(
       "UPDATE conversations SET archived = $1, updated_at = $2 WHERE id = $3",
       [archived ? 1 : 0, Date.now(), id]
@@ -236,7 +233,6 @@ const conversations = {
 
   async setGroup(id: string, groupId: string): Promise<void> {
     const db = await getDb();
-    if (!db) return;
     const project_id = groupId === "ungrouped" ? null : groupId;
     await db.execute(
       "UPDATE conversations SET project_id = $1, updated_at = $2 WHERE id = $3",
@@ -246,7 +242,6 @@ const conversations = {
 
   async setUnread(id: string, unread: boolean): Promise<void> {
     const db = await getDb();
-    if (!db) return;
     await db.execute(
       "UPDATE conversations SET unread = $1 WHERE id = $2",
       [unread ? 1 : 0, id]
@@ -255,13 +250,11 @@ const conversations = {
 
   async remove(id: string): Promise<void> {
     const db = await getDb();
-    if (!db) return;
     await db.execute("DELETE FROM conversations WHERE id = $1", [id]);
   },
 
   async upsertMany(rows: ConversationRow[]): Promise<void> {
     const db = await getDb();
-    if (!db) return;
     for (const r of rows) {
       await db.execute(
         `INSERT OR REPLACE INTO conversations
@@ -309,7 +302,6 @@ const conversations = {
 const messages = {
   async listByConversation(convId: string): Promise<MessageRow[]> {
     const db = await getDb();
-    if (!db) return [];
     return db.select(
       "SELECT * FROM messages WHERE conversation_id = $1 ORDER BY ts ASC",
       [convId]
@@ -318,19 +310,19 @@ const messages = {
 
   async append(row: MessageRow): Promise<void> {
     const db = await getDb();
-    if (!db) return;
     await db.execute(
       `INSERT OR REPLACE INTO messages
-         (id, conversation_id, role, text, body, code_lang, code_text, image, ts)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+         (id, conversation_id, role, text, body, code_lang, code_text,
+          reasoning, image, ts, agent_id, via_agent)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
       [row.id, row.conversation_id, row.role, row.text, row.body,
-       row.code_lang, row.code_text, row.image, row.ts]
+       row.code_lang, row.code_text, row.reasoning, row.image, row.ts,
+       row.agent_id, row.via_agent]
     );
   },
 
   async removeByConversation(convId: string): Promise<void> {
     const db = await getDb();
-    if (!db) return;
     await db.execute(
       "DELETE FROM messages WHERE conversation_id = $1", [convId]
     );
@@ -344,13 +336,11 @@ const messages = {
 const projects = {
   async list(): Promise<ProjectRow[]> {
     const db = await getDb();
-    if (!db) return [];
     return db.select("SELECT * FROM projects ORDER BY created_at DESC") as Promise<ProjectRow[]>;
   },
 
   async create(row: ProjectRow): Promise<void> {
     const db = await getDb();
-    if (!db) return;
     await db.execute(
       "INSERT OR IGNORE INTO projects (id, name, created_at) VALUES ($1, $2, $3)",
       [row.id, row.name, row.created_at]
@@ -359,13 +349,11 @@ const projects = {
 
   async rename(id: string, name: string): Promise<void> {
     const db = await getDb();
-    if (!db) return;
     await db.execute("UPDATE projects SET name = $1 WHERE id = $2", [name, id]);
   },
 
   async remove(id: string): Promise<void> {
     const db = await getDb();
-    if (!db) return;
     await db.execute("DELETE FROM projects WHERE id = $1", [id]);
   },
 };
@@ -377,13 +365,11 @@ const projects = {
 const generations = {
   async list(): Promise<GenerationRow[]> {
     const db = await getDb();
-    if (!db) return [];
     return db.select("SELECT * FROM generations ORDER BY ts DESC") as Promise<GenerationRow[]>;
   },
 
   async create(row: GenerationRow): Promise<void> {
     const db = await getDb();
-    if (!db) return;
     await db.execute(
       `INSERT OR IGNORE INTO generations
          (id, prompt, negative, ratio, model, seed, steps, guidance, style, hue, status, result_url, ts)
@@ -396,13 +382,11 @@ const generations = {
 
   async remove(id: string): Promise<void> {
     const db = await getDb();
-    if (!db) return;
     await db.execute("DELETE FROM generations WHERE id = $1", [id]);
   },
 
   async upsertMany(rows: GenerationRow[]): Promise<void> {
     const db = await getDb();
-    if (!db) return;
     for (const r of rows) {
       await db.execute(
         `INSERT OR REPLACE INTO generations
@@ -423,7 +407,6 @@ const generations = {
 const jobs = {
   async list(filter?: { status?: string; kind?: string }): Promise<JobRow[]> {
     const db = await getDb();
-    if (!db) return [];
     if (filter?.status && filter?.kind) {
       return db.select(
         "SELECT * FROM jobs WHERE status = $1 AND kind = $2 ORDER BY created_at DESC",
@@ -447,7 +430,6 @@ const jobs = {
 
   async get(id: string): Promise<JobRow | null> {
     const db = await getDb();
-    if (!db) return null;
     const rows: JobRow[] = await db.select(
       "SELECT * FROM jobs WHERE id = $1 LIMIT 1", [id]
     );
@@ -456,7 +438,6 @@ const jobs = {
 
   async create(row: JobRow): Promise<void> {
     const db = await getDb();
-    if (!db) return;
     await db.execute(
       `INSERT OR IGNORE INTO jobs
          (id, kind, status, payload, result, created_at, updated_at)
@@ -468,7 +449,6 @@ const jobs = {
 
   async setStatus(id: string, status: string, result?: string): Promise<void> {
     const db = await getDb();
-    if (!db) return;
     await db.execute(
       "UPDATE jobs SET status = $1, result = $2, updated_at = $3 WHERE id = $4",
       [status, result ?? null, Date.now(), id]
@@ -483,7 +463,6 @@ const jobs = {
 const logs = {
   async recent(limit = 200): Promise<LogRow[]> {
     const db = await getDb();
-    if (!db) return [];
     return db.select(
       "SELECT * FROM logs ORDER BY ts DESC LIMIT $1", [limit]
     ) as Promise<LogRow[]>;
@@ -491,7 +470,6 @@ const logs = {
 
   async append(level: string, source: string | null, message: string): Promise<void> {
     const db = await getDb();
-    if (!db) return;
     await db.execute(
       "INSERT INTO logs (level, source, message, ts) VALUES ($1, $2, $3, $4)",
       [level, source, message, Date.now()]
@@ -506,7 +484,6 @@ const logs = {
 const settings = {
   async get(key: string): Promise<string | null> {
     const db = await getDb();
-    if (!db) return null;
     const rows: SettingRow[] = await db.select(
       "SELECT value FROM settings WHERE key = $1 LIMIT 1", [key]
     );
@@ -515,7 +492,6 @@ const settings = {
 
   async set(key: string, value: string): Promise<void> {
     const db = await getDb();
-    if (!db) return;
     await db.execute(
       `INSERT OR REPLACE INTO settings (key, value, updated_at)
        VALUES ($1, $2, $3)`,
@@ -525,7 +501,6 @@ const settings = {
 
   async all(): Promise<SettingRow[]> {
     const db = await getDb();
-    if (!db) return [];
     return db.select("SELECT * FROM settings") as Promise<SettingRow[]>;
   },
 };
@@ -559,7 +534,6 @@ export const db = {
 
 export async function seedIfEmpty(): Promise<void> {
   const database = await getDb();
-  if (!database) return;
 
   const existing: ConversationRow[] = await database.select(
     "SELECT id FROM conversations LIMIT 1"
@@ -634,6 +608,9 @@ export async function seedIfEmpty(): Promise<void> {
         id: String(m.id),
         conversation_id: "c1",
         role: m.role,
+        reasoning: null,
+        agent_id: null,
+        via_agent: 0,
         text: m.text ?? null,
         body: m.body ?? null,
         code_lang: m.code?.lang ?? null,

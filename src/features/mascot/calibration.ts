@@ -86,10 +86,6 @@ export function loadCalibration(): ChibiCalibration {
 
 const TAURI_EVENT = "mascot://calibration-changed";
 
-function isTauri(): boolean {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-}
-
 /**
  * Persist to localStorage AND broadcast via the Tauri event bus so the
  * mascot window picks up the change even when the `storage` event
@@ -102,18 +98,16 @@ export function saveCalibration(cal: ChibiCalibration): void {
   } catch {
     // Storage quota or unavailable — silently ignore.
   }
-  if (isTauri()) {
-    // Async import + emit; we don't await — the receiver is on the other
-    // window's event loop, latency is irrelevant for a calibration slider.
-    void (async () => {
-      try {
-        const mod = await import("@tauri-apps/api/event");
-        await mod.emit(TAURI_EVENT, cal);
-      } catch (err) {
-        console.warn("[calibration] emit failed:", err);
-      }
-    })();
-  }
+  // Async import + emit; we don't await — the receiver is on the other
+  // window's event loop, latency is irrelevant for a calibration slider.
+  void (async () => {
+    try {
+      const mod = await import("@tauri-apps/api/event");
+      await mod.emit(TAURI_EVENT, cal);
+    } catch (err) {
+      console.warn("[calibration] emit failed:", err);
+    }
+  })();
 }
 
 /**
@@ -133,28 +127,26 @@ export function subscribeCalibration(callback: (cal: ChibiCalibration) => void):
 
   // Channel 2: Tauri custom event (reliable cross-window).
   let unlistenTauri: (() => void) | null = null;
-  if (isTauri()) {
-    void (async () => {
-      try {
-        const mod = await import("@tauri-apps/api/event");
-        unlistenTauri = await mod.listen<ChibiCalibration>(TAURI_EVENT, (e) => {
-          // Trust the payload (sender just computed it); fall back to a
-          // localStorage re-read only if the payload looks invalid.
-          if (
-            e.payload &&
-            typeof e.payload.left === "number" &&
-            typeof e.payload.right === "number"
-          ) {
-            callback(e.payload);
-          } else {
-            callback(loadCalibration());
-          }
-        });
-      } catch (err) {
-        console.warn("[calibration] listen failed:", err);
-      }
-    })();
-  }
+  void (async () => {
+    try {
+      const mod = await import("@tauri-apps/api/event");
+      unlistenTauri = await mod.listen<ChibiCalibration>(TAURI_EVENT, (e) => {
+        // Trust the payload (sender just computed it); fall back to a
+        // localStorage re-read only if the payload looks invalid.
+        if (
+          e.payload &&
+          typeof e.payload.left === "number" &&
+          typeof e.payload.right === "number"
+        ) {
+          callback(e.payload);
+        } else {
+          callback(loadCalibration());
+        }
+      });
+    } catch (err) {
+      console.warn("[calibration] listen failed:", err);
+    }
+  })();
 
   return () => {
     window.removeEventListener("storage", onStorage);

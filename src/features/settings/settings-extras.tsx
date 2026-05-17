@@ -78,7 +78,7 @@ export function loadJSON<T>(key: string, fallback: T): T {
 
 export function saveJSON(key: string, val: any) {
   try { localStorage.setItem(key, JSON.stringify(val)); } catch { /* quota / disabled */ }
-  // Mirror to SQLite (fire-and-forget; no-op in web mode)
+  // Mirror to SQLite (fire-and-forget).
   void db.settings.set(key, JSON.stringify(val));
 }
 
@@ -88,7 +88,6 @@ export function saveJSON(key: string, val: any) {
  * since it is the live session store). This recovers a fresh session on a
  * machine that has SQLite data but cleared localStorage (e.g. after a
  * browser cache wipe or cross-device sync).
- * No-op in web mode (db.settings.all() returns [] when getDb() is null).
  */
 export async function hydrateSettingsFromSqlite(): Promise<void> {
   const rows = await db.settings.all();

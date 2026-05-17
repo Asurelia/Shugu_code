@@ -22,10 +22,12 @@ export const PROVIDER_REGISTRY: Record<string, ProviderDescriptor> = {
   ollama:    { protocol: "ollama",    baseUrl: "http://localhost:11434" },
   // llama.cpp's `llama-server` exposes an OpenAI-compatible /v1/chat/completions
   // endpoint, so we reuse the openai protocol here and only differ on the
-  // baseUrl default. The user is expected to start the server with a flag
-  // like `--host 127.0.0.1 --port 8080` (or whatever port they prefer; the
-  // override goes through the Settings → Connections card).
-  llamacpp:  { protocol: "openai",    baseUrl: "http://localhost:8080" },
+  // baseUrl default. Shugu spawns its bundled sidecar on `--host 127.0.0.1
+  // --port 8090` — a dedicated port (NOT llama.cpp's conventional 8080) so
+  // we don't collide with any other llama-server the user already runs for
+  // a separate project. The override is still surfaced in Settings →
+  // Connections for power users who pin their own server.
+  llamacpp:  { protocol: "openai",    baseUrl: "http://localhost:8090" },
   mistral:   { protocol: "openai",    baseUrl: "https://api.mistral.ai" },
   groq:      { protocol: "openai",    baseUrl: "https://api.groq.com/openai" },
 };
@@ -122,15 +124,3 @@ export function groupedModels(): { group: ModelGroup; items: ModelDescriptor[] }
     .filter((g) => g.items.length > 0);
 }
 
-/**
- * Returns the catalog shaped for the web/dev mock of the `models_list`
- * Tauri command. Protocol is derived from PROVIDER_REGISTRY — the `!`
- * assertion will throw at mock-time if a catalog entry references a prefix
- * not declared in the registry, which is the invariant we want.
- */
-export function mockModelsList(): { id: string; label: string; protocol: Protocol }[] {
-  return MODEL_CATALOG.map((m) => {
-    const prefix = m.id.slice(0, m.id.indexOf("/"));
-    return { id: m.id, label: m.label, protocol: PROVIDER_REGISTRY[prefix]!.protocol };
-  });
-}

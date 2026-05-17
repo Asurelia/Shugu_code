@@ -4,10 +4,6 @@
 // db.settings (key/value) rather than localStorage. Two reasons:
 //   1. Survives across the main IDE + mascot windows uniformly.
 //   2. Stays inside the same shugu.db file as the rest of the user data.
-//
-// Web mode (pnpm dev, no Tauri): db.settings.get/set are no-ops/null, so
-// load() returns null and save() silently does nothing. The IDE still
-// renders with whatever seed file tree it has — just without tab restore.
 
 import { db } from "@/lib/db";
 
@@ -40,9 +36,9 @@ export async function saveOpenFiles(state: IdeOpenState): Promise<void> {
   }
 }
 
-/** Read the persisted tab state. Returns null if absent, malformed, or
- * if we're in web mode. Schema-tolerant: drops unknown fields, validates
- * types per field, falls back to defaults for invalid pieces. */
+/** Read the persisted tab state. Returns null if absent or malformed.
+ * Schema-tolerant: drops unknown fields, validates types per field,
+ * falls back to defaults for invalid pieces. */
 export async function loadOpenFiles(): Promise<IdeOpenState | null> {
   try {
     const raw = await db.settings.get(KEY);

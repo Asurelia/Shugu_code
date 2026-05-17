@@ -492,6 +492,43 @@ export function DockTerminal({ tabId, name: _name }: { tabId: string; name: stri
         console.warn('[DockTerminal] term_snapshot failed:', err);
       }
 
+      // ─────────────────────────────────────────────────────────────────
+      // NOT TanStack because:
+      //
+      // Politique du projet (CLAUDE.md "State management") : tout state
+      // externe à un composant passe par TanStack Query. CES LISTENERS
+      // SONT UNE DÉROGATION DOCUMENTÉE, voici pourquoi :
+      //
+      //   1. Volume — `term://output/{id}` fire ~50-500 fois par seconde
+      //      avec des chunks de bytes ANSI bruts. Stocker dans TanStack
+      //      cache (setQueryData append) signifierait :
+      //        - Sérialiser le payload à chaque IPC (coût pur)
+      //        - Maintenir un Set d'observers TanStack et notifier 50-500
+      //          fois/sec par observer (re-render storm potentiel)
+      //        - Doubler la mémoire (xterm scrollback + TanStack cache)
+      //
+      //   2. xterm a son propre buffer scrollback (Terminal#buffer) —
+      //      c'est SA responsabilité de tracker les bytes, pas la nôtre.
+      //      L'écriture directe `term.write(payload.data)` est l'API
+      //      attendue par xterm, optimisée pour ce volume.
+      //
+      //   3. Pas de consumer React qui doit observer le flux de bytes.
+      //      Le rendu est fait par xterm via canvas, hors de React.
+      //      Aucun composant ne fait `useTerminalOutput()`. Donc le cache
+      //      TanStack n'aurait aucun observer = update silencieuse de cache
+      //      sans bénéfice.
+      //
+      //   4. Le listener est PER-TAB et scope-bound au lifecycle DockTerminal —
+      //      attache au mount, détache au unmount via le cleanup useEffect.
+      //      Pas de risque d'orphelin cross-window (chaque tab a son propre
+      //      DockTerminal mount).
+      //
+      // SI un jour un consumer React doit observer l'output du terminal
+      // (ex: panel "tail des N dernières lignes" séparé du xterm visuel),
+      // on créerait une synthetic query `dockKeys.tailBuffer(tabId)` mise
+      // à jour ici via setQueryData ratemod (toutes les N ms, pas par
+      // byte). Pour l'instant ce besoin n'existe pas.
+      // ─────────────────────────────────────────────────────────────────
       unlistenOut = await listen<{ data: string }>(`term://output/${tabId}`, (payload) => {
         if (disposed) return;
         term.write(payload.data);

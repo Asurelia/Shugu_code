@@ -60,9 +60,7 @@ export function LiquidLayers() {
 // the command system. MenuBar is assembled in RootLayout and passed down.
 //
 // Window controls (close / minimize / maximize) are wired directly here via
-// dynamic Tauri imports — same pattern as src/mascot.tsx. In web mode (no
-// Tauri runtime), the handlers no-op silently so `pnpm dev` browsers don't
-// crash on click.
+// dynamic Tauri imports — same pattern as src/mascot.tsx.
 //
 // CLOSE: hides the main window to the system tray (Discord/Steam pattern).
 // Does NOT actually exit the app — the Rust side keeps running so the user
@@ -72,11 +70,8 @@ export function LiquidLayers() {
 // The mascot window is intentionally left alone. It has its own visibility
 // state (tucked/un-tucked, click-through) and the user typically wants it
 // to keep floating even when the main IDE is hidden.
-const inTauri =
-  typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 async function windowClose(): Promise<void> {
-  if (!inTauri) return;
   try {
     const mod = await import("@tauri-apps/api/webviewWindow");
     // Hide the current window only — Rust tray code handles restore on
@@ -88,7 +83,6 @@ async function windowClose(): Promise<void> {
 }
 
 async function windowMinimize(): Promise<void> {
-  if (!inTauri) return;
   try {
     const mod = await import("@tauri-apps/api/webviewWindow");
     await mod.getCurrentWebviewWindow().minimize();
@@ -98,7 +92,6 @@ async function windowMinimize(): Promise<void> {
 }
 
 async function windowToggleMaximize(): Promise<void> {
-  if (!inTauri) return;
   try {
     const mod = await import("@tauri-apps/api/webviewWindow");
     const win = mod.getCurrentWebviewWindow();

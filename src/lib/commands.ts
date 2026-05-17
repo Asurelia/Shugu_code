@@ -2,7 +2,7 @@
 // Pure data module — no React imports. Safe to import from anywhere.
 // Pass 1: flat COMMANDS array with default keybindings, categories, run/when predicates.
 
-import { fsOpenFolder, fsReadDir } from "@/lib/fs";
+import { fsOpenFolder } from "@/lib/fs";
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -53,7 +53,9 @@ export interface CommandContext {
   saveFile: (path: string) => Promise<void>;
   setActiveFile: React.Dispatch<React.SetStateAction<string | null>>;
   setFileContents: React.Dispatch<React.SetStateAction<Record<string, any>>>;
-  setFileTree: React.Dispatch<React.SetStateAction<any[]>>;
+  /** Trigger un refetch du file tree (post-migration TanStack — voir
+   *  `src/features/fs/queries.ts::invalidateFileTree`). */
+  invalidateFileTree: () => void;
   setOpenFiles: React.Dispatch<React.SetStateAction<string[]>>;
 
   // Gallery / Agents
@@ -210,8 +212,10 @@ export const COMMANDS: Command[] = [
     run: async (ctx) => {
       const root = await fsOpenFolder();
       if (!root) return;
-      const tree = await fsReadDir();
-      ctx.setFileTree(tree);
+      // Le file tree est maintenant un useQuery — on déclenche un refetch
+      // au lieu de set manuellement. Le useFileTree hook propage à tous
+      // les consumers automatiquement.
+      ctx.invalidateFileTree();
       ctx.setOpenFiles([]);
       ctx.setActiveFile(null);
       ctx.setFileContents({});

@@ -23,6 +23,7 @@ import {
 } from "@/components/components";
 import { MenuBar } from "@/components/MenuBar";
 import { ChatSidebar } from "@/features/chat/chat-sidebar";
+import { Onboarding } from "@/features/onboarding/Onboarding";
 import {
   DockWorkspace,
   ContextMenu,
@@ -46,7 +47,15 @@ import type { DockState, FileNode } from "@/lib/types";
 import { db, seedIfEmpty, toGenerationRow } from "@/lib/db";
 import { useActiveConv, createConversation, sendChatMessage } from "@/features/chat/chat-sync";
 import { loadOpenFiles, saveOpenFiles } from "@/lib/ide-state";
-import { inTauri, fsReadDir, fsReadFile, fsWriteFile, fsCreateDir, fsCreateFile, langToExt, onFsChanged } from "@/lib/fs";
+import { fsReadFile, fsWriteFile, fsCreateDir, fsCreateFile, langToExt } from "@/lib/fs";
+import { useFileTree, invalidateFileTree } from "@/features/fs/queries";
+import { useFsEvents } from "@/features/fs/useEvents";
+import { AgentsPanel } from "@/features/agents/AgentsPanel";
+import { useAgentEvents } from "@/features/agents/useEvents";
+import { useActiveAgents, setSelectedAgentId } from "@/features/agents/queries";
+import { useChatEvents } from "@/features/chat/useEvents";
+import { useChatStreamListener } from "@/features/chat/useChatStream";
+import { useLlamaLifecycle } from "@/features/llama/useLlamaLifecycle";
 import { COMMANDS, getCommandById, fmtKbd, type CommandContext } from "@/lib/commands";
 import { useCommandKeybindings } from "@/lib/keybindings";
 
@@ -321,8 +330,72 @@ export function RootLayout() {
   const [activeConvo, setActiveConvo] = useActiveConv();
   const [activeConvoTitle, setActiveConvoTitle] = useState<string | null>(null);
 
-  // File state
-  const [fileTree, setFileTree] = useState<FileNode[]>([]);
+  // TanStack-only : un seul listener Tauri qui invalide les queries agent.
+  // Plus de store Zustand custom, plus de applyEvent manuel. Le freeze
+  // diagnostiqué dans Plan v2 est résolu par cette migration architecturale.
+  useAgentEvents();
+  // Chat events : invalide useMessages quand un message est appendé OU
+  // quand un agent complete (le delegate flow appende sa réponse alors).
+  useChatEvents();
+  // Chat stream listener : capte les chat://delta events et accumule
+  // dans le cache TanStack pour que TOUTES les windows voient le
+  // streaming (au lieu d'un acceptingRef local qui drop les chunks).
+  useChatStreamListener();
+
+  // Auto-stop/start llama-server quand le model chat passe local↔API.
+  // Restauré après diagnostic — innocent du freeze (testé Plan v2 Step C).
+  useLlamaLifecycle();
+  // Count via TanStack — re-render uniquement quand le nombre change
+  // (TanStack fait un compare structurel sur le résultat, et data?.length
+  // est une primitive number). Renommé `activeAgents` pour éviter le
+  // conflit avec une autre variable `agents` dans le scope.
+  const { data: activeAgents } = useActiveAgents();
+  const agentsCount = activeAgents?.length ?? 0;
+  // Local toggle for the agents side overlay. Phase 0: chat view only —
+  // Phase 1+ may extend to code/image views once the orchestrator can
+  // run alongside other workflows.
+  const [showAgentsPanel, setShowAgentsPanel] = useState(false);
+
+  // Phase 1 — cross-component "open this agent" trigger. When the user
+  // clicks a "via orchestrator" chip on a chat message, `revealAgent()`
+  // emits `app://reveal-agent` (Tauri event bus) so every window can
+  // react. Here we react by: 1/ navigating to /chat (the agents overlay
+  // is scoped to that view), 2/ flipping the overlay on, 3/ selecting
+  // the targeted agent in the agents store so its transcript drawer
+  // auto-expands. Decoupled from any React context — pure event-bus.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const mod = await import("@tauri-apps/api/event");
+        unlisten = await mod.listen<{ agentId?: string }>("app://reveal-agent", (e) => {
+          if (cancelled) return;
+          const agentId = e.payload?.agentId;
+          if (!agentId) return;
+          navigate({ to: "/chat" as any });
+          setShowAgentsPanel(true);
+          setSelectedAgentId(agentId);
+        });
+      } catch (err) {
+        console.warn("[RootLayout] reveal-agent listen failed:", err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+    // navigate is stable (router-provided); setShowAgentsPanel + store
+    // setter are stable React identity. Empty deps are correct.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // File state — fileTree migré vers useFileTree (TanStack Query).
+  // Le useState local + useEffect+useState async ont disparu dans la
+  // Phase G de la migration TanStack (mai 2026). `invalidateFileTree()`
+  // est exposé via shellContext pour les mutations externes (command
+  // palette open-folder).
+  const { data: fileTree = [] } = useFileTree();
   const [openFiles, setOpenFiles] = useState<string[]>([]);
   const [activeFile, setActiveFile] = useState<string | null>(null);
   const [fileContents, setFileContents] = useState<Record<string, any>>({});
@@ -333,8 +406,7 @@ export function RootLayout() {
 
   /**
    * Write-through wrapper: whenever a generation is ADDED (new id appears),
-   * persist it to SQLite via db.generations.create. No-op in web mode since
-   * getDb() returns null when not running under Tauri.
+   * persist it to SQLite via db.generations.create.
    */
   const setGenerationsPersisted: React.Dispatch<React.SetStateAction<any[]>> = useCallback(
     (updater) => {
@@ -407,13 +479,10 @@ export function RootLayout() {
     return () => { cancelled = true; };
   }, []);
 
-  // Load the workspace file tree on mount.
-  // In web mode: fsReadDir() returns seedFileTree (never rejects).
-  // In Tauri mode with no workspace: fs_read_dir rejects with "no workspace open"
-  // — the .catch must yield [] to avoid crashing the app.
-  useEffect(() => {
-    fsReadDir().then(setFileTree).catch(() => setFileTree([]));
-  }, []);
+  // File tree loading + fs watcher : maintenant gérés par useFileTree /
+  // useFsEvents (Phase G migration TanStack). Le hook fetch au mount,
+  // le listener invalide sur fs://changed.
+  useFsEvents();
 
   // Restore the previously open tabs + active file from SQLite.
   //
@@ -458,23 +527,6 @@ export function RootLayout() {
     }, 500);
     return () => clearTimeout(t);
   }, [openFiles, activeFile]);
-
-  // Re-fetch the tree whenever the Rust watcher reports a workspace change
-  // (200 ms debounced).  No-op in web mode (the listener never fires).
-  useEffect(() => {
-    let unlisten: (() => void) | null = null;
-    let cancelled = false;
-    void onFsChanged(() => {
-      // Latest-write-wins: a new fetch supersedes any in-flight one.
-      fsReadDir().then(t => { if (!cancelled) setFileTree(t); }).catch(() => {});
-    }).then(fn => {
-      if (cancelled) fn(); else unlisten = fn;
-    });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, []);
 
   // CSS variable sync from tweaks
   useEffect(() => {
@@ -564,12 +616,10 @@ export function RootLayout() {
     const content = fileContents[path];
     if (!content) return;
     await fsWriteFile(path, content.text);
-    if (inTauri) {
-      setFileContents(c => ({
-        ...c,
-        [path]: { ...c[path], dirty: false, original: content.text },
-      }));
-    }
+    setFileContents(c => ({
+      ...c,
+      [path]: { ...c[path], dirty: false, original: content.text },
+    }));
   }, [fileContents]);
 
   const saveAll = useCallback(async () => {
@@ -641,7 +691,11 @@ export function RootLayout() {
     saveFile,
     setActiveFile,
     setFileContents,
-    setFileTree,
+    /** Refetch le file tree (utilisé par command palette open-folder).
+     *  Remplace l'ancien `setFileTree` (qui était un useState setter)
+     *  par un trigger d'invalidation TanStack — le useFileTree hook
+     *  refetch automatiquement et propage à tous les consumers. */
+    invalidateFileTree,
     setOpenFiles,
     // Gallery / Agents
     generations,
@@ -656,7 +710,7 @@ export function RootLayout() {
     // Files (alphabetical)
     activeFile, fileContents, fileTree, openFiles,
     saveAll, saveFile,
-    setActiveFile, setFileContents, setFileTree, setOpenFiles,
+    setActiveFile, setFileContents, setOpenFiles,
     // Gallery / Agents
     generations, agents,
     onAnnotate,
@@ -811,6 +865,24 @@ export function RootLayout() {
                 {view === "chat" && <>
                   <button className="lgb lgb-sm"><Icon name="copy" size={11}/> Share</button>
                   <button className="lgb lgb-sm"><Icon name="sparkle" size={11}/> Compact</button>
+                  {/* Agents observability toggle. Inline SVG (org-chart glyph) so
+                      we don't have to invent a new Icon name in the design kit
+                      just for Phase 0. `lgb-primary` lights up when the panel
+                      is visible so the user has a visual cue of which surface
+                      is on top. */}
+                  <button
+                    className={"lgb lgb-sm" + (showAgentsPanel ? " lgb-primary" : "")}
+                    onClick={() => setShowAgentsPanel(o => !o)}
+                    title={showAgentsPanel ? "Hide agents panel" : "Show agents panel"}
+                  >
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <rect x="9" y="2" width="6" height="5" rx="1"/>
+                      <rect x="2" y="17" width="6" height="5" rx="1"/>
+                      <rect x="16" y="17" width="6" height="5" rx="1"/>
+                      <path d="M12 7v4M5 17v-2a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v2"/>
+                    </svg>
+                    Agents{agentsCount > 0 ? ` (${agentsCount})` : ""}
+                  </button>
                 </>}
                 {view === "code" && <>
                   <button className="lgb lgb-sm"><Icon name="git" size={11}/> Commit</button>
@@ -835,6 +907,29 @@ export function RootLayout() {
               ) : (
                 <div className="content-body" style={{ position: "relative" }}>
                   {editorBody}
+                  {/* Agents side overlay — visible only on chat view in Phase 0.
+                      Anchored right within the content-body's relative
+                      positioning context so it scrolls/sizes with the chat
+                      surface. Inline styles for Phase 0; once the UX is
+                      validated we'll move this to a real CSS class. */}
+                  {view === "chat" && showAgentsPanel && (
+                    <div
+                      style={{
+                        position: "absolute",
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                        width: 380,
+                        background: "var(--surface, rgba(20, 16, 36, 0.96))",
+                        backdropFilter: "blur(var(--lg-blur, 12px))",
+                        borderLeft: "1px solid rgba(124, 58, 237, 0.22)",
+                        overflowY: "auto",
+                        zIndex: 10,
+                      }}
+                    >
+                      <AgentsPanel />
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -898,6 +993,13 @@ export function RootLayout() {
             <TweakSlider label="Intensity" min={0} max={100} step={5} value={tweaks.auroraIntensity} onChange={(v: number) => setTweak("auroraIntensity", v)} unit="%"/>
           </TweakSection>
         </TweaksPanel>
+
+        {/* First-run onboarding overlay. Self-decides whether to show:
+            renders nothing if the default bundle model is already installed
+            or if the user clicked "Plus tard" in a previous session. The
+            overlay sits at z-index 5000 (above TweaksPanel) so it pre-empts
+            the rest of the chrome while it's visible. */}
+        <Onboarding/>
       </>
     </ShellContext.Provider>
   );

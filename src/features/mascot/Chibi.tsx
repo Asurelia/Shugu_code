@@ -4,8 +4,7 @@
 // mascot's facial-state vocabulary. The peek poses are used only when the
 // mascot is tucked against a screen edge (geometry, not emotion).
 //
-// PNG assets live in public/assets/chibi/ → served at /assets/chibi/*
-// (works identically in `pnpm dev` web mode and the bundled Tauri webview).
+// PNG assets live in public/assets/chibi/ → served at /assets/chibi/*.
 //
 // This is a PURE visual component. State + mood derivation lives in
 // `useChibiMood` (next door in this folder) so the same chibi can be

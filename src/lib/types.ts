@@ -12,6 +12,17 @@ export interface Message {
   ts?: string;
   code?: CodeAttachment;
   image?: boolean;
+  /** `<think>...</think>` reasoning trace from thinking-enabled models
+   * (Qwen 3.5, DeepSeek-R1, Llama-3.3-R). Captured live during streaming,
+   * persisted alongside the message so it stays consultable later. NOT
+   * sent back to the model as conversation history — chat-sync rebuilds
+   * history from `text`/`body`/`code` only. */
+  reasoning?: string;
+  /** True when this message is a verbatim relay of an orchestrator agent's
+   * output. Drives the "via orchestrator" chip + click-to-transcript flow. */
+  viaAgent?: boolean;
+  /** Agent id for the badge click handler (open the transcript drawer). */
+  agentId?: string;
 }
 
 export interface Conversation {

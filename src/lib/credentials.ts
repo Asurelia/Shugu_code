@@ -17,17 +17,9 @@
 //
 // Examples: provider.anthropic.apiKey, provider.openai.orgId,
 //           provider.llamacpp.endpoint
-//
-// Web mode (`pnpm dev`, no Tauri) — no OS keychain available, so we degrade
-// gracefully to localStorage + sessionStorage. This is OBVIOUSLY not secure;
-// the in-app UI must warn the user when running in web mode if it ever
-// becomes a customer-facing scenario. For now it just keeps the dev loop
-// usable without booting Tauri every time.
 
 import { invoke } from "@/lib/tauri";
 import { db } from "@/lib/db";
-
-const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 // ─── Account-name helpers ──────────────────────────────────────────────
 
@@ -39,26 +31,11 @@ function configKey(providerId: string, fieldKey: string): string {
   return `provider.${providerId}.${fieldKey}`;
 }
 
-// ─── Web-mode fallback (localStorage prefixed to avoid pollution) ──────
-
-const WEB_PREFIX = "shugu.cred.v1::";
-
-function webGet(account: string): string | null {
-  try { return localStorage.getItem(WEB_PREFIX + account); } catch { return null; }
-}
-function webSet(account: string, value: string): void {
-  try { localStorage.setItem(WEB_PREFIX + account, value); } catch { /* quota */ }
-}
-function webDelete(account: string): void {
-  try { localStorage.removeItem(WEB_PREFIX + account); } catch { /* noop */ }
-}
-
 // ─── Secrets API — backed by OS keychain ───────────────────────────────
 
 /** Read a secret. Returns `null` when absent (no thrown errors on common path). */
 export async function getSecret(providerId: string, fieldKey: string): Promise<string | null> {
   const account = secretAccount(providerId, fieldKey);
-  if (!inTauri) return webGet(account);
   try {
     const v = await invoke<string | null>("cred_get", { account });
     return v ?? null;
@@ -70,16 +47,14 @@ export async function getSecret(providerId: string, fieldKey: string): Promise<s
 
 /** Write or update a secret. Empty `value` is treated as a delete. */
 export async function setSecret(providerId: string, fieldKey: string, value: string): Promise<void> {
-  const account = secretAccount(providerId, fieldKey);
   if (!value) return deleteSecret(providerId, fieldKey);
-  if (!inTauri) { webSet(account, value); return; }
+  const account = secretAccount(providerId, fieldKey);
   await invoke("cred_set", { account, secret: value });
 }
 
 /** Remove a secret. Idempotent on the not-found case. */
 export async function deleteSecret(providerId: string, fieldKey: string): Promise<void> {
   const account = secretAccount(providerId, fieldKey);
-  if (!inTauri) { webDelete(account); return; }
   await invoke("cred_delete", { account });
 }
 
@@ -88,20 +63,14 @@ export async function deleteSecret(providerId: string, fieldKey: string): Promis
 /** Read a non-secret config value. Returns `null` when absent. */
 export async function getConfig(providerId: string, fieldKey: string): Promise<string | null> {
   const key = configKey(providerId, fieldKey);
-  if (!inTauri) return webGet(key);
   try { return await db.settings.get(key); } catch { return null; }
 }
 
-/** Write or update a non-secret config value. Empty `value` deletes the row. */
+/** Write or update a non-secret config value. Empty `value` stores "" (treated as absent on read). */
 export async function setConfig(providerId: string, fieldKey: string, value: string): Promise<void> {
   const key = configKey(providerId, fieldKey);
-  if (!inTauri) { value ? webSet(key, value) : webDelete(key); return; }
-  if (!value) {
-    // db.settings has no explicit delete — store empty string. resolveProviderConfig
-    // treats "" the same as absent.
-    await db.settings.set(key, "");
-    return;
-  }
+  // db.settings has no explicit delete — store empty string. resolveProviderConfig
+  // treats "" the same as absent.
   await db.settings.set(key, value);
 }
 

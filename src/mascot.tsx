@@ -16,14 +16,50 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { queryClient } from "./lib/queryClient";
 import "./styles/styles.css";
 import "./styles/panels.css";
 import "./styles/chat-sidebar.css";
 import "./styles/settings-extras.css";
+
+// Debug instrumentation — mirror of main.tsx. See the comment there.
+// Both windows wire this so we can tell from which window an error
+// originated via the `window` field in the payload.
+void (async () => {
+  try {
+    const { emit } = await import("@tauri-apps/api/event");
+    window.addEventListener("error", (e) => {
+      void emit("debug://js-error", {
+        kind: "error",
+        message: e.message,
+        filename: e.filename,
+        line: e.lineno,
+        col: e.colno,
+        stack: (e.error as Error | undefined)?.stack ?? null,
+        window: "mascot",
+      });
+    });
+    window.addEventListener("unhandledrejection", (e) => {
+      const reason = e.reason as unknown;
+      void emit("debug://js-error", {
+        kind: "unhandledrejection",
+        message: "unhandledrejection: " + String(reason),
+        stack: (reason as { stack?: string } | null)?.stack ?? null,
+        window: "mascot",
+      });
+    });
+  } catch (err) {
+    console.warn("[mascot] debug js-error wiring failed", err);
+  }
+})();
 import { FloatShell } from "@/features/floating/FloatShell";
 import { ChibiWithMood } from "@/features/mascot/ChibiWithMood";
 import { ChatPanel } from "@/features/chat/ChatPanel";
 import { ThemeBootstrap } from "@/lib/ThemeBootstrap";
+import { useChatEvents } from "@/features/chat/useEvents";
+import { useChatStreamListener } from "@/features/chat/useChatStream";
+import { useAgentEvents } from "@/features/agents/useEvents";
 import {
   loadCalibration,
   subscribeCalibration,
@@ -64,7 +100,7 @@ function useMascotClickThrough() {
     let cleanup: (() => void) | null = null;
 
     (async () => {
-      // Lazy-import Tauri so plain `pnpm dev` (no Tauri runtime) is a no-op.
+      // Lazy-import keeps Vite's static graph tidy.
       let win: any = null;
       let cursorPos: (() => Promise<{ x: number; y: number }>) | null = null;
       try {
@@ -454,6 +490,24 @@ function MascotApp() {
 
   useMascotClickThrough();
   useMascotWindowDrag(setForcedSide, setForceEdge, calibrationRef);
+  // Chat events listener — invalide useMessages quand un message arrive
+  // ou qu'un agent complete (le delegate flow appende sa réponse alors).
+  useChatEvents();
+  // Chat stream listener — capte les chat://delta dans cette window.
+  useChatStreamListener();
+  // Agent events listener — capte agent://lifecycle pour mettre à jour
+  // le cache `agentKeys.detail(aid)` de CE QueryClient (mascotte a son
+  // propre instance, séparé du main IDE). Sans ça :
+  //   - Le cache du mascot reste vide pour cet agentId
+  //   - useMessageDisplay (utilisé par MascotMessage) ne voit aucun delta
+  //   - La bulle de chat mascotte reste figée à "Orchestrateur au travail…"
+  //
+  // Plan v4 (2026-05-17) — ré-activé. L'ancienne décision de ne PAS le
+  // monter datait du pattern Zustand pre-TanStack qui causait des freezes
+  // (cascade de re-renders sur burst d'events). Avec TanStack passif +
+  // coalescing des deltas + React 18 batching, le coût d'un re-render
+  // par batch est négligeable et la fenêtre reste draggable.
+  useAgentEvents();
   return (
     <>
       <ThemeBootstrap />
@@ -472,8 +526,18 @@ function MascotApp() {
 
 const root = document.getElementById("mascot-root");
 if (!root) throw new Error("mascot-root not found");
+// La mascotte est une React root SÉPARÉE (son propre webview Tauri).
+// Elle doit avoir son propre QueryClientProvider — le singleton queryClient
+// est importé du même module, mais ce module est instancié séparément
+// dans le JS context de cette webview, donc c'est UNE instance par window.
+// On utilise QueryClientProvider basique (pas PersistQueryClient) pour ne
+// pas avoir 2 windows qui se battent pour la même clé localStorage : la
+// main IDE est la "primary" qui persiste, la mascotte hydrate via les
+// Tauri events broadcast (agent://lifecycle, chat://messages-changed, …).
 createRoot(root).render(
   <React.StrictMode>
-    <MascotApp />
+    <QueryClientProvider client={queryClient}>
+      <MascotApp />
+    </QueryClientProvider>
   </React.StrictMode>
 );
