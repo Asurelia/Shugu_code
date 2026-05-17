@@ -61,3 +61,6 @@ src-tauri/binaries/**/*.dll
 src-tauri/binaries/**/*.so
 src-tauri/binaries/**/*.dylib
 src-tauri/binaries/**/llama-server-*
+
+# Fastembed local model cache (87+ MB ONNX model — downloaded on first use)
+src-tauri/.fastembed_cache/

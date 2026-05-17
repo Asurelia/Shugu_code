@@ -490,12 +490,20 @@ export function RootLayout() {
   // le listener invalide sur fs://changed.
   useFsEvents();
 
-  // VEC3 — best-effort workspace indexer. Fires whenever the file tree changes
-  // (workspace opened or files added/removed). Gated by a 24-h TTL in
-  // db.settings so it does NOT re-index on every fs://changed event.
+  // VEC3 — best-effort workspace indexer. Run ONCE on mount, after a small
+  // delay so it doesn't compete with the boot phase (window mount, llama
+  // autostart, file tree first load). The indexer has its own internal
+  // in-flight guard + 24-h TTL so re-triggers are no-ops.
+  //
+  // IMPORTANT — must NOT depend on [fileTree] : the fs watcher fires
+  // `fs://changed` events repeatedly at boot (db creation, seed writes,
+  // first openFile), each one invalidating the file tree query, each
+  // invalidation re-running this effect, each re-run spawning a parallel
+  // workspace walk → catastrophic freeze (observed 2026-05-17).
   useEffect(() => {
-    void indexWorkspace();
-  }, [fileTree]);
+    const t = setTimeout(() => { void indexWorkspace(); }, 5000);
+    return () => clearTimeout(t);
+  }, []);
 
   // Restore the previously open tabs + active file from SQLite.
   //

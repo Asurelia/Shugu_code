@@ -26,7 +26,12 @@ import type { FileNode } from "@/lib/types";
 const MAX_FILE_BYTES = 200_000;
 const INDEX_TTL_MS   = 24 * 60 * 60 * 1000; // 24 h
 
-const SKIP_DIRS = new Set(["node_modules", "target", ".git", ".svn", "dist", "build", ".next", "out"]);
+const SKIP_DIRS = new Set([
+  "node_modules", "target", ".git", ".svn", ".hg",
+  "dist", "build", ".next", "out", "coverage",
+  ".claude", ".pcc", ".playwright-mcp", ".remember", ".cache",
+  "_design_extracted", ".turbo", ".vite", ".vercel",
+]);
 
 const BINARY_EXTS = new Set([
   "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp",
@@ -83,6 +88,12 @@ function simpleHash(paths: string[]): string {
 // Public API
 // ---------------------------------------------------------------------------
 
+// In-flight guard. Without this, the indexer can be invoked concurrently
+// (e.g. multiple useEffect triggers at boot) and each invocation would
+// walk the entire workspace before the TTL stamp lands → N parallel walks
+// blocking the renderer on every IPC vec_index call.
+let indexInFlight: Promise<void> | null = null;
+
 /**
  * Index all text files in the current workspace into the "code" vector
  * collection. Gated by a 24-h TTL stored in db.settings — safe to call
@@ -91,6 +102,18 @@ function simpleHash(paths: string[]): string {
  * Never throws — any failure is logged as a warning.
  */
 export async function indexWorkspace(): Promise<void> {
+  if (indexInFlight) return indexInFlight;
+  indexInFlight = (async () => {
+    try {
+      await runIndex();
+    } finally {
+      indexInFlight = null;
+    }
+  })();
+  return indexInFlight;
+}
+
+async function runIndex(): Promise<void> {
   try {
     // 1. Read the file tree.
     const tree = await fsReadDir();
@@ -113,7 +136,11 @@ export async function indexWorkspace(): Promise<void> {
     }
 
     // 4. Index each file (best-effort).
-    for (const path of paths) {
+    // Yield to the event loop between files so the renderer thread can keep
+    // up with chat streaming, fs watcher events, and Tauri IPC traffic. The
+    // indexer is background work — slow + responsive UI > fast + frozen UI.
+    for (let i = 0; i < paths.length; i++) {
+      const path = paths[i];
       try {
         const content = await fsReadFile(path);
         if (content.text.length > MAX_FILE_BYTES) continue; // too large
@@ -121,6 +148,10 @@ export async function indexWorkspace(): Promise<void> {
         await vecIndex("code", path, content.text);
       } catch (err) {
         console.warn("[workspaceIndexer] skipping", path, err);
+      }
+      // Yield every 5 files to keep the UI responsive.
+      if (i > 0 && i % 5 === 0) {
+        await new Promise((r) => setTimeout(r, 50));
       }
     }
 
