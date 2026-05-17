@@ -119,8 +119,28 @@ export function FloatShell({
     <FloatShellContext.Provider value={ctx}>
       <div className={shellClass} style={{ left: pos.x, top: pos.y }}>
         <div className="float-cluster">
+          {/* Visual layer — pointer-events disabled so clicks pass through to
+              the button below. The orbit/flip chain carries all animations and
+              edge-transform rules; keeping them here means existing CSS works
+              without changes. */}
+          <div className="float-avatar-visual" aria-hidden="true">
+            <span className="float-avatar-orbit">
+              <span className="float-avatar-flip">
+                {anchor}
+              </span>
+            </span>
+            <span className="float-avatar-glow"></span>
+          </div>
+          {/* Interactive layer — absolutely positioned over the visual layer,
+              clipped to a circle so the transparent halo around the chibi PNG
+              does NOT capture clicks or drag events. clip-path makes the area
+              outside the circle fully uninteractive (pointer-events: none
+              would not clip hit-testing alone without the path). */}
           <button
             className="float-avatar-btn"
+            aria-label={edge
+              ? "Ramener la mascotte"
+              : (mode === "closed" ? "Ouvrir" : "Fermer")}
             onMouseDown={onAvatarMouseDown}
             onClick={onAvatarClick}
             onDoubleClick={onAvatarDouble}
@@ -130,14 +150,7 @@ export function FloatShell({
               : (mode === "closed"
                 ? "Cliquer pour ouvrir · drag · alt+clic pour changer d'humeur"
                 : "Cliquer pour fermer · double pour étendre · drag pour déplacer · alt+clic pour humeur")}
-          >
-            <span className="float-avatar-orbit">
-              <span className="float-avatar-flip">
-                {anchor}
-              </span>
-            </span>
-            <span className="float-avatar-glow"></span>
-          </button>
+          />
           {edge && <span className="float-edge-tip">Click to bring back</span>}
         </div>
         <div className="float-body">

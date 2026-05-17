@@ -698,17 +698,36 @@
   z-index: 2;
 }
 
-/* The mascot button */
+/* Visual layer — holds the orbit/flip/glow chain.
+   pointer-events: none ensures mouse events fall through to the button
+   below, so only the button's clipped circle captures interactions.
+   NOTE: alt+click mood-cycle (ChibiWithMood's onClickCapture) is muted
+   because this layer has no pointer-events. It should be lifted to the
+   button's onClick handler in FloatShell if re-enabled later. */
+.float-avatar-visual {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+/* The mascot button — invisible circular hit-zone.
+   Absolutely positioned over .float-avatar-visual; clip-path makes the
+   area OUTSIDE the circle fully uninteractive (pointer-events would not
+   clip hit-testing alone). Circle sized ~40% (≈62px radius on 156px box),
+   Y-center at 55% to align with the chibi's torso rather than feet. */
 .float-avatar-btn {
-  width: 100%;
-  height: 100%;
+  position: absolute;
+  inset: 0;
+  width: 100%; height: 100%;
   min-width: 0; min-height: 0;
   padding: 0; border: 0;
   background: transparent;
   cursor: grab;
-  display: grid; place-items: center;
-  position: relative;
   touch-action: none;
+  /* clip-path clips the interactive zone to the chibi body circle.
+     The transparent halo outside the circle is fully click-through. */
+  clip-path: circle(40% at 50% 55%);
+  border-radius: 50%;
   overflow: visible;
 }
 .float-avatar-btn:active { cursor: grabbing; }
@@ -760,6 +779,10 @@
   object-fit: contain;
   -webkit-user-drag: none;
   user-select: none;
+  /* CRITICAL: pointer-events none so the PNG halo never captures clicks.
+     Inherited from .float-avatar-visual but stated explicitly here as
+     a hard guarantee — chibi hit-zone lives on .float-avatar-btn only. */
+  pointer-events: none;
   /* Slight saturation bump so the pastel character harmonizes with
      the Celestial Veil palette. */
   filter: saturate(1.05) contrast(1.02);

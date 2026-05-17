@@ -139,11 +139,30 @@ function useMascotClickThrough() {
       };
 
       // Hit-test: is the painted UI under (cssX, cssY) in this document?
-      // The painted UI tree is rooted at `.float-shell` (the FloatChat
-      // outer container). Anything else (body, html) is transparent.
+      //
+      // IMPORTANT: We no longer use a blanket `.float-shell` selector.
+      // The chibi PNG has ~40px transparent halo around the visible character.
+      // With .float-avatar-visual having pointer-events:none, elementFromPoint
+      // on the transparent halo returns whatever is BEHIND (body / html), not
+      // .float-shell — so those corners correctly fall through to the desktop.
+      // We whitelist only the actually-interactive zones:
+      //   .float-avatar-btn        — chibi body (circular clip-path hit-zone)
+      //   .float-body              — chat panel (closed/edge-hidden get
+      //                              pointer-events:none via CSS, so they are
+      //                              never returned by elementFromPoint)
+      //   .float-history-shell     — conversation history dropdown
+      //   .float-bubble            — speech bubbles
+      //   .float-edge-tip          — edge-tucked "click to bring back" tip
       const isOverPainted = (cssX: number, cssY: number): boolean => {
         const el = document.elementFromPoint(cssX, cssY);
-        return !!(el && el.closest(".float-shell"));
+        if (!el) return false;
+        return !!el.closest(
+          ".float-avatar-btn, " +
+          ".float-body, " +
+          ".float-history-shell, " +
+          ".float-bubble, " +
+          ".float-edge-tip"
+        );
       };
 
       // Path 1: cursor events ARE allowed — DOM mousemove handles us.
