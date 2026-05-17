@@ -58,6 +58,12 @@ export interface MessageRow {
   /** 1 when this message is a verbatim orchestrator relay (V5 schema);
    *  0 for user + direct-chat AI messages. */
   via_agent: number;    // 0 | 1
+  /** Unix ms timestamp of last edit. NULL if never edited (V6 schema). */
+  edited_at: number | null;
+  /** Unix ms timestamp of soft-delete. NULL = live; non-null = deleted (V6 schema). */
+  deleted_at: number | null;
+  /** UUID of the message this is a re-generation of (V6 schema). */
+  parent_id: string | null;
 }
 
 export interface ProjectRow {
@@ -302,8 +308,11 @@ const conversations = {
 const messages = {
   async listByConversation(convId: string): Promise<MessageRow[]> {
     const db = await getDb();
+    // deleted_at IS NULL → soft-delete filter applied here so that BOTH the
+    // UI reader AND sendChatMessage (which calls this to build LLM history)
+    // automatically exclude deleted messages without any extra guard.
     return db.select(
-      "SELECT * FROM messages WHERE conversation_id = $1 ORDER BY ts ASC",
+      "SELECT * FROM messages WHERE conversation_id = $1 AND deleted_at IS NULL ORDER BY ts ASC",
       [convId]
     ) as Promise<MessageRow[]>;
   },
@@ -313,11 +322,96 @@ const messages = {
     await db.execute(
       `INSERT OR REPLACE INTO messages
          (id, conversation_id, role, text, body, code_lang, code_text,
-          reasoning, image, ts, agent_id, via_agent)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+          reasoning, image, ts, agent_id, via_agent,
+          edited_at, deleted_at, parent_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
       [row.id, row.conversation_id, row.role, row.text, row.body,
        row.code_lang, row.code_text, row.reasoning, row.image, row.ts,
-       row.agent_id, row.via_agent]
+       row.agent_id, row.via_agent,
+       row.edited_at ?? null, row.deleted_at ?? null, row.parent_id ?? null]
+    );
+  },
+
+  /** Soft-delete a single message: sets deleted_at to now. */
+  async softDelete(id: string): Promise<void> {
+    const db = await getDb();
+    await db.execute(
+      "UPDATE messages SET deleted_at = $1 WHERE id = $2",
+      [Date.now(), id]
+    );
+  },
+
+  /**
+   * Soft-delete a message and every message in the same conversation whose ts
+   * is >= the target message's ts. Used by "Regenerate from here" to prune
+   * the tail of the conversation before re-sending.
+   *
+   * Also soft-deletes the last user message BEFORE the cut point (the prompt
+   * that will be re-sent), so that `sendChatMessage` can re-append it fresh.
+   * Without this, sendChatMessage would duplicate the user prompt in history.
+   *
+   * Returns the text of the last user message before the cut point (the prompt
+   * to re-send), or null if none exists.
+   */
+  async softDeleteFrom(messageId: string, convId: string): Promise<MessageRow | null> {
+    const db = await getDb();
+
+    // 1. Find the target message's ts.
+    const rows: MessageRow[] = await db.select(
+      "SELECT * FROM messages WHERE id = $1 LIMIT 1",
+      [messageId]
+    );
+    if (rows.length === 0) return null;
+    const cutTs = rows[0].ts;
+
+    // 2. Find the last user message before the cut point BEFORE deleting it,
+    //    so we can return it to the caller for re-submission.
+    const prior: MessageRow[] = await db.select(
+      `SELECT * FROM messages
+       WHERE conversation_id = $1 AND role = 'user' AND ts < $2 AND deleted_at IS NULL
+       ORDER BY ts DESC LIMIT 1`,
+      [convId, cutTs]
+    );
+    const priorUserMsg = prior[0] ?? null;
+
+    // 3. Soft-delete the tail (target + everything at or after cut point).
+    const now = Date.now();
+    await db.execute(
+      `UPDATE messages
+       SET deleted_at = $1
+       WHERE conversation_id = $2 AND ts >= $3 AND deleted_at IS NULL`,
+      [now, convId, cutTs]
+    );
+
+    // 4. Also soft-delete the prior user message so sendChatMessage re-appends
+    //    it fresh — prevents a duplicate user turn in the conversation history.
+    if (priorUserMsg) {
+      await db.execute(
+        "UPDATE messages SET deleted_at = $1 WHERE id = $2",
+        [now, priorUserMsg.id]
+      );
+    }
+
+    return priorUserMsg;
+  },
+
+  /**
+   * Update the editable content of a message and stamp edited_at.
+   *
+   * Both `text` and `body` are updated to the new value. This covers all
+   * message shapes:
+   *   - User messages: text is set, body is null → text gets the edit,
+   *     body stays null (null overwrite is no-op).
+   *   - AI messages: body is set, text is null → both get the new value;
+   *     displayBody in useMessageDisplay reads `text ?? body`, so the
+   *     first non-null wins. After edit both fields hold the same string,
+   *     which is consistent and never shows stale original content.
+   */
+  async editText(id: string, newText: string): Promise<void> {
+    const db = await getDb();
+    await db.execute(
+      "UPDATE messages SET text = $1, body = $1, edited_at = $2 WHERE id = $3",
+      [newText, Date.now(), id]
     );
   },
 
@@ -617,6 +711,10 @@ export async function seedIfEmpty(): Promise<void> {
         code_text: m.code?.text ?? null,
         image: m.image ? 1 : 0,
         ts: base + i * 1000,
+        // V6 columns — all null for seed data (messages start unedited, undeleted)
+        edited_at: null,
+        deleted_at: null,
+        parent_id: null,
       }));
       for (const row of messageRows) {
         await messages.append(row);

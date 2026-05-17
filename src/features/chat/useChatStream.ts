@@ -15,7 +15,7 @@
 
 import { useEffect, useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { listen } from "@/lib/tauri";
+import { listen, invoke } from "@/lib/tauri";
 import { diag, diagEveryN } from "@/lib/diag";
 import { queryClient } from "@/lib/queryClient";
 
@@ -111,6 +111,9 @@ export interface ChatStreamHandle {
   partialReasoning: string;
   start: () => void;
   stop: () => void;
+  /** Abort the in-flight stream for `activeConvId` — signals the Rust backend
+   * to exit the streaming loop and resets local streaming state. */
+  abort: () => void;
 }
 
 /**
@@ -152,5 +155,16 @@ export function useChatStream(activeConvId?: string | null): ChatStreamHandle {
     queryClient.setQueryData<ChatStreamState>(STREAM_KEY, INITIAL_STREAM);
   }, []);
 
-  return { streaming, partial, partialReasoning, start, stop };
+  const abort = useCallback(() => {
+    // Reset local streaming state immediately so the UI responds at once.
+    queryClient.setQueryData<ChatStreamState>(STREAM_KEY, INITIAL_STREAM);
+    // Signal the Rust backend to exit the in-flight collect_lines loop.
+    // Only meaningful when we have a conversation ID — if not, the stream
+    // was fire-and-forget without abort registration on the Rust side.
+    if (activeConvId) {
+      void invoke("chat_abort", { conversationId: activeConvId });
+    }
+  }, [activeConvId]);
+
+  return { streaming, partial, partialReasoning, start, stop, abort };
 }

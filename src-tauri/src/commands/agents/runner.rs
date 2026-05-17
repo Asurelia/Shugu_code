@@ -565,7 +565,7 @@ async fn call_agent_llm_with_tools(
         "anthropic" => {
             let messages = build_anthropic_messages(history);
             chat::call_anthropic(
-                client, base_url, model, &messages, api_key, /* with_tools */ true, &mut on_chunk,
+                client, base_url, model, &messages, api_key, /* with_tools */ true, None, &mut on_chunk,
             )
             .await
         }
@@ -598,6 +598,7 @@ async fn call_agent_llm_with_tools(
                 protocol,
                 chat_template_kwargs,
                 /* with_tools */ true,
+                None,
                 &mut on_chunk,
             )
             .await
@@ -618,7 +619,7 @@ async fn call_agent_llm_with_tools(
                     _ => None,
                 })
                 .collect();
-            chat::call_ollama(client, base_url, model, &messages, &mut on_chunk).await
+            chat::call_ollama(client, base_url, model, &messages, None, &mut on_chunk).await
         }
         other => Err(format!("unsupported protocol for agent: {other}")),
     }

@@ -48,9 +48,21 @@ export function ChatView({
   const [input, setInput] = useState("");
   const [typing, setTyping] = useState(false);
   const [mode, setMode] = useState("chat");
+  // ─────────────────────────────────────────────────────────────────
+  // NOT TanStack because:
+  //   1. pendingImage is transient UI state for a single composer — it
+  //      exists only between "user picks/pastes an image" and "user clicks
+  //      Send". No other component needs to observe it.
+  //   2. Sharing via QueryClient would require a per-conversation key and
+  //      cleanup on send — net complexity for zero benefit.
+  // SI un jour on voulait "draft persisté entre sessions", on basculerait
+  // vers setQueryData(chatKeys.pendingAttachment(convId)).
+  // ─────────────────────────────────────────────────────────────────
+  const [pendingImage, setPendingImage] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const feedRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
-  const chatStream = useChatStream();
+  const chatStream = useChatStream(activeConv);
   const { data: messages } = useMessages(activeConv);
   // The model the user has actually picked. Defaults to llamacpp/local on
   // a brand-new install, or to `modelProp` if a legacy route still passes
@@ -79,21 +91,46 @@ export function ChatView({
 
   const send = useCallback(async () => {
     const text = input.trim();
-    if (!text) return;
+    if (!text && !pendingImage) return;
     setInput("");
+    const imageToSend = pendingImage;
+    setPendingImage(null);
     setTyping(true);
     chatStream.start();
     try {
-      await sendChatMessage(activeConv, text, model);
+      await sendChatMessage(activeConv, text, model, imageToSend ?? undefined);
     } finally {
       setTyping(false);
       chatStream.stop();
     }
-  }, [input, model, activeConv, chatStream]);
+  }, [input, pendingImage, model, activeConv, chatStream]);
 
   const onKey = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); }
   };
+
+  const readFileAsDataUrl = (file: File): Promise<string> =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+
+  const handlePaste = useCallback(async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = Array.from(e.clipboardData?.items ?? []);
+    const imageItem = items.find((item) => item.type.startsWith("image/"));
+    if (!imageItem) return;
+    e.preventDefault();
+    const file = imageItem.getAsFile();
+    if (!file) return;
+    try {
+      const dataUrl = await readFileAsDataUrl(file);
+      setPendingImage(dataUrl);
+    } catch (err) {
+      console.warn("[ChatView] paste image read failed:", err);
+    }
+  }, []);
 
   return (
     <div className="chat-shell">
@@ -143,6 +180,42 @@ export function ChatView({
       </div>
       <div className="composer-wrap">
         <div className="composer">
+          {/* Hidden file input for attach button */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            style={{ display: "none" }}
+            onChange={async (e) => {
+              const file = e.target.files?.[0];
+              if (!file) return;
+              try {
+                const dataUrl = await readFileAsDataUrl(file);
+                setPendingImage(dataUrl);
+              } catch (err) {
+                console.warn("[ChatView] file attach read failed:", err);
+              }
+              // Reset so the same file can be re-attached if cleared.
+              e.target.value = "";
+            }}
+          />
+          {/* Pending image thumbnail preview */}
+          {pendingImage && (
+            <div style={{ padding: "4px 8px 0", display: "flex", alignItems: "center", gap: 6 }}>
+              <img
+                src={pendingImage}
+                alt="pending attachment"
+                style={{ height: 40, borderRadius: 4, objectFit: "cover", border: "1px solid rgba(255,255,255,0.1)" }}
+              />
+              <button
+                onClick={() => setPendingImage(null)}
+                title="Remove image"
+                style={{ background: "none", border: "none", cursor: "pointer", color: "var(--on-surface-muted)", fontSize: 14 }}
+              >
+                ×
+              </button>
+            </div>
+          )}
           <textarea
             ref={inputRef}
             className="composer-input"
@@ -150,20 +223,64 @@ export function ChatView({
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={onKey}
+            onPaste={handlePaste}
             rows={1}
           />
           <div className="composer-bar">
             <div className="composer-tools">
-              <button className="composer-tool" title="Attach"><Icon name="attach" size={15}/></button>
+              <button
+                className="composer-tool"
+                title="Attach image"
+                onClick={() => fileInputRef.current?.click()}
+              >
+                <Icon name="attach" size={15}/>
+              </button>
               <button className={"composer-tool" + (mode === "image" ? " on" : "")} onClick={() => setMode(m => m === "image" ? "chat" : "image")} title="Image mode"><Icon name="image" size={15}/></button>
-              <button className="composer-tool" title="Code block"><Icon name="code" size={15}/></button>
+              <button
+                className="composer-tool"
+                title="Code block"
+                onClick={() => {
+                  const el = inputRef.current;
+                  if (!el) return;
+                  const start = el.selectionStart ?? el.value.length;
+                  const end = el.selectionEnd ?? el.value.length;
+                  const before = el.value.slice(0, start);
+                  const after = el.value.slice(end);
+                  const insertion = "```\n\n```";
+                  el.value = before + insertion + after;
+                  // Place caret inside the code block (after the first ``\n).
+                  const cursorPos = start + 4;
+                  el.setSelectionRange(cursorPos, cursorPos);
+                  // Sync React controlled state.
+                  setInput(el.value);
+                  el.focus();
+                }}
+              >
+                <Icon name="code" size={15}/>
+              </button>
               <button className="composer-tool" title="Voice"><Icon name="mic" size={15}/></button>
             </div>
             <div className="composer-spacer"></div>
             <ModelPicker model={model} onChange={setModel} className="composer-model"/>
-            <button className="composer-send" onClick={send} disabled={!input.trim()} title="Send">
-              <Icon name="send" size={15}/>
-            </button>
+            {typing ? (
+              <button
+                className="composer-send"
+                title="Stop generation"
+                onClick={() => {
+                  chatStream.abort();
+                  setTyping(false);
+                }}
+                style={{ color: "var(--accent-red, #e05252)" }}
+              >
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="4" y="4" width="16" height="16" rx="2"/>
+                </svg>
+              </button>
+            ) : (
+              <button className="composer-send" onClick={send} disabled={!input.trim()} title="Send">
+                <Icon name="send" size={15}/>
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -182,7 +299,7 @@ export function ChatMessage({
   // agent encore "au travail" et y branche le streaming live (depuis
   // useAgentTranscript, cache prouvé fonctionnel via le drawer agent).
   // Pour les messages normaux, no-op.
-  const { displayBody, liveReasoning, isStreamingAgent } = useMessageDisplay(m);
+  const { displayBody, liveReasoning, isStreamingAgent, imageDataUrl } = useMessageDisplay(m);
 
   if (m.role === "user") {
     return (
@@ -190,7 +307,15 @@ export function ChatMessage({
         <div className="avatar">VU</div>
         <div className="body">
           <div className="who">You <span className="ts">— {m.ts}</span></div>
-          <div className="text">{m.text}</div>
+          {imageDataUrl ? (
+            <img
+              src={imageDataUrl}
+              alt="attached"
+              style={{ maxWidth: "100%", maxHeight: 300, borderRadius: 6, display: "block", marginTop: 4 }}
+            />
+          ) : (
+            <div className="text">{m.text}</div>
+          )}
         </div>
       </div>
     );
@@ -278,9 +403,18 @@ export function ChatMessage({
           </details>
         )}
         <div className="text">
-          {displayBody && <p style={{whiteSpace: "pre-wrap"}}>{displayBody}</p>}
-          {m.code && <CodeBlock lang={m.code.lang} text={m.code.text} onOpenInEditor={onOpenSnippet}/>}
-          {m.image && <InlineImage prompt="dreamy aurora, soft pinks and cyan"/>}
+          {imageDataUrl ? (
+            <img
+              src={imageDataUrl}
+              alt="generated"
+              style={{ maxWidth: "100%", maxHeight: 300, borderRadius: 6, display: "block", marginTop: 4 }}
+            />
+          ) : (
+            <>
+              {displayBody && <p style={{whiteSpace: "pre-wrap"}}>{displayBody}</p>}
+              {m.code && <CodeBlock lang={m.code.lang} text={m.code.text} onOpenInEditor={onOpenSnippet}/>}
+            </>
+          )}
         </div>
       </div>
     </div>

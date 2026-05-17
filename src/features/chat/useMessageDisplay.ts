@@ -28,6 +28,10 @@ export interface MessageDisplay {
   liveReasoning: string;
   /** True si on est en train de stream le contenu d'un agent encore actif. */
   isStreamingAgent: boolean;
+  /** Populated when the message is an image attachment (m.image === true and
+   *  body starts with "data:"). Renderers should show an <img> tag instead of
+   *  interpreting displayBody as text. */
+  imageDataUrl?: string;
 }
 
 /**
@@ -62,5 +66,11 @@ export function useMessageDisplay(m: Message): MessageDisplay {
       ? liveContent
       : (m.text ?? m.body ?? "");
 
-  return { displayBody, liveReasoning, isStreamingAgent };
+  // Detect image messages — body is a data URL when image=true.
+  const imageDataUrl =
+    m.image === true && typeof m.body === "string" && m.body.startsWith("data:")
+      ? m.body
+      : undefined;
+
+  return { displayBody, liveReasoning, isStreamingAgent, imageDataUrl };
 }

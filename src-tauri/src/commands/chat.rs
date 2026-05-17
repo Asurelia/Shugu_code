@@ -1,8 +1,27 @@
 use futures_util::StreamExt;
 use serde::Deserialize;
 use tauri::Emitter;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
 
 use crate::commands::agents::{tools_json_anthropic, tools_json_openai, ToolCall, ToolCallAccumulator};
+
+// ---------------------------------------------------------------------------
+// Abort registry — tracks in-flight chat streams so the frontend can cancel.
+// ---------------------------------------------------------------------------
+
+/// Per-conversation abort flags.  `chat_send` registers a fresh
+/// `Arc<AtomicBool>` when it starts streaming; `chat_abort` looks up the
+/// flag and sets it.  `collect_lines` polls the flag on every chunk boundary
+/// and returns early when it fires.
+///
+/// Using Tauri State (`.manage()` in `lib.rs`) rather than a file-level static
+/// is the canonical Tauri 2 pattern — the same pattern used by `PtyRegistry`,
+/// `LlamaServerState`, and `AgentManagerState`.  A global static Lazy would
+/// work but leaks across test harnesses and is harder to mock.
+#[derive(Default)]
+pub struct ChatAbortRegistry(pub Mutex<HashMap<String, Arc<AtomicBool>>>);
 
 // ────────────────────────────────────────────────────────────────────────
 // AssistantTurn — Phase 2 return shape for the streaming helpers.
@@ -114,8 +133,16 @@ pub(crate) fn resolve_key(protocol: &str, api_key: &Option<String>) -> Result<St
 /// byte-level buffer.  Handles arbitrary chunk boundaries (including chunks
 /// that split multi-byte UTF-8 sequences mid-codepoint) by accumulating raw
 /// bytes and slicing only at `\n` boundaries.
+///
+/// `abort`: optional shared flag — when `Some(flag)` is provided, the loop
+/// checks `flag.load(Relaxed)` before every network-read iteration and
+/// returns `Ok(())` immediately (graceful truncation) when the flag is set.
+/// This is the sole abort path for `chat_abort`; the closure cannot signal
+/// early termination by itself because it can only `return`, not `break` the
+/// outer `while let`.
 pub(crate) async fn collect_lines<F>(
     response: reqwest::Response,
+    abort: Option<Arc<AtomicBool>>,
     mut on_line: F,
 ) -> Result<(), String>
 where
@@ -125,6 +152,12 @@ where
     let mut buf: Vec<u8> = Vec::new();
 
     while let Some(chunk) = stream.next().await {
+        // Check abort flag before processing each network chunk.
+        if let Some(ref flag) = abort {
+            if flag.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+        }
         let bytes = chunk.map_err(|e| e.to_string())?;
         buf.extend_from_slice(&bytes);
         while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
@@ -174,6 +207,7 @@ pub(crate) async fn call_anthropic(
     messages: &[ChatMessage],
     api_key: &str,
     with_tools: bool,
+    abort: Option<Arc<AtomicBool>>,
     on_chunk: &mut (dyn FnMut(&str, &str) + Send),
 ) -> Result<AssistantTurn, String> {
     let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
@@ -238,7 +272,7 @@ pub(crate) async fn call_anthropic(
     let mut blocks: std::collections::HashMap<usize, BlockState> = std::collections::HashMap::new();
     let mut text_acc = String::new();
 
-    collect_lines(response, |line| {
+    collect_lines(response, abort, |line| {
         let Some(payload) = line.strip_prefix("data: ") else { return };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else { return };
 
@@ -329,6 +363,7 @@ pub(crate) async fn call_openai_compat(
     protocol: &str,
     chat_template_kwargs: &Option<serde_json::Value>,
     with_tools: bool,
+    abort: Option<Arc<AtomicBool>>,
     on_chunk: &mut (dyn FnMut(&str, &str) + Send),
 ) -> Result<AssistantTurn, String> {
     // Normalise: strip trailing slash, then decide whether to append /v1.
@@ -388,7 +423,7 @@ pub(crate) async fn call_openai_compat(
 
     eprintln!("[chat:{protocol}] streaming model={model} url={url} with_tools={with_tools}");
 
-    collect_lines(response, |line| {
+    collect_lines(response, abort, |line| {
         let Some(payload) = line.strip_prefix("data: ") else { return };
         // Terminal sentinel — not JSON; just stop accumulating.
         if payload.trim() == "[DONE]" { return }
@@ -450,6 +485,7 @@ pub(crate) async fn call_ollama(
     base_url: &str,
     model: &str,
     messages: &[ChatMessage],
+    abort: Option<Arc<AtomicBool>>,
     on_chunk: &mut (dyn FnMut(&str, &str) + Send),
 ) -> Result<AssistantTurn, String> {
     let url = format!("{}/api/chat", base_url.trim_end_matches('/'));
@@ -479,7 +515,7 @@ pub(crate) async fn call_ollama(
 
     let mut acc = String::new();
 
-    collect_lines(response, |line| {
+    collect_lines(response, abort, |line| {
         if line.is_empty() { return }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
         let Some(text) = v["message"]["content"].as_str() else { return };
@@ -509,8 +545,14 @@ pub(crate) async fn call_ollama(
 /// arrive.  After the stream ends a final `ChatDelta { chunk: "", done: true }`
 /// is emitted before the command resolves with the complete accumulated text.
 ///
+/// When `conversation_id` is `Some(id)`, a fresh `Arc<AtomicBool>` abort flag
+/// is registered in `ChatAbortRegistry` for the duration of the stream.  The
+/// companion `chat_abort` command sets the flag, causing `collect_lines` to
+/// return early on the next chunk boundary.  The flag is always cleaned up
+/// (removed from the registry) before `chat_send` returns, regardless of
+/// success, abort, or error.
+///
 /// Follow-up TODOs:
-/// - Cancellation: expose an abort handle so the frontend can cancel mid-stream.
 /// - Per-message history: thread `conversation_id` through a message store and
 ///   pass the full history in the `messages` array.
 /// - SSRF allowlist: for `custom` protocol, validate `base_url` against a
@@ -527,6 +569,7 @@ pub async fn chat_send(
     api_key: Option<String>,
     conversation_id: Option<String>,
     chat_template_kwargs: Option<serde_json::Value>,
+    abort_registry: tauri::State<'_, ChatAbortRegistry>,
 ) -> Result<String, String> {
     let model = if model.is_empty() {
         "claude-haiku-4-5".to_string()
@@ -540,6 +583,16 @@ pub async fn chat_send(
 
     let client = reqwest::Client::new();
     let protocol_str = protocol.as_str();
+
+    // Register an abort flag for this conversation (if we have an ID).
+    // The flag is shared between the streaming loop and the abort command.
+    let abort_flag: Option<Arc<AtomicBool>> = conversation_id.as_ref().map(|id| {
+        let flag = Arc::new(AtomicBool::new(false));
+        if let Ok(mut reg) = abort_registry.0.lock() {
+            reg.insert(id.clone(), Arc::clone(&flag));
+        }
+        flag
+    });
 
     // Build the chat-channel emit callback. The streaming helpers no
     // longer emit Tauri events themselves — instead they call this
@@ -569,17 +622,25 @@ pub async fn chat_send(
     let result: Result<AssistantTurn, String> = match protocol_str {
         "anthropic" => {
             let key = resolve_key(protocol_str, &api_key)?;
-            call_anthropic(&client, &base_url, &model, &messages, &key, /* with_tools */ false, &mut on_chunk).await
+            call_anthropic(&client, &base_url, &model, &messages, &key, /* with_tools */ false, abort_flag.clone(), &mut on_chunk).await
         }
         "openai" | "custom" => {
             let key = resolve_key(protocol_str, &api_key)?;
-            call_openai_compat(&client, &base_url, &model, &messages, &key, protocol_str, &chat_template_kwargs, /* with_tools */ false, &mut on_chunk).await
+            call_openai_compat(&client, &base_url, &model, &messages, &key, protocol_str, &chat_template_kwargs, /* with_tools */ false, abort_flag.clone(), &mut on_chunk).await
         }
         "ollama" => {
-            call_ollama(&client, &base_url, &model, &messages, &mut on_chunk).await
+            call_ollama(&client, &base_url, &model, &messages, abort_flag.clone(), &mut on_chunk).await
         }
         other => Err(format!("unsupported protocol: {}", other)),
     };
+
+    // Clean up the abort flag from the registry (always, regardless of result).
+    if let Some(id) = &conversation_id {
+        if let Ok(mut reg) = abort_registry.0.lock() {
+            reg.remove(id);
+        }
+    }
+
     let result: Result<String, String> = result.map(|turn| turn.content);
 
     // Emit a terminal `done` delta regardless of success/failure so the
@@ -593,4 +654,21 @@ pub async fn chat_send(
     let _ = app.emit("chat://delta", done_delta);
 
     result
+}
+
+/// Abort an in-flight `chat_send` for the given conversation.
+///
+/// Sets the `Arc<AtomicBool>` flag registered by `chat_send` so that
+/// `collect_lines` exits on the next chunk boundary.  If no stream is active
+/// for `conversation_id` (e.g. the stream already finished), this is a no-op.
+#[tauri::command]
+pub fn chat_abort(
+    conversation_id: String,
+    abort_registry: tauri::State<'_, ChatAbortRegistry>,
+) {
+    if let Ok(reg) = abort_registry.0.lock() {
+        if let Some(flag) = reg.get(&conversation_id) {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
 }

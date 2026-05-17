@@ -352,6 +352,7 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
           convo={ctx.convo}
           groups={groups}
           onClose={closeCtx}
+          onActivate={(id: string) => { setActiveId(id); closeCtx(); }}
           onPin={() => { togglePin(ctx.convo.id); closeCtx(); }}
           onUnread={() => { const nu = !ctx.convo.unread; patch(ctx.convo.id, { unread: nu }); void db.conversations.setUnread(ctx.convo.id, nu); closeCtx(); }}
           onRename={() => { setRenaming(ctx.convo.id); closeCtx(); }}
@@ -519,7 +520,7 @@ export function FiltersPanel({ filters, setFilters, groups, onClose: _onClose }:
   );
 }
 
-export function ChatContextMenu({ x, y, submenu, setSubmenu, convo, groups, onClose, onPin, onUnread, onRename, onDuplicate, onMove, onArchive, onUnarchive, onDelete }: any) {
+export function ChatContextMenu({ x, y, submenu, setSubmenu, convo, groups, onClose, onActivate, onPin, onUnread, onRename, onDuplicate, onMove, onArchive, onUnarchive, onDelete }: any) {
   const W = 240;
   const left = Math.min(x, window.innerWidth - W - 8);
   const top = Math.min(y, window.innerHeight - 360);
@@ -535,10 +536,51 @@ export function ChatContextMenu({ x, y, submenu, setSubmenu, convo, groups, onCl
           <span className="submark">›</span>
           {submenu === "open-in" && (
             <div className="chat-ctx chat-ctx-sub" onMouseLeave={() => setSubmenu(null)}>
-              <button className="chat-ctx-item"><span className="label">Current tab</span></button>
-              <button className="chat-ctx-item"><span className="label">New tab</span></button>
-              <button className="chat-ctx-item"><span className="label">New window</span></button>
-              <button className="chat-ctx-item"><span className="label">Float chat</span></button>
+              <button
+                className="chat-ctx-item"
+                onClick={() => onActivate(convo.id)}
+              >
+                <span className="label">Current tab</span>
+              </button>
+              <button
+                className="chat-ctx-item"
+                disabled
+                title="bientôt"
+                style={{ opacity: 0.45, cursor: "not-allowed" }}
+              >
+                <span className="label">New tab</span>
+              </button>
+              <button
+                className="chat-ctx-item"
+                disabled
+                title="bientôt"
+                style={{ opacity: 0.45, cursor: "not-allowed" }}
+              >
+                <span className="label">New window</span>
+              </button>
+              <button
+                className="chat-ctx-item"
+                onClick={async () => {
+                  // Reveal the mascot window and focus it so the conversation
+                  // can be picked up in the floating chat. Best-effort: if the
+                  // mascot label doesn't exist (e.g. the window was closed),
+                  // we just close the menu.
+                  try {
+                    const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+                    const mascot = await WebviewWindow.getByLabel("mascot");
+                    if (mascot) {
+                      await mascot.show();
+                      await mascot.unminimize();
+                      await mascot.setFocus();
+                    }
+                  } catch (err) {
+                    console.warn("[ChatContextMenu] float chat reveal failed:", err);
+                  }
+                  onClose();
+                }}
+              >
+                <span className="label">Float chat</span>
+              </button>
             </div>
           )}
         </button>

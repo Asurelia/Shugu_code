@@ -90,6 +90,12 @@ interface DbMessageRow {
   agent_id: string | null;
   /** 1 = verbatim orchestrator relay; 0 = direct chat message (V5 schema). */
   via_agent: number;
+  /** Unix ms timestamp of last edit. NULL if never edited (V6 schema). */
+  edited_at: number | null;
+  /** Unix ms timestamp of soft-delete. NULL = live (V6 schema). */
+  deleted_at: number | null;
+  /** UUID of the message this is a re-generation of (V6 schema). */
+  parent_id: string | null;
 }
 
 function rowToMessage(r: DbMessageRow): Message {
@@ -124,6 +130,12 @@ function messageToRow(m: Message, convId: string): DbMessageRow {
     ts: Date.now(),
     agent_id: m.agentId ?? null,
     via_agent: m.viaAgent ? 1 : 0,
+    // V6 columns — new messages written through appendMessage are always
+    // unedited and undeleted at creation time; parent_id is set externally
+    // (e.g. by useRegenerateFrom) when the message is a re-generation.
+    edited_at: null,
+    deleted_at: null,
+    parent_id: null,
   };
 }
 
@@ -184,17 +196,26 @@ export async function sendChatMessage(
   convId: string,
   text: string,
   modelId: string,
+  imageDataUrl?: string,
 ): Promise<void> {
   const trimmed = text.trim();
-  if (!trimmed) return;
+  // Allow empty text when an image is provided (image-only messages are valid).
+  if (!trimmed && !imageDataUrl) return;
 
   const userId = newMessageId("u");
-  await appendMessage(convId, {
+  const userMsg: Message = {
     id: userId,
     role: "user",
-    text: trimmed,
     ts: nowHHMM(),
-  });
+  };
+  if (trimmed) userMsg.text = trimmed;
+  if (imageDataUrl) {
+    // The data URL IS the message body when image=true. The image flag tells
+    // renderers to show an <img> instead of interpreting body as markdown text.
+    userMsg.body = imageDataUrl;
+    userMsg.image = true;
+  }
+  await appendMessage(convId, userMsg);
 
   // ── Phase 1: routing classification ────────────────────────────────
   // The mascot's send path forks into three routes:
@@ -347,12 +368,26 @@ export async function sendChatMessage(
   }
 
   try {
+    // If an image was attached, inject it as a user content item at the end
+    // of the messages list. We represent it as a compact text description so
+    // text-only backends degrade gracefully ("User attached an image: <url>").
+    // In a future phase, for vision-capable models (GPT-4o, Claude 3+), we
+    // can pass the data URL in the content array — but that requires per-model
+    // capability detection and an extended ChatMessage shape on the Rust side.
+    if (imageDataUrl && apiMessages.length > 0) {
+      const last = apiMessages[apiMessages.length - 1];
+      if (last.role === "user") {
+        // Prefix or append a compact note so the LLM knows an image was sent.
+        last.content = (last.content ? last.content + "\n\n" : "") + "[User attached an image]";
+      }
+    }
     const reply = await invoke<string>("chat_send", {
       messages: apiMessages,
       model: realModel,
       protocol,
       baseUrl,
       apiKey,
+      conversationId: convId,
       chatTemplateKwargs,
     });
     // Parse fenced ```code blocks``` out of the reply so the UI gets the

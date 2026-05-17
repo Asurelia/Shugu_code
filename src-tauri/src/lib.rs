@@ -92,6 +92,26 @@ const MIGRATION_V3: &str = "
 ALTER TABLE messages ADD COLUMN reasoning TEXT;
 ";
 
+// V6 — soft-delete + edit tracking + branching scaffold.
+//
+//   * edited_at  — NULL = never edited, otherwise the ms-timestamp of last
+//                  edit. Lets the UI show a small "edited" badge and
+//                  preserves an audit trail without versioning row history.
+//   * deleted_at — NULL = live message; otherwise the ms-timestamp of the
+//                  soft-delete. `listByConversation` filters these out so
+//                  they are invisible to the user and to the LLM history
+//                  builder (chat-sync). Preserved for undo and audit.
+//   * parent_id  — branching scaffold only (Phase C). NULL for all current
+//                  messages; the regenerate flow will populate it in a
+//                  future schema version. Index created now so the column
+//                  is ready for efficient range queries.
+const MIGRATION_V6: &str = "
+ALTER TABLE messages ADD COLUMN edited_at INTEGER;
+ALTER TABLE messages ADD COLUMN deleted_at INTEGER;
+ALTER TABLE messages ADD COLUMN parent_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_id);
+";
+
 // V5 — wire chat messages to the agent system (Phase 1).
 //
 // Two new columns on `messages`:
@@ -194,6 +214,12 @@ pub fn run() {
             sql: MIGRATION_V5,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 6,
+            description: "message_edit_delete_scaffold",
+            sql: MIGRATION_V6,
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
@@ -210,6 +236,7 @@ pub fn run() {
         .manage(commands::terminal::PtyRegistry::default())
         .manage(commands::llama::LlamaServerState::default())
         .manage(commands::agents::AgentManagerState::default())
+        .manage(commands::chat::ChatAbortRegistry::default())
         .setup(|app| {
             // Debug instrumentation — relay JS uncaught errors into stdout.
             //
@@ -361,6 +388,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::chat::chat_send,
+            commands::chat::chat_abort,
             commands::credentials::cred_set,
             commands::credentials::cred_get,
             commands::credentials::cred_delete,

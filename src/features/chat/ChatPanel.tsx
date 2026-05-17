@@ -24,6 +24,7 @@ import {
   reconcileOrphanPlaceholders,
 } from "@/features/chat/chat-sync";
 import { useChatStream } from "@/features/chat/useChatStream";
+import { useEditMessage, useDeleteMessage, useRegenerateFrom } from "@/features/chat/mutations";
 import { db } from "@/lib/db";
 import { useDiscoveredModels } from "@/lib/modelDiscovery";
 import { AgentsPanel } from "@/features/agents/AgentsPanel";
@@ -42,11 +43,50 @@ import type { Message } from "@/lib/types";
 // est partagée avec le main IDE chat via `useMessageDisplay`. Seul le STYLE
 // diverge — la mascotte est en mode bulle compacte (fonts 8-10px, padding
 // serré) là où views-chat.tsx utilise un layout full panel avec avatars.
-function MascotMessage({ m }: { m: Message }) {
-  const { displayBody, liveReasoning, isStreamingAgent } = useMessageDisplay(m);
+//
+// B4 (V6): context menu (Edit / Delete / Regenerate) is exposed on hover via
+// a tight row of icon buttons. Edit mode opens an inline textarea — ephemeral
+// per-message state managed with useState (see dérogation comment below).
+interface MascotMessageProps {
+  m: Message;
+  onEdit: (id: string, newText: string) => void;
+  onDelete: (id: string) => void;
+  onRegenerate: (id: string) => void;
+}
+
+function MascotMessage({ m, onEdit, onDelete, onRegenerate }: MascotMessageProps) {
+  const { displayBody, liveReasoning, isStreamingAgent, imageDataUrl } = useMessageDisplay(m);
+
+  // ─────────────────────────────────────────────────────────────────
+  // NOT TanStack because:
+  //   1. editDraft is transient UI state for the inline textarea — it
+  //      exists only while this specific message is being actively edited
+  //      (0→open→confirm/cancel→0). No other component needs to read it.
+  //   2. Sharing this via QueryClient would add a queryKey per-message-id
+  //      and require cleanup on unmount — net complexity gain, zero benefit.
+  // SI un jour l'édition devait persister entre navigations ou être visible
+  // depuis un autre panel, on basculerait vers setQueryData(chatKeys.editDraft(id)).
+  // ─────────────────────────────────────────────────────────────────
+  const [editDraft, setEditDraft] = useState<string | null>(null);
+  const [hovered, setHovered] = useState(false);
+  const isEditing = editDraft !== null;
+
+  const commitEdit = () => {
+    if (editDraft !== null && editDraft.trim()) {
+      onEdit(String(m.id), editDraft.trim());
+    }
+    setEditDraft(null);
+  };
+
+  const cancelEdit = () => setEditDraft(null);
 
   return (
-    <div className={"fm " + (m.role === "user" ? "you" : "ai")}>
+    <div
+      className={"fm " + (m.role === "user" ? "you" : "ai")}
+      style={{ position: "relative" }}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+    >
       {m.role !== "user" && m.viaAgent && m.agentId && (
         <button
           type="button"
@@ -112,7 +152,115 @@ function MascotMessage({ m }: { m: Message }) {
           </div>
         </details>
       )}
-      <span style={{whiteSpace: "pre-wrap"}}>{displayBody}</span>
+
+      {/* Body — inline textarea when editing, plain text otherwise */}
+      {isEditing ? (
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          <textarea
+            autoFocus
+            value={editDraft}
+            onChange={(e) => setEditDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); commitEdit(); }
+              if (e.key === "Escape") cancelEdit();
+            }}
+            rows={3}
+            style={{
+              width: "100%",
+              fontSize: 10,
+              fontFamily: "var(--font-mono)",
+              background: "rgba(255,255,255,0.06)",
+              border: "1px solid rgba(124, 58, 237, 0.4)",
+              borderRadius: 4,
+              padding: "4px 6px",
+              color: "inherit",
+              resize: "vertical",
+            }}
+          />
+          <div style={{ display: "flex", gap: 4 }}>
+            <button
+              type="button"
+              onClick={commitEdit}
+              style={{ fontSize: 9, padding: "2px 8px", borderRadius: 4, background: "rgba(124,58,237,0.22)", color: "var(--primary, #7c3aed)", border: "1px solid rgba(124,58,237,0.4)", cursor: "pointer" }}
+            >
+              Save
+            </button>
+            <button
+              type="button"
+              onClick={cancelEdit}
+              style={{ fontSize: 9, padding: "2px 8px", borderRadius: 4, background: "transparent", color: "var(--on-surface-muted)", border: "1px solid rgba(255,255,255,0.1)", cursor: "pointer" }}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : imageDataUrl ? (
+        <img
+          src={imageDataUrl}
+          alt="attached"
+          style={{ maxWidth: "100%", maxHeight: 160, borderRadius: 4, display: "block", marginTop: 2 }}
+        />
+      ) : (
+        <span style={{ whiteSpace: "pre-wrap" }}>{displayBody}</span>
+      )}
+
+      {/* Per-message action bar — visible on hover, hidden during editing */}
+      {hovered && !isEditing && (
+        <div
+          style={{
+            position: "absolute",
+            top: 2,
+            right: 2,
+            display: "flex",
+            gap: 2,
+            background: "rgba(20,14,35,0.85)",
+            borderRadius: 5,
+            padding: "2px 3px",
+            border: "1px solid rgba(255,255,255,0.08)",
+            zIndex: 10,
+          }}
+        >
+          {/* Edit — available on any message with text content */}
+          <button
+            type="button"
+            title="Modifier"
+            onClick={() => setEditDraft(String(m.text ?? m.body ?? ""))}
+            style={{ background: "none", border: "none", cursor: "pointer", padding: "1px 3px", color: "var(--on-surface-muted)", lineHeight: 1 }}
+          >
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+              <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+            </svg>
+          </button>
+          {/* Delete — available on any message */}
+          <button
+            type="button"
+            title="Supprimer"
+            onClick={() => onDelete(String(m.id))}
+            style={{ background: "none", border: "none", cursor: "pointer", padding: "1px 3px", color: "var(--on-surface-muted)", lineHeight: 1 }}
+          >
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="3 6 5 6 21 6"/>
+              <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+              <path d="M10 11v6"/><path d="M14 11v6"/>
+            </svg>
+          </button>
+          {/* Regenerate — only on AI messages (re-triggers the LLM from this turn) */}
+          {m.role === "ai" && (
+            <button
+              type="button"
+              title="Regénérer depuis ici"
+              onClick={() => onRegenerate(String(m.id))}
+              style={{ background: "none", border: "none", cursor: "pointer", padding: "1px 3px", color: "var(--on-surface-muted)", lineHeight: 1 }}
+            >
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="1 4 1 10 7 10"/>
+                <path d="M3.51 15a9 9 0 1 0 .49-3.65"/>
+              </svg>
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -136,11 +284,51 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
   const hasKey = discoveredModels.length > 0;
   const [model] = useActiveModel();
   const [activeConv, setActiveConv] = useActiveConv();
+
   const { data: msgs } = useMessages(activeConv);
   const [lastMsgCount, setLastMsgCount] = useState(0);
   const [input, setInput] = useState("");
+  // ─────────────────────────────────────────────────────────────────
+  // NOT TanStack because:
+  //   1. pendingImage is transient composer UI state — lives only between
+  //      paste/attach and the Send click. No other component reads it.
+  //   2. No cross-window or cross-mount visibility needed.
+  // ─────────────────────────────────────────────────────────────────
+  const [pendingImage, setPendingImage] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const busy = useChatBusy();
-  const chatStream = useChatStream();
+  const chatStream = useChatStream(activeConv);
+
+  // ── B4: per-message action mutations ─────────────────────────────────────
+  // Instantiated here (parent) so a single mutation instance is shared across
+  // all MascotMessage bubbles in this conversation — avoids one useMutation
+  // per row (which would be wasteful since only one action can be in flight
+  // at a time per conversation). chatStream must be declared before these
+  // handlers so handleRegenerate can call chatStream.start/stop.
+  const editMessage = useEditMessage(activeConv);
+  const deleteMessage = useDeleteMessage(activeConv);
+  const regenerateFrom = useRegenerateFrom(activeConv, model);
+
+  const handleEdit = (messageId: string, newText: string) => {
+    editMessage.mutate({ messageId, newText });
+  };
+  const handleDelete = (messageId: string) => {
+    deleteMessage.mutate({ messageId });
+  };
+  const handleRegenerate = (messageId: string) => {
+    setChatBusy(true);
+    chatStream.start();
+    regenerateFrom.mutate(
+      { messageId },
+      {
+        onSettled: () => {
+          setChatBusy(false);
+          chatStream.stop();
+          bumpInteract();
+        },
+      },
+    );
+  };
   // Listener is owned by the window root (RootLayout on the main IDE,
   // MascotApp on the mascot). Calling useAgents() here would double-
   // subscribe in the SAME window context — both RootLayout and ChatPanel
@@ -248,21 +436,47 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
 
   const send = () => {
     const t = input.trim();
-    if (!t || !hasKey) return;
+    if (!t && !pendingImage) return;
+    if (!hasKey) return;
     setInput("");
+    const imageToSend = pendingImage;
+    setPendingImage(null);
     setChatBusy(true);
     setMode("full");
     bumpInteract();
     chatStream.start();
     void (async () => {
       try {
-        await sendChatMessage(activeConv, t, model);
+        await sendChatMessage(activeConv, t, model, imageToSend ?? undefined);
       } finally {
         setChatBusy(false);
         chatStream.stop();
         bumpInteract();
       }
     })();
+  };
+
+  const readFileAsDataUrl = (file: File): Promise<string> =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+
+  const handlePaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = Array.from(e.clipboardData?.items ?? []);
+    const imageItem = items.find((item) => item.type.startsWith("image/"));
+    if (!imageItem) return;
+    e.preventDefault();
+    const file = imageItem.getAsFile();
+    if (!file) return;
+    try {
+      const dataUrl = await readFileAsDataUrl(file);
+      setPendingImage(dataUrl);
+    } catch (err) {
+      console.warn("[ChatPanel] paste image read failed:", err);
+    }
   };
 
   return (
@@ -277,7 +491,13 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
                 </div>
               )}
               {msgs.map((m) => (
-                <MascotMessage key={String(m.id)} m={m} />
+                <MascotMessage
+                  key={String(m.id)}
+                  m={m}
+                  onEdit={handleEdit}
+                  onDelete={handleDelete}
+                  onRegenerate={handleRegenerate}
+                />
               ))}
               {/* Live streaming preview — shows the reasoning trace (Qwen 3.5 /
                   DeepSeek-style `<think>` block) above the visible answer as
@@ -394,11 +614,47 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
         )}
 
         <div className="float-composer">
+          {/* Hidden file input for attach */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            style={{ display: "none" }}
+            onChange={async (e) => {
+              const file = e.target.files?.[0];
+              if (!file) return;
+              try {
+                const dataUrl = await readFileAsDataUrl(file);
+                setPendingImage(dataUrl);
+              } catch (err) {
+                console.warn("[ChatPanel] file attach read failed:", err);
+              }
+              e.target.value = "";
+            }}
+          />
+          {/* Pending image thumbnail */}
+          {pendingImage && (
+            <div style={{ padding: "2px 6px 0", display: "flex", alignItems: "center", gap: 4 }}>
+              <img
+                src={pendingImage}
+                alt="pending"
+                style={{ height: 28, borderRadius: 3, objectFit: "cover", border: "1px solid rgba(255,255,255,0.1)" }}
+              />
+              <button
+                onClick={() => setPendingImage(null)}
+                title="Remove"
+                style={{ background: "none", border: "none", cursor: "pointer", color: "var(--on-surface-muted)", fontSize: 12, lineHeight: 1 }}
+              >
+                ×
+              </button>
+            </div>
+          )}
           <div style={{position:"relative", minWidth:0}}>
             <textarea
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+              onPaste={handlePaste}
               placeholder={busy ? "…" : "Message Shugu…"}
               rows={1}
             />
@@ -434,10 +690,30 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
             )}
           </div>
           <div className="float-actions-col">
-            <span className={"float-kbd-hint" + (input.trim() && hasKey && !busy ? " ready" : "")} onClick={send} title="Send (Enter)">
-              <span className="k">↵</span>
-            </span>
-            <button className="float-icon-btn attach" title="Attach a file or screenshot">
+            {busy ? (
+              <button
+                className="float-icon-btn"
+                title="Stop generation"
+                onClick={() => {
+                  chatStream.abort();
+                  setChatBusy(false);
+                }}
+                style={{ color: "var(--accent-red, #e05252)" }}
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="4" y="4" width="16" height="16" rx="2"/>
+                </svg>
+              </button>
+            ) : (
+              <span className={"float-kbd-hint" + (input.trim() && hasKey ? " ready" : "")} onClick={send} title="Send (Enter)">
+                <span className="k">↵</span>
+              </span>
+            )}
+            <button
+              className="float-icon-btn attach"
+              title="Attach an image"
+              onClick={() => fileInputRef.current?.click()}
+            >
               <Icon name="attach" size={13}/>
             </button>
           </div>
