@@ -179,16 +179,22 @@ export function useMessages(convId: string | null): MessagesResult {
 export async function appendMessage(convId: string, msg: Message): Promise<void> {
   await db.messages.append(messageToRow(msg, convId));
 
-  // VEC1 — best-effort index for semantic search. Never blocks the user flow.
-  // Skip image-only messages (data URLs) and empty messages.
+  // VEC1 — best-effort index for semantic search. FIRE-AND-FORGET so the
+  // user-visible appendMessage returns as soon as the SQL INSERT lands.
+  // Awaiting vecIndex blocks the chat flow for 5-30s on the very first call
+  // (fastembed downloads/loads the 87 MB ONNX model lazily). Skipping the
+  // await is safe: the chat UI re-renders from the SQL invalidation, not
+  // from the vector index.
   const indexText = (msg.text ?? msg.body ?? "").trim();
   if (indexText && !indexText.startsWith("data:image")) {
-    try {
-      const { vecIndex } = await import("@/lib/vector");
-      await vecIndex("messages", String(msg.id), indexText);
-    } catch (err) {
-      console.warn("[chat-sync] vecIndex messages failed:", err);
-    }
+    void (async () => {
+      try {
+        const { vecIndex } = await import("@/lib/vector");
+        await vecIndex("messages", String(msg.id), indexText);
+      } catch (err) {
+        console.warn("[chat-sync] vecIndex messages failed:", err);
+      }
+    })();
   }
 
   try {

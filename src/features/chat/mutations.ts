@@ -56,12 +56,13 @@ export function useDeleteMessage(convId: string) {
   return useMutation({
     mutationFn: async ({ messageId }: { messageId: string }) => {
       await db.messages.softDelete(messageId);
-      // VEC1 — best-effort remove from semantic index on soft-delete.
-      try {
-        await vecDelete("messages", messageId);
-      } catch (err) {
+      // VEC1 — best-effort remove from semantic index. Fire-and-forget so
+      // the delete mutation resolves immediately on the SQL soft-delete
+      // (the vec layer is a denormalized search index — UX never depends
+      // on it being in sync down to the millisecond).
+      void vecDelete("messages", messageId).catch((err) => {
         console.warn("[mutations] vecDelete messages failed:", err);
-      }
+      });
     },
     onSuccess: async () => {
       await qc.invalidateQueries({ queryKey: chatKeys.messagesByConv(convId) });
