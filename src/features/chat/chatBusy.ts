@@ -1,43 +1,37 @@
-// Shugu Forge — chat busy store (module-scope).
+// Shugu Forge — chat busy flag (TanStack-backed).
 //
-// `busy` is the "the model is generating right now" flag set by ChatPanel
-// when send() fires and cleared when sendChatMessage() resolves. It used to
-// be local state inside FloatChat — Phase 5 split it out so the ChibiWithMood
-// anchor (which lives next to ChatPanel inside FloatShell) can read it for
-// mood derivation without prop drilling through the shell.
+// `busy` = "the model is generating right now". Set par ChatPanel quand
+// `send()` fire, clear quand `sendChatMessage()` resolve. Read par
+// ChibiWithMood pour driver son mood (busy ⇒ peek_thinking).
 //
-// Single-window store: each window (main IDE + mascot) has its own busy
-// flag because each window's ChatPanel maintains its own composer. Cross-
-// window chat sync happens at the message-broadcast level (chat-sync.ts) —
-// not here.
+// Refactor 2026-05-17 : ancien store custom (subscribers/publishers
+// manuel) → TanStack Query avec setQueryData. Pas de fetch — la query
+// existe juste comme "slot de state observable" partagé. Cohérent avec
+// la directive TanStack-only (plus aucun pattern subscriber artisanal).
 
-import { useEffect, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { queryClient } from "@/lib/queryClient";
 
-let busy = false;
-const subscribers = new Set<() => void>();
+const CHAT_BUSY_KEY = ["chat", "busy"] as const;
 
-function notify(): void {
-  subscribers.forEach(fn => fn());
-}
-
-export function setChatBusy(value: boolean): void {
-  if (busy === value) return;
-  busy = value;
-  notify();
-}
-
+/** Lit le flag de manière non-réactive (helpers hors-React). */
 export function getChatBusy(): boolean {
-  return busy;
+  return queryClient.getQueryData<boolean>(CHAT_BUSY_KEY) ?? false;
 }
 
-export function subscribeChatBusy(fn: () => void): () => void {
-  subscribers.add(fn);
-  return () => { subscribers.delete(fn); };
+/** Set le flag. Déclenche un re-render des consumers `useChatBusy()`. */
+export function setChatBusy(value: boolean): void {
+  if (getChatBusy() === value) return;
+  queryClient.setQueryData<boolean>(CHAT_BUSY_KEY, value);
 }
 
-/** React-reactive read of the chat-busy flag. */
+/** Hook React-réactif sur le flag chat-busy. */
 export function useChatBusy(): boolean {
-  const [value, setValue] = useState(busy);
-  useEffect(() => subscribeChatBusy(() => setValue(busy)), []);
-  return value;
+  const { data } = useQuery<boolean>({
+    queryKey: CHAT_BUSY_KEY,
+    queryFn: () => false, // initial only — setChatBusy override
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  return data ?? false;
 }

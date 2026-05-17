@@ -38,8 +38,8 @@ export const FMT_RELATIVE = (ts: number) => {
 };
 
 export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
-  // Initial state from seeds ensures web mode and first paint always show data.
-  // In Tauri mode the useEffect below replaces with SQLite data after mount.
+  // Initial state from seeds ensures the first paint always has data.
+  // The useEffect below replaces it with SQLite data after mount.
   const [groups, setGroups]   = useState<any[]>(SEED_GROUPS);
   const [convos, setConvos]   = useState<any[]>(SEED_CONVOS);
   const [filtersOpen, setFiltersOpen] = useState(false);
@@ -64,7 +64,7 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
     onActiveTitle(c?.title || null);
   }, [activeId, convos, onActiveTitle]);
 
-  // Hydrate from SQLite on mount (Tauri mode only; no-op in web mode).
+  // Hydrate from SQLite on mount.
   // listNested() reconstructs the parent→children tree from parent_id so that
   // sub-conversations (e.g. c6a/c6b under c6) are properly nested instead of
   // appearing as flat top-level rows after a SQLite round-trip.

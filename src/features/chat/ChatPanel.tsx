@@ -21,13 +21,101 @@ import {
   useActiveModel,
   sendChatMessage,
   createConversation,
+  reconcileOrphanPlaceholders,
 } from "@/features/chat/chat-sync";
+import { useChatStream } from "@/features/chat/useChatStream";
 import { db } from "@/lib/db";
 import { useDiscoveredModels } from "@/lib/modelDiscovery";
+import { AgentsPanel } from "@/features/agents/AgentsPanel";
+import { useActiveAgents } from "@/features/agents/queries";
+import { revealAgent } from "@/lib/agents";
 import { useFloatShell } from "@/features/floating/FloatShell";
 import { setChatBusy, useChatBusy } from "@/features/chat/chatBusy";
 import { setChatUnread } from "@/features/chat/chatUnread";
 import { bumpInteract } from "@/features/mascot/idleStore";
+import { useMessageDisplay } from "./useMessageDisplay";
+import type { Message } from "@/lib/types";
+
+// Bulle d'un message dans le chat mascotte (variant compact).
+//
+// La LOGIQUE data (placeholder agent → live streaming, reasoning extraction)
+// est partagée avec le main IDE chat via `useMessageDisplay`. Seul le STYLE
+// diverge — la mascotte est en mode bulle compacte (fonts 8-10px, padding
+// serré) là où views-chat.tsx utilise un layout full panel avec avatars.
+function MascotMessage({ m }: { m: Message }) {
+  const { displayBody, liveReasoning, isStreamingAgent } = useMessageDisplay(m);
+
+  return (
+    <div className={"fm " + (m.role === "user" ? "you" : "ai")}>
+      {m.role !== "user" && m.viaAgent && m.agentId && (
+        <button
+          type="button"
+          onClick={() => void revealAgent(m.agentId!)}
+          title="Voir la trace de l'orchestrator"
+          style={{
+            display: "inline-block",
+            marginBottom: 4,
+            padding: "1px 6px",
+            borderRadius: 99,
+            fontSize: 8,
+            fontWeight: 700,
+            letterSpacing: 0.5,
+            textTransform: "uppercase",
+            background: "rgba(124, 58, 237, 0.18)",
+            color: "var(--primary, #7c3aed)",
+            border: "1px solid rgba(124, 58, 237, 0.4)",
+            cursor: "pointer",
+            fontFamily: "var(--font-mono)",
+          }}
+        >
+          via orchestrator
+        </button>
+      )}
+      {isStreamingAgent && liveReasoning && !m.reasoning && (
+        <details
+          open
+          style={{
+            marginBottom: 4,
+            padding: "4px 6px",
+            borderLeft: "2px solid rgba(124, 58, 237, 0.35)",
+            background: "rgba(124, 58, 237, 0.04)",
+            borderRadius: 3,
+            fontSize: 10,
+            fontFamily: "var(--font-mono)",
+          }}
+        >
+          <summary style={{ cursor: "pointer", color: "var(--on-surface-muted)", fontSize: 9, letterSpacing: 0.5, textTransform: "uppercase" }}>
+            Thinking…
+          </summary>
+          <div style={{ marginTop: 4, fontStyle: "italic", color: "var(--on-surface-muted)", whiteSpace: "pre-wrap" }}>
+            {liveReasoning}
+          </div>
+        </details>
+      )}
+      {m.role !== "user" && m.reasoning && (
+        <details
+          style={{
+            marginBottom: 4,
+            padding: "4px 6px",
+            borderLeft: "2px solid rgba(124, 58, 237, 0.35)",
+            background: "rgba(124, 58, 237, 0.04)",
+            borderRadius: 3,
+            fontSize: 10,
+            fontFamily: "var(--font-mono)",
+          }}
+        >
+          <summary style={{ cursor: "pointer", color: "var(--on-surface-muted)", fontSize: 9, letterSpacing: 0.5, textTransform: "uppercase" }}>
+            Thinking ({m.reasoning.length} chars)
+          </summary>
+          <div style={{ marginTop: 4, fontStyle: "italic", color: "var(--on-surface-muted)", whiteSpace: "pre-wrap" }}>
+            {m.reasoning}
+          </div>
+        </details>
+      )}
+      <span style={{whiteSpace: "pre-wrap"}}>{displayBody}</span>
+    </div>
+  );
+}
 
 function fmtAgo(ts: number): string {
   const s = Math.max(0, (Date.now() - ts) / 1000);
@@ -52,7 +140,17 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
   const [lastMsgCount, setLastMsgCount] = useState(0);
   const [input, setInput] = useState("");
   const busy = useChatBusy();
-  const [tab, setTab] = useState<"feed" | "history">("feed");
+  const chatStream = useChatStream();
+  // Listener is owned by the window root (RootLayout on the main IDE,
+  // MascotApp on the mascot). Calling useAgents() here would double-
+  // subscribe in the SAME window context — both RootLayout and ChatPanel
+  // live in the main window's JS context when /chat is open, so two
+  // listeners would have fired per delta event, causing visible freezes
+  // on reasoning-heavy LLM runs (~400 chunks × 2 = ~800 store updates).
+  // We only READ from the store here; the wiring is done upstream.
+  const { data: agentsData } = useActiveAgents();
+  const agentsCount = agentsData?.length ?? 0;
+  const [tab, setTab] = useState<"feed" | "history" | "agents">("feed");
   const [historyConvs, setHistoryConvs] = useState<{ id: string; title: string; ts: number }[]>([]);
   const [histRefresh, setHistRefresh] = useState(0);
   const historyRef = useRef<HTMLDivElement | null>(null);
@@ -110,6 +208,15 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
     }
   }, [msgs, mode]);
 
+  // Réconcilie les placeholders "Orchestrateur au travail…" laissés
+  // orphelins par un freeze/crash précédent (l'agent a fini côté Rust
+  // mais le listener JS a manqué le complete event). Innocent du freeze
+  // récent (testé Plan v2 Step C).
+  useEffect(() => {
+    if (!activeConv) return;
+    void reconcileOrphanPlaceholders(activeConv);
+  }, [activeConv]);
+
   const newConvo = async () => {
     if (msgs.length === 0) {
       setTab("feed");
@@ -146,11 +253,13 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
     setChatBusy(true);
     setMode("full");
     bumpInteract();
+    chatStream.start();
     void (async () => {
       try {
         await sendChatMessage(activeConv, t, model);
       } finally {
         setChatBusy(false);
+        chatStream.stop();
         bumpInteract();
       }
     })();
@@ -168,12 +277,40 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
                 </div>
               )}
               {msgs.map((m) => (
-                <div key={String(m.id)} className={"fm " + (m.role === "user" ? "you" : "ai")}>
-                  {m.text ?? m.body ?? ""}
-                </div>
+                <MascotMessage key={String(m.id)} m={m} />
               ))}
+              {/* Live streaming preview — shows the reasoning trace (Qwen 3.5 /
+                  DeepSeek-style `<think>` block) above the visible answer as
+                  they're generated. Disappears the moment the message is
+                  persisted to SQLite (chatStream.stop in the send finally). */}
+              {chatStream.streaming && (chatStream.partial || chatStream.partialReasoning) && (
+                <div className="fm ai">
+                  {chatStream.partialReasoning && (
+                    <details
+                      open
+                      style={{
+                        marginBottom: 4,
+                        padding: "4px 6px",
+                        borderLeft: "2px solid rgba(124, 58, 237, 0.35)",
+                        background: "rgba(124, 58, 237, 0.04)",
+                        borderRadius: 3,
+                        fontSize: 11,
+                        fontFamily: "var(--font-mono)",
+                      }}
+                    >
+                      <summary style={{ cursor: "pointer", color: "var(--on-surface-muted)", fontSize: 9, letterSpacing: 0.5, textTransform: "uppercase" }}>
+                        Thinking…
+                      </summary>
+                      <div style={{ marginTop: 4, fontStyle: "italic", color: "var(--on-surface-muted)", whiteSpace: "pre-wrap" }}>
+                        {chatStream.partialReasoning}
+                      </div>
+                    </details>
+                  )}
+                  {chatStream.partial && <span style={{ whiteSpace: "pre-wrap" }}>{chatStream.partial}</span>}
+                </div>
+              )}
             </div>
-          ) : (
+          ) : tab === "history" ? (
             <div className="float-history-list">
               {historyConvs.length === 0 ? (
                 <div style={{color:"var(--on-surface-muted)", fontSize:12, padding:"24px 8px", textAlign:"center", fontFamily:"var(--font-mono)"}}>
@@ -194,6 +331,16 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
                   </div>
                 ))
               )}
+            </div>
+          ) : (
+            // Agents observability — the third tab, sibling of Chat and Historique.
+            // Renders the multi-agent live view (tree of running agents, their
+            // status, transcript drawer). The useAgents() call at the top of
+            // this component keeps the underlying listener alive even when this
+            // tab isn't visible, so agents spawned while the user is on the
+            // Chat tab appear instantly when they switch over.
+            <div className="float-history-list" style={{ padding: 0 }}>
+              <AgentsPanel />
             </div>
           )}
         </div>
@@ -220,6 +367,19 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
             </svg>
             <span>Historique</span>
             {historyConvs.length > 0 && <span className="float-tab-count">{historyConvs.length}</span>}
+          </button>
+          {/* Agents tab — third sibling, shows the multi-agent observability
+              view (runtime tree, transcripts). Org-chart-style icon to read
+              instantly as "agent hierarchy" without needing a label scan. */}
+          <button className={"float-tab" + (tab === "agents" ? " on" : "")} onClick={() => setTab("agents")} title="Agents">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="9" y="2" width="6" height="5" rx="1"/>
+              <rect x="2" y="17" width="6" height="5" rx="1"/>
+              <rect x="16" y="17" width="6" height="5" rx="1"/>
+              <path d="M12 7v4M5 17v-2a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v2"/>
+            </svg>
+            <span>Agents</span>
+            {agentsCount > 0 && <span className="float-tab-count">{agentsCount}</span>}
           </button>
         </div>
       )}
@@ -249,7 +409,7 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
                 title="Aucun provider configuré — ouvre Settings → Connections dans la fenêtre principale"
                 onClick={async () => {
                   // Cross-window deep-link to Settings → Connections. Each
-                  // step is best-effort: web mode (no Tauri) no-ops.
+                  // step is best-effort and logs on failure.
                   try {
                     const eventMod = await import("@tauri-apps/api/event");
                     await eventMod.emit("app://navigate", { path: "/settings/connections" });

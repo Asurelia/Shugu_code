@@ -6,17 +6,13 @@
 //   - Cross-window notification rides on the Tauri custom event bus.
 //   - The `storage` browser event is wired as a best-effort second channel
 //     for state that ALSO lives in localStorage (active conv id only).
-//   - Web mode (pnpm dev, no Tauri) degrades to an in-memory module-level
-//     cache + subscriber set, so the chat UI stays interactive without
-//     SQLite / without a second window.
 //
 // Public API:
 //   useMessages(convId)       — React hook, returns the live message list
 //                               and refetches when chat://messages-changed
 //                               fires for that convId.
 //   appendMessage(convId, m)  — write a single message: SQLite insert +
-//                               broadcast event (or web-cache push +
-//                               local notify).
+//                               broadcast event.
 //   sendChatMessage(...)      — high-level helper used by both ChatView and
 //                               FloatChat: appends user prompt, awaits the
 //                               chat_send invoke, appends AI reply.
@@ -31,14 +27,22 @@
 // filter, every keystroke in any conv would refetch in every window.
 
 import { useCallback, useEffect, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { db } from "@/lib/db";
 import { invoke } from "@/lib/tauri";
 import { resolveProvider, type Protocol } from "@/lib/providers";
 import { loadProviderConfig, getConfig, getProviderEnabled } from "@/lib/credentials";
 import { parseAiReply } from "@/lib/markdown";
+import { parseThinkingMode, resolveThinking } from "@/lib/thinkingHeuristic";
+import { resolveRoute, parseDelegateOverride } from "@/lib/routingHeuristic";
+import { spawnAgent, awaitAgentComplete } from "@/lib/agents";
+import { queryClient } from "@/lib/queryClient";
+import { diag } from "@/lib/diag";
+import { chatKeys } from "./keys";
+import { agentKeys } from "@/features/agents/keys";
+import type { ParsedAgentTranscript } from "@/features/agents/queries";
+import type { AgentRow } from "@/lib/agents";
 import type { Message } from "@/lib/types";
-
-const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
 // ─── Event names + storage keys (centralized to prevent drift) ─────────
 const EVT_MESSAGES     = "chat://messages-changed";
@@ -53,16 +57,6 @@ const KEY_ACTIVE_MODEL = "shugu.chat.activeModel.v1";
 // which is a worse first-run UX. If llama-server isn't running the user will
 // see a connection-refused error and can switch from the picker.
 const DEFAULT_ACTIVE_MODEL = "llamacpp/local";
-
-// ─── Web-mode in-memory cache ──────────────────────────────────────────
-// In pnpm dev (no Tauri), db.messages.append is a no-op. To keep the chat
-// UI functional anyway we mirror appends in a module-level Map and notify
-// a local subscriber set. This branch is dormant under Tauri.
-const webCache = new Map<string, Message[]>();
-const webSubscribers = new Set<(convId: string) => void>();
-function notifyWeb(convId: string): void {
-  for (const fn of webSubscribers) fn(convId);
-}
 
 // ─── Shape mapping (DB row ↔ UI Message) ───────────────────────────────
 // Row uses unix-ms timestamps; UI renders "HH:MM" clock strings. We
@@ -86,8 +80,16 @@ interface DbMessageRow {
   body: string | null;
   code_lang: string | null;
   code_text: string | null;
+  /** `<think>` trace from thinking-enabled models (V3 schema). NULL for
+   * messages persisted before V3 and for non-reasoning models. */
+  reasoning: string | null;
   image: number;
   ts: number;
+  /** UUID of the agent that produced this message (V5 schema). NULL for
+   * regular chat messages. */
+  agent_id: string | null;
+  /** 1 = verbatim orchestrator relay; 0 = direct chat message (V5 schema). */
+  via_agent: number;
 }
 
 function rowToMessage(r: DbMessageRow): Message {
@@ -97,8 +99,11 @@ function rowToMessage(r: DbMessageRow): Message {
     text: r.text ?? undefined,
     body: r.body ?? undefined,
     code: r.code_lang && r.code_text ? { lang: r.code_lang, text: r.code_text } : undefined,
+    reasoning: r.reasoning ?? undefined,
     image: r.image === 1 ? true : undefined,
     ts: fmtClock(r.ts),
+    viaAgent: r.via_agent === 1 ? true : undefined,
+    agentId: r.agent_id ?? undefined,
   };
 }
 
@@ -111,11 +116,14 @@ function messageToRow(m: Message, convId: string): DbMessageRow {
     body: m.body ?? null,
     code_lang: m.code?.lang ?? null,
     code_text: m.code?.text ?? null,
+    reasoning: m.reasoning ?? null,
     image: m.image ? 1 : 0,
     // m.ts is the rendered HH:MM string in the UI shape; we don't try to
     // parse it back — the insertion moment is what matters and Date.now()
     // captures it accurately. The clock string is re-derived on read.
     ts: Date.now(),
+    agent_id: m.agentId ?? null,
+    via_agent: m.viaAgent ? 1 : 0,
   };
 }
 
@@ -127,100 +135,43 @@ function messageToRow(m: Message, convId: string): DbMessageRow {
 export interface MessagesResult {
   data: Message[];
   isLoading: boolean;
-  source: "sqlite" | "web-cache" | "seed";
+  source: "sqlite";
 }
 
+/**
+ * Live message list pour une conversation. Refactor 2026-05-17 :
+ * useEffect+useState+listener manuel → TanStack useQuery + invalidation
+ * via `useChatMessageEvents` (mount dans ChatPanel).
+ *
+ * Bénéfices :
+ *  - Cache automatique : naviguer entre 2 conv ne re-fetch pas si fresh.
+ *  - Pas de listener à clean dans un useEffect — l'invalidation est wired
+ *    en un seul point (useEvents.ts), pas dispersée dans chaque hook.
+ *  - React 18 batching natif quand plusieurs events arrivent rapidement.
+ */
 export function useMessages(convId: string | null): MessagesResult {
-  const [data, setData] = useState<Message[]>([]);
-  const [isLoading, setIsLoading] = useState<boolean>(!!convId);
-  const [source, setSource] = useState<MessagesResult["source"]>("seed");
-
-  useEffect(() => {
-    if (!convId) {
-      setData([]);
-      setIsLoading(false);
-      return;
-    }
-    let cancelled = false;
-
-    const refetch = async () => {
-      if (inTauri) {
-        const rows = await db.messages.listByConversation(convId);
-        if (cancelled) return;
-        setData(rows.map((r) => rowToMessage(r as DbMessageRow)));
-        setSource("sqlite");
-        setIsLoading(false);
-        return;
-      }
-      // Web mode: lazy-seed c1 from prototype data, otherwise blank.
-      if (!webCache.has(convId)) {
-        if (convId === "c1") {
-          const seed = await import("@/mocks/seedMessages");
-          if (cancelled) return;
-          webCache.set(convId, [...seed.seedMessages]);
-        } else {
-          webCache.set(convId, []);
-        }
-      }
-      if (cancelled) return;
-      setData([...(webCache.get(convId) ?? [])]);
-      setSource(convId === "c1" ? "seed" : "web-cache");
-      setIsLoading(false);
-    };
-
-    void refetch();
-
-    // Subscribe to incoming change events.
-    let unlisten: (() => void) | null = null;
-    if (inTauri) {
-      void (async () => {
-        try {
-          const mod = await import("@tauri-apps/api/event");
-          unlisten = await mod.listen<{ conversationId: string }>(EVT_MESSAGES, (e) => {
-            if (cancelled) return;
-            // Short-circuit when the change isn't for our conv — keeps the
-            // mascot's chat panel from re-rendering on every main-window
-            // edit in another conversation.
-            if (e.payload?.conversationId !== convId) return;
-            void refetch();
-          });
-        } catch (err) {
-          console.warn("[chat-sync] listen messages failed:", err);
-        }
-      })();
-    } else {
-      const sub = (changed: string) => {
-        if (changed === convId) void refetch();
-      };
-      webSubscribers.add(sub);
-      unlisten = () => { webSubscribers.delete(sub); };
-    }
-
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [convId]);
-
-  return { data, isLoading, source };
+  const { data = [], isLoading } = useQuery<Message[]>({
+    queryKey: chatKeys.messagesByConv(convId ?? "__none__"),
+    queryFn: async () => {
+      if (!convId) return [];
+      const rows = await db.messages.listByConversation(convId);
+      return rows.map((r) => rowToMessage(r as DbMessageRow));
+    },
+    enabled: !!convId,
+    staleTime: 0,
+  });
+  return { data, isLoading, source: "sqlite" };
 }
 
 // ─── appendMessage — single-message write + broadcast ──────────────────
 export async function appendMessage(convId: string, msg: Message): Promise<void> {
-  if (inTauri) {
-    await db.messages.append(messageToRow(msg, convId));
-    try {
-      const mod = await import("@tauri-apps/api/event");
-      await mod.emit(EVT_MESSAGES, { conversationId: convId });
-    } catch (err) {
-      console.warn("[chat-sync] emit messages failed:", err);
-    }
-    return;
+  await db.messages.append(messageToRow(msg, convId));
+  try {
+    const mod = await import("@tauri-apps/api/event");
+    await mod.emit(EVT_MESSAGES, { conversationId: convId });
+  } catch (err) {
+    console.warn("[chat-sync] emit messages failed:", err);
   }
-  // Web mode: mutate the in-memory cache and notify local subscribers.
-  if (!webCache.has(convId)) webCache.set(convId, []);
-  webCache.get(convId)!.push(msg);
-  notifyWeb(convId);
 }
 
 // ─── sendChatMessage — high-level user→provider→ai round-trip ──────────
@@ -244,6 +195,27 @@ export async function sendChatMessage(
     text: trimmed,
     ts: nowHHMM(),
   });
+
+  // ── Phase 1: routing classification ────────────────────────────────
+  // The mascot's send path forks into three routes:
+  //   - chat-direct  : existing fast path (force think OFF below)
+  //   - chat-think   : existing path with thinking auto/on
+  //   - delegate     : spawn an orchestrator agent + relay verbatim
+  // The heuristic is in routingHeuristic.ts. Settings can override via
+  // `routing.delegateOverride` ("always-delegate" / "never-delegate").
+  const overrideRaw = await db.settings.get("routing.delegateOverride");
+  const delegateOverride = parseDelegateOverride(overrideRaw);
+  const route = resolveRoute(trimmed, delegateOverride);
+
+  if (route === "delegate") {
+    await handleDelegate(convId, trimmed);
+    return;
+  }
+  // Below: chat-direct + chat-think continue the existing chat flow.
+  // chat-direct callers will want thinking OFF; we annotate that intent
+  // into `forceThinkingOff` so the chat_template_kwargs resolution below
+  // honours it without depending on the per-provider toggle.
+  const forceThinkingOff = route === "chat-direct";
 
   // Default to anthropic if the caller passed a bare model id (no prefix).
   const id = modelId?.includes("/") ? modelId : "anthropic/claude-haiku-4-5";
@@ -286,6 +258,31 @@ export async function sendChatMessage(
   const baseUrl: string = (cfg.baseUrl && cfg.baseUrl !== "") ? cfg.baseUrl : defaultBaseUrl;
   const apiKey: string | undefined = (cfg.apiKey && cfg.apiKey !== "") ? cfg.apiKey : undefined;
 
+  // Per-provider thinking-mode router. Three values:
+  //   - "auto"  (default): run a cheap regex heuristic on `trimmed` to
+  //                        decide. Casual messages get fast direct answers,
+  //                        substantive ones get the reasoning phase.
+  //   - "on"               : always reason (model's untouched default).
+  //   - "off"              : never reason, direct answers only.
+  // See src/lib/thinkingHeuristic.ts for the decision tree. The resolved
+  // boolean is forwarded to llama-server as chat_template_kwargs so the
+  // chat template either injects or omits the `<think>` prefix on a
+  // per-request basis (no server restart needed). Anthropic / OpenAI /
+  // Ollama ignore unknown body fields, so the kwarg is safe to send
+  // everywhere.
+  const thinkingMode = parseThinkingMode(await getConfig(providerId, "enableThinking"));
+  // chat-direct route forces thinking OFF regardless of the per-provider
+  // toggle — that's the whole point of the route classification (casual
+  // messages skip the reasoning phase). chat-think defers to the provider
+  // toggle.
+  const thinkingEnabled = forceThinkingOff ? false : resolveThinking(thinkingMode, trimmed);
+  // We only inject the kwarg when we want to FORCE OFF — leaving the field
+  // absent means "use the chat template's default", which on Qwen 3.5 is
+  // thinking-on. Forcing on with `{enable_thinking: true}` is harmless but
+  // redundant.
+  const chatTemplateKwargs: Record<string, unknown> | undefined =
+    thinkingEnabled ? undefined : { enable_thinking: false };
+
   // Build the full conversation history from SQLite so the LLM has context
   // for follow-up questions. Without this, every message was treated as a
   // fresh conversation — Gemma even confidently claimed it had "memory of
@@ -295,14 +292,19 @@ export async function sendChatMessage(
   // so iterating the rows gives us [...prior turns, this fresh user turn]
   // in the exact order the API expects. Empty / image-only rows are skipped
   // because the OpenAI / Anthropic / Ollama APIs all reject empty content.
-  const rows = inTauri ? await db.messages.listByConversation(convId) : (webCache.get(convId) ?? []).map((m) => messageToRow(m, convId));
+  const rows = await db.messages.listByConversation(convId);
   const apiMessages = rows
     .map((r) => {
       // SQLite row: role is "user" / "ai"; map to API expectation "assistant".
+      // V5: messages with via_agent=1 are verbatim orchestrator output.
+      // We map them as role:"assistant" rather than as a synthetic system
+      // injection — the orchestrator IS the assistant of this conversation
+      // at that turn (the mascot has explicitly delegated), and the user's
+      // follow-ups will reference "what you just produced". Treating them
+      // as the previous assistant turn preserves multi-turn coherence at
+      // the cost of letting the chat model "see" content from a more
+      // capable model — acceptable per the Phase 1 trade-offs.
       const role = r.role === "ai" ? "assistant" : r.role;
-      // Prefer `text` (user), fall back to `body` (AI prose), then to nothing.
-      // If a row only has a `code` block we still send its text content so
-      // the LLM can reason about its own prior code suggestions.
       const text = (r.text ?? "").trim()
         || (r.body ?? "").trim()
         || (r.code_text ?? "").trim();
@@ -316,6 +318,34 @@ export async function sendChatMessage(
     apiMessages.push({ role: "user", content: trimmed });
   }
 
+  // Capture the reasoning trace for persistence. The streaming UI hooks
+  // (useChatStream in ChatView / ChatPanel) already consume `chat://delta`
+  // events for live rendering — we attach a SECOND, persistence-oriented
+  // listener here so the reasoning is durable across reloads and the user
+  // can re-consult what the model "thought". The two listeners are
+  // independent: Tauri broadcasts each event to every subscriber.
+  //
+  // We `await` the listener attach BEFORE the invoke so the subscription
+  // is guaranteed live when Rust starts emitting (otherwise the first
+  // 50-200 ms of reasoning would race the listener registration).
+  let reasoningAcc = "";
+  let unlistenReasoning: (() => void) | null = null;
+  try {
+    const mod = await import("@tauri-apps/api/event");
+    unlistenReasoning = await mod.listen<{ kind?: string; chunk: string; done: boolean }>(
+      "chat://delta",
+      (e) => {
+        const p = e.payload;
+        if (p?.done) return;
+        if (p?.kind === "reasoning" && typeof p.chunk === "string") {
+          reasoningAcc += p.chunk;
+        }
+      },
+    );
+  } catch (err) {
+    console.warn("[chat-sync] reasoning listener attach failed:", err);
+  }
+
   try {
     const reply = await invoke<string>("chat_send", {
       messages: apiMessages,
@@ -323,6 +353,7 @@ export async function sendChatMessage(
       protocol,
       baseUrl,
       apiKey,
+      chatTemplateKwargs,
     });
     // Parse fenced ```code blocks``` out of the reply so the UI gets the
     // structured Message.code shape (CodeBlock component highlights + the
@@ -340,14 +371,330 @@ export async function sendChatMessage(
     // Safety: a reply that was JUST whitespace would produce neither body
     // nor code — fall back to the raw text so the user sees SOMETHING.
     if (!aiMsg.body && !aiMsg.code) aiMsg.body = reply;
+    if (reasoningAcc) aiMsg.reasoning = reasoningAcc;
     await appendMessage(convId, aiMsg);
   } catch (err) {
     await appendMessage(convId, {
       id: newMessageId("e"),
       role: "ai",
       body: "⚠ chat_send failed: " + String(err),
+      reasoning: reasoningAcc || undefined,
       ts: nowHHMM(),
     });
+  } finally {
+    unlistenReasoning?.();
+  }
+}
+
+// ─── Phase 1: delegation path ─────────────────────────────────────────
+//
+// When the routing heuristic returns "delegate", the user's task is
+// handed off to a separately-configured orchestrator agent (Claude
+// Sonnet, OpenCode, Codex, …). The orchestrator's output is appended
+// to the chat VERBATIM — no LLM re-wrapping, no parseAiReply pass,
+// just `output → message.body`. A "via orchestrator" badge on the
+// rendered message links back to the agent's transcript in the
+// Agents panel.
+//
+// CTA path: if no `routing.orchestratorModel` is configured (or the
+// associated provider is disabled), we append a short instructional
+// message instead and emit `app://navigate` so the main IDE jumps to
+// Settings → Connections.
+async function handleDelegate(convId: string, task: string): Promise<void> {
+  const orchestratorModelRaw = await db.settings.get("routing.orchestratorModel");
+  const orchestratorModel = orchestratorModelRaw && orchestratorModelRaw.trim();
+
+  if (!orchestratorModel) {
+    await appendMessage(convId, {
+      id: newMessageId("e"),
+      role: "ai",
+      body:
+        "⚠ Cette demande ressemble à une tâche de développement, mais aucun **orchestrator** n'est configuré.\n\n" +
+        "Configure-le dans **Settings → Connections** (section Routing) pour activer la délégation — par exemple un Claude Sonnet via API, ou un OpenCode/Codex local.",
+      ts: nowHHMM(),
+    });
+    try {
+      const mod = await import("@tauri-apps/api/event");
+      await mod.emit("app://navigate", { path: "/connections" });
+    } catch (err) {
+      console.warn("[chat-sync] navigate emit failed", err);
+    }
+    return;
+  }
+
+  // Resolve provider config for the orchestrator. Same path as the chat
+  // model — prefix the id with `openai/` if no slash so resolveProvider
+  // doesn't fall through to "unknown provider".
+  const fullId = orchestratorModel.includes("/")
+    ? orchestratorModel
+    : `openai/${orchestratorModel}`;
+  const { providerId, protocol: defaultProtocol, baseUrl: defaultBaseUrl, model: realModel } =
+    resolveProvider(fullId);
+
+  const enabled = await getProviderEnabled(providerId);
+  if (enabled !== "true") {
+    await appendMessage(convId, {
+      id: newMessageId("e"),
+      role: "ai",
+      body: `⚠ Le provider orchestrator "${providerId}" n'est pas activé. Ouvre Settings → Connections, configure-le et clique Save.`,
+      ts: nowHHMM(),
+    });
+    return;
+  }
+
+  const cfg = await loadProviderConfig(providerId);
+  let protocol: Protocol = defaultProtocol;
+  if (defaultProtocol === "custom") {
+    const storedProtocol = await getConfig(providerId, "protocol");
+    if (
+      storedProtocol === "anthropic" ||
+      storedProtocol === "openai" ||
+      storedProtocol === "ollama" ||
+      storedProtocol === "custom"
+    ) {
+      protocol = storedProtocol;
+    }
+  }
+  const baseUrl: string = cfg.baseUrl && cfg.baseUrl !== "" ? cfg.baseUrl : defaultBaseUrl;
+  const apiKey: string | undefined = cfg.apiKey && cfg.apiKey !== "" ? cfg.apiKey : undefined;
+
+  // Spawn the agent FIRST. We need the agentId to attach to the placeholder
+  // so the reconciler (on mount) can match an orphan placeholder back to
+  // its (possibly already-completed) agent. Without this link, an orphan
+  // "Orchestrateur au travail…" message stays forever even though its
+  // output is sitting in the agents table.
+  let agentId: string;
+  try {
+    agentId = await spawnAgent({
+      role: "orchestrator",
+      task,
+      model: realModel,
+      conversationId: convId,
+      protocol,
+      baseUrl,
+      apiKey,
+    });
+  } catch (err) {
+    await appendMessage(convId, {
+      id: newMessageId("e"),
+      role: "ai",
+      body: `⚠ Impossible de lancer l'orchestrator : ${String(err)}`,
+      ts: nowHHMM(),
+    });
+    return;
+  }
+
+  // Plan v4 — pré-populer le cache `agentKeys.detail(agentId)` AVEC un
+  // transcript vide AVANT que les premiers deltas n'arrivent. Sans ça,
+  // useAgentEvents.setQueryData verrait `prev === undefined` et dropperait
+  // les premiers deltas (cf. comment dans useEvents.ts:43-52). Le queryFn
+  // de useAgentTranscript (passif, staleTime: Infinity) ne refetchera
+  // jamais, donc on doit fournir un container valide dès maintenant.
+  // useAgentEvents appendra les deltas / non-delta events au fur et à
+  // mesure ; quand un consumer mount useAgentTranscript(agentId), le
+  // cache est déjà initialisé donc pas de fetch déclenché.
+  const placeholderAgentRow: AgentRow = {
+    id: agentId,
+    role: "orchestrator",
+    status: "running",
+    parentId: null,
+    model: realModel,
+    task,
+    conversationId: convId,
+    createdAt: Date.now(),
+    finishedAt: null,
+    output: null,
+    error: null,
+  };
+  queryClient.setQueryData<ParsedAgentTranscript>(
+    agentKeys.detail(agentId),
+    (prev) => prev ?? { agent: placeholderAgentRow, events: [] },
+  );
+
+  // Placeholder message linked to the agent. Same id reused on overwrite
+  // below so we hit `INSERT OR REPLACE` in `db.messages.append`. The
+  // `agentId` is critical: it lets the reconciler at mount time find this
+  // placeholder, query its agent's status, and replace the body with the
+  // final output if the JS-side listener missed the `complete` event
+  // (e.g. window crash during streaming, 5-min timeout race, HMR reload).
+  const placeholderId = newMessageId("a");
+  const placeholderTs = nowHHMM();
+  const placeholderMsg: Message = {
+    id: placeholderId,
+    role: "ai",
+    body: "Orchestrateur au travail…",
+    ts: placeholderTs,
+    viaAgent: true,
+    agentId,
+  };
+
+  // SYNCHRONOUS pre-populate du cache TanStack AVANT le SQLite write. Sans
+  // ça, le premier delta de l'agent peut arriver entre `appendMessage` et
+  // le refetch déclenché par `chat://messages-changed` — la map `messages.map`
+  // dans `useChatEvents` ne trouve pas le placeholder, le delta se perd dans
+  // un buffer module-scope sans jamais s'attacher à un message visible.
+  // En pré-populant le cache, on garantit que dès le tout premier delta, le
+  // placeholder est déjà accessible via getQueriesData → setQueryData partiel.
+  queryClient.setQueryData<Message[]>(
+    chatKeys.messagesByConv(convId),
+    (prev = []) => {
+      if (prev.some((m) => m.id === placeholderId)) return prev;
+      return [...prev, placeholderMsg];
+    },
+  );
+
+  await appendMessage(convId, placeholderMsg);
+
+  diag("delegate", `placeholder injected agent=${agentId.slice(0, 8)} conv=${convId}`);
+  const delegateT0 = performance.now();
+  const [waitPromise] = awaitAgentComplete(agentId, { timeoutMs: 5 * 60 * 1000 });
+
+  try {
+    const { output } = await waitPromise;
+    const elapsed = Math.round(performance.now() - delegateT0);
+    diag(
+      "delegate",
+      `complete agent=${agentId.slice(0, 8)} elapsed=${elapsed}ms outputLen=${output.length}`,
+    );
+    // VERBATIM relay — no parseAiReply, no code-block splitting, no
+    // mascot re-wrapping. The orchestrator's output goes straight into
+    // the message body, with the agent_id link so the chip can deep-
+    // link to the transcript.
+    await appendMessage(convId, {
+      id: placeholderId,
+      role: "ai",
+      body: output,
+      ts: placeholderTs,
+      viaAgent: true,
+      agentId,
+    });
+  } catch (err) {
+    // The JS listener gave up (timeout, window thrash, etc.) — but the
+    // Rust agent may have completed anyway. Do ONE last SQLite check
+    // before declaring failure to the user. This is the path that
+    // recovers the "Orchestrateur au travail…" stuck-placeholder bug we
+    // saw in production: agent.status=complete with a 2.5KB output sat
+    // in the DB while the chat displayed "agent timeout".
+    try {
+      const { getAgentTranscript } = await import("@/lib/agents");
+      const transcript = await getAgentTranscript(agentId);
+      if (transcript.agent.status === "complete" && transcript.agent.output) {
+        await appendMessage(convId, {
+          id: placeholderId,
+          role: "ai",
+          body: transcript.agent.output,
+          ts: placeholderTs,
+          viaAgent: true,
+          agentId,
+        });
+        return;
+      }
+    } catch (probeErr) {
+      console.warn("[chat-sync] final transcript probe failed:", probeErr);
+    }
+    await appendMessage(convId, {
+      id: placeholderId,
+      role: "ai",
+      body: `⚠ Orchestrator a échoué : ${String(err)}`,
+      ts: placeholderTs,
+      viaAgent: true,
+      agentId,
+    });
+  }
+}
+
+/**
+ * Sweep the conversation for orphan "Orchestrateur au travail…" placeholders
+ * left behind when the JS listener died before the `complete` event arrived
+ * (window crash mid-stream, 5-min timeout race, HMR reload during a run,
+ * pre-agentId-in-placeholder legacy rows). For each, query the agent's
+ * current status — if it's `complete`, replace the placeholder body with
+ * the durable output sitting in `agents.output`.
+ *
+ * Safe to call multiple times: the placeholder check is exact-string, so
+ * any message that has already been reconciled (body now contains the
+ * real output) is skipped.
+ *
+ * Pre-agentId-in-placeholder messages have `agentId == null` — those we
+ * can still recover by finding the latest complete agent in the same
+ * conversation that has no message linking to it. We only attempt that
+ * for the SINGLE most-recent unlinked complete agent to avoid cross-
+ * matching multiple historical placeholders to the wrong agent.
+ */
+export async function reconcileOrphanPlaceholders(convId: string): Promise<void> {
+  try {
+    const messages = await db.messages.listByConversation(convId);
+    const { getAgentTranscript, listAgentsByConversation } = await import("@/lib/agents");
+
+    // Pass 1: placeholders with an explicit agentId (post-fix runs).
+    // Note: MessageRow uses snake_case (`agent_id`), while the UI-side
+    // Message type uses camelCase (`agentId`). MessageRow.ts is a number
+    // (epoch ms) while Message.ts is the HH:MM display string — for the
+    // overwrite we just use `nowHHMM()` since the placeholderId stays
+    // stable (INSERT OR REPLACE), so ordering is preserved by id, not ts.
+    for (const msg of messages) {
+      if (msg.role !== "ai") continue;
+      if (msg.body !== "Orchestrateur au travail…") continue;
+      if (!msg.agent_id) continue;
+      try {
+        const t = await getAgentTranscript(msg.agent_id);
+        if (t.agent.status === "complete" && t.agent.output) {
+          await appendMessage(convId, {
+            id: msg.id,
+            role: "ai",
+            body: t.agent.output,
+            ts: nowHHMM(),
+            viaAgent: true,
+            agentId: msg.agent_id,
+          });
+        } else if (t.agent.status === "error" || t.agent.status === "killed") {
+          await appendMessage(convId, {
+            id: msg.id,
+            role: "ai",
+            body: `⚠ Orchestrator a échoué : ${t.agent.error || t.agent.status}`,
+            ts: nowHHMM(),
+            viaAgent: true,
+            agentId: msg.agent_id,
+          });
+        }
+        // pending/running: leave the placeholder; awaitAgentComplete or
+        // the next reconcile pass will catch it.
+      } catch {
+        // Transcript fetch failed (agent row gone?) — leave the placeholder.
+      }
+    }
+
+    // Pass 2: legacy placeholders without an agentId. Match to the
+    // single most-recent complete agent of this conv that no message
+    // currently links to.
+    const orphanLegacy = messages.find(
+      (m) => m.role === "ai" && m.body === "Orchestrateur au travail…" && !m.agent_id,
+    );
+    if (orphanLegacy) {
+      try {
+        const agents = await listAgentsByConversation(convId);
+        const linkedIds = new Set(
+          messages.map((m) => m.agent_id).filter((x): x is string => !!x),
+        );
+        const candidate = agents
+          .filter((a) => a.status === "complete" && a.output && !linkedIds.has(a.id))
+          .sort((a, b) => b.createdAt - a.createdAt)[0];
+        if (candidate) {
+          await appendMessage(convId, {
+            id: orphanLegacy.id,
+            role: "ai",
+            body: candidate.output as string,
+            ts: nowHHMM(),
+            viaAgent: true,
+            agentId: candidate.id,
+          });
+        }
+      } catch (err) {
+        console.warn("[chat-sync] legacy reconcile failed:", err);
+      }
+    }
+  } catch (err) {
+    console.warn("[chat-sync] reconcileOrphanPlaceholders failed:", err);
   }
 }
 
@@ -378,57 +725,33 @@ export function getActiveConv(): string {
   return loadActive();
 }
 
+/**
+ * useActiveConv (TanStack) — id de la conversation actuellement ouverte.
+ *
+ * Persistance localStorage + sync cross-window via Tauri event. Le state
+ * vit dans le QueryClient (queryKey synthétique). Le setter écrit dans
+ * localStorage + emit Tauri event ; le listener (mount dans useChatEvents)
+ * cross-window setQueryData. Pas de useState, pas d'useEffect dispersé.
+ */
 export function useActiveConv(): [string, (id: string) => void] {
-  const [active, setActiveLocal] = useState<string>(() => loadActive());
-
-  useEffect(() => {
-    let unlisten: (() => void) | null = null;
-
-    // Channel 1: storage event — fires when the OTHER window writes to
-    // localStorage. Best-effort across Tauri WebviewWindows (see
-    // calibration.ts for the same caveat).
-    const onStorage = (e: StorageEvent) => {
-      if (e.key !== KEY_ACTIVE) return;
-      if (typeof e.newValue === "string" && e.newValue) {
-        setActiveLocal(e.newValue);
-      }
-    };
-    window.addEventListener("storage", onStorage);
-
-    // Channel 2: Tauri custom event — guaranteed cross-window.
-    if (inTauri) {
-      void (async () => {
-        try {
-          const mod = await import("@tauri-apps/api/event");
-          unlisten = await mod.listen<{ conversationId: string }>(EVT_ACTIVE, (e) => {
-            const id = e.payload?.conversationId;
-            if (typeof id === "string" && id) setActiveLocal(id);
-          });
-        } catch (err) {
-          console.warn("[chat-sync] listen active failed:", err);
-        }
-      })();
-    }
-
-    return () => {
-      window.removeEventListener("storage", onStorage);
-      unlisten?.();
-    };
-  }, []);
+  const { data: active = loadActive() } = useQuery<string>({
+    queryKey: chatKeys.activeConv(),
+    queryFn: () => loadActive(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
 
   const setActive = useCallback((id: string) => {
-    setActiveLocal(id);
+    queryClient.setQueryData<string>(chatKeys.activeConv(), id);
     try { localStorage.setItem(KEY_ACTIVE, id); } catch { /* quota */ }
-    if (inTauri) {
-      void (async () => {
-        try {
-          const mod = await import("@tauri-apps/api/event");
-          await mod.emit(EVT_ACTIVE, { conversationId: id });
-        } catch (err) {
-          console.warn("[chat-sync] emit active failed:", err);
-        }
-      })();
-    }
+    void (async () => {
+      try {
+        const mod = await import("@tauri-apps/api/event");
+        await mod.emit(EVT_ACTIVE, { conversationId: id });
+      } catch (err) {
+        console.warn("[chat-sync] emit active failed:", err);
+      }
+    })();
   }, []);
 
   return [active, setActive];
@@ -456,50 +779,24 @@ function loadActiveModel(initial?: string): string {
 }
 
 export function useActiveModel(initial?: string): [string, (m: string) => void] {
-  const [active, setActiveLocal] = useState<string>(() => loadActiveModel(initial));
-
-  useEffect(() => {
-    let unlisten: (() => void) | null = null;
-
-    const onStorage = (e: StorageEvent) => {
-      if (e.key !== KEY_ACTIVE_MODEL) return;
-      if (typeof e.newValue === "string" && e.newValue) setActiveLocal(e.newValue);
-    };
-    window.addEventListener("storage", onStorage);
-
-    if (inTauri) {
-      void (async () => {
-        try {
-          const mod = await import("@tauri-apps/api/event");
-          unlisten = await mod.listen<{ model: string }>(EVT_ACTIVE_MODEL, (e) => {
-            const m = e.payload?.model;
-            if (typeof m === "string" && m) setActiveLocal(m);
-          });
-        } catch (err) {
-          console.warn("[chat-sync] listen active-model failed:", err);
-        }
-      })();
-    }
-
-    return () => {
-      window.removeEventListener("storage", onStorage);
-      unlisten?.();
-    };
-  }, []);
+  const { data: active = loadActiveModel(initial) } = useQuery<string>({
+    queryKey: chatKeys.activeModel(),
+    queryFn: () => loadActiveModel(initial),
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
 
   const setActive = useCallback((m: string) => {
-    setActiveLocal(m);
+    queryClient.setQueryData<string>(chatKeys.activeModel(), m);
     try { localStorage.setItem(KEY_ACTIVE_MODEL, m); } catch { /* quota */ }
-    if (inTauri) {
-      void (async () => {
-        try {
-          const mod = await import("@tauri-apps/api/event");
-          await mod.emit(EVT_ACTIVE_MODEL, { model: m });
-        } catch (err) {
-          console.warn("[chat-sync] emit active-model failed:", err);
-        }
-      })();
-    }
+    void (async () => {
+      try {
+        const mod = await import("@tauri-apps/api/event");
+        await mod.emit(EVT_ACTIVE_MODEL, { model: m });
+      } catch (err) {
+        console.warn("[chat-sync] emit active-model failed:", err);
+      }
+    })();
   }, []);
 
   return [active, setActive];
@@ -508,18 +805,16 @@ export function useActiveModel(initial?: string): [string, (m: string) => void] 
 // ─── createConversation — insert a fresh conv row + return its id ──────
 export async function createConversation(title: string = "New chat"): Promise<string> {
   const id = `c${Date.now()}`;
-  if (inTauri) {
-    await db.conversations.create({
-      id,
-      title,
-      project_id: null,
-      pinned: 0,
-      archived: 0,
-      unread: 0,
-      env: null,
-      parent_id: null,
-      updated_at: Date.now(),
-    });
-  }
+  await db.conversations.create({
+    id,
+    title,
+    project_id: null,
+    pinned: 0,
+    archived: 0,
+    unread: 0,
+    env: null,
+    parent_id: null,
+    updated_at: Date.now(),
+  });
   return id;
 }

@@ -8,6 +8,8 @@ import { useChatStream } from "./useChatStream";
 import { useMessages, sendChatMessage, useActiveModel } from "./chat-sync";
 import { ModelPicker } from "@/features/panels/panels";
 import { resolveImageProvider } from "@/lib/imageProviders";
+import { revealAgent } from "@/lib/agents";
+import { useMessageDisplay } from "./useMessageDisplay";
 
 type ImageResult = {
   id: number | string;
@@ -27,10 +29,9 @@ type ImageResult = {
 // ─── Chat ───────────────────────────────────────────────────
 //
 // ChatView reads its message list from the shared chat-sync layer, which
-// is backed by SQLite (Tauri) or an in-memory module-level cache (web mode).
-// Cross-window sync with the mascot's FloatChat rides on the
-// chat://messages-changed Tauri event — both windows render the same
-// SQLite truth.
+// is backed by SQLite. Cross-window sync with the mascot's FloatChat rides
+// on the chat://messages-changed Tauri event — both windows render the
+// same SQLite truth.
 export function ChatView({
   activeConv,
   model: modelProp,
@@ -57,9 +58,20 @@ export function ChatView({
   // here and broadcasts to the mascot window so both stay in sync.
   const [model, setModel] = useActiveModel(modelProp);
 
+  // Auto-scroll the feed to the bottom on any content change so the live
+  // streaming preview stays in view. The previous deps list missed
+  // `partialReasoning` and `streaming` — meaning that when Qwen 3.5 is in
+  // its thinking phase (reasoning streaming, content still empty), the
+  // typing block was growing downward OFF-SCREEN with no auto-scroll.
+  // From the user's point of view: nothing visible during reasoning, then
+  // the message appears via the SQLite refetch once `stop()` fires — i.e.
+  // "no streaming, no thinking" even though both ARE rendered (just below
+  // the viewport). The mascot's ChatPanel doesn't hit this because its
+  // history container is compact and the streaming row stays naturally in
+  // view.
   useEffect(() => {
     if (feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
-  }, [messages, typing, chatStream.partial]);
+  }, [messages, typing, chatStream.streaming, chatStream.partial, chatStream.partialReasoning]);
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -93,9 +105,36 @@ export function ChatView({
               <div className="avatar">S</div>
               <div className="body">
                 <div className="who">Shugu <span className="ts">— {model}</span></div>
+                {/* Reasoning trace from thinking-enabled models (Qwen 3.5, DeepSeek-R1, …).
+                    Rendered above the visible answer so the user can watch the model's
+                    internal monologue stream in live, then see the actual reply form
+                    below it. Italic + dimmed so it's clearly distinct from the answer.
+                    Hidden once a reply is persisted to SQLite (typing flips off). */}
+                {chatStream.streaming && chatStream.partialReasoning && (
+                  <details
+                    open
+                    style={{
+                      margin: "4px 0 8px",
+                      padding: "6px 10px",
+                      borderLeft: "2px solid rgba(124, 58, 237, 0.35)",
+                      background: "rgba(124, 58, 237, 0.04)",
+                      borderRadius: 4,
+                      fontSize: 12,
+                    }}
+                  >
+                    <summary style={{ cursor: "pointer", color: "var(--on-surface-muted)", fontFamily: "var(--font-mono)", fontSize: 10, letterSpacing: 0.5, textTransform: "uppercase" }}>
+                      Thinking…
+                    </summary>
+                    <p style={{ margin: "6px 0 0", fontStyle: "italic", color: "var(--on-surface-muted)", whiteSpace: "pre-wrap" }}>
+                      {chatStream.partialReasoning}
+                    </p>
+                  </details>
+                )}
                 {chatStream.streaming && chatStream.partial
-                  ? <div className="text"><p>{chatStream.partial}</p></div>
-                  : <div className="typing"><span className="d"></span><span className="d"></span><span className="d"></span></div>
+                  ? <div className="text"><p style={{ whiteSpace: "pre-wrap" }}>{chatStream.partial}</p></div>
+                  : !chatStream.partialReasoning
+                    ? <div className="typing"><span className="d"></span><span className="d"></span><span className="d"></span></div>
+                    : null
                 }
               </div>
             </div>
@@ -139,6 +178,12 @@ export function ChatMessage({
   m: any;
   onOpenSnippet?: (code: string, lang: string) => void;
 }) {
+  // Hook partagé avec le ChatPanel mascotte — détecte les placeholders
+  // agent encore "au travail" et y branche le streaming live (depuis
+  // useAgentTranscript, cache prouvé fonctionnel via le drawer agent).
+  // Pour les messages normaux, no-op.
+  const { displayBody, liveReasoning, isStreamingAgent } = useMessageDisplay(m);
+
   if (m.role === "user") {
     return (
       <div className="msg user">
@@ -154,9 +199,86 @@ export function ChatMessage({
     <div className="msg ai">
       <div className="avatar">S</div>
       <div className="body">
-        <div className="who">Shugu <span className="ts">— {m.ts}</span><span className="chip primary" style={{marginLeft:4}}>shugu-haiku</span></div>
+        <div className="who">
+          Shugu <span className="ts">— {m.ts}</span>
+          <span className="chip primary" style={{marginLeft:4}}>shugu-haiku</span>
+          {/* Verbatim relay badge — surfaces when the message body is the
+              direct output of an orchestrator agent (not the chat model).
+              Click → opens the Agents panel + selects the agent's
+              transcript drawer. Pure presentation toggle via the Tauri
+              event bus; no shared React context required. */}
+          {m.viaAgent && m.agentId && (
+            <button
+              type="button"
+              onClick={() => void revealAgent(m.agentId!)}
+              title="Voir la trace de l'orchestrator"
+              style={{
+                marginLeft: 6,
+                padding: "2px 8px",
+                borderRadius: 99,
+                fontSize: 9,
+                fontWeight: 600,
+                letterSpacing: 0.5,
+                textTransform: "uppercase",
+                background: "rgba(124, 58, 237, 0.16)",
+                color: "var(--primary, #7c3aed)",
+                border: "1px solid rgba(124, 58, 237, 0.35)",
+                cursor: "pointer",
+              }}
+            >
+              via orchestrator
+            </button>
+          )}
+        </div>
+        {/* Live reasoning pendant l'agent run (deltas coalesced du
+            transcript). Affiché au-dessus du body pour matcher le
+            pattern des autres messages thinking-enabled. */}
+        {isStreamingAgent && liveReasoning && !m.reasoning && (
+          <details
+            open
+            style={{
+              margin: "4px 0 8px",
+              padding: "6px 10px",
+              borderLeft: "2px solid rgba(124, 58, 237, 0.35)",
+              background: "rgba(124, 58, 237, 0.04)",
+              borderRadius: 4,
+              fontSize: 12,
+            }}
+          >
+            <summary style={{ cursor: "pointer", color: "var(--on-surface-muted)", fontFamily: "var(--font-mono)", fontSize: 10, letterSpacing: 0.5, textTransform: "uppercase" }}>
+              Thinking…
+            </summary>
+            <p style={{ margin: "6px 0 0", fontStyle: "italic", color: "var(--on-surface-muted)", whiteSpace: "pre-wrap" }}>
+              {liveReasoning}
+            </p>
+          </details>
+        )}
+        {/* Persisted reasoning trace — collapsed by default for historical
+            messages so the conversation stays scan-friendly, but one click
+            reveals the full thinking process. Only thinking-enabled models
+            (Qwen 3.5, DeepSeek-R1, Llama-3.3-R) populate this; for everyone
+            else m.reasoning is undefined and nothing renders. */}
+        {m.reasoning && (
+          <details
+            style={{
+              margin: "4px 0 8px",
+              padding: "6px 10px",
+              borderLeft: "2px solid rgba(124, 58, 237, 0.35)",
+              background: "rgba(124, 58, 237, 0.04)",
+              borderRadius: 4,
+              fontSize: 12,
+            }}
+          >
+            <summary style={{ cursor: "pointer", color: "var(--on-surface-muted)", fontFamily: "var(--font-mono)", fontSize: 10, letterSpacing: 0.5, textTransform: "uppercase" }}>
+              Thinking ({m.reasoning.length} chars)
+            </summary>
+            <p style={{ margin: "6px 0 0", fontStyle: "italic", color: "var(--on-surface-muted)", whiteSpace: "pre-wrap" }}>
+              {m.reasoning}
+            </p>
+          </details>
+        )}
         <div className="text">
-          {m.body && <p>{m.body}</p>}
+          {displayBody && <p style={{whiteSpace: "pre-wrap"}}>{displayBody}</p>}
           {m.code && <CodeBlock lang={m.code.lang} text={m.code.text} onOpenInEditor={onOpenSnippet}/>}
           {m.image && <InlineImage prompt="dreamy aurora, soft pinks and cyan"/>}
         </div>

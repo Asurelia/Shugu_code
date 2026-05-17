@@ -1,37 +1,34 @@
-// Shugu Forge — chat unread store (module-scope).
+// Shugu Forge — chat unread flag (TanStack-backed).
 //
-// `hasUnread` is "an AI reply arrived while the panel was closed or tucked
-// at an edge". It used to be local state inside FloatChat. After Phase 5,
-// ChatPanel is the sole writer (it owns the msgs/input/mode context needed
-// to set/clear it) and ChibiWithMood is the sole reader (it factors hasUnread
-// into the peek_open vs peek_closed mood decision).
+// `hasUnread` = "an AI reply arrived while the panel was closed or tucked
+// at an edge". ChatPanel sole writer (owns msgs/input/mode context).
+// ChibiWithMood sole reader (factors hasUnread into the peek_open vs
+// peek_closed mood decision).
+//
+// Refactor 2026-05-17 : ancien store custom → TanStack Query avec
+// setQueryData. Voir chatBusy.ts pour la motivation (directive
+// TanStack-only).
 
-import { useEffect, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { queryClient } from "@/lib/queryClient";
 
-let unread = false;
-const subscribers = new Set<() => void>();
+const CHAT_UNREAD_KEY = ["chat", "unread"] as const;
 
-function notify(): void {
-  subscribers.forEach(fn => fn());
+export function getChatUnread(): boolean {
+  return queryClient.getQueryData<boolean>(CHAT_UNREAD_KEY) ?? false;
 }
 
 export function setChatUnread(value: boolean): void {
-  if (unread === value) return;
-  unread = value;
-  notify();
-}
-
-export function getChatUnread(): boolean {
-  return unread;
-}
-
-export function subscribeChatUnread(fn: () => void): () => void {
-  subscribers.add(fn);
-  return () => { subscribers.delete(fn); };
+  if (getChatUnread() === value) return;
+  queryClient.setQueryData<boolean>(CHAT_UNREAD_KEY, value);
 }
 
 export function useChatUnread(): boolean {
-  const [value, setValue] = useState(unread);
-  useEffect(() => subscribeChatUnread(() => setValue(unread)), []);
-  return value;
+  const { data } = useQuery<boolean>({
+    queryKey: CHAT_UNREAD_KEY,
+    queryFn: () => false,
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  return data ?? false;
 }
