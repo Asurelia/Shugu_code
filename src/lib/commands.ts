@@ -64,6 +64,9 @@ export interface CommandContext {
 
   // Annotations
   onAnnotate: (payload: { kind: string; payload: any; target: any }) => void;
+
+  // Model selection
+  setActiveModel?: (id: string) => void;
 }
 
 // ─── Command interface ─────────────────────────────────────────
@@ -284,7 +287,7 @@ export const COMMANDS: Command[] = [
     category: "Workbench",
     icon: "sparkle",
     description: "balanced · 200k ctx",
-    run: () => { /* TODO: set active model to shugu-sonnet-5 */ },
+    run: (ctx) => ctx.setActiveModel?.("shugu-sonnet-5"),
   },
   {
     id: "set-model-h",
@@ -292,7 +295,7 @@ export const COMMANDS: Command[] = [
     category: "Workbench",
     icon: "sparkle",
     description: "fast · default",
-    run: () => { /* TODO: set active model to shugu-haiku-4-5 */ },
+    run: (ctx) => ctx.setActiveModel?.("shugu-haiku-4-5"),
   },
   {
     id: "set-model-l",
@@ -300,7 +303,7 @@ export const COMMANDS: Command[] = [
     category: "Workbench",
     icon: "sparkle",
     description: "ollama",
-    run: () => { /* TODO: set active model to local qwen-32b */ },
+    run: (ctx) => ctx.setActiveModel?.("qwen-32b"),
   },
 
   // ── Edit ─────────────────────────────────────────────────
@@ -412,7 +415,12 @@ export const COMMANDS: Command[] = [
     // Pass 2: ["Ctrl","Tab"] collides with the primary modifier on Win/Linux now that Ctrl→Cmd in eventToKey; rebind to a non-Ctrl chord.
     keybinding: ["Ctrl", "Tab"],
     when: () => false,
-    run: () => { /* TODO: advance to next dock/editor tab */ },
+    run: (ctx) => {
+      if (!ctx.openFiles || ctx.openFiles.length <= 1) return;
+      const i = ctx.openFiles.indexOf(ctx.activeFile);
+      if (i < 0) return;
+      ctx.setActiveFile?.(ctx.openFiles[(i + 1) % ctx.openFiles.length]);
+    },
   },
   {
     id: "prev-tab",
@@ -421,7 +429,12 @@ export const COMMANDS: Command[] = [
     // Pass 2: ["Ctrl","Shift","Tab"] collides with the primary modifier on Win/Linux now that Ctrl→Cmd in eventToKey; rebind to a non-Ctrl chord.
     keybinding: ["Ctrl", "Shift", "Tab"],
     when: () => false,
-    run: () => { /* TODO: advance to previous dock/editor tab */ },
+    run: (ctx) => {
+      if (!ctx.openFiles || ctx.openFiles.length <= 1) return;
+      const i = ctx.openFiles.indexOf(ctx.activeFile);
+      if (i < 0) return;
+      ctx.setActiveFile?.(ctx.openFiles[(i - 1 + ctx.openFiles.length) % ctx.openFiles.length]);
+    },
   },
   {
     // New command per decision 9. Disabled: search backend does not exist yet.
@@ -469,7 +482,7 @@ export const COMMANDS: Command[] = [
     keybinding: ["Cmd", "`"],
     // pty backend not yet wired.
     when: () => false,
-    run: () => { /* TODO: toggle dock terminal panel (setDockState) */ },
+    run: (ctx) => { ctx.setDockState?.((s: any) => ({ ...s, terminalOpen: !s.terminalOpen })); },
   },
 
   // ── Conversation list (input-local) ───────────────────────
