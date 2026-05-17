@@ -51,14 +51,34 @@ const IGNORED_NAMES: &[&str] = &[
     ".hg",
 ];
 
+/// Suffixes (extensions) ignored to prevent feedback loops with the
+/// debug `trace-*.log` files captured by `tauri-dev.cmd > trace.log`
+/// (cf. CLAUDE.md "Diagnostic cross-process"). Without this, every log
+/// write triggers fs://changed → tree invalidate → js diag log →
+/// another trace write → ... a tight loop that saturates IPC.
+const IGNORED_SUFFIXES: &[&str] = &[".log"];
+
 pub(crate) fn is_ignored(name: &str) -> bool {
     // Case-insensitive on Windows, case-sensitive on macOS/Linux.
     #[cfg(target_os = "windows")]
-    return IGNORED_NAMES
-        .iter()
-        .any(|&n| n.eq_ignore_ascii_case(name));
+    {
+        if IGNORED_NAMES
+            .iter()
+            .any(|&n| n.eq_ignore_ascii_case(name))
+        {
+            return true;
+        }
+        return IGNORED_SUFFIXES
+            .iter()
+            .any(|&s| name.to_ascii_lowercase().ends_with(s));
+    }
     #[cfg(not(target_os = "windows"))]
-    return IGNORED_NAMES.contains(&name);
+    {
+        if IGNORED_NAMES.contains(&name) {
+            return true;
+        }
+        return IGNORED_SUFFIXES.iter().any(|&s| name.ends_with(s));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -625,6 +645,133 @@ fn delete_dir_no_follow(dir: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Inner helpers — shared between the Tauri commands and the Phase 2 agent
+// tool dispatcher.
+//
+// Why a separate layer:
+//   * Tauri `#[tauri::command]` functions take `tauri::State<...>` which
+//     can't be called from async agent code that only has an `AppHandle`.
+//   * Sharing the path-resolution + read/write logic via a free function
+//     means BOTH the Tauri command and the tool dispatcher use the same
+//     `safe_resolve` / `safe_resolve_for_write` validation — there's no
+//     risk of one path getting a stricter guard than the other.
+//   * The reads have different size-cap semantics : the Tauri command
+//     for the editor wants the full file (up to 5 MiB), whereas the
+//     agent tool wants a hard 32 KiB cap on what flows back into the
+//     LLM context to keep token usage bounded. We express that with
+//     an optional `max_chars` cap argument — `None` = no truncation
+//     (just the 5 MiB hard guard), `Some(N)` = soft-truncate with a
+//     sentinel suffix so the model knows the content was cut.
+// ---------------------------------------------------------------------------
+
+/// Read a workspace-relative file. Two-stage cap:
+///   * Hard 5 MiB guard from `meta.len()` — files larger than this return
+///     Err regardless of `max_chars`.
+///   * Optional soft cap via `max_chars`. When `Some(N)` and the decoded
+///     UTF-8 content exceeds N chars, truncate at N chars and append:
+///       `"\n[... TRUNCATED at X bytes — original size: {Y} bytes ...]"`
+///   When `None`, returns the full file content (still subject to the
+///   hard 5 MiB guard).
+///
+/// Binary detection: scans the first 8 KiB for null bytes. Returns Err
+/// on detection. Note: UTF-16 files contain null bytes and will be
+/// falsely rejected — acceptable v1 trade-off; the agent can ask the
+/// user to convert to UTF-8 if blocked.
+pub(crate) fn read_file_inner(
+    root: &Path,
+    rel: &str,
+    max_chars: Option<usize>,
+) -> Result<String, String> {
+    const MAX_SIZE: u64 = 5 * 1024 * 1024; // 5 MiB hard guard
+
+    let resolved = safe_resolve(root, rel)?;
+
+    let meta = std::fs::metadata(&resolved).map_err(|e| format!("stat error: {e}"))?;
+    let file_size = meta.len();
+    if file_size > MAX_SIZE {
+        return Err("file too large (>5 MiB)".into());
+    }
+
+    let bytes = std::fs::read(&resolved).map_err(|e| format!("read error: {e}"))?;
+
+    let scan_len = bytes.len().min(8 * 1024);
+    if bytes[..scan_len].contains(&0u8) {
+        return Err("binary file".into());
+    }
+
+    let raw = String::from_utf8_lossy(&bytes).into_owned();
+
+    match max_chars {
+        Some(cap) if raw.len() > cap => {
+            // char_indices().nth(cap) would be perfect, but for the common
+            // ASCII case `raw.len()` IS the char count. For multibyte we
+            // fall back to byte-slicing on a char boundary to avoid
+            // splitting a codepoint.
+            let safe_end = (0..=cap)
+                .rev()
+                .find(|i| raw.is_char_boundary(*i))
+                .unwrap_or(cap);
+            let truncated = &raw[..safe_end];
+            Ok(format!(
+                "{truncated}\n[... TRUNCATED at {cap} bytes — original size: {file_size} bytes ...]"
+            ))
+        }
+        _ => Ok(raw),
+    }
+}
+
+/// Write `content` atomically (temp-file + rename) to a workspace-relative
+/// path. Creates missing parent directories. Returns the byte count written.
+/// Uses the same atomic-write contract as the existing `fs_write_file`
+/// Tauri command.
+pub(crate) fn write_file_inner(
+    root: &Path,
+    rel: &str,
+    content: &str,
+) -> Result<usize, String> {
+    let target = safe_resolve_for_write(root, rel)?;
+
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all: {e}"))?;
+    }
+
+    let tmp = target.with_extension({
+        let orig_ext = target
+            .extension()
+            .map(|e| format!("{}.shugu_tmp", e.to_string_lossy()))
+            .unwrap_or_else(|| "shugu_tmp".to_string());
+        orig_ext
+    });
+
+    std::fs::write(&tmp, content.as_bytes()).map_err(|e| format!("write temp file: {e}"))?;
+    if let Err(e) = std::fs::rename(&tmp, &target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("atomic rename failed: {e}"));
+    }
+    Ok(content.len())
+}
+
+/// List the immediate children of a workspace-relative directory as a
+/// JSON string. Returns `[{"name":"foo","is_dir":true}, ...]`.
+///
+/// **NOT recursive** — unlike `fs_read_dir` which walks the tree, this
+/// helper is designed for LLM consumption (one level at a time, easy
+/// to reason about, won't blow up token budgets on large directories).
+pub(crate) fn list_dir_inner(root: &Path, rel: &str) -> Result<String, String> {
+    let resolved = safe_resolve(root, rel)?;
+    let entries = std::fs::read_dir(&resolved).map_err(|e| format!("read_dir error: {e}"))?;
+
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("entry error: {e}"))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        items.push(serde_json::json!({ "name": name, "is_dir": is_dir }));
+    }
+    serde_json::to_string(&items).map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@ mod commands;
 use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::Manager;
+use tauri::{Listener, Manager};
 use tauri_plugin_sql::{Builder as SqlBuilder, Migration, MigrationKind};
 
 const MIGRATION_V1: &str = "
@@ -80,6 +80,87 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts);
 ";
 
+// V3 — persist the reasoning trace (Qwen 3.5 / DeepSeek-R1 / Llama-3.3-R
+// `<think>...</think>` content) alongside each AI message. The trace is
+// ephemeral by default in most chat UIs (Claude, ChatGPT o1) but Shugu's
+// user explicitly wants to be able to re-read it later, hence persistence.
+// Stored separately from `body` so chat history sent back to the model on
+// the next turn (chat-sync builds it from `body`/`text`/`code_text`)
+// remains clean — the reasoning is a UI affordance, not part of the
+// dialogue.
+const MIGRATION_V3: &str = "
+ALTER TABLE messages ADD COLUMN reasoning TEXT;
+";
+
+// V5 — wire chat messages to the agent system (Phase 1).
+//
+// Two new columns on `messages`:
+//   * `agent_id`   — UUID of the agent whose output this message relays.
+//                    NULL for regular chat messages (the vast majority).
+//                    Matches `agents.id` (no FK constraint to avoid a
+//                    cascade-delete contract we haven't designed yet).
+//   * `via_agent`  — 0 by default; 1 when this message is a VERBATIM
+//                    orchestrator output. Drives the "via orchestrator"
+//                    badge in the chat UI + the role rewrite when
+//                    rebuilding history for the chat model's next turn.
+//
+// Index on agent_id supports the (future) "open the message that this
+// agent produced" navigation flow.
+const MIGRATION_V5: &str = "
+ALTER TABLE messages ADD COLUMN agent_id TEXT;
+ALTER TABLE messages ADD COLUMN via_agent INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_messages_agent ON messages(agent_id);
+";
+
+// V4 — multi-agent system foundation (Phase 0).
+//
+// `agents` holds one row per agent lifecycle (orchestrator, sub-agents,
+// later). Status is the FSM state: pending → running → (complete | error
+// | killed). `parent_id` lets us build the orchestrator → sub-agent tree
+// without a separate join table. `conversation_id` ties an agent to the
+// chat conversation that triggered it so the UI can surface "this chat
+// spawned 3 agents".
+//
+// `agent_events` is an append-only audit log of everything that happens
+// to an agent — spawn, model messages, tool calls + results, streaming
+// deltas, completion, errors. The `payload` column is the serialized
+// AgentEvent JSON (camelCase, see commands/agents.rs::AgentEvent). We
+// keep events as a flat table (not a column on `agents`) because a
+// single agent run can emit thousands of delta events; a TEXT column
+// would blow up row sizes and break SQLite's preferred page model.
+//
+// Indexes target the three hot read paths:
+//   - "which agents belong to this conversation?" → idx_agents_conv
+//   - "who are the children of this agent?" → idx_agents_parent
+//   - "give me the transcript of agent X in order" → idx_agent_events_agent_ts
+//   - "what's the global event stream by time?" → idx_agent_events_ts
+const MIGRATION_V4: &str = "
+CREATE TABLE IF NOT EXISTS agents (
+    id              TEXT    PRIMARY KEY,
+    role            TEXT    NOT NULL,
+    status          TEXT    NOT NULL DEFAULT 'pending',
+    parent_id       TEXT,
+    model           TEXT    NOT NULL,
+    task            TEXT    NOT NULL,
+    conversation_id TEXT,
+    created_at      INTEGER NOT NULL,
+    finished_at     INTEGER,
+    output          TEXT,
+    error           TEXT
+);
+CREATE TABLE IF NOT EXISTS agent_events (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id  TEXT    NOT NULL,
+    ts        INTEGER NOT NULL,
+    kind      TEXT    NOT NULL,
+    payload   TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agents_conv          ON agents(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_agents_parent        ON agents(parent_id);
+CREATE INDEX IF NOT EXISTS idx_agent_events_agent_ts ON agent_events(agent_id, ts);
+CREATE INDEX IF NOT EXISTS idx_agent_events_ts      ON agent_events(ts);
+";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = vec![
@@ -93,6 +174,24 @@ pub fn run() {
             version: 2,
             description: "jobs_logs_settings",
             sql: MIGRATION_V2,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 3,
+            description: "messages_reasoning_column",
+            sql: MIGRATION_V3,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 4,
+            description: "agents_system_foundation",
+            sql: MIGRATION_V4,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 5,
+            description: "messages_agent_link",
+            sql: MIGRATION_V5,
             kind: MigrationKind::Up,
         },
     ];
@@ -110,7 +209,25 @@ pub fn run() {
         .manage(Mutex::new(None::<std::path::PathBuf>))
         .manage(commands::terminal::PtyRegistry::default())
         .manage(commands::llama::LlamaServerState::default())
+        .manage(commands::agents::AgentManagerState::default())
         .setup(|app| {
+            // Debug instrumentation — relay JS uncaught errors into stdout.
+            //
+            // WebView2 crashes wipe the DevTools console: when the page dies,
+            // the frontend log is gone. The two entry points (main.tsx,
+            // mascot.tsx) attach window.onerror + onunhandledrejection that
+            // emit a `debug://js-error` Tauri event with the message + stack.
+            // We catch it here, `eprintln!` to stdout, and the tauri-dev.cmd
+            // wrapper's Tee-Object pipes it into boot.log — so a JS crash
+            // becomes visible in the same log the Monitor tail is watching.
+            //
+            // Hot path: this listener fires once per uncaught error. The
+            // payload is the raw JSON string the frontend emitted (we don't
+            // parse it here — the `[js-error]` prefix is enough to grep).
+            app.listen("debug://js-error", |event| {
+                eprintln!("[js-error] {}", event.payload());
+            });
+
             // Spawn the filesystem watcher before restoring the workspace root
             // so the watcher is ready to receive the seed path below.
             let watcher_tx = commands::watcher::spawn_watcher(app.handle().clone());
@@ -159,6 +276,36 @@ pub fn run() {
                 app,
                 &[&show_item, &separator, &quit_item],
             )?;
+
+            // ──────────────────────────────────────────────────────────────
+            // Auto-start llama-server if the default bundle model is on
+            // disk. Runs in a background task so the UI window opens
+            // immediately — the spawn takes seconds (binary launch + model
+            // mmap), and we don't want the user staring at a blank screen
+            // while it boots. The frontend's `llama_status` polling will
+            // pick up the running server once it's listening.
+            //
+            // Failures are silent: if the sidecar binary is missing, the
+            // model isn't installed, or something else goes wrong, the
+            // onboarding overlay on the frontend will catch the case and
+            // offer to download. No need to surface boot errors here.
+            let autostart_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                match commands::llama::llama_autostart(autostart_handle).await {
+                    Ok(s) if s.running => {
+                        eprintln!(
+                            "[autostart] llama-server running (pid={:?}, binary={:?})",
+                            s.pid, s.binary
+                        );
+                    }
+                    Ok(_) => {
+                        eprintln!("[autostart] skipped (no bundle model installed yet)");
+                    }
+                    Err(e) => {
+                        eprintln!("[autostart] failed: {e}");
+                    }
+                }
+            });
 
             let _tray = TrayIconBuilder::with_id("main-tray")
                 .icon(
@@ -221,6 +368,8 @@ pub fn run() {
             commands::llama::llama_stop,
             commands::llama::llama_status,
             commands::llama::llama_force_stop_external,
+            commands::llama::llama_autostart,
+            commands::llama::llama_backend_info,
             commands::fs::fs_open_folder,
             commands::fs::fs_read_dir,
             commands::fs::fs_read_file,
@@ -236,9 +385,22 @@ pub fn run() {
             commands::terminal::term_snapshot,
             commands::image::image_generate,
             commands::models::models_list,
+            commands::models::models_discover_external,
             commands::vector::vec_index,
             commands::vector::vec_search,
             commands::vector::vec_delete,
+            commands::model_bundle::model_bundle_catalog,
+            commands::model_bundle::model_bundle_status,
+            commands::model_bundle::model_bundle_download,
+            commands::model_bundle::model_bundle_delete,
+            commands::model_bundle::model_bundle_path,
+            commands::model_bundle::model_bundle_installed_ids,
+            commands::agents::agent_spawn,
+            commands::agents::agent_kill,
+            commands::agents::agent_list_active,
+            commands::agents::agent_get_transcript,
+            commands::agents::agent_list_by_conversation,
+            commands::diag::js_diag,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -250,7 +412,7 @@ pub fn run() {
             // claim in the older llama.rs header comment was wrong.
             //
             // Skipping this leaves llama-server alive after Shugu closes and
-            // it reappears as a port-8080 zombie on next launch (which the
+            // it reappears as a port-8090 zombie on next launch (which the
             // HTTP-probe path in llama_status now exposes as "external").
             //
             // Abnormal exits (process kill, panic before this fires) still

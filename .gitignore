@@ -50,3 +50,14 @@ Shugu_Dev.zip
 # Tauri icon auto-backup folders (created by icon regen scripts; the live
 # src-tauri/icons/ directory is what matters)
 src-tauri/icons.backup-*/
+
+# Sidecar binaries — fetched per-machine via scripts/fetch-llama-binary.ps1,
+# never committed (they are large, target-triple-specific, and version-
+# bound). The directory itself, its README.md and checksum.txt ARE
+# committed; only the actual binary artefacts are excluded.
+src-tauri/binaries/*.exe
+src-tauri/binaries/*.dll
+src-tauri/binaries/runtime/*.dll
+src-tauri/binaries/runtime/*.so
+src-tauri/binaries/runtime/*.dylib
+src-tauri/binaries/llama-server-*
