@@ -326,9 +326,11 @@ export async function sendChatMessage(
       // the cost of letting the chat model "see" content from a more
       // capable model — acceptable per the Phase 1 trade-offs.
       const role = r.role === "ai" ? "assistant" : r.role;
-      const text = (r.text ?? "").trim()
-        || (r.body ?? "").trim()
-        || (r.code_text ?? "").trim();
+      // Image rows: r.body is a base64 dataURL (potentially MBs). Never send
+      // it to the LLM API — use the user-visible text or a compact placeholder.
+      const text = r.image === 1
+        ? ((r.text ?? "").trim() || "[image attached]")
+        : ((r.text ?? "").trim() || (r.body ?? "").trim() || (r.code_text ?? "").trim());
       return { role, content: text };
     })
     .filter((m) => m.content !== "");
@@ -368,19 +370,9 @@ export async function sendChatMessage(
   }
 
   try {
-    // If an image was attached, inject it as a user content item at the end
-    // of the messages list. We represent it as a compact text description so
-    // text-only backends degrade gracefully ("User attached an image: <url>").
-    // In a future phase, for vision-capable models (GPT-4o, Claude 3+), we
-    // can pass the data URL in the content array — but that requires per-model
-    // capability detection and an extended ChatMessage shape on the Rust side.
-    if (imageDataUrl && apiMessages.length > 0) {
-      const last = apiMessages[apiMessages.length - 1];
-      if (last.role === "user") {
-        // Prefix or append a compact note so the LLM knows an image was sent.
-        last.content = (last.content ? last.content + "\n\n" : "") + "[User attached an image]";
-      }
-    }
+    // imageDataUrl is persisted in the SQLite row (r.body, r.image=1) and the
+    // apiMessages map above already produces "[image attached]" as the content
+    // for those rows — no post-hoc injection needed here.
     const reply = await invoke<string>("chat_send", {
       messages: apiMessages,
       model: realModel,
