@@ -1598,3 +1598,369 @@ body {
 }
 .side-toast:hover { background: rgba(60, 16, 30, 0.95); }
 
+/* ============================================================
+   LOT 1 — CodeMirror IDE additions (snippets / hover / brackets)
+   ============================================================ */
+
+/* ── Bracket pair colorization (LOT 1.3) ──────────────────────
+   Rainbow 6 niveaux dérivés de la palette Celestial Veil :
+   on alterne entre les 3 accents (primary/secondary/tertiary)
+   et leurs variantes dim. Saturation volontairement modérée pour
+   ne pas surcharger les fichiers très imbriqués. */
+.cm-bracket-l1 { color: var(--primary);         font-weight: 600; }
+.cm-bracket-l2 { color: var(--tertiary);        font-weight: 600; }
+.cm-bracket-l3 { color: var(--secondary);       font-weight: 600; }
+.cm-bracket-l4 { color: var(--primary-dim);     font-weight: 600; }
+.cm-bracket-l5 { color: var(--tertiary-dim);    font-weight: 600; }
+.cm-bracket-l6 { color: var(--secondary-dim);   font-weight: 600; }
+
+/* ── Hover tooltip basique (LOT 1.5) ───────────────────────────
+   Tooltip stylisé en glassmorph cohérent avec la charte ; sera
+   complété en LOT 3 par les hovers riches LSP (markdown). */
+.cm-hover-basic {
+  padding: 6px 10px;
+  background: var(--lg-tint-strong);
+  border: 1px solid var(--outline-variant);
+  border-radius: 6px;
+  color: var(--on-surface);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  max-width: 360px;
+  word-break: break-word;
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturation));
+  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturation));
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.45);
+}
+
+/* ── Autocomplete dropdown (LOT 1.4) ──────────────────────────
+   Override le style par défaut de @codemirror/autocomplete pour
+   s'aligner avec Celestial Veil. */
+.cm-tooltip.cm-tooltip-autocomplete {
+  background: var(--surface-container-high) !important;
+  border: 1px solid var(--outline-variant) !important;
+  border-radius: 8px !important;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(var(--lg-blur));
+  -webkit-backdrop-filter: blur(var(--lg-blur));
+}
+.cm-tooltip.cm-tooltip-autocomplete > ul > li {
+  padding: 4px 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--on-surface);
+}
+.cm-tooltip.cm-tooltip-autocomplete > ul > li[aria-selected="true"] {
+  background: rgba(224, 142, 254, 0.18);
+  color: var(--primary);
+}
+.cm-completionLabel { color: inherit; }
+.cm-completionDetail {
+  color: var(--on-surface-muted);
+  font-style: italic;
+  margin-left: 10px;
+  font-size: 11px;
+}
+
+/* ── Multi-cursor / rectangular selection cosmetics ───────────
+   Le secondary caret est plus discret (semi-transparent) pour
+   distinguer du primary, comme le fait VS Code. */
+.cm-cursor.cm-cursor-secondary { border-left-color: rgba(224, 142, 254, 0.55); }
+
+/* ============================================================
+   LOT 2 — Find / Outline / Breadcrumbs panels
+   ============================================================ */
+
+/* ── IDE layout grid (LOT 2 — editor + outline side-by-side) ──
+   ide-body était flex column (editor au-dessus, statusbar en bas).
+   On insère un wrapper .ide-main qui contient editor + outline en row. */
+.ide-main {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: row;
+  position: relative;
+}
+.ide-main > .ide-editor {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+}
+.ide-main > .outline-panel {
+  width: 240px;
+  flex-shrink: 0;
+}
+
+/* ── Breadcrumbs (LOT 2.3) ────────────────────────────────────
+   Bandeau fin au-dessus de l'éditeur, font monospace, segments
+   séparés par ›. Le dernier segment (symbole courant) est légèrement
+   plus visible pour aider la navigation. */
+.breadcrumbs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 4px 14px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--on-surface-muted);
+  border-bottom: 1px solid var(--outline-variant);
+  background: var(--surface-container-low);
+  min-height: 26px;
+}
+.breadcrumbs__seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.breadcrumbs__sep {
+  margin: 0 6px;
+  /* Smoke test fix : `›` peut mal rendre dans certaines mono fonts.
+     On force un fallback display font qui le supporte mieux, et un
+     poids un peu plus marqué pour distinguer visuellement les
+     segments de path (autrement les `/` du filepath et `›` peuvent
+     se confondre visuellement). */
+  font-family: var(--font-display), system-ui, sans-serif;
+  color: var(--primary-dim);
+  opacity: 0.75;
+  font-weight: 600;
+  font-size: 12px;
+}
+.breadcrumbs__text {
+  color: var(--on-surface-variant);
+}
+.breadcrumbs__seg--sym .breadcrumbs__text {
+  color: var(--primary);
+  font-weight: 500;
+}
+
+/* ── Outline panel (LOT 2.2) ──────────────────────────────────
+   Panel latéral à droite de l'éditeur, liste de symboles avec
+   icônes/couleurs par kind (function/class/heading/...). */
+.outline-panel {
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-container-low);
+  border-left: 1px solid var(--outline-variant);
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.outline-panel--empty {
+  padding: 20px 14px;
+  color: var(--on-surface-muted);
+  font-size: 11.5px;
+  font-style: italic;
+}
+.outline-panel__head {
+  padding: 8px 14px;
+  font-family: var(--font-display);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--on-surface-muted);
+  border-bottom: 1px solid var(--outline-variant);
+  position: sticky;
+  top: 0;
+  background: var(--surface-container-low);
+  z-index: 1;
+}
+.outline-panel__list {
+  display: flex;
+  flex-direction: column;
+}
+.outline-panel__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  background: transparent;
+  border: none;
+  color: var(--on-surface);
+  font-family: inherit;
+  font-size: inherit;
+  text-align: left;
+  cursor: pointer;
+  border-radius: 4px;
+  margin: 0 6px;
+  width: calc(100% - 12px);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.outline-panel__item:hover {
+  background: rgba(224, 142, 254, 0.08);
+}
+/* Smoke test fix — kind affiché en mot lisible (function, class, query,
+   mutation, etc.) au lieu d'un glyph Unicode. Plus accessible, plus
+   informatif, plus VS Code-like. La couleur vient du style inline
+   (COLOR_FOR_KIND) ; le poids et taille via la classe pour cohérence. */
+.outline-panel__kind {
+  flex-shrink: 0;
+  min-width: 56px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: lowercase;
+  letter-spacing: 0.04em;
+  font-family: var(--font-mono);
+  opacity: 0.85;
+}
+.outline-panel__name {
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* ── Find panel (LOT 2.1) ─────────────────────────────────────
+   Overlay flottant centré sur la fenêtre, ressemble à VS Code
+   Cmd+Shift+F mais avec la charte Veil. Couvre le contenu IDE
+   sans bloquer le rail/sidebar. */
+.find-panel {
+  position: fixed;
+  top: 80px;
+  right: 24px;
+  width: 480px;
+  max-width: calc(100vw - 48px);
+  max-height: calc(100vh - 140px);
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-container-high);
+  border: 1px solid var(--outline-variant);
+  border-radius: 10px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.55), var(--glow-primary);
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturation));
+  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturation));
+  z-index: 4000; /* au-dessus du chrome (rail, sidebar, dock). La CommandPalette
+                    scrim est à z-index: 1000 ; comme search-in-files ferme la
+                    palette avant d'ouvrir le panel, il n'y a jamais de
+                    superposition fonctionnelle entre les deux. */
+  overflow: hidden;
+}
+.find-panel__head {
+  padding: 10px 12px 8px 12px;
+  border-bottom: 1px solid var(--outline-variant);
+}
+.find-panel__input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.find-panel__input {
+  flex: 1;
+  min-width: 0;
+  background: var(--surface-container);
+  border: 1px solid var(--outline-variant);
+  border-radius: 6px;
+  padding: 6px 10px;
+  color: var(--on-surface);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  outline: none;
+}
+.find-panel__input:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(224, 142, 254, 0.18);
+}
+.find-panel__toggle {
+  width: 28px;
+  height: 28px;
+  background: var(--surface-container);
+  border: 1px solid var(--outline-variant);
+  border-radius: 6px;
+  color: var(--on-surface-variant);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.find-panel__toggle:hover { background: var(--surface-container-high); color: var(--on-surface); }
+.find-panel__toggle.on {
+  background: rgba(224, 142, 254, 0.18);
+  border-color: var(--primary);
+  color: var(--primary);
+}
+.find-panel__close {
+  width: 24px;
+  height: 24px;
+  background: transparent;
+  border: none;
+  color: var(--on-surface-muted);
+  font-size: 18px;
+  cursor: pointer;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+.find-panel__close:hover { background: var(--surface-container); color: var(--on-surface); }
+.find-panel__status {
+  margin-top: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--on-surface-muted);
+}
+.find-panel__error { color: var(--danger); }
+.find-panel__hint { font-style: italic; opacity: 0.7; }
+.find-panel__results {
+  overflow-y: auto;
+  flex: 1;
+  padding: 6px 0;
+}
+.find-panel__group {
+  margin-bottom: 6px;
+}
+.find-panel__group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--primary);
+  background: rgba(224, 142, 254, 0.04);
+}
+.find-panel__group-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.find-panel__group-count {
+  color: var(--on-surface-muted);
+  font-weight: 600;
+  flex-shrink: 0;
+  margin-left: 8px;
+}
+.find-panel__group-matches {
+  display: flex;
+  flex-direction: column;
+}
+.find-panel__match {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 4px 12px 4px 24px;
+  background: transparent;
+  border: none;
+  color: var(--on-surface);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+}
+.find-panel__match:hover { background: rgba(129, 236, 255, 0.06); }
+.find-panel__match-line {
+  color: var(--on-surface-muted);
+  flex-shrink: 0;
+  min-width: 32px;
+  text-align: right;
+  font-size: 10.5px;
+}
+.find-panel__match-preview {
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+

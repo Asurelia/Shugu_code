@@ -41,6 +41,24 @@ notify = "6"
 portable-pty = "0.8"
 which = "6"
 
+# Find-in-files (LOT 2) — ripgrep en mode librairie.
+#   - `ignore` : walker qui respecte .gitignore, .ignore, et les globs custom.
+#               C'est le même walker que ripgrep utilise en CLI.
+#   - `grep-searcher` : moteur de recherche line-oriented, avec sink callback.
+#   - `grep-regex` : matcher regex (PCRE-like sans PCRE — uses Rust regex crate).
+#   - `regex` : pour `regex::escape()` quand l'utilisateur cherche du texte
+#               littéral (non-regex mode). Déjà transitif via grep-regex mais
+#               on l'expose explicitement pour clarté.
+ignore = "0.4"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+regex = "1"
+
+# LOT 3 — LSP file:// URI percent-encoding (rust-analyzer/pylsp rejettent les
+# URI avec espaces ou caractères non-ASCII non-encodés, fréquent sur des
+# chemins Windows type `C:\Users\Jean Côté\OneDrive\...`).
+percent-encoding = "2"
+
 # keyring v3 has NO default features — without an explicit platform feature
 # it compiles but provides no real backend (a fall-through "sample" store
 # that silently accepts writes and reads but never persists across processes).

@@ -39,6 +39,19 @@ export interface ShellContextValue {
    * search panel programmatically.
    */
   editorViewRef?: RefObject<CodeMirrorEditorHandle>;
+
+  // ─── LOT 2 : Find-in-files panel state ─────────────────────────────
+  // Piloté par la commande `search-in-files` (Cmd+Shift+F) — voir
+  // src/lib/commands.ts:447 et src/features/code/FindPanel.tsx.
+  findPanelOpen: boolean;
+  setFindPanelOpen: Dispatch<SetStateAction<boolean>>;
+
+  // ─── LOT 2 : Open file (read+open+focus) ───────────────────────────
+  // Lifted depuis RootLayout pour que FindPanel puisse ouvrir un fichier
+  // depuis un résultat grep même s'il n'est pas dans openFiles. Sans ça,
+  // setActiveFile sur un path absent de fileContents montre "No file open".
+  // Async : fait fsReadFile en interne avant d'ouvrir le tab.
+  openFile: (path: string) => Promise<void>;
 }
 
 // ─── Context ──────────────────────────────────────────────────

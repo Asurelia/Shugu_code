@@ -1,0 +1,56 @@
+[
+  {
+    "label": "print",
+    "prefix": "print",
+    "description": "print(...)",
+    "body": "print(${1:value})"
+  },
+  {
+    "label": "def",
+    "prefix": "def",
+    "description": "function definition",
+    "body": "def ${1:name}(${2:args}) -> ${3:None}:\n\t${0:pass}"
+  },
+  {
+    "label": "adef",
+    "prefix": "adef",
+    "description": "async function definition",
+    "body": "async def ${1:name}(${2:args}) -> ${3:None}:\n\t${0:pass}"
+  },
+  {
+    "label": "class",
+    "prefix": "class",
+    "description": "class definition",
+    "body": "class ${1:Name}:\n\tdef __init__(self, ${2:args}) -> None:\n\t\t${0:pass}"
+  },
+  {
+    "label": "tryc",
+    "prefix": "tryc",
+    "description": "try/except block",
+    "body": "try:\n\t${1:pass}\nexcept ${2:Exception} as ${3:e}:\n\t${4:raise}"
+  },
+  {
+    "label": "ife",
+    "prefix": "ife",
+    "description": "if/else block",
+    "body": "if ${1:cond}:\n\t${2:pass}\nelse:\n\t${3:pass}"
+  },
+  {
+    "label": "for",
+    "prefix": "for",
+    "description": "for loop",
+    "body": "for ${1:item} in ${2:iterable}:\n\t${0:pass}"
+  },
+  {
+    "label": "main",
+    "prefix": "main",
+    "description": "if __name__ guard",
+    "body": "if __name__ == '__main__':\n\t${0:main()}"
+  },
+  {
+    "label": "ds",
+    "prefix": "ds",
+    "description": "dataclass declaration",
+    "body": "from dataclasses import dataclass\n\n@dataclass\nclass ${1:Name}:\n\t${2:field}: ${3:str}"
+  }
+]

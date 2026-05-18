@@ -237,6 +237,8 @@ pub fn run() {
         .manage(commands::llama::LlamaServerState::default())
         .manage(commands::agents::AgentManagerState::default())
         .manage(commands::chat::ChatAbortRegistry::default())
+        // LOT 3 — LSP server registry (un LspSession par langId).
+        .manage(commands::lsp::LspServerRegistry::default())
         .setup(|app| {
             // Debug instrumentation — relay JS uncaught errors into stdout.
             //
@@ -406,6 +408,12 @@ pub fn run() {
             commands::fs::fs_create_dir,
             commands::fs::fs_rename,
             commands::fs::fs_delete,
+            // LOT 2 — ripgrep workspace search (palette Cmd+Shift+F).
+            commands::grep::fs_grep_workspace,
+            // LOT 3 — Language Server Protocol bridge.
+            commands::lsp::lsp_init,
+            commands::lsp::lsp_send,
+            commands::lsp::lsp_shutdown,
             commands::terminal::term_spawn,
             commands::terminal::term_write,
             commands::terminal::term_resize,
@@ -462,6 +470,13 @@ pub fn run() {
                         let _ = child.kill();
                     }
                 }
+
+                // LOT 3 — Tear down all LSP children (typescript-language-server,
+                // rust-analyzer, etc.). Sans ça, le sous-process node.exe ou
+                // rust-analyzer.exe survit à Shugu et tient stdin ouvert
+                // indéfiniment (same pattern que llama).
+                let lsp_state = app_handle.state::<commands::lsp::LspServerRegistry>();
+                commands::lsp::kill_all(lsp_state.inner());
             }
         });
 }
