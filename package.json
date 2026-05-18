@@ -18,12 +18,15 @@
     "convex:dev": "convex dev"
   },
   "dependencies": {
+    "@codemirror/autocomplete": "^6.20.2",
     "@codemirror/commands": "^6.5.0",
     "@codemirror/lang-javascript": "^6.2.2",
     "@codemirror/lang-json": "^6.0.1",
     "@codemirror/lang-markdown": "^6.2.5",
     "@codemirror/lang-python": "^6.1.6",
     "@codemirror/language": "^6.10.2",
+    "@codemirror/lint": "^6.9.6",
+    "@codemirror/lsp-client": "^6.2.4",
     "@codemirror/search": "^6.7.0",
     "@codemirror/state": "^6.4.1",
     "@codemirror/view": "^6.26.3",
@@ -48,7 +51,8 @@
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
-    "typescript": "^5.5.3",
+    "typescript": "^5.9.3",
+    "typescript-language-server": "^5.2.0",
     "vite": "^5.3.4"
   }
 }

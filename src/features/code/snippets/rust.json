@@ -1,0 +1,62 @@
+[
+  {
+    "label": "fn",
+    "prefix": "fn",
+    "description": "function declaration",
+    "body": "fn ${1:name}(${2:args}) -> ${3:()} {\n\t${0}\n}"
+  },
+  {
+    "label": "afn",
+    "prefix": "afn",
+    "description": "async function declaration",
+    "body": "async fn ${1:name}(${2:args}) -> ${3:Result<(), String>} {\n\t${0:Ok(())}\n}"
+  },
+  {
+    "label": "pubfn",
+    "prefix": "pubfn",
+    "description": "public function",
+    "body": "pub fn ${1:name}(${2:args}) -> ${3:()} {\n\t${0}\n}"
+  },
+  {
+    "label": "println",
+    "prefix": "println",
+    "description": "println!(...) macro",
+    "body": "println!(\"${1:{}}\", ${2:value});"
+  },
+  {
+    "label": "match",
+    "prefix": "match",
+    "description": "match expression",
+    "body": "match ${1:expr} {\n\t${2:pattern} => ${3:value},\n\t_ => ${4:default},\n}"
+  },
+  {
+    "label": "struct",
+    "prefix": "struct",
+    "description": "struct definition",
+    "body": "pub struct ${1:Name} {\n\tpub ${2:field}: ${3:String},\n}"
+  },
+  {
+    "label": "impl",
+    "prefix": "impl",
+    "description": "impl block",
+    "body": "impl ${1:Name} {\n\tpub fn ${2:method}(&self) -> ${3:()} {\n\t\t${0}\n\t}\n}"
+  },
+  {
+    "label": "iflet",
+    "prefix": "iflet",
+    "description": "if let Some pattern",
+    "body": "if let Some(${1:value}) = ${2:option} {\n\t${0}\n}"
+  },
+  {
+    "label": "tcmd",
+    "prefix": "tcmd",
+    "description": "Tauri command",
+    "body": "#[tauri::command]\nasync fn ${1:name}(${2:args}) -> Result<${3:()}, String> {\n\t${0:Ok(())}\n}"
+  },
+  {
+    "label": "derive",
+    "prefix": "derive",
+    "description": "derive Debug Serialize Deserialize Clone",
+    "body": "#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]"
+  }
+]

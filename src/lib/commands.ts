@@ -72,6 +72,12 @@ export interface CommandContext {
 
   // Editor (CodeMirror) — optional; only present when /code view is active.
   editorViewRef?: React.RefObject<CodeMirrorEditorHandle>;
+
+  // ─── LOT 2 : Find-in-files panel toggle ────────────────────────────
+  // Câblé par RootLayout depuis le shell-context (ShellContextValue).
+  // Utilisé par la commande `search-in-files` (Cmd+Shift+F) pour ouvrir
+  // le panel grep textuel à la place de l'ancien semantic search.
+  setFindPanelOpen?: (open: boolean) => void;
 }
 
 // ─── Command interface ─────────────────────────────────────────
@@ -220,6 +226,18 @@ export const COMMANDS: Command[] = [
     run: async (ctx) => {
       const root = await fsOpenFolder();
       if (!root) return;
+      // LOT 3 — Disconnect tous les LSP clients AVANT le refetch tree :
+      // leur workspaceUri pointe sur l'ancien dossier, les requêtes
+      // go-to-def / find-refs y resteraient ancrées. Le prochain ouvrir
+      // de fichier déclenchera un nouveau spawn LSP avec le bon root.
+      // L'import est dynamique (évite de charger @codemirror/lsp-client
+      // côté palette qui doit rester légère).
+      try {
+        const { disconnectAllClients } = await import("@/features/code/lsp/client");
+        await disconnectAllClients();
+      } catch (err) {
+        console.warn("[open-folder] LSP disconnect failed:", err);
+      }
       // Le file tree est maintenant un useQuery — on déclenche un refetch
       // au lieu de set manuellement. Le useFileTree hook propage à tous
       // les consumers automatiquement.
@@ -442,33 +460,21 @@ export const COMMANDS: Command[] = [
     },
   },
   {
-    // VEC3 — semantic file search via the "code" vector collection.
-    // NOTE: ⌘⇧F is also claimed by anno-flag (both disabled in Pass 1 — no conflict fires).
+    // LOT 2 — grep textuel workspace via ripgrep-as-library (Rust backend
+    // fs_grep_workspace). Remplace l'ancien wiring vecSearch (semantic) —
+    // celui-ci reste disponible en interne via lib/vector.ts mais quitte
+    // la palette (Cmd+Shift+F a une sémantique "grep textuel" dans tous
+    // les IDE modernes, l'ancienne UX confondait les utilisateurs).
     id: "search-in-files",
     title: "Search in files",
     category: "Go",
     keybinding: ["Cmd", "Shift", "F"],
     when: () => true,
-    run: async (ctx) => {
-      const query = window.prompt("Semantic file search:");
-      if (!query?.trim()) return;
-      try {
-        const { vecSearch } = await import("@/lib/vector");
-        const hits = await vecSearch("code", query.trim(), 10);
-        if (hits.length === 0) {
-          window.alert("No matching files found.");
-          return;
-        }
-        // Open the top hit in the editor.
-        const topHit = hits[0];
-        ctx.navigateTo("code");
-        ctx.setActiveFile(topHit.id);
-        if (!ctx.openFiles.includes(topHit.id)) {
-          ctx.setOpenFiles([...ctx.openFiles, topHit.id]);
-        }
-      } catch (err) {
-        console.warn("[search-in-files] vecSearch code failed:", err);
-      }
+    run: (ctx) => {
+      // Si on n'est pas déjà sur /code, on bascule pour que les click-
+      // through dans le panel ouvrent bien le fichier dans l'éditeur.
+      if (ctx.currentView !== "code") ctx.navigateTo("code");
+      ctx.setFindPanelOpen?.(true);
     },
   },
 

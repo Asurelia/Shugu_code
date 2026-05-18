@@ -1,0 +1,86 @@
+[
+  {
+    "label": "log",
+    "prefix": "log",
+    "description": "console.log(...)",
+    "body": "console.log(${1:value});"
+  },
+  {
+    "label": "fn",
+    "prefix": "fn",
+    "description": "function declaration",
+    "body": "function ${1:name}(${2:args}): ${3:void} {\n\t${0}\n}"
+  },
+  {
+    "label": "afn",
+    "prefix": "afn",
+    "description": "async function declaration",
+    "body": "async function ${1:name}(${2:args}): Promise<${3:void}> {\n\t${0}\n}"
+  },
+  {
+    "label": "arrow",
+    "prefix": "arrow",
+    "description": "arrow function const",
+    "body": "const ${1:name} = (${2:args}): ${3:void} => {\n\t${0}\n};"
+  },
+  {
+    "label": "tryc",
+    "prefix": "tryc",
+    "description": "try/catch block",
+    "body": "try {\n\t${1:// try}\n} catch (${2:err}) {\n\t${3:console.error(${2:err});}\n}"
+  },
+  {
+    "label": "ife",
+    "prefix": "ife",
+    "description": "if/else block",
+    "body": "if (${1:cond}) {\n\t${2}\n} else {\n\t${3}\n}"
+  },
+  {
+    "label": "forof",
+    "prefix": "forof",
+    "description": "for...of loop",
+    "body": "for (const ${1:item} of ${2:list}) {\n\t${0}\n}"
+  },
+  {
+    "label": "iface",
+    "prefix": "iface",
+    "description": "interface declaration",
+    "body": "interface ${1:Name} {\n\t${2:field}: ${3:string};\n}"
+  },
+  {
+    "label": "rcomp",
+    "prefix": "rcomp",
+    "description": "React functional component",
+    "body": "export function ${1:Component}({ ${2:props} }: { ${2:props}: ${3:string} }) {\n\treturn (\n\t\t<div>${0}</div>\n\t);\n}"
+  },
+  {
+    "label": "ueff",
+    "prefix": "ueff",
+    "description": "React useEffect hook",
+    "body": "useEffect(() => {\n\t${1:// effect}\n\treturn () => {\n\t\t${2:// cleanup}\n\t};\n}, [${3:deps}]);"
+  },
+  {
+    "label": "ust",
+    "prefix": "ust",
+    "description": "React useState hook",
+    "body": "const [${1:value}, set${2:Value}] = useState<${3:string}>(${4:initial});"
+  },
+  {
+    "label": "uquery",
+    "prefix": "uquery",
+    "description": "TanStack useQuery hook",
+    "body": "const { data, isLoading, error } = useQuery({\n\tqueryKey: [${1:'key'}],\n\tqueryFn: async () => {\n\t\t${0}\n\t},\n});"
+  },
+  {
+    "label": "umut",
+    "prefix": "umut",
+    "description": "TanStack useMutation hook",
+    "body": "const ${1:mutation} = useMutation({\n\tmutationFn: async (${2:input}: ${3:string}) => {\n\t\t${0}\n\t},\n\tonSuccess: () => {\n\t\tqueryClient.invalidateQueries({ queryKey: [${4:'key'}] });\n\t},\n});"
+  },
+  {
+    "label": "tcmd",
+    "prefix": "tcmd",
+    "description": "Tauri invoke call",
+    "body": "const ${1:result} = await invoke<${2:string}>('${3:command_name}', { ${4:args} });"
+  }
+]

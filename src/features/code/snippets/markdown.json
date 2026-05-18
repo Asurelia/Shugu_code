@@ -1,0 +1,50 @@
+[
+  {
+    "label": "h1",
+    "prefix": "h1",
+    "description": "level-1 heading",
+    "body": "# ${1:Title}\n\n${0}"
+  },
+  {
+    "label": "h2",
+    "prefix": "h2",
+    "description": "level-2 heading",
+    "body": "## ${1:Title}\n\n${0}"
+  },
+  {
+    "label": "h3",
+    "prefix": "h3",
+    "description": "level-3 heading",
+    "body": "### ${1:Title}\n\n${0}"
+  },
+  {
+    "label": "code",
+    "prefix": "code",
+    "description": "fenced code block",
+    "body": "```${1:lang}\n${0}\n```"
+  },
+  {
+    "label": "link",
+    "prefix": "link",
+    "description": "markdown link",
+    "body": "[${1:text}](${2:url})"
+  },
+  {
+    "label": "img",
+    "prefix": "img",
+    "description": "markdown image",
+    "body": "![${1:alt}](${2:url})"
+  },
+  {
+    "label": "task",
+    "prefix": "task",
+    "description": "task list item",
+    "body": "- [ ] ${0:task}"
+  },
+  {
+    "label": "table",
+    "prefix": "table",
+    "description": "simple markdown table",
+    "body": "| ${1:Col1} | ${2:Col2} |\n|---|---|\n| ${3:a} | ${4:b} |\n${0}"
+  }
+]

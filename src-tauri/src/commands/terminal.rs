@@ -63,6 +63,43 @@ fn resolve_cwd(
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// Normalize Windows extended-length path (`\\?\X:\...`) to a regular
+/// Windows path (`X:\...`) before passing it to the PTY shell.
+///
+/// **Pourquoi** : sur Windows, `fs::canonicalize()` (utilisé par fs.rs
+/// au boot du workspace) retourne TOUJOURS un extended-length path
+/// préfixé par `\\?\` (e.g. `\\?\F:\Dev\shugu_code`). Le filesystem Rust
+/// l'accepte parfaitement, mais quand on le passe à PowerShell via
+/// `CommandBuilder::cwd()`, PowerShell le voit comme un chemin UNC
+/// non-standard et l'expose à l'utilisateur comme
+/// `Microsoft.PowerShell.Core\FileSystem::\\?\F:\Dev\shugu_code` —
+/// chaîne sur laquelle Node.js (`lstat 'F:'`) et pnpm cassent avec
+/// `EISDIR: illegal operation on a directory`.
+///
+/// Cette normalisation est PUREMENT cosmétique côté process child :
+/// elle change la représentation du cwd visible au shell sans changer
+/// le filesystem mappé. Le `workspace_root` du Mutex Tauri conserve la
+/// forme `\\?\` (utile pour la canonicalisation interne et le containment).
+///
+/// Couvre `C:`, `D:`, `F:`, chemins avec espaces / accents / parenthèses —
+/// rien n'est hardcodé : on strip uniquement le préfixe `\\?\`.
+fn normalize_cwd_for_shell(path: PathBuf) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let s = path.to_string_lossy();
+        // strip_prefix conserve le reste tel quel (drive letter + path).
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+        // Sécurité défensive — au cas où Tauri normalise déjà les
+        // backslashes en forward slashes lors de la sérialisation IPC.
+        if let Some(rest) = s.strip_prefix("//?/") {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
 fn is_cmd_basename(shell: &str) -> bool {
     let lower = shell.to_lowercase();
     lower.ends_with("cmd.exe") || lower == "cmd"
@@ -98,7 +135,10 @@ pub fn term_spawn(
     }
 
     let shell_path = resolve_shell(shell);
-    let cwd_path = resolve_cwd(cwd, &workspace_root);
+    // Normalize extended-length path (`\\?\X:\...`) → `X:\...` AVANT de
+    // passer au shell. Voir normalize_cwd_for_shell pour le pourquoi
+    // (PowerShell + Node casseraient autrement).
+    let cwd_path = normalize_cwd_for_shell(resolve_cwd(cwd, &workspace_root));
 
     let pty_system = native_pty_system();
     let pair = pty_system

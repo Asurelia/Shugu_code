@@ -50,6 +50,7 @@ import { loadOpenFiles, saveOpenFiles } from "@/lib/ide-state";
 import { fsReadFile, fsWriteFile, fsCreateDir, fsCreateFile, langToExt } from "@/lib/fs";
 import { useFileTree, invalidateFileTree } from "@/features/fs/queries";
 import { useFsEvents } from "@/features/fs/useEvents";
+import { useRefreshOpenFiles } from "@/features/fs/useRefreshOpenFiles";
 import { indexWorkspace } from "@/features/fs/workspaceIndexer";
 import { AgentsPanel } from "@/features/agents/AgentsPanel";
 import { useAgentEvents } from "@/features/agents/useEvents";
@@ -59,6 +60,7 @@ import { useChatStreamListener } from "@/features/chat/useChatStream";
 import { useLlamaLifecycle } from "@/features/llama/useLlamaLifecycle";
 import { COMMANDS, getCommandById, fmtKbd, type CommandContext } from "@/lib/commands";
 import { useCommandKeybindings } from "@/lib/keybindings";
+import { FindPanel } from "@/features/code/FindPanel";
 
 // Context + hook live in ./shell-context to keep this file Fast-Refresh
 // friendly (a module exporting both a hook and a component forces a full
@@ -428,6 +430,12 @@ export function RootLayout() {
   const [agents] = useState(seedAgents);
   const [activeAgent, setActiveAgent] = useState("a1");
 
+  // LOT 2 — Find-in-files panel open state. Lifted ici car (1) la commande
+  // `search-in-files` (commands.ts:447) doit pouvoir l'ouvrir depuis le
+  // CommandContext, et (2) le panel lui-même est mounté en overlay dans
+  // la return tree de ce composant. Exposé aux routes via ShellContext.
+  const [findPanelOpen, setFindPanelOpen] = useState(false);
+
   // Editor ref — forwarded from CodeMirrorEditor via ShellContext + CommandContext
   // so that find-in-file / replace-in-file commands can open the search panel.
   // The ref is null while any route other than /code is mounted.
@@ -489,6 +497,13 @@ export function RootLayout() {
   // useFsEvents (Phase G migration TanStack). Le hook fetch au mount,
   // le listener invalide sur fs://changed.
   useFsEvents();
+  // Smoke test fix — auto-refresh des fichiers ouverts (non-dirty) quand
+  // ils changent sur le disque depuis un éditeur externe.
+  // NB : on passe openFiles/fileContents/setFileContents en arguments
+  // (pas via useShell()) parce que ce hook tourne DANS RootLayout, qui
+  // EST le Provider du ShellContext — utiliser useShell() ici throw
+  // "useShell must be used inside RootLayout".
+  useRefreshOpenFiles(openFiles, fileContents, setFileContents);
 
   // VEC3 — best-effort workspace indexer. Run ONCE on mount, after a small
   // delay so it doesn't compete with the boot phase (window mount, llama
@@ -623,15 +638,25 @@ export function RootLayout() {
     }
   }, [activeConvo]);
 
+  // LOT 2 — openFile est maintenant exposé via ShellContext (utilisé par
+  // FindPanel pour ouvrir un fichier depuis un résultat grep). On évite
+  // de capturer `fileContents` dans la closure : sinon openFile serait
+  // recréé à chaque édition, ce qui recréerait shellValue, ce qui
+  // re-renderait TOUS les consumers useShell en cascade — y compris au
+  // boot où loadOpenFiles ouvre N fichiers séquentiellement (cf. ligne 515).
+  // Pattern useRef sync : lit fileContents via fileContentsRef.current,
+  // jamais via fermeture. openFile devient un callback stable (deps vides).
+  const fileContentsRef = useRef(fileContents);
+  fileContentsRef.current = fileContents;
   const openFile = useCallback(async (path: string) => {
-    if (!(path in fileContents)) {
+    if (!(path in fileContentsRef.current)) {
       const content = await fsReadFile(path);
       setFileContents(c => ({ ...c, [path]: content }));
     }
     setOpenFiles(p => p.includes(path) ? p : [...p, path]);
     setActiveFile(path);
     setFilesPanelActive(path);
-  }, [fileContents]);
+  }, []);
 
   const saveFile = useCallback(async (path: string) => {
     const content = fileContents[path];
@@ -724,6 +749,8 @@ export function RootLayout() {
     onAnnotate,
     // Editor
     editorViewRef,
+    // LOT 2 — Find-in-files panel
+    setFindPanelOpen,
   }), [
     navigateTo, view, setPaletteOpen,
     sideCollapsed, setSideCollapsed,
@@ -739,6 +766,8 @@ export function RootLayout() {
     onAnnotate,
     // Editor (stable ref object — inclusion is defensive/explicit)
     editorViewRef,
+    // LOT 2 — setFindPanelOpen est stable (setter useState), inclusion explicite.
+    setFindPanelOpen,
   ]);
 
   // Global keybinding dispatcher — replaces the hardcoded Cmd+K useEffect.
@@ -836,12 +865,20 @@ export function RootLayout() {
     agents,
     openSnippetInEditor,
     editorViewRef,
+    // LOT 2 — Find-in-files panel state piped to /code route components.
+    findPanelOpen, setFindPanelOpen,
+    // LOT 2 — openFile (read+open+focus) lifted so FindPanel can open a
+    // file from a grep result even if it isn't already in openFiles.
+    openFile,
   }), [
     openFiles, activeFile, fileContents, generations, agents,
     setOpenFiles, setActiveFile, setFileContents, setGenerationsPersisted,
     openSnippetInEditor,
     // editorViewRef is a stable ref object; included for explicit dependency tracking
     editorViewRef,
+    // LOT 2
+    findPanelOpen, setFindPanelOpen,
+    openFile,
   ]);
 
   // The per-view content (the routed <Outlet/> + the absolute annotation layer).
@@ -987,6 +1024,11 @@ export function RootLayout() {
           onClose={() => setPaletteOpen(false)}
           ctx={cmdCtx}
         />
+
+        {/* LOT 2 — Find-in-files workspace panel (ripgrep backend).
+            Self-mounted via shell-context.findPanelOpen ; triggered par
+            commands.ts::search-in-files (Cmd+Shift+F). */}
+        <FindPanel />
 
         <TweaksPanel title="Tweaks">
           <TweakSection label="Palette">

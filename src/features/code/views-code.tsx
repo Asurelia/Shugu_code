@@ -4,6 +4,8 @@
 import { useState, useEffect, useRef } from "react";
 import { Icon } from "@/components/components";
 import { CodeMirrorEditor } from "./CodeMirrorEditor";
+import { Breadcrumbs } from "./Breadcrumbs";
+import { OutlinePanel } from "./OutlinePanel";
 import { ShortcutsSettings, InterfaceSettings } from "@/features/settings/settings-extras";
 import { MascotCalibration } from "@/features/settings/MascotCalibration";
 import { ConnectionsView, ProfileView } from "@/features/panels/panels";
@@ -72,11 +74,17 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
         })}
       </div>
       <div className="ide-body">
-        <div className="ide-editor">
-          {activeFile && fileContents[activeFile]
-            ? <CodeMirrorEditor ref={editorViewRef} key={activeFile} path={activeFile} value={fileContents[activeFile].text} onChange={onChange} language={fileContents[activeFile].lang}/>
-            : <div style={{position:"absolute", inset:0, display:"flex", alignItems:"center", justifyContent:"center", color:"var(--on-surface-muted)", fontFamily:"var(--font-mono)", fontSize:12}}>No file open. Pick one from the explorer.</div>
-          }
+        {/* LOT 2 — Breadcrumbs above editor + OutlinePanel to the right.
+            Both poll editorViewRef for view + docVersion via getDocVersion(). */}
+        <Breadcrumbs filePath={activeFile} editorHandle={editorViewRef} />
+        <div className="ide-main">
+          <div className="ide-editor">
+            {activeFile && fileContents[activeFile]
+              ? <CodeMirrorEditor ref={editorViewRef} key={activeFile} path={activeFile} value={fileContents[activeFile].text} onChange={onChange} language={fileContents[activeFile].lang}/>
+              : <div style={{position:"absolute", inset:0, display:"flex", alignItems:"center", justifyContent:"center", color:"var(--on-surface-muted)", fontFamily:"var(--font-mono)", fontSize:12}}>No file open. Pick one from the explorer.</div>
+            }
+          </div>
+          <OutlinePanel editorHandle={editorViewRef} filePath={activeFile} />
         </div>
         <div className="statusbar">
           <span className="item branch">main</span>
