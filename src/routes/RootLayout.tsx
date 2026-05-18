@@ -66,7 +66,8 @@ import { FindPanel } from "@/features/code/FindPanel";
 // friendly (a module exporting both a hook and a component forces a full
 // page reload on every HMR edit, which in turn caused the intermittent
 // "useShell must be used inside RootLayout" errors in the Tauri webview).
-import { ShellContext, type ShellContextValue } from "./shell-context";
+import { ShellContext, type ShellContextValue, type EditorPrefs, DEFAULT_EDITOR_PREFS } from "./shell-context";
+import { loadJSON, saveJSON } from "@/features/settings/settings-extras";
 
 // ─── Path → view string (derived navigation) ─────────────────
 
@@ -436,6 +437,21 @@ export function RootLayout() {
   // la return tree de ce composant. Exposé aux routes via ShellContext.
   const [findPanelOpen, setFindPanelOpen] = useState(false);
 
+  // LOT 1 — Editor preferences. Lifted here so toggling a setting propagates
+  // to the live editor in the same window without relying on the `storage`
+  // DOM event (which only fires cross-window). Hydrated from localStorage via
+  // loadJSON (synchronous), persisted on mutation via saveJSON.
+  const [editorPrefs, setEditorPrefsState] = useState<EditorPrefs>(
+    () => ({ ...DEFAULT_EDITOR_PREFS, ...loadJSON("shugu.editor.v1", {}) }),
+  );
+  const setEditorPref = useCallback(<K extends keyof EditorPrefs>(key: K, value: EditorPrefs[K]) => {
+    setEditorPrefsState(prev => {
+      const next = { ...prev, [key]: value };
+      saveJSON("shugu.editor.v1", next);
+      return next;
+    });
+  }, []);
+
   // Editor ref — forwarded from CodeMirrorEditor via ShellContext + CommandContext
   // so that find-in-file / replace-in-file commands can open the search panel.
   // The ref is null while any route other than /code is mounted.
@@ -751,6 +767,9 @@ export function RootLayout() {
     editorViewRef,
     // LOT 2 — Find-in-files panel
     setFindPanelOpen,
+    // LOT 1 — editor prefs
+    editorPrefs,
+    setEditorPref,
   }), [
     navigateTo, view, setPaletteOpen,
     sideCollapsed, setSideCollapsed,
@@ -768,6 +787,9 @@ export function RootLayout() {
     editorViewRef,
     // LOT 2 — setFindPanelOpen est stable (setter useState), inclusion explicite.
     setFindPanelOpen,
+    // LOT 1 — editor prefs
+    editorPrefs,
+    setEditorPref,
   ]);
 
   // Global keybinding dispatcher — replaces the hardcoded Cmd+K useEffect.
@@ -870,6 +892,9 @@ export function RootLayout() {
     // LOT 2 — openFile (read+open+focus) lifted so FindPanel can open a
     // file from a grep result even if it isn't already in openFiles.
     openFile,
+    // LOT 1 — editor prefs
+    editorPrefs,
+    setEditorPref,
   }), [
     openFiles, activeFile, fileContents, generations, agents,
     setOpenFiles, setActiveFile, setFileContents, setGenerationsPersisted,
@@ -879,6 +904,9 @@ export function RootLayout() {
     // LOT 2
     findPanelOpen, setFindPanelOpen,
     openFile,
+    // LOT 1 — editor prefs
+    editorPrefs,
+    setEditorPref,
   ]);
 
   // The per-view content (the routed <Outlet/> + the absolute annotation layer).

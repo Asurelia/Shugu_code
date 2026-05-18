@@ -1,0 +1,28 @@
+# LOT 1 — TOML syntax highlighting test.
+# Expected: section headers violet, keys default, strings teal, numbers/booleans tinted.
+
+[package]
+name = "shugu-forge-fixture"
+version = "0.1.0"
+edition = "2021"
+authors = ["Shugu Forge <noreply@shugu.dev>"]
+license = "MIT"
+repository = "https://github.com/example/shugu-forge"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+
+[dev-dependencies]
+mockall = "0.12"
+tempfile = "3.10"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+debug = true
+opt-level = 0

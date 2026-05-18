@@ -14,6 +14,33 @@ import { createContext, useContext } from "react";
 import type { Dispatch, SetStateAction, RefObject } from "react";
 import type { CodeMirrorEditorHandle } from "@/features/code/CodeMirrorEditor";
 
+// ─── Editor preferences ───────────────────────────────────────
+//
+// LOT 1 — lifted into ShellContext so in-window propagation works.
+// localStorage does NOT fire `storage` events in the same window;
+// putting prefs here is the only way to keep the live editor in sync
+// when the user toggles a setting inside the same Tauri window.
+//
+// Derogation from `feedback_tanstack_mandatory`: these are pure UI-state
+// values (no async fetch, no network). Pattern mirrors DEFAULT_INTERFACE in
+// settings-extras.tsx. Justified in the TanStack usage map (plan section).
+
+export interface EditorPrefs {
+  wordWrap: boolean;
+  stickyScroll: boolean;
+  minimap: boolean;
+  formatOnSave: boolean;
+  gitDecorations: boolean;
+}
+
+export const DEFAULT_EDITOR_PREFS: EditorPrefs = {
+  wordWrap: false,
+  stickyScroll: true,
+  minimap: true,
+  formatOnSave: true,
+  gitDecorations: true,
+};
+
 // ─── Shape ────────────────────────────────────────────────────
 
 export interface ShellContextValue {
@@ -52,6 +79,13 @@ export interface ShellContextValue {
   // setActiveFile sur un path absent de fileContents montre "No file open".
   // Async : fait fsReadFile en interne avant d'ouvrir le tab.
   openFile: (path: string) => Promise<void>;
+
+  // ─── LOT 1 : Editor preferences ─────────────────────────────────────
+  // Source of truth for all editor toggle prefs. Persisted via saveJSON on
+  // each mutation; hydrated from loadJSON at RootLayout mount. Passed as
+  // props to CodeMirrorEditor to drive Compartment reconfigures.
+  editorPrefs: EditorPrefs;
+  setEditorPref: <K extends keyof EditorPrefs>(key: K, value: EditorPrefs[K]) => void;
 }
 
 // ─── Context ──────────────────────────────────────────────────

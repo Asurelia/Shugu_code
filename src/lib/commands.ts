@@ -5,6 +5,7 @@
 import { fsOpenFolder } from "@/lib/fs";
 import { openSearchPanel } from "@codemirror/search";
 import type { CodeMirrorEditorHandle } from "@/features/code/CodeMirrorEditor";
+import type { EditorPrefs } from "@/routes/shell-context";
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -78,6 +79,11 @@ export interface CommandContext {
   // Utilisé par la commande `search-in-files` (Cmd+Shift+F) pour ouvrir
   // le panel grep textuel à la place de l'ancien semantic search.
   setFindPanelOpen?: (open: boolean) => void;
+
+  // ─── LOT 1 : Editor preferences ─────────────────────────────────────
+  // Required (not optional) — one instantiation site in RootLayout cmdCtx.
+  editorPrefs: EditorPrefs;
+  setEditorPref: <K extends keyof EditorPrefs>(key: K, value: EditorPrefs[K]) => void;
 }
 
 // ─── Command interface ─────────────────────────────────────────
@@ -301,6 +307,15 @@ export const COMMANDS: Command[] = [
     keybinding: ["Cmd", "D"],
     when: () => false,
     run: () => { /* TODO: toggle diff view (requires git integration) */ },
+  },
+  {
+    // LOT 1 — Word wrap toggle. Mirrors VS Code Alt+Z.
+    id: "toggle-word-wrap",
+    title: "View: Toggle Word Wrap",
+    category: "View",
+    keybinding: ["Alt", "Z"],
+    when: (ctx) => ctx.currentView === "code",
+    run: (ctx) => ctx.setEditorPref("wordWrap", !ctx.editorPrefs.wordWrap),
   },
 
   // ── Models (palette-only, no keybinding) ──────────────────

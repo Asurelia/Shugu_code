@@ -11,9 +11,14 @@ import { MascotCalibration } from "@/features/settings/MascotCalibration";
 import { ConnectionsView, ProfileView } from "@/features/panels/panels";
 import { db } from "@/lib/db";
 import { queryClient } from "@/lib/queryClient";
+import { useShell } from "@/routes/shell-context";
 
 // ─── Code view (editor + tabs + statusbar) ──────────────────
 export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, fileContents, setFileContents, editorViewRef }: any) {
+  // LOT 1 — read wordWrap from ShellContext (the source of truth for editor prefs).
+  // useShell() is safe here: CodeView is rendered inside the <Outlet> which is
+  // inside <ShellContext.Provider> in RootLayout.tsx.
+  const { editorPrefs } = useShell();
   const [savedFlash, setSavedFlash] = useState(false);
   // Track previous dirty state for the active file to detect true→false transitions.
   // Reset the ref when the active file changes to avoid cross-tab false positives.
@@ -80,7 +85,7 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
         <div className="ide-main">
           <div className="ide-editor">
             {activeFile && fileContents[activeFile]
-              ? <CodeMirrorEditor ref={editorViewRef} key={activeFile} path={activeFile} value={fileContents[activeFile].text} onChange={onChange} language={fileContents[activeFile].lang}/>
+              ? <CodeMirrorEditor ref={editorViewRef} key={activeFile} path={activeFile} value={fileContents[activeFile].text} onChange={onChange} language={fileContents[activeFile].lang} wordWrap={editorPrefs.wordWrap}/>
               : <div style={{position:"absolute", inset:0, display:"flex", alignItems:"center", justifyContent:"center", color:"var(--on-surface-muted)", fontFamily:"var(--font-mono)", fontSize:12}}>No file open. Pick one from the explorer.</div>
             }
           </div>
@@ -387,15 +392,24 @@ export function SettingsImage() {
 }
 
 export function SettingsEditor() {
+  // LOT 1 — Source of truth: ShellContext editorPrefs (live-synced to the
+  // mounted CodeMirrorEditor via the wordWrap prop → useEffect chain).
+  // Moved here from InterfaceSettings: word-wrap is an editor preference,
+  // not an interface chrome preference. Replaces the previous fake Switch
+  // (cleanup-on-replace policy).
+  const { editorPrefs, setEditorPref } = useShell();
   return (
     <div className="settings-shell scroll">
       <div className="settings-inner">
         <div className="setting-section">
           <h3>Editor</h3>
-          <p className="sub">CodeMirror 6 — preferences.</p>
-          <SettingRow label="Tab size" desc="Espaces ou tab — par fichier."><span className="chip">2 spaces</span></SettingRow>
-          <SettingRow label="Word wrap" desc="Soft-wrap des lignes longues."><Switch on={true} onChange={() => {}}/></SettingRow>
-          <SettingRow label="Inline AI completions" desc="Suggestions IA en gris pendant la frappe (Tab pour accepter)."><Switch on={true} onChange={() => {}}/></SettingRow>
+          <p className="sub">Comportement de l'éditeur de code. Les changements sont immédiats sans rechargement.</p>
+          <SettingRow label="Tab size" desc="Espaces ou tab — par fichier (à venir).">
+            <span className="chip">2 spaces</span>
+          </SettingRow>
+          <SettingRow label="Word wrap" desc="Retour à la ligne automatique (Alt+Z). Désactive la minimap.">
+            <Switch on={editorPrefs.wordWrap} onChange={(v) => setEditorPref("wordWrap", v)}/>
+          </SettingRow>
         </div>
       </div>
     </div>

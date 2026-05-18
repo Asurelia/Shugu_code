@@ -31,12 +31,11 @@ import {
   completeAnyWord,
 } from "@codemirror/autocomplete";
 import { lintGutter } from "@codemirror/lint";
-import { javascript } from "@codemirror/lang-javascript";
-import { json } from "@codemirror/lang-json";
-import { markdown } from "@codemirror/lang-markdown";
-import { python } from "@codemirror/lang-python";
 import { tags } from "@lezer/highlight";
 import { langFromPath } from "@/lib/fs";
+import { langExtensionFor } from "./languages";
+import { wordWrapCompartment, wordWrapInitial, setWordWrap } from "./extensions/wordWrap";
+import { regionFoldingService } from "./extensions/regionFolding";
 import { diag } from "@/lib/diag";
 import { bracketPairColors } from "./extensions/bracketPairColors";
 import { snippetCompletionSource } from "./snippets/loader";
@@ -79,17 +78,6 @@ const veilTheme = EditorView.theme({
   ".cm-selectionBackground, ::selection": { backgroundColor: "rgba(224,142,254,0.22)" },
   ".cm-cursor": { borderLeft: "2px solid #e08efe" },
 }, { dark: true });
-
-/** Derive the CodeMirror language extension from the file path extension. */
-function langExtForPath(path?: string): ReturnType<typeof javascript> | ReturnType<typeof json> | ReturnType<typeof markdown> | ReturnType<typeof python> {
-  const ext = path ? path.split(".").pop()?.toLowerCase() : undefined;
-  switch (ext) {
-    case "json":  return json();
-    case "md":    return markdown();
-    case "py":    return python();
-    default:      return javascript({ typescript: true, jsx: true });
-  }
-}
 
 /**
  * Keyword completion seed per language — minimal word list used by the
@@ -187,7 +175,10 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
   path?: string;
   /** @deprecated Pass `path` instead — kept for callers not yet sending a path. */
   language?: string;
-}>(function CodeMirrorEditor({ value, onChange, path, language = "typescript" }, ref) {
+  /** LOT 1 — enable line wrapping. Default: false. Reconfigured via Compartment
+   *  on change — does NOT re-mount the editor (cursor/scroll preserved). */
+  wordWrap?: boolean;
+}>(function CodeMirrorEditor({ value, onChange, path, language = "typescript", wordWrap = false }, ref) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
@@ -215,17 +206,13 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
   const lspCompartment = useMemo(() => new Compartment(), []);
 
   // Re-compute language extension only when path (or legacy language) changes.
-  const langExt = useMemo(() => {
-    // If a full path is available, prefer path-based dispatch.
-    if (path) return langExtForPath(path);
-    // Fallback: honour the legacy `language` prop.
-    switch (language) {
-      case "json":     return json();
-      case "markdown": return markdown();
-      case "python":   return python();
-      default:         return javascript({ typescript: language === "typescript", jsx: true });
-    }
-  }, [path, language]);
+  // LOT 1: delegates to the central langExtensionFor mapper (languages.ts).
+  // Deps [path, language] unchanged — wordWrap must NOT be a dep here, as that
+  // would trigger a full editor re-mount on toggle (destroying cursor/scroll).
+  const langExt = useMemo(
+    () => langExtensionFor(path ? langFromPath(path) : (language ?? "")),
+    [path, language],
+  );
 
   // Expose getView(), openSearch(), getDocVersion(), getPath() to parent refs.
   // Dépendance [path] : le handle DOIT être recréé quand path change pour
@@ -316,6 +303,17 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
         // long identifiers et heading texts tronqués).
         ...(isLspSupported(langId) ? [] : [basicHoverTooltip]),
 
+        // ─── LOT 1 (this LOT) : Word wrap Compartment ──────────
+        // Singleton module-level — see extensions/wordWrap.ts.
+        // Reconfigured via setWordWrap() in the useEffect below, not here;
+        // the initial value seeds the Compartment slot so reconfigure works.
+        wordWrapCompartment.of(wordWrapInitial(wordWrap)),
+
+        // ─── LOT 1 (this LOT) : Region folding ─────────────────
+        // foldService.of(...) is registered here; the actual fold logic
+        // lives in extensions/regionFolding.ts.
+        regionFoldingService(langId),
+
         // ─── LOT 3 : LSP plugin compartment (vide initialement) ───
         // Reconfiguré dynamiquement après getLspClient() async ; voir le
         // useEffect ci-dessous. Si le LSP n'est pas dispo (binaire absent,
@@ -362,6 +360,15 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
       v.dispatch({ changes: { from: 0, to: current.length, insert: value ?? "" } });
     }
   }, [value]);
+
+  // LOT 1 — Reconfigure word wrap without re-mounting the editor.
+  // Runs whenever the wordWrap prop changes (e.g. Settings toggle or Alt+Z).
+  // Cursor position, scroll offset, and undo history are all preserved.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    setWordWrap(view, wordWrap);
+  }, [wordWrap]);
 
   // ── LOT 3 : Attach LSP plugin once the client is ready ──────────────
   //

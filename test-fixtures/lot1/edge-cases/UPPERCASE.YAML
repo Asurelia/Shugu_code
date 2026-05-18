@@ -1,0 +1,26 @@
+# LOT 1 — Case-insensitive extension test.
+# Filename is UPPERCASE.YAML (not lowercase .yaml).
+# Expected: highlighting works because LANG_MAP normalizes via .toLowerCase().
+
+version: 1
+metadata:
+  name: case-sensitivity-test
+  language: yaml
+  expected_highlighting: true
+
+# region Config
+config:
+  port: 8080
+  debug: true
+  features:
+    - auth
+    - logging
+    - cache
+# endregion
+
+defaults:
+  timeout: 30s
+  retries: 3
+  endpoints:
+    primary: https://api.example.com
+    fallback: https://api-backup.example.com
