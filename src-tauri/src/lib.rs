@@ -262,6 +262,12 @@ pub fn run() {
             let watcher_tx = commands::watcher::spawn_watcher(app.handle().clone());
             app.manage(commands::watcher::WatcherCtl(watcher_tx.clone()));
 
+            // Spawn the dedicated .git/ watcher. Same lifecycle as the fs
+            // watcher — receives the workspace root on open and resync's its
+            // notify subscription on each change.
+            let git_watcher_tx = commands::git_watcher::spawn_git_watcher(app.handle().clone());
+            app.manage(commands::git_watcher::WatcherCtl(git_watcher_tx.clone()));
+
             // Restore the last workspace root from the settings table.
             // This runs after plugin init (so the DB migrations have run).
             // Any failure (missing row, path gone, DB error) is silently ignored —
@@ -273,9 +279,10 @@ pub fn run() {
                         .state::<Mutex<Option<std::path::PathBuf>>>();
                     let mut guard = state.lock().map_err(|_| ())?;
                     *guard = Some(canonical.clone());
-                    // Seed the watcher with the restored root so file-change
-                    // events are watched immediately on startup.
-                    let _ = watcher_tx.send(canonical);
+                    // Seed both watchers with the restored root so file-change
+                    // and .git/ events are watched immediately on startup.
+                    let _ = watcher_tx.send(canonical.clone());
+                    let _ = git_watcher_tx.send(canonical);
                 }
                 Ok(())
             })();
@@ -422,6 +429,28 @@ pub fn run() {
             // LOT 3 — git decorations backend (HEAD content for inline diff).
             commands::git::git_is_repo,
             commands::git::git_show_head,
+            // Git IDE integration (LOT 1) — read-side via git2, mutators via CLI.
+            commands::git::git_status,
+            commands::git::git_diff_file,
+            commands::git::git_stage,
+            commands::git::git_unstage,
+            commands::git::git_discard,
+            commands::git::git_stage_hunk,
+            commands::git::git_unstage_hunk,
+            commands::git::git_commit,
+            commands::git::git_log,
+            commands::git::git_branches,
+            commands::git::git_checkout,
+            commands::git::git_blame,
+            commands::git::git_push,
+            commands::git::git_pull,
+            commands::git::git_fetch,
+            commands::git::git_stash_list,
+            commands::git::git_stash_save,
+            commands::git::git_stash_apply,
+            commands::git::git_remotes,
+            commands::git::git_remote_add,
+            commands::git::git_remote_remove,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

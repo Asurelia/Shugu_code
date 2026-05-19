@@ -41,6 +41,14 @@ notify = "6"
 portable-pty = "0.8"
 which = "6"
 
+# Git read-side ops (status, log, blame, diff) via libgit2 bindings.
+# `vendored-libgit2` bundle libgit2 — pas de dep système. NE PAS activer
+# `vendored-openssl` : sur Windows libgit2 utilise Schannel par défaut, et
+# Shugu Forge ne fait JAMAIS de HTTPS via git2 (push/pull/fetch passent
+# par `git` CLI pour respecter les hooks/credentials/config locales).
+# Économie : pas de perl-strawberry requis pour le build MSVC.
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
+
 # Find-in-files (LOT 2) — ripgrep en mode librairie.
 #   - `ignore` : walker qui respecte .gitignore, .ignore, et les globs custom.
 #               C'est le même walker que ripgrep utilise en CLI.
