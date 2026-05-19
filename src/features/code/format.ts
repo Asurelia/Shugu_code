@@ -65,7 +65,14 @@ export async function formatCurrentDocumentCli(
     return false;
   }
 
-  const code = view.state.doc.toString();
+  // Snapshot the doc reference BEFORE the await. If the user types during
+  // the format round-trip, view.state.doc !== docAtFormat and we abort the
+  // dispatch — otherwise the LCS-computed ChangeSpecs (against T0 content)
+  // would overwrite the user's mid-format keystrokes. This mirrors the
+  // withMapping guard in @codemirror/lsp-client's formatDocument command.
+  // Triangulated by Reviewer A + Reviewer B + Tester LOT 2b.
+  const docAtFormat = view.state.doc;
+  const code = docAtFormat.toString();
 
   let formatted: string;
   try {
@@ -88,7 +95,13 @@ export async function formatCurrentDocumentCli(
     return false;
   }
 
-  const changes = computeMinimalChanges(view.state.doc, formatted);
+  // Race guard — see comment above docAtFormat.
+  if (view.state.doc !== docAtFormat) {
+    diag("format", `${langId}: doc changed during format, skipping dispatch`);
+    return false;
+  }
+
+  const changes = computeMinimalChanges(docAtFormat, formatted);
   if (changes.length === 0) {
     diag("format", `${langId}: no changes`);
     return true; // Already formatted — success with no-op

@@ -696,13 +696,15 @@ export function RootLayout() {
       if (isActiveFile) {
         const view = editorViewRef.current?.getView();
         if (view) {
-          try {
-            await formatCurrentDocumentCli(view, content.lang, path);
-            // Read the updated doc from the view (formatter applied via LCS dispatch)
-            textToWrite = view.state.doc.toString();
-          } catch {
-            // Format failed — save with original content (already set above)
-          }
+          // formatCurrentDocumentCli never throws (contract: catches errors
+          // internally, returns boolean) — no try/catch needed. Reading
+          // view.state.doc after the await captures whichever of these cases
+          // applies: (a) format dispatched → formatted content; (b) format
+          // skipped (no formatter, race, error) → unchanged content; (c) user
+          // typed during format → formatCurrentDocumentCli bails out and the
+          // typing is preserved. In all three cases textToWrite is correct.
+          await formatCurrentDocumentCli(view, content.lang, path);
+          textToWrite = view.state.doc.toString();
         }
       } else {
         // Non-active file: format directly without touching the editor view.

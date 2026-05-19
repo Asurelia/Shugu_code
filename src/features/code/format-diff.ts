@@ -153,7 +153,14 @@ export function computeMinimalChanges(
       const from = fromPos;
       const to = aPos;
       const insert = formatted.slice(bInsertStart, bPos);
-      changes.push({ from, to, insert });
+      // Skip empty no-op changes (from===to && insert==="") that can occur
+      // at the boundary of a mismatch run when LCS aligns perfectly.
+      // CodeMirror tolerates them, but they're wasted dispatch slots and
+      // make change.length counts misleading in diag logs.
+      // Reviewer A LOT 2b MINOR finding.
+      if (!(from === to && insert === "")) {
+        changes.push({ from, to, insert });
+      }
     }
   }
 

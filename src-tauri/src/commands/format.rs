@@ -14,8 +14,13 @@
 //! | rust             | rustfmt   | --edition 2021                    |
 //! | go               | gofmt     | (stdin mode by default)           |
 //! | python           | black     | - --quiet --stdin-filename <file> |
-//! | js/ts/jsx/tsx    | prettier  | --parser <parser> --stdin-filepath|
+//! | js/ts/jsx/tsx    | prettier  | --stdin-filepath <file>           |
 //! | json/css/html/…  | prettier  | --stdin-filepath <file>           |
+//!
+//! Prettier auto-detects the parser from `--stdin-filepath`'s extension
+//! (.ts → babel-ts, .tsx → babel-ts with JSX, .css → css, etc.). We do NOT
+//! pass `--parser` explicitly — that would override the more accurate
+//! filepath-based detection.
 //!
 //! ## Workspace root
 //!
