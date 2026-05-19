@@ -12,8 +12,7 @@ import { ConnectionsView, ProfileView } from "@/features/panels/panels";
 import { db } from "@/lib/db";
 import { queryClient } from "@/lib/queryClient";
 import { useShell } from "@/routes/shell-context";
-import { useGitHead } from "@/features/git/queries";
-// LOT git-editor: add `import { useGitBlame } from "@/features/git/queries";` here
+import { useGitHead, useGitBlame } from "@/features/git/queries";
 // LOT 3 — 2-pane compare view (MergeView). Aliased to avoid collision with
 // the existing simple DiffView below (which is used by FilesView for the
 // before/after split display in the files browser).
@@ -31,7 +30,11 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
   // Returns null when: file untracked, repo has no commits, not a git repo,
   // or still loading. The prop is passed through to CodeMirrorEditor.
   const gitHeadOriginal = useGitHead(editorPrefs.gitDecorations ? activeFile : null);
-  // LOT git-editor: add `const blame = useGitBlame(editorPrefs.gitBlame ? activeFile : null);` here
+  // LOT 3 bis — Per-line blame for the active file. `useGitBlame` is gated by
+  // the gitBlame pref AND by `useIsGitRepo()` internally, so it never spams
+  // the backend when off or outside a repo. Returns null while loading.
+  const blameQuery = useGitBlame(editorPrefs.gitBlame ? activeFile : null);
+  const blame = blameQuery.data ?? null;
   const [savedFlash, setSavedFlash] = useState(false);
   // Track previous dirty state for the active file to detect true→false transitions.
   // Reset the ref when the active file changes to avoid cross-tab false positives.
@@ -117,7 +120,8 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
                 minimap={editorPrefs.minimap}
                 gitHeadOriginal={gitHeadOriginal}
                 gitDecorations={editorPrefs.gitDecorations}
-                /* LOT git-editor: add `blame={blame}` and `gitBlameEnabled={editorPrefs.gitBlame}` props here */
+                blame={blame}
+                gitBlameEnabled={editorPrefs.gitBlame}
               />
             ) : (
               <div style={{position:"absolute", inset:0, display:"flex", alignItems:"center", justifyContent:"center", color:"var(--on-surface-muted)", fontFamily:"var(--font-mono)", fontSize:12}}>
@@ -465,6 +469,10 @@ export function SettingsEditor() {
           {/* LOT 3 — Git inline diff decorations */}
           <SettingRow label="Git decorations" desc="Affiche les lignes ajoutées, modifiées et supprimées vs HEAD dans le gutter. Désactivé dans les repos sans commits ou les fichiers non-trackés.">
             <Switch on={editorPrefs.gitDecorations} onChange={(v) => setEditorPref("gitDecorations", v)}/>
+          </SettingRow>
+          {/* LOT 3 bis — Inline git blame gutter */}
+          <SettingRow label="Git blame inline" desc="Affiche l'auteur, le SHA court et l'âge du commit pour chaque ligne dans le gutter. Survol = popup détaillé (SHA complet, auteur, message de commit). Désactivé hors d'un repo git ou pour les fichiers non-trackés.">
+            <Switch on={editorPrefs.gitBlame} onChange={(v) => setEditorPref("gitBlame", v)}/>
           </SettingRow>
         </div>
       </div>

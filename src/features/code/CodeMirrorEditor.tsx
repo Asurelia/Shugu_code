@@ -42,6 +42,8 @@ import { bracketPairColors } from "./extensions/bracketPairColors";
 import { snippetCompletionSource } from "./snippets/loader";
 import { getLspClient, isLspSupported, fileUriForPath, fmtErr } from "./lsp/client";
 import { gitDiffCompartment, buildGitDecorations } from "./git-decorations";
+import { blameCompartment, buildBlameGutter } from "./blame-decorations";
+import type { GitBlameLine } from "@/lib/types";
 
 /**
  * Keyword completion seed per language — minimal word list used by the
@@ -153,7 +155,13 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
   gitHeadOriginal?: string | null;
   /** LOT 3 — whether git decorations are enabled (from editorPrefs). */
   gitDecorations?: boolean;
-}>(function CodeMirrorEditor({ value, onChange, path, language = "typescript", wordWrap = false, stickyScroll = false, minimap = false, gitHeadOriginal = null, gitDecorations = true }, ref) {
+  /** LOT 3 bis — Per-line blame data (`Vec<GitBlameLine>` from `gitBlame()`).
+   *  Drives the inline blame gutter + hover tooltip via `blameCompartment`.
+   *  Pass null when loading / untracked / not a repo. */
+  blame?: GitBlameLine[] | null;
+  /** LOT 3 bis — whether inline blame is enabled (from editorPrefs.gitBlame). */
+  gitBlameEnabled?: boolean;
+}>(function CodeMirrorEditor({ value, onChange, path, language = "typescript", wordWrap = false, stickyScroll = false, minimap = false, gitHeadOriginal = null, gitDecorations = true, blame = null, gitBlameEnabled = false }, ref) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
@@ -315,6 +323,12 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
         // gitHeadOriginal or gitDecorations changes.
         gitDiffCompartment.of([] as Extension[]),
 
+        // ─── LOT 3 bis : Git inline blame gutter + tooltip ─────────
+        // Module-level singleton Compartment (see blame-decorations.ts).
+        // Seeded empty; reconfigured by the useEffect below when `blame`
+        // or `gitBlameEnabled` changes.
+        blameCompartment.of([] as Extension[]),
+
         // ─── Keymap (étendu LOT 1.4) ────────────────────────────
         // Note : snippetKeymap est un Facet (extension point pour l'utilisateur),
         // pas un array — les bindings par défaut de snippet (Tab/Esc pour
@@ -402,6 +416,19 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
       ),
     });
   }, [gitHeadOriginal, gitDecorations]);
+
+  // LOT 3 bis — Reconfigure inline blame gutter + tooltip on data/pref change.
+  // Mirrors the gitDecorations effect above. buildBlameGutter returns [] when
+  // disabled or blame is null, which removes the gutter cleanly.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: blameCompartment.reconfigure(
+        buildBlameGutter(blame, gitBlameEnabled),
+      ),
+    });
+  }, [blame, gitBlameEnabled]);
 
   // ── LOT 3 : Attach LSP plugin once the client is ready ──────────────
   //
