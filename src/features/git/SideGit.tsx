@@ -256,12 +256,16 @@ function CommitBox(): JSX.Element {
   const [message, setMessage] = useState("");
   const [amend, setAmend] = useState(false);
   const [showDialog, setShowDialog] = useState(false);
+  const [justCommitted, setJustCommitted] = useState(false);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const { data: status } = useGitStatus();
   const commit = useCommit();
+  const stage = useStageFiles();
   const ai = useAICommit();
 
-  const stagedCount = (status ?? []).filter((s) => s.isStaged).length;
+  const changed = status ?? [];
+  const stagedCount = changed.filter((s) => s.isStaged).length;
+  const changedCount = changed.length;
 
   // Autosize the textarea : line-count clamped to [1, 8].
   useEffect(() => {
@@ -271,15 +275,29 @@ function CommitBox(): JSX.Element {
     }
   }, [message]);
 
-  const doCommit = () => {
+  const doCommit = async () => {
     const m = message.trim();
-    if (!m || stagedCount === 0) return;
+    if (!m) return;
+    // Smart commit (façon VSCode) : si rien n'est préparé (staged) mais qu'il
+    // y a des modifications, on les prépare TOUTES automatiquement avant de
+    // commiter. Évite le piège "bouton grisé" pour qui ne connaît pas l'étape
+    // de staging — cliquer "Tout commiter" suffit.
+    if (stagedCount === 0 && !amend) {
+      if (changedCount === 0) return;
+      try {
+        await stage.mutateAsync(changed.map((s) => s.path));
+      } catch {
+        return; // l'erreur de préparation s'affiche via stage.isError
+      }
+    }
     commit.mutate(
       { message: m, amend },
       {
         onSuccess: () => {
           setMessage("");
           setAmend(false);
+          setJustCommitted(true);
+          window.setTimeout(() => setJustCommitted(false), 2500);
         },
       },
     );
@@ -377,15 +395,30 @@ function CommitBox(): JSX.Element {
         <div style={{ flex: 1 }} />
         <button
           className="lgb lgb-sm lgb-primary"
-          disabled={commit.isPending || !message.trim() || stagedCount === 0}
+          disabled={
+            commit.isPending ||
+            stage.isPending ||
+            !message.trim() ||
+            (!amend && changedCount === 0)
+          }
           onClick={doCommit}
           title={
-            stagedCount === 0
-              ? "Stage files first"
-              : `Commit ${stagedCount} file${stagedCount !== 1 ? "s" : ""}`
+            changedCount === 0 && !amend
+              ? "Aucune modification à commiter"
+              : stagedCount === 0
+                ? `Préparer et commiter ${changedCount} fichier${changedCount !== 1 ? "s" : ""}`
+                : `Commiter ${stagedCount} fichier${stagedCount !== 1 ? "s" : ""} préparé${stagedCount !== 1 ? "s" : ""}`
           }
         >
-          {commit.isPending ? "Committing…" : amend ? "Amend" : "Commit"}
+          {commit.isPending
+            ? "Commit…"
+            : stage.isPending
+              ? "Préparation…"
+              : amend
+                ? "Amend"
+                : stagedCount === 0 && changedCount > 0
+                  ? "Tout commiter"
+                  : "Commit"}
         </button>
       </div>
       {ai.error && (
@@ -399,7 +432,7 @@ function CommitBox(): JSX.Element {
           AI: {ai.error}
         </div>
       )}
-      {commit.isError && (
+      {(commit.isError || stage.isError) && (
         <div
           style={{
             fontSize: 10,
@@ -407,7 +440,18 @@ function CommitBox(): JSX.Element {
             fontFamily: "var(--font-mono)",
           }}
         >
-          {String(commit.error)}
+          {String(commit.error ?? stage.error)}
+        </div>
+      )}
+      {justCommitted && (
+        <div
+          style={{
+            fontSize: 10,
+            color: "var(--success)",
+            fontFamily: "var(--font-mono)",
+          }}
+        >
+          ✓ Commit créé
         </div>
       )}
       {showDialog && (
