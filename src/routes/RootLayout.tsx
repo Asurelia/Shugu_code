@@ -68,6 +68,8 @@ import { FindPanel } from "@/features/code/FindPanel";
 // "useShell must be used inside RootLayout" errors in the Tauri webview).
 import { ShellContext, type ShellContextValue, type EditorPrefs, DEFAULT_EDITOR_PREFS } from "./shell-context";
 import { loadJSON, saveJSON } from "@/features/settings/settings-extras";
+import { formatCurrentDocumentCli } from "@/features/code/format";
+import { invoke } from "@/lib/tauri";
 
 // ─── Path → view string (derived navigation) ─────────────────
 
@@ -677,12 +679,53 @@ export function RootLayout() {
   const saveFile = useCallback(async (path: string) => {
     const content = fileContents[path];
     if (!content) return;
-    await fsWriteFile(path, content.text);
+
+    // Format-on-save: run CLI formatter before writing.
+    // NEVER blocks save — if format fails, save proceeds with original content.
+    // Uses CLI-only path (not LSP) because formatDocument is async-dispatch:
+    // reading view.state.doc immediately after would return pre-format content.
+    //
+    // Corruption guard: editorViewRef always points to the ACTIVE file's view.
+    // When saveAll() iterates dirty files, non-active files must NOT use the
+    // view — they would read the active file's content and write it to the
+    // wrong path. Two paths:
+    //   • isActiveFile  → view-based (LCS cursor preservation, then read doc)
+    //   • !isActiveFile → direct invoke on content.text (no view dispatch)
+    let textToWrite = content.text;
+    if (editorPrefs.formatOnSave) {
+      const isActiveFile = path === activeFile;
+      if (isActiveFile) {
+        const view = editorViewRef.current?.getView();
+        if (view) {
+          try {
+            await formatCurrentDocumentCli(view, content.lang, path);
+            // Read the updated doc from the view (formatter applied via LCS dispatch)
+            textToWrite = view.state.doc.toString();
+          } catch {
+            // Format failed — save with original content (already set above)
+          }
+        }
+      } else {
+        // Non-active file: format directly without touching the editor view
+        try {
+          const formatted = await invoke<string>("format_code", {
+            lang: content.lang,
+            code: content.text,
+            filePath: path,
+          });
+          textToWrite = formatted;
+        } catch {
+          // Format failed or no formatter for this lang — save with original content
+        }
+      }
+    }
+
+    await fsWriteFile(path, textToWrite);
     setFileContents(c => ({
       ...c,
-      [path]: { ...c[path], dirty: false, original: content.text },
+      [path]: { ...c[path], text: textToWrite, dirty: false, original: textToWrite },
     }));
-  }, [fileContents]);
+  }, [fileContents, editorPrefs.formatOnSave, activeFile, editorViewRef]);
 
   const saveAll = useCallback(async () => {
     const dirty = openFiles.filter(p => fileContents[p]?.dirty);

@@ -421,6 +421,9 @@ export function SettingsEditor() {
           >
             <Switch on={editorPrefs.minimap} onChange={(v) => setEditorPref("minimap", v)}/>
           </SettingRow>
+          <SettingRow label="Format on save" desc="Formate automatiquement le document lors de la sauvegarde (Ctrl+S). Requiert rustfmt, black ou prettier selon le langage.">
+            <Switch on={editorPrefs.formatOnSave} onChange={(v) => setEditorPref("formatOnSave", v)}/>
+          </SettingRow>
         </div>
       </div>
     </div>

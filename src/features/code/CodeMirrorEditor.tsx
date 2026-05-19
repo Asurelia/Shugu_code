@@ -42,6 +42,7 @@ import { diag } from "@/lib/diag";
 import { bracketPairColors } from "./extensions/bracketPairColors";
 import { snippetCompletionSource } from "./snippets/loader";
 import { getLspClient, isLspSupported, fileUriForPath, fmtErr } from "./lsp/client";
+import { formatKeymap } from "@codemirror/lsp-client";
 
 const veilHighlight = HighlightStyle.define([
   { tag: tags.keyword,        color: "#d180ef" },
@@ -350,6 +351,9 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
         // Mod-d → selectNextOccurrence est DÉJÀ dans searchKeymap (CodeMirror
         // 6.7+) ; pas besoin de le re-binder explicitement.
         keymap.of([
+          // formatKeymap binds Shift-Alt-f to LSP formatDocument.
+          // It must come before defaultKeymap so it takes priority.
+          ...formatKeymap,
           ...searchKeymap,
           ...defaultKeymap,
           ...historyKeymap,

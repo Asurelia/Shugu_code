@@ -416,6 +416,8 @@ pub fn run() {
             commands::agents::agent_get_transcript,
             commands::agents::agent_list_by_conversation,
             commands::diag::js_diag,
+            // LOT 2b — format document via CLI formatter (rustfmt/black/prettier/gofmt).
+            commands::format::format_code,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

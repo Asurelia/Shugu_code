@@ -6,6 +6,7 @@ import { fsOpenFolder } from "@/lib/fs";
 import { openSearchPanel } from "@codemirror/search";
 import type { CodeMirrorEditorHandle } from "@/features/code/CodeMirrorEditor";
 import type { EditorPrefs } from "@/routes/shell-context";
+import { formatCurrentDocument } from "@/features/code/format";
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -384,6 +385,22 @@ export const COMMANDS: Command[] = [
       // openSearchPanel also exposes the replace UI when called from a replace keybinding.
       const view = ctx.editorViewRef?.current?.getView();
       if (view) openSearchPanel(view);
+    },
+  },
+  {
+    // LOT 2b — Format document via LSP (Shift+Alt+F).
+    // LSP-first for interactive use; CLI fallback if LSP returns false or lang unsupported.
+    // For format-on-save the CLI-only path is used (see format.ts module header).
+    id: "format-document",
+    title: "Format Document",
+    category: "Edit",
+    keybinding: ["Shift", "Alt", "F"],
+    when: (ctx) => ctx.currentView === "code" && ctx.activeFile !== null,
+    run: async (ctx) => {
+      const view = ctx.editorViewRef?.current?.getView();
+      if (!view || !ctx.activeFile) return;
+      const langId = ctx.fileContents[ctx.activeFile]?.lang ?? "";
+      await formatCurrentDocument(view, langId, ctx.activeFile, true);
     },
   },
   {

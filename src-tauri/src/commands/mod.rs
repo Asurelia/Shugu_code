@@ -2,6 +2,7 @@ pub mod agents;
 pub mod chat;
 pub mod credentials;
 pub mod diag;
+pub mod format;
 pub mod fs;
 pub mod grep;
 pub mod llama;
