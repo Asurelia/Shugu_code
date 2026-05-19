@@ -349,7 +349,14 @@ export const COMMANDS: Command[] = [
       // (e.g. "C:" / "F:") since detecting platform in the browser without
       // an extra plugin is awkward; on POSIX this regex never matches so
       // the comparison stays case-sensitive.
-      const normalize = (p: string) => p.replace(/\\/g, "/");
+      // Normalize: backslashes → forward slashes, AND strip the Windows
+      // extended-length path prefix `\\?\` (after normalization: `//?/`).
+      // Rust's canonicalize() emits `\\?\F:\...` for safety, but the file
+      // picker returns plain `F:\...` — without stripping the prefix the
+      // startsWith check fails on every Windows pick. Encountered before
+      // in the LSP work (LOT 3 LSP commands) — same root cause.
+      const normalize = (p: string) =>
+        p.replace(/\\/g, "/").replace(/^\/\/\?\//, "");
       const normalizedPicked = normalize(picked);
       const normalizedRoot = normalize(wsRoot);
       const rootWithSlash = normalizedRoot.endsWith("/")
@@ -488,7 +495,13 @@ export const COMMANDS: Command[] = [
     id: "format-document",
     title: "Format Document",
     category: "Edit",
-    keybinding: ["Shift", "Alt", "F"],
+    // Tokens MUST be in canonical order Cmd → Ctrl → Alt → Shift → KEY
+    // (matches eventToKey() in keybindings.ts). ["Shift", "Alt", "F"] would
+    // produce the string "Shift+Alt+F" via the naive bindingToKey join,
+    // but the user's keypress is normalized to "Alt+Shift+F" → keymap.get
+    // misses, the command silently never fires. User-visible symptom: press
+    // Shift+Alt+F → NOTHING in the console.
+    keybinding: ["Alt", "Shift", "F"],
     when: (ctx) => ctx.currentView === "code" && ctx.activeFile !== null,
     run: async (ctx) => {
       const view = ctx.editorViewRef?.current?.getView();
