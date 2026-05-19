@@ -91,6 +91,9 @@ export interface ShellContextValue {
   // When set, the code view renders a 2-pane MergeView instead of the
   // single CodeMirrorEditor. Both paths are workspace-relative. Cleared by
   // the `close-compare` command or when the user switches the active file.
+  //
+  // Derogation from feedback_tanstack_mandatory — pure UI state, no async,
+  // no disk read. Matches the editorPrefs / findPanelOpen pattern.
   compareFile: { left: string; right: string } | null;
   setCompareFile: Dispatch<SetStateAction<{ left: string; right: string } | null>>;
 }

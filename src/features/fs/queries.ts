@@ -64,7 +64,14 @@ export function useFileContent(path: string | null): FileContent | null {
     queryKey: fsKeys.file(path ?? ""),
     queryFn: () => fsReadFile(path!),
     enabled: Boolean(path),
-    staleTime: 0,
+    // Infinity — DiffView shows a "frozen comparison" snapshot. Without this
+    // cap, every fs://changed event (which fires for ANY workspace write,
+    // including unrelated format-on-save or snippet creation) would mark
+    // the compared content stale → MergeView destroy+recreate on each save.
+    // Invalidation is still triggered explicitly via TanStack on saveFile
+    // and via invalidateAllFsKeys on fs://changed for relevant paths.
+    // Reviewer A LOT 3 MAJOR (75%).
+    staleTime: Infinity,
   });
   return data ?? null;
 }

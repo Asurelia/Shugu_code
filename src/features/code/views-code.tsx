@@ -458,7 +458,7 @@ export function SettingsEditor() {
             <Switch on={editorPrefs.formatOnSave} onChange={(v) => setEditorPref("formatOnSave", v)}/>
           </SettingRow>
           {/* LOT 3 — Git inline diff decorations */}
-          <SettingRow label="Git decorations" desc="Affiche les lignes ajoutées, modifiees et supprimees vs HEAD dans le gutter. Desactive dans les repos sans commits ou les fichiers non-trackes.">
+          <SettingRow label="Git decorations" desc="Affiche les lignes ajoutées, modifiées et supprimées vs HEAD dans le gutter. Désactivé dans les repos sans commits ou les fichiers non-trackés.">
             <Switch on={editorPrefs.gitDecorations} onChange={(v) => setEditorPref("gitDecorations", v)}/>
           </SettingRow>
         </div>

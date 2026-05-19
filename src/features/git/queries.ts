@@ -54,7 +54,12 @@ export function useGitHead(path: string | null): string | null {
     queryKey: gitKeys.head(path ?? ""),
     queryFn: () => invoke<string | null>("git_show_head", { path: path! }),
     enabled: Boolean(path),
-    staleTime: 0,
+    // 5 minutes — HEAD content only changes on explicit commit/push/reset.
+    // `invalidateGitHead(path)` is called in saveFile, and `invalidateAllGit`
+    // fires on fs://changed (catches external git ops). staleTime: 0 would
+    // refetch on every tab switch (each spawning `git show` subprocess).
+    // Triangulated by Reviewer A (90%) + Reviewer B (85%) LOT 3.
+    staleTime: 5 * 60_000,
     retry: false,
   });
   return data ?? null;

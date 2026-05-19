@@ -17,7 +17,6 @@ import {
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import {
   syntaxHighlighting,
-  HighlightStyle,
   bracketMatching,
   indentOnInput,
   foldGutter,
@@ -31,8 +30,8 @@ import {
   completeAnyWord,
 } from "@codemirror/autocomplete";
 import { lintGutter } from "@codemirror/lint";
-import { tags } from "@lezer/highlight";
 import { langFromPath } from "@/lib/fs";
+import { veilHighlight, veilTheme } from "./theme";
 import { langExtensionFor } from "./languages";
 import { wordWrapCompartment, wordWrapInitial, setWordWrap } from "./extensions/wordWrap";
 import { regionFoldingService } from "./extensions/regionFolding";
@@ -43,44 +42,6 @@ import { bracketPairColors } from "./extensions/bracketPairColors";
 import { snippetCompletionSource } from "./snippets/loader";
 import { getLspClient, isLspSupported, fileUriForPath, fmtErr } from "./lsp/client";
 import { gitDiffCompartment, buildGitDecorations } from "./git-decorations";
-
-const veilHighlight = HighlightStyle.define([
-  { tag: tags.keyword,        color: "#d180ef" },
-  { tag: tags.controlKeyword, color: "#e08efe", fontWeight: "600" },
-  { tag: tags.string,         color: "#8aefc7" },
-  { tag: tags.number,         color: "#ffcf6b" },
-  { tag: tags.comment,        color: "#6e6a89", fontStyle: "italic" },
-  { tag: tags.function(tags.variableName), color: "#81ecff" },
-  { tag: tags.typeName,       color: "#fd6c9c" },
-  { tag: tags.propertyName,   color: "#c9b9ff" },
-  { tag: tags.operator,       color: "#a5a0bf" },
-  { tag: tags.variableName,   color: "#ece8f5" },
-  { tag: tags.bracket,        color: "#a5a0bf" },
-  { tag: tags.bool,           color: "#ffcf6b" },
-  { tag: tags.atom,           color: "#ffcf6b" },
-  { tag: tags.meta,           color: "#81ecff" },
-]);
-
-const veilTheme = EditorView.theme({
-  "&": { backgroundColor: "transparent", color: "#ece8f5", height: "100%" },
-  ".cm-content": {
-    caretColor: "#e08efe",
-    padding: "16px 0",
-    fontFamily: "JetBrains Mono, monospace",
-    fontSize: "13px",
-  },
-  ".cm-gutters": {
-    backgroundColor: "transparent",
-    color: "#6e6a89",
-    border: "none",
-    fontFamily: "JetBrains Mono, monospace",
-    fontSize: "12px",
-  },
-  ".cm-activeLineGutter": { backgroundColor: "rgba(224,142,254,0.06)", color: "#e08efe" },
-  ".cm-activeLine": { backgroundColor: "rgba(224,142,254,0.04)" },
-  ".cm-selectionBackground, ::selection": { backgroundColor: "rgba(224,142,254,0.22)" },
-  ".cm-cursor": { borderLeft: "2px solid #e08efe" },
-}, { dark: true });
 
 /**
  * Keyword completion seed per language — minimal word list used by the

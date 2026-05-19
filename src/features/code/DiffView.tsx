@@ -9,10 +9,14 @@
 
 import { useEffect, useRef } from "react";
 import { MergeView } from "@codemirror/merge";
-import { EditorState } from "@codemirror/state";
+import type { Extension } from "@codemirror/state";
 import { EditorView, lineNumbers, highlightActiveLine } from "@codemirror/view";
-import { defaultHighlightStyle, syntaxHighlighting } from "@codemirror/language";
+import { syntaxHighlighting } from "@codemirror/language";
 import { useFileContent } from "@/features/fs/queries";
+import { langFromPath } from "@/lib/fs";
+import { diag } from "@/lib/diag";
+import { langExtensionFor } from "./languages";
+import { veilHighlight, veilTheme } from "./theme";
 
 // ---------------------------------------------------------------------------
 // Props
@@ -28,6 +32,29 @@ interface DiffViewProps {
 }
 
 // ---------------------------------------------------------------------------
+// Per-pane extension builder
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds the extension list for one DiffView pane. Each pane gets its own
+ * language extension based on its file path (left and right may be different
+ * langs). Uses the same Celestial Veil theme + highlight as the main editor
+ * (Reviewer A/B LOT 3 MAJOR — defaultHighlightStyle was visually inconsistent
+ * with the main editor view).
+ */
+function paneExtensions(path: string): Extension[] {
+  return [
+    lineNumbers(),
+    highlightActiveLine(),
+    syntaxHighlighting(veilHighlight),
+    veilTheme,
+    langExtensionFor(langFromPath(path)),
+    EditorView.lineWrapping,
+    EditorView.editable.of(false),
+  ];
+}
+
+// ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
@@ -38,15 +65,6 @@ export function DiffView({ left, right, onClose }: DiffViewProps): JSX.Element {
   const leftContent = useFileContent(left);
   const rightContent = useFileContent(right);
 
-  // Build a minimal extension list for the read-only side panels.
-  const baseExtensions = [
-    lineNumbers(),
-    highlightActiveLine(),
-    syntaxHighlighting(defaultHighlightStyle),
-    EditorView.lineWrapping,
-    EditorView.editable.of(false),
-  ];
-
   useEffect(() => {
     if (!containerRef.current) return;
     // Wait until both files are loaded.
@@ -55,31 +73,35 @@ export function DiffView({ left, right, onClose }: DiffViewProps): JSX.Element {
     // Destroy previous MergeView if any (e.g. different file pair).
     mergeViewRef.current?.destroy();
 
-    mergeViewRef.current = new MergeView({
-      parent: containerRef.current,
-      a: {
-        doc: leftContent.text,
-        extensions: baseExtensions,
-      },
-      b: {
-        doc: rightContent.text,
-        extensions: baseExtensions,
-      },
-      // highlight changed character ranges within modified lines.
-      highlightChanges: true,
-      // Show a unified diff gutter.
-      gutter: true,
-      // Do not show revert controls — this is a read-only compare.
-      // (MergeConfig uses `revertControls`, not `mergeControls`)
-      // Omitting revertControls defaults to undefined = no revert buttons.
-    });
+    // Wrap construction in try/catch — malformed docs, theme conflicts, or
+    // a transient @codemirror/merge bug could throw, and silent failure
+    // (the loading spinner staying forever) is worse than a diag log.
+    // Reviewer B LOT 3 MINOR finding.
+    try {
+      mergeViewRef.current = new MergeView({
+        parent: containerRef.current,
+        a: {
+          doc: leftContent.text,
+          extensions: paneExtensions(left),
+        },
+        b: {
+          doc: rightContent.text,
+          extensions: paneExtensions(right),
+        },
+        highlightChanges: true,
+        gutter: true,
+        // No revertControls — read-only compare, not a merge resolver.
+      });
+    } catch (err) {
+      diag("diff-view", `MergeView construction failed for ${left} ↔ ${right}: ${String(err)}`);
+    }
 
     return () => {
       mergeViewRef.current?.destroy();
       mergeViewRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [leftContent?.text, rightContent?.text]);
+  }, [leftContent?.text, rightContent?.text, left, right]);
 
   const isLoading = leftContent === null || rightContent === null;
 
