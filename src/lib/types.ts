@@ -54,7 +54,11 @@ export interface FileNode {
   name: string;
   path: string;
   open?: boolean;
-  git?: "M" | "A" | "D";
+  // Widened (LOT 3 git-ui) so SideFiles can carry the full headline status
+  // emitted by useGitStatusMap.computeStatusChar (`U` = conflicted,
+  // `?` = untracked). The tree node itself doesn't carry git info from
+  // Rust — it's stamped at render time by SideFiles via gitStatusMap.
+  git?: "M" | "A" | "D" | "U" | "?";
   children?: FileNode[];
 }
 
@@ -104,4 +108,99 @@ export interface DockState {
   splitId?: string | null;
   splitRatio: number;
   _lastSide?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Git types — mirror the Rust serde structs in src-tauri/src/commands/git.rs.
+// Field names are camelCase here because the Rust side uses
+// `#[serde(rename_all = "camelCase")]` on each struct.
+// Source of truth : docs/git-ipc-contract.md.
+// ---------------------------------------------------------------------------
+
+/** Origin used by `gitDiffFile(path, vs)` to pick the diff sides. */
+export type DiffSource = "head" | "index" | "worktree";
+
+export interface GitFileStatus {
+  /** Workspace-relative, forward-slash. */
+  path: string;
+  /** Single-char index status: 'M' 'A' 'D' 'R' 'C' 'T' 'U' '?' ' '. */
+  indexStatus: string;
+  /** Single-char worktree status: same alphabet. */
+  worktreeStatus: string;
+  isConflicted: boolean;
+  /** Derived Rust-side: `index_status != ' '` and `!= '?'`. */
+  isStaged: boolean;
+  /** Derived Rust-side: `index_status == '?'`. */
+  isUntracked: boolean;
+}
+
+export interface GitLogEntry {
+  /** Full 40-char SHA. */
+  oid: string;
+  /** 7-char SHA. */
+  shortOid: string;
+  /** First line of the commit message. */
+  summary: string;
+  /** Full commit message. */
+  message: string;
+  authorName: string;
+  authorEmail: string;
+  /** Unix seconds (UTC). */
+  timestamp: number;
+  /** Parent OIDs — 1 for normal commits, 2+ for merges, 0 for root. */
+  parents: string[];
+}
+
+export interface GitBranch {
+  /** "main", "origin/feature/x". */
+  name: string;
+  /** Tracking branch if any (e.g. "origin/main"). */
+  upstream: string | null;
+  /** Commits ahead of upstream. */
+  ahead: number;
+  /** Commits behind upstream. */
+  behind: number;
+  /** Tip commit OID. */
+  lastCommitOid: string;
+}
+
+export interface GitBranchList {
+  /** Detached HEAD → null. */
+  current: string | null;
+  local: GitBranch[];
+  remote: GitBranch[];
+}
+
+export interface GitBlameLine {
+  /** 1-indexed line number. */
+  lineNumber: number;
+  oid: string;
+  shortOid: string;
+  authorName: string;
+  authorEmail: string;
+  /** Unix seconds (UTC). */
+  timestamp: number;
+  /** Commit summary (first message line). */
+  summary: string;
+  /** True for lines not yet committed. */
+  isUncommitted: boolean;
+}
+
+export interface GitStash {
+  /** 0-indexed position in the stash list. */
+  index: number;
+  oid: string;
+  /** "WIP on main: …". */
+  message: string;
+  /** Unix seconds. */
+  timestamp: number;
+}
+
+export interface GitRemote {
+  /** "origin". */
+  name: string;
+  /** Fetch URL. */
+  url: string;
+  /** Only set if different from `url`. */
+  pushUrl: string | null;
 }

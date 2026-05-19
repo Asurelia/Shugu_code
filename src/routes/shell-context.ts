@@ -31,6 +31,7 @@ export interface EditorPrefs {
   minimap: boolean;
   formatOnSave: boolean;
   gitDecorations: boolean;
+  gitBlame: boolean;
 }
 
 export const DEFAULT_EDITOR_PREFS: EditorPrefs = {
@@ -39,6 +40,7 @@ export const DEFAULT_EDITOR_PREFS: EditorPrefs = {
   minimap: true,
   formatOnSave: true,
   gitDecorations: true,
+  gitBlame: false,
 };
 
 // ─── Shape ────────────────────────────────────────────────────

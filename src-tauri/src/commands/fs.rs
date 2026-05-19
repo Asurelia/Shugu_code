@@ -316,6 +316,7 @@ pub fn fs_open_folder(
     app: tauri::AppHandle,
     root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
     watcher_ctl: tauri::State<'_, crate::commands::watcher::WatcherCtl>,
+    git_watcher_ctl: tauri::State<'_, crate::commands::git_watcher::WatcherCtl>,
 ) -> Result<Option<String>, String> {
     // Show blocking native folder picker.
     let picked = app.dialog().file().blocking_pick_folder();
@@ -343,8 +344,9 @@ pub fn fs_open_folder(
     // Persist to settings table (best-effort — don't fail the command on DB error).
     let _ = persist_workspace_root(&app, &canonical);
 
-    // Notify the watcher of the new root (best-effort — never fail the command).
+    // Notify both watchers of the new root (best-effort — never fail the command).
     let _ = watcher_ctl.0.send(canonical.clone());
+    let _ = git_watcher_ctl.0.send(canonical.clone());
 
     Ok(Some(display))
 }

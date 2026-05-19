@@ -5,6 +5,7 @@ pub mod diag;
 pub mod format;
 pub mod fs;
 pub mod git;
+pub mod git_watcher;
 pub mod grep;
 pub mod llama;
 pub mod lsp;
