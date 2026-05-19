@@ -35,6 +35,13 @@ export function Icon({ name, size = 18, className = "" }: { name: string; size?:
     case "copy":   return p(<><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></>);
     case "download": return p(<><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/></>);
     case "git":    return p(<><circle cx="6" cy="6" r="2"/><circle cx="6" cy="18" r="2"/><circle cx="18" cy="12" r="2"/><path d="M6 8v8"/><path d="M16 12H8a2 2 0 0 1-2-2"/></>);
+    case "branch": return p(<><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></>);
+    case "commit": return p(<><circle cx="12" cy="12" r="4"/><line x1="1.05" y1="12" x2="7" y2="12"/><line x1="17.01" y1="12" x2="22.96" y2="12"/></>);
+    case "merge":  return p(<><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></>);
+    case "pull":   return p(<><path d="M12 5v14"/><path d="m5 12 7 7 7-7"/></>);
+    case "push":   return p(<><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></>);
+    case "stash":  return p(<><rect x="3" y="3" width="18" height="6" rx="1"/><rect x="3" y="11" width="18" height="6" rx="1"/><line x1="8" y1="19" x2="16" y2="19"/></>);
+    case "revert": return p(<><path d="M3 12a9 9 0 1 0 9-9"/><path d="m3 4 0 5 5 0"/></>);
     case "diff":   return p(<><path d="M9 3v6m0 6v6"/><path d="M6 6h6"/><path d="M6 18h6"/><path d="M15 9h6"/></>);
     case "file":   return p(<><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z"/><path d="M14 3v6h6"/></>);
     case "folderTree": return p(<><path d="M3 7a2 2 0 0 1 2-2h3l2 2h4a2 2 0 0 1 2 2v1"/><path d="M8 21H5a2 2 0 0 1-2-2V7"/><path d="M21 14h-7a2 2 0 0 0-2 2v3a2 2 0 0 0 2 2h7Z"/></>);
@@ -152,6 +159,7 @@ export function Rail({ view, setView }: any) {
   const items = [
     { id: "chat",    icon: "chat",    label: "Chat" },
     { id: "code",    icon: "code",    label: "Editor" },
+    { id: "git",     icon: "git",     label: "Source Control" },
     { id: "image",   icon: "image",   label: "Image" },
     { id: "agents",  icon: "agent",   label: "Agents" },
     { id: "gallery", icon: "gallery", label: "Gallery" },

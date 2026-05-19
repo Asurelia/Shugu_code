@@ -13,6 +13,7 @@ import { db } from "@/lib/db";
 import { queryClient } from "@/lib/queryClient";
 import { useShell } from "@/routes/shell-context";
 import { useGitHead } from "@/features/git/queries";
+// LOT git-editor: add `import { useGitBlame } from "@/features/git/queries";` here
 // LOT 3 — 2-pane compare view (MergeView). Aliased to avoid collision with
 // the existing simple DiffView below (which is used by FilesView for the
 // before/after split display in the files browser).
@@ -30,6 +31,7 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
   // Returns null when: file untracked, repo has no commits, not a git repo,
   // or still loading. The prop is passed through to CodeMirrorEditor.
   const gitHeadOriginal = useGitHead(editorPrefs.gitDecorations ? activeFile : null);
+  // LOT git-editor: add `const blame = useGitBlame(editorPrefs.gitBlame ? activeFile : null);` here
   const [savedFlash, setSavedFlash] = useState(false);
   // Track previous dirty state for the active file to detect true→false transitions.
   // Reset the ref when the active file changes to avoid cross-tab false positives.
@@ -115,6 +117,7 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
                 minimap={editorPrefs.minimap}
                 gitHeadOriginal={gitHeadOriginal}
                 gitDecorations={editorPrefs.gitDecorations}
+                /* LOT git-editor: add `blame={blame}` and `gitBlameEnabled={editorPrefs.gitBlame}` props here */
               />
             ) : (
               <div style={{position:"absolute", inset:0, display:"flex", alignItems:"center", justifyContent:"center", color:"var(--on-surface-muted)", fontFamily:"var(--font-mono)", fontSize:12}}>
@@ -125,7 +128,9 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
           <OutlinePanel editorHandle={editorViewRef} filePath={activeFile} />
         </div>
         <div className="statusbar">
+          {/* LOT git-ui: replace hardcoded "main" with <BranchSwitcher compact /> here */}
           <span className="item branch">main</span>
+          {/* LOT git-ui: replace hardcoded "+12 −4" with <GitDiffStats /> here */}
           <span className="item git">+12 −4</span>
           <span className="item">UTF-8</span>
           <span className="item">{activeFile ? (fileContents[activeFile]?.lang || "text") : "—"}</span>

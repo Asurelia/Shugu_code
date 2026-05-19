@@ -17,6 +17,7 @@ import { RootLayout } from "./routes/RootLayout";
 // ─── Lazy route components (code-split by route) ─────────────
 const LazyChatRoute        = lazy(() => import("./routes/chat"));
 const LazyCodeRoute        = lazy(() => import("./routes/code"));
+const LazyGitRoute         = lazy(() => import("./routes/git"));
 const LazyImageRoute       = lazy(() => import("./routes/image"));
 const LazyAgentsRoute      = lazy(() => import("./routes/agents"));
 const LazyGalleryRoute     = lazy(() => import("./routes/gallery"));
@@ -48,6 +49,14 @@ const codeRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/code",
   component: () => <LazyCodeRoute />,
+});
+
+// ─── /git (Source Control — réutilise CodeRoute pour l'éditeur central,
+//          seule la SidePanel gauche change via view === "git" dans RootLayout) ──
+const gitRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/git",
+  component: () => <LazyGitRoute />,
 });
 
 // ─── /image ──────────────────────────────────────────────────
@@ -104,6 +113,7 @@ const routeTree = rootRoute.addChildren([
   indexRoute,
   chatRoute,
   codeRoute,
+  gitRoute,
   imageRoute,
   agentsRoute,
   galleryRoute,

@@ -62,6 +62,7 @@ import { COMMANDS, getCommandById, fmtKbd, type CommandContext } from "@/lib/com
 import { useCommandKeybindings } from "@/lib/keybindings";
 import { FindPanel } from "@/features/code/FindPanel";
 import { invalidateGitHead } from "@/features/git/queries";
+import { SideGit } from "@/features/git/SideGit";
 
 // Context + hook live in ./shell-context to keep this file Fast-Refresh
 // friendly (a module exporting both a hook and a component forces a full
@@ -74,12 +75,13 @@ import { formatCurrentDocumentCli, formatCodeDirect } from "@/features/code/form
 // ─── Path → view string (derived navigation) ─────────────────
 
 type ViewKey =
-  | "chat" | "code" | "image" | "agents"
+  | "chat" | "code" | "git" | "image" | "agents"
   | "gallery" | "settings" | "profile" | "connections";
 
 function pathToView(pathname: string): ViewKey {
   if (pathname === "/chat")         return "chat";
   if (pathname === "/code")         return "code";
+  if (pathname === "/git")          return "git";
   if (pathname === "/image")        return "image";
   if (pathname === "/agents")       return "agents";
   if (pathname === "/gallery")      return "gallery";
@@ -91,7 +93,7 @@ function pathToView(pathname: string): ViewKey {
 
 function railTargetFor(v: string): string {
   const map: Record<string, string> = {
-    chat: "/chat", code: "/code", image: "/image",
+    chat: "/chat", code: "/code", git: "/git", image: "/image",
     agents: "/agents", gallery: "/gallery", settings: "/settings",
     profile: "/profile", connections: "/connections",
   };
@@ -894,6 +896,9 @@ export function RootLayout() {
         />
       );
     }
+    if (view === "git") {
+      return <SideGit />;
+    }
     if (view === "agents") {
       return (
         <SideAgents
@@ -927,6 +932,7 @@ export function RootLayout() {
     switch (view) {
       case "chat":     return { title: "Conversation",  sub: activeConvoTitle || "(none selected)" };
       case "code":     return { title: "Editor",        sub: activeFile };
+      case "git":      return { title: "Source Control", sub: activeFile || "" };
       case "image":    return { title: <span><span className="acc">Image Studio</span></span>, sub: "flux.1 · sdxl · lcm-fast" };
       case "agents":   return { title: "Agents",        sub: `${agents.filter((a: any) => a.status === "running").length} running · ${agents.length} total` };
       case "gallery":  return { title: "Gallery",       sub: `${generations.length} generations` };
@@ -937,7 +943,10 @@ export function RootLayout() {
     }
   })();
 
-  const isCode = view === "code" && dockState.side !== "hidden";
+  // /git réutilise le main content de /code (l'éditeur reste central) — donc le
+  // dock est rendu dans les deux vues. Pattern VSCode : changer le sidebar ne
+  // doit pas masquer le terminal ouvert en bas.
+  const isCode = (view === "code" || view === "git") && dockState.side !== "hidden";
 
   // Shared state exposed to leaf routes via context
   const shellValue: ShellContextValue = useMemo(() => ({
