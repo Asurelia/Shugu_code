@@ -68,8 +68,7 @@ import { FindPanel } from "@/features/code/FindPanel";
 // "useShell must be used inside RootLayout" errors in the Tauri webview).
 import { ShellContext, type ShellContextValue, type EditorPrefs, DEFAULT_EDITOR_PREFS } from "./shell-context";
 import { loadJSON, saveJSON } from "@/features/settings/settings-extras";
-import { formatCurrentDocumentCli } from "@/features/code/format";
-import { invoke } from "@/lib/tauri";
+import { formatCurrentDocumentCli, formatCodeDirect } from "@/features/code/format";
 
 // ─── Path → view string (derived navigation) ─────────────────
 
@@ -706,17 +705,12 @@ export function RootLayout() {
           }
         }
       } else {
-        // Non-active file: format directly without touching the editor view
-        try {
-          const formatted = await invoke<string>("format_code", {
-            lang: content.lang,
-            code: content.text,
-            filePath: path,
-          });
-          textToWrite = formatted;
-        } catch {
-          // Format failed or no formatter for this lang — save with original content
-        }
+        // Non-active file: format directly without touching the editor view.
+        // formatCodeDirect respects the shared noCliFormatter cache and
+        // populates it on "no formatter" / "formatter not found" errors so
+        // repeated saveAll calls don't re-spawn a failing process.
+        const formatted = await formatCodeDirect(content.lang, content.text, path);
+        if (formatted !== null) textToWrite = formatted;
       }
     }
 

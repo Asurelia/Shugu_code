@@ -100,6 +100,50 @@ export async function formatCurrentDocumentCli(
 }
 
 /**
+ * Formats the source string directly via the CLI formatter, without a
+ * CodeMirror view. Used by saveFile for non-active (background) files
+ * where the view belongs to the active file and must not be touched.
+ *
+ * Respects the same `noCliFormatter` cache as formatCurrentDocumentCli.
+ * Returns the formatted string on success, or null if formatting is
+ * unavailable or fails (caller should save with original content).
+ *
+ * @param langId   Language ID.
+ * @param code     Source code string to format.
+ * @param filePath Absolute path (for config discovery + prettier --stdin-filepath).
+ */
+export async function formatCodeDirect(
+  langId: string,
+  code: string,
+  filePath: string | null,
+): Promise<string | null> {
+  if (noCliFormatter.has(langId)) {
+    diag("format", `${langId} in noCliFormatter cache — skip (direct)`);
+    return null;
+  }
+  try {
+    const formatted = await invoke<string>("format_code", {
+      lang: langId,
+      code,
+      filePath: filePath ?? null,
+    });
+    return formatted;
+  } catch (err) {
+    const msg = typeof err === "string" ? err : String(err);
+    if (
+      msg.startsWith("no formatter for lang:") ||
+      msg.startsWith("formatter not found:")
+    ) {
+      noCliFormatter.add(langId);
+      diag("format", `no cli formatter for ${langId} — cached (direct)`);
+    } else {
+      diag("format", `format error direct (${langId}): ${msg}`);
+    }
+    return null;
+  }
+}
+
+/**
  * Formats the current document.
  *
  * - From the interactive keymap (Shift+Alt+F): tries LSP first if supported,

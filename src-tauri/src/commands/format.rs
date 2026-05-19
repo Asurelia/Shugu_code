@@ -32,7 +32,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Mutex;
 
-use tauri::{command, AppHandle, Manager, State};
+use tauri::{command, AppHandle, Manager};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
