@@ -61,6 +61,7 @@ import { useLlamaLifecycle } from "@/features/llama/useLlamaLifecycle";
 import { COMMANDS, getCommandById, fmtKbd, type CommandContext } from "@/lib/commands";
 import { useCommandKeybindings } from "@/lib/keybindings";
 import { FindPanel } from "@/features/code/FindPanel";
+import { invalidateGitHead } from "@/features/git/queries";
 
 // Context + hook live in ./shell-context to keep this file Fast-Refresh
 // friendly (a module exporting both a hook and a component forces a full
@@ -438,6 +439,19 @@ export function RootLayout() {
   // la return tree de ce composant. Exposé aux routes via ShellContext.
   const [findPanelOpen, setFindPanelOpen] = useState(false);
 
+  // LOT 3 — Compare mode: both workspace-relative paths for the 2-pane diff.
+  // When non-null, the /code view renders a MergeView instead of the standard
+  // CodeMirrorEditor. Cleared on activeFile change or by the `close-compare`
+  // command.
+  const [compareFile, setCompareFile] = useState<{ left: string; right: string } | null>(null);
+
+  // Auto-close compare view when the user switches to a different file.
+  // Without this, switching tabs while a diff is open leaves a stale
+  // comparison (the left/right paths no longer relate to the new activeFile).
+  useEffect(() => {
+    setCompareFile(null);
+  }, [activeFile]);
+
   // LOT 1 — Editor preferences. Lifted here so toggling a setting propagates
   // to the live editor in the same window without relying on the `storage`
   // DOM event (which only fires cross-window). Hydrated from localStorage via
@@ -721,6 +735,9 @@ export function RootLayout() {
       ...c,
       [path]: { ...c[path], text: textToWrite, dirty: false, original: textToWrite },
     }));
+    // LOT 3 — invalidate git HEAD cache for this file so that inline diff
+    // decorations reflect the new saved state vs HEAD immediately.
+    invalidateGitHead(path);
   }, [fileContents, editorPrefs.formatOnSave, activeFile, editorViewRef]);
 
   const saveAll = useCallback(async () => {
@@ -809,6 +826,9 @@ export function RootLayout() {
     // LOT 1 — editor prefs
     editorPrefs,
     setEditorPref,
+    // LOT 3 — compare mode
+    compareFile,
+    setCompareFile,
   }), [
     navigateTo, view, setPaletteOpen,
     sideCollapsed, setSideCollapsed,
@@ -829,6 +849,8 @@ export function RootLayout() {
     // LOT 1 — editor prefs
     editorPrefs,
     setEditorPref,
+    // LOT 3 — compare mode
+    compareFile, setCompareFile,
   ]);
 
   // Global keybinding dispatcher — replaces the hardcoded Cmd+K useEffect.
@@ -934,6 +956,9 @@ export function RootLayout() {
     // LOT 1 — editor prefs
     editorPrefs,
     setEditorPref,
+    // LOT 3 — compare mode
+    compareFile,
+    setCompareFile,
   }), [
     openFiles, activeFile, fileContents, generations, agents,
     setOpenFiles, setActiveFile, setFileContents, setGenerationsPersisted,
@@ -946,6 +971,8 @@ export function RootLayout() {
     // LOT 1 — editor prefs
     editorPrefs,
     setEditorPref,
+    // LOT 3 — compare mode
+    compareFile, setCompareFile,
   ]);
 
   // The per-view content (the routed <Outlet/> + the absolute annotation layer).

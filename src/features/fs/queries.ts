@@ -13,9 +13,9 @@
 // tabs avec contenu dirty). Phase ultérieure si besoin.
 
 import { useQuery } from "@tanstack/react-query";
-import { fsReadDir } from "@/lib/fs";
+import { fsReadDir, fsReadFile } from "@/lib/fs";
 import { queryClient } from "@/lib/queryClient";
-import type { FileNode } from "@/lib/types";
+import type { FileNode, FileContent } from "@/lib/types";
 import { fsKeys } from "./keys";
 
 /**
@@ -47,4 +47,24 @@ export function useFileTree() {
  */
 export function invalidateFileTree(): void {
   void queryClient.invalidateQueries({ queryKey: fsKeys.tree() });
+}
+
+/**
+ * Content of a single workspace-relative file, typed with the language
+ * inferred from its extension.
+ *
+ * Used by DiffView to read both sides of a compare operation without
+ * going through the RootLayout file-tab machinery (which is for editor
+ * tabs, not compare-only reads).
+ *
+ * Returns `null` while loading or when `path` is falsy (disabled query).
+ */
+export function useFileContent(path: string | null): FileContent | null {
+  const { data } = useQuery<FileContent>({
+    queryKey: fsKeys.file(path ?? ""),
+    queryFn: () => fsReadFile(path!),
+    enabled: Boolean(path),
+    staleTime: 0,
+  });
+  return data ?? null;
 }

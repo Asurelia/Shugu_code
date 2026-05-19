@@ -387,6 +387,7 @@ pub fn run() {
             commands::fs::fs_create_dir,
             commands::fs::fs_rename,
             commands::fs::fs_delete,
+            commands::fs::fs_get_workspace_root,
             // LOT 2 — ripgrep workspace search (palette Cmd+Shift+F).
             commands::grep::fs_grep_workspace,
             // LOT 3 — Language Server Protocol bridge.
@@ -418,6 +419,9 @@ pub fn run() {
             commands::diag::js_diag,
             // LOT 2b — format document via CLI formatter (rustfmt/black/prettier/gofmt).
             commands::format::format_code,
+            // LOT 3 — git decorations backend (HEAD content for inline diff).
+            commands::git::git_is_repo,
+            commands::git::git_show_head,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

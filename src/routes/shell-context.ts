@@ -86,6 +86,13 @@ export interface ShellContextValue {
   // props to CodeMirrorEditor to drive Compartment reconfigures.
   editorPrefs: EditorPrefs;
   setEditorPref: <K extends keyof EditorPrefs>(key: K, value: EditorPrefs[K]) => void;
+
+  // ─── LOT 3 : Compare mode ────────────────────────────────────────────
+  // When set, the code view renders a 2-pane MergeView instead of the
+  // single CodeMirrorEditor. Both paths are workspace-relative. Cleared by
+  // the `close-compare` command or when the user switches the active file.
+  compareFile: { left: string; right: string } | null;
+  setCompareFile: Dispatch<SetStateAction<{ left: string; right: string } | null>>;
 }
 
 // ─── Context ──────────────────────────────────────────────────

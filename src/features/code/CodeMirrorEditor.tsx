@@ -42,6 +42,7 @@ import { diag } from "@/lib/diag";
 import { bracketPairColors } from "./extensions/bracketPairColors";
 import { snippetCompletionSource } from "./snippets/loader";
 import { getLspClient, isLspSupported, fileUriForPath, fmtErr } from "./lsp/client";
+import { gitDiffCompartment, buildGitDecorations } from "./git-decorations";
 
 const veilHighlight = HighlightStyle.define([
   { tag: tags.keyword,        color: "#d180ef" },
@@ -185,7 +186,13 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
   /** LOT 2a — show minimap in the right gutter. Default: false.
    *  Forced off when wordWrap is true (package limitation). */
   minimap?: boolean;
-}>(function CodeMirrorEditor({ value, onChange, path, language = "typescript", wordWrap = false, stickyScroll = false, minimap = false }, ref) {
+  /** LOT 3 — HEAD content of the file (LF-normalized). When provided and
+   *  `gitDecorations` pref is on, drives the inline diff overlay via
+   *  `gitDiffCompartment`. Pass null to clear decorations. */
+  gitHeadOriginal?: string | null;
+  /** LOT 3 — whether git decorations are enabled (from editorPrefs). */
+  gitDecorations?: boolean;
+}>(function CodeMirrorEditor({ value, onChange, path, language = "typescript", wordWrap = false, stickyScroll = false, minimap = false, gitHeadOriginal = null, gitDecorations = true }, ref) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
@@ -341,6 +348,12 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
         lspCompartment.of([] as Extension[]),
         lintGutter(),
 
+        // ─── LOT 3 : Git inline diff (unifiedMergeView) ────────────
+        // Module-level singleton Compartment (see git-decorations.ts).
+        // Seeded empty here; reconfigured by the useEffect below when
+        // gitHeadOriginal or gitDecorations changes.
+        gitDiffCompartment.of([] as Extension[]),
+
         // ─── Keymap (étendu LOT 1.4) ────────────────────────────
         // Note : snippetKeymap est un Facet (extension point pour l'utilisateur),
         // pas un array — les bindings par défaut de snippet (Tab/Esc pour
@@ -414,6 +427,20 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
       effects: minimapCompartment.reconfigure(effective ? buildMinimap() : []),
     });
   }, [minimap, wordWrap]);
+
+  // LOT 3 — Reconfigure git diff decorations when HEAD content or pref changes.
+  // Runs after every render where gitHeadOriginal or gitDecorations changed.
+  // buildGitDecorations returns [] when disabled or original is null,
+  // which clears the overlay cleanly.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: gitDiffCompartment.reconfigure(
+        buildGitDecorations(gitHeadOriginal, gitDecorations),
+      ),
+    });
+  }, [gitHeadOriginal, gitDecorations]);
 
   // ── LOT 3 : Attach LSP plugin once the client is ready ──────────────
   //

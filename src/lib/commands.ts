@@ -2,7 +2,8 @@
 // Pure data module — no React imports. Safe to import from anywhere.
 // Pass 1: flat COMMANDS array with default keybindings, categories, run/when predicates.
 
-import { fsOpenFolder } from "@/lib/fs";
+import { fsOpenFolder, fsGetWorkspaceRoot } from "@/lib/fs";
+import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
 import { openSearchPanel } from "@codemirror/search";
 import type { CodeMirrorEditorHandle } from "@/features/code/CodeMirrorEditor";
 import type { EditorPrefs } from "@/routes/shell-context";
@@ -85,6 +86,13 @@ export interface CommandContext {
   // Required (not optional) — one instantiation site in RootLayout cmdCtx.
   editorPrefs: EditorPrefs;
   setEditorPref: <K extends keyof EditorPrefs>(key: K, value: EditorPrefs[K]) => void;
+
+  // ─── LOT 3 : Compare mode ────────────────────────────────────────────
+  // When non-null, the /code view shows a 2-pane MergeView instead of the
+  // CodeMirrorEditor. The `compare-files` command sets this; `close-compare`
+  // clears it.
+  compareFile?: { left: string; right: string } | null;
+  setCompareFile?: React.Dispatch<React.SetStateAction<{ left: string; right: string } | null>>;
 }
 
 // ─── Command interface ─────────────────────────────────────────
@@ -302,12 +310,67 @@ export const COMMANDS: Command[] = [
     run: (ctx) => ctx.navigateTo("gallery"),
   },
   {
-    id: "toggle-diff",
-    title: "Toggle diff view",
+    // LOT 3 — Compare two files side-by-side via MergeView.
+    // Opens the native file picker, then renders DiffView in the /code route.
+    // NOTE: Cmd+D is NOT used — CodeMirror searchKeymap already binds
+    // Mod-d → selectNextOccurrence and the editor would swallow it.
+    id: "compare-files",
+    title: "File: Compare with...",
+    category: "File",
+    keybinding: ["Cmd", "Shift", "D"],
+    when: (ctx) => ctx.currentView === "code" && ctx.activeFile !== null,
+    run: async (ctx) => {
+      if (!ctx.activeFile || !ctx.setCompareFile) return;
+
+      // Get workspace root so we can relativize the picked absolute path.
+      const wsRoot = await fsGetWorkspaceRoot();
+      if (!wsRoot) return;
+
+      // Ensure we are on the /code view so the DiffView renders.
+      ctx.navigateTo("code");
+
+      const picked = await dialogOpen({
+        multiple: false,
+        defaultPath: wsRoot,
+        filters: [{ name: "All files", extensions: ["*"] }],
+      });
+
+      if (typeof picked !== "string") return; // cancelled
+
+      // Relativize: strip workspace root prefix + leading slash.
+      const normalized = picked.replace(/\\/g, "/");
+      const rootWithSlash = wsRoot.endsWith("/") ? wsRoot : wsRoot + "/";
+      const relative = normalized.startsWith(rootWithSlash)
+        ? normalized.slice(rootWithSlash.length)
+        : null;
+
+      if (!relative) {
+        // File is outside the workspace — cannot read via fs_read_file.
+        console.warn("[compare-files] picked file is outside workspace:", picked);
+        return;
+      }
+
+      ctx.setCompareFile({ left: ctx.activeFile, right: relative });
+    },
+  },
+  {
+    // LOT 3 — Close compare mode, return to single-editor view.
+    id: "close-compare",
+    title: "File: Close Compare",
+    category: "File",
+    keybinding: ["Escape"],
+    when: (ctx) => ctx.currentView === "code" && ctx.compareFile != null,
+    run: (ctx) => {
+      ctx.setCompareFile?.(null);
+    },
+  },
+  {
+    // LOT 3 — Toggle git inline diff decorations (added/modified/deleted lines).
+    id: "toggle-git-decorations",
+    title: "View: Toggle Git Decorations",
     category: "View",
-    keybinding: ["Cmd", "D"],
-    when: () => false,
-    run: () => { /* TODO: toggle diff view (requires git integration) */ },
+    when: (ctx) => ctx.currentView === "code",
+    run: (ctx) => ctx.setEditorPref("gitDecorations", !ctx.editorPrefs.gitDecorations),
   },
   {
     // LOT 1 — Word wrap toggle. Mirrors VS Code Alt+Z.

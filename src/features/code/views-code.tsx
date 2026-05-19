@@ -12,13 +12,24 @@ import { ConnectionsView, ProfileView } from "@/features/panels/panels";
 import { db } from "@/lib/db";
 import { queryClient } from "@/lib/queryClient";
 import { useShell } from "@/routes/shell-context";
+import { useGitHead } from "@/features/git/queries";
+// LOT 3 — 2-pane compare view (MergeView). Aliased to avoid collision with
+// the existing simple DiffView below (which is used by FilesView for the
+// before/after split display in the files browser).
+import { DiffView as CompareDiffView } from "./DiffView";
 
 // ─── Code view (editor + tabs + statusbar) ──────────────────
 export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, fileContents, setFileContents, editorViewRef }: any) {
   // LOT 1 — read wordWrap from ShellContext (the source of truth for editor prefs).
   // useShell() is safe here: CodeView is rendered inside the <Outlet> which is
   // inside <ShellContext.Provider> in RootLayout.tsx.
-  const { editorPrefs } = useShell();
+  const { editorPrefs, compareFile, setCompareFile } = useShell();
+
+  // LOT 3 — HEAD content for the active file. Used by gitDiffCompartment to
+  // render inline diff decorations (added/modified/deleted line markers).
+  // Returns null when: file untracked, repo has no commits, not a git repo,
+  // or still loading. The prop is passed through to CodeMirrorEditor.
+  const gitHeadOriginal = useGitHead(editorPrefs.gitDecorations ? activeFile : null);
   const [savedFlash, setSavedFlash] = useState(false);
   // Track previous dirty state for the active file to detect true→false transitions.
   // Reset the ref when the active file changes to avoid cross-tab false positives.
@@ -84,10 +95,32 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
         <Breadcrumbs filePath={activeFile} editorHandle={editorViewRef} />
         <div className="ide-main">
           <div className="ide-editor">
-            {activeFile && fileContents[activeFile]
-              ? <CodeMirrorEditor ref={editorViewRef} key={activeFile} path={activeFile} value={fileContents[activeFile].text} onChange={onChange} language={fileContents[activeFile].lang} wordWrap={editorPrefs.wordWrap} stickyScroll={editorPrefs.stickyScroll} minimap={editorPrefs.minimap}/>
-              : <div style={{position:"absolute", inset:0, display:"flex", alignItems:"center", justifyContent:"center", color:"var(--on-surface-muted)", fontFamily:"var(--font-mono)", fontSize:12}}>No file open. Pick one from the explorer.</div>
-            }
+            {/* LOT 3 — Compare mode: render 2-pane MergeView when compareFile is set. */}
+            {compareFile != null ? (
+              <CompareDiffView
+                left={compareFile.left}
+                right={compareFile.right}
+                onClose={() => setCompareFile(null)}
+              />
+            ) : activeFile && fileContents[activeFile] ? (
+              <CodeMirrorEditor
+                ref={editorViewRef}
+                key={activeFile}
+                path={activeFile}
+                value={fileContents[activeFile].text}
+                onChange={onChange}
+                language={fileContents[activeFile].lang}
+                wordWrap={editorPrefs.wordWrap}
+                stickyScroll={editorPrefs.stickyScroll}
+                minimap={editorPrefs.minimap}
+                gitHeadOriginal={gitHeadOriginal}
+                gitDecorations={editorPrefs.gitDecorations}
+              />
+            ) : (
+              <div style={{position:"absolute", inset:0, display:"flex", alignItems:"center", justifyContent:"center", color:"var(--on-surface-muted)", fontFamily:"var(--font-mono)", fontSize:12}}>
+                No file open. Pick one from the explorer.
+              </div>
+            )}
           </div>
           <OutlinePanel editorHandle={editorViewRef} filePath={activeFile} />
         </div>
@@ -423,6 +456,10 @@ export function SettingsEditor() {
           </SettingRow>
           <SettingRow label="Format on save" desc="Formate automatiquement le document lors de la sauvegarde (Ctrl+S). Requiert rustfmt, black ou prettier selon le langage.">
             <Switch on={editorPrefs.formatOnSave} onChange={(v) => setEditorPref("formatOnSave", v)}/>
+          </SettingRow>
+          {/* LOT 3 — Git inline diff decorations */}
+          <SettingRow label="Git decorations" desc="Affiche les lignes ajoutées, modifiees et supprimees vs HEAD dans le gutter. Desactive dans les repos sans commits ou les fichiers non-trackes.">
+            <Switch on={editorPrefs.gitDecorations} onChange={(v) => setEditorPref("gitDecorations", v)}/>
           </SettingRow>
         </div>
       </div>

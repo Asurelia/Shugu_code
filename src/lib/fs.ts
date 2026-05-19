@@ -138,6 +138,15 @@ export async function fsOpenFolder(): Promise<string | null> {
   return invoke<string | null>("fs_open_folder");
 }
 
+/**
+ * Returns the current workspace root as an absolute, forward-slash path,
+ * or null when no workspace is open.
+ * Used by `compare-files` to relativize dialog-picked absolute paths.
+ */
+export async function fsGetWorkspaceRoot(): Promise<string | null> {
+  return invoke<string | null>("fs_get_workspace_root");
+}
+
 /** Read the recursive directory tree rooted at the current workspace. */
 export async function fsReadDir(): Promise<FileNode[]> {
   const entries = await invoke<FsEntry[]>("fs_read_dir");
