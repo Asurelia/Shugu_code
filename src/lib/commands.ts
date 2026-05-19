@@ -338,15 +338,34 @@ export const COMMANDS: Command[] = [
       if (typeof picked !== "string") return; // cancelled
 
       // Relativize: strip workspace root prefix + leading slash.
-      const normalized = picked.replace(/\\/g, "/");
-      const rootWithSlash = wsRoot.endsWith("/") ? wsRoot : wsRoot + "/";
-      const relative = normalized.startsWith(rootWithSlash)
-        ? normalized.slice(rootWithSlash.length)
+      // BUG fixed (user smoke): the picker returns native paths (\\) on
+      // Windows, the Rust workspace root returns native paths too, but the
+      // previous impl only normalized `picked` to forward-slash — leaving
+      // `wsRoot` with backslashes and breaking startsWith entirely.
+      // Also: Windows paths are case-insensitive (drive letter casing varies
+      // between picker output and workspace state) — comparison must be
+      // case-insensitive when running on Windows. We test platform via the
+      // simple heuristic of looking for a Windows drive letter in wsRoot
+      // (e.g. "C:" / "F:") since detecting platform in the browser without
+      // an extra plugin is awkward; on POSIX this regex never matches so
+      // the comparison stays case-sensitive.
+      const normalize = (p: string) => p.replace(/\\/g, "/");
+      const normalizedPicked = normalize(picked);
+      const normalizedRoot = normalize(wsRoot);
+      const rootWithSlash = normalizedRoot.endsWith("/")
+        ? normalizedRoot
+        : normalizedRoot + "/";
+      const isWindowsRoot = /^[A-Za-z]:/.test(normalizedRoot);
+      const matches = isWindowsRoot
+        ? normalizedPicked.toLowerCase().startsWith(rootWithSlash.toLowerCase())
+        : normalizedPicked.startsWith(rootWithSlash);
+      const relative = matches
+        ? normalizedPicked.slice(rootWithSlash.length)
         : null;
 
       if (!relative) {
         // File is outside the workspace — cannot read via fs_read_file.
-        console.warn("[compare-files] picked file is outside workspace:", picked);
+        console.warn("[compare-files] picked file is outside workspace:", picked, "root:", wsRoot);
         return;
       }
 
