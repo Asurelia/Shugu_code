@@ -13,9 +13,11 @@
 //
 // Edge cases handled:
 //   - Initial mount before model has loaded → skip (model is empty).
-//   - Boot race with `llama_autostart` triggered from lib.rs::setup —
-//     idempotent on both sides (Rust early-returns if already running;
-//     stopping a non-running server is a no-op).
+//   - Llama binary not installed (no winget/scoop install, no system path) →
+//     `startLlama` returns an error, we log and let the chat surface a clean
+//     "llama-server not found" message. Since 2026-05-19 (Option A: removed
+//     boot autostart + bundled binary), this is the expected first-run case
+//     until the user installs via Settings → AI.
 //   - Rapid switching between two API models → consecutive stop calls
 //     hit a server already dead, both succeed cleanly.
 //   - Network errors talking to the Rust side → logged, not rethrown

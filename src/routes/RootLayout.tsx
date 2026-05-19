@@ -61,12 +61,15 @@ import { useLlamaLifecycle } from "@/features/llama/useLlamaLifecycle";
 import { COMMANDS, getCommandById, fmtKbd, type CommandContext } from "@/lib/commands";
 import { useCommandKeybindings } from "@/lib/keybindings";
 import { FindPanel } from "@/features/code/FindPanel";
+import { invalidateGitHead } from "@/features/git/queries";
 
 // Context + hook live in ./shell-context to keep this file Fast-Refresh
 // friendly (a module exporting both a hook and a component forces a full
 // page reload on every HMR edit, which in turn caused the intermittent
 // "useShell must be used inside RootLayout" errors in the Tauri webview).
-import { ShellContext, type ShellContextValue } from "./shell-context";
+import { ShellContext, type ShellContextValue, type EditorPrefs, DEFAULT_EDITOR_PREFS } from "./shell-context";
+import { loadJSON, saveJSON } from "@/features/settings/settings-extras";
+import { formatCurrentDocumentCli, formatCodeDirect } from "@/features/code/format";
 
 // ─── Path → view string (derived navigation) ─────────────────
 
@@ -436,6 +439,34 @@ export function RootLayout() {
   // la return tree de ce composant. Exposé aux routes via ShellContext.
   const [findPanelOpen, setFindPanelOpen] = useState(false);
 
+  // LOT 3 — Compare mode: both workspace-relative paths for the 2-pane diff.
+  // When non-null, the /code view renders a MergeView instead of the standard
+  // CodeMirrorEditor. Cleared on activeFile change or by the `close-compare`
+  // command.
+  const [compareFile, setCompareFile] = useState<{ left: string; right: string } | null>(null);
+
+  // Auto-close compare view when the user switches to a different file.
+  // Without this, switching tabs while a diff is open leaves a stale
+  // comparison (the left/right paths no longer relate to the new activeFile).
+  useEffect(() => {
+    setCompareFile(null);
+  }, [activeFile]);
+
+  // LOT 1 — Editor preferences. Lifted here so toggling a setting propagates
+  // to the live editor in the same window without relying on the `storage`
+  // DOM event (which only fires cross-window). Hydrated from localStorage via
+  // loadJSON (synchronous), persisted on mutation via saveJSON.
+  const [editorPrefs, setEditorPrefsState] = useState<EditorPrefs>(
+    () => ({ ...DEFAULT_EDITOR_PREFS, ...loadJSON("shugu.editor.v1", {}) }),
+  );
+  const setEditorPref = useCallback(<K extends keyof EditorPrefs>(key: K, value: EditorPrefs[K]) => {
+    setEditorPrefsState(prev => {
+      const next = { ...prev, [key]: value };
+      saveJSON("shugu.editor.v1", next);
+      return next;
+    });
+  }, []);
+
   // Editor ref — forwarded from CodeMirrorEditor via ShellContext + CommandContext
   // so that find-in-file / replace-in-file commands can open the search panel.
   // The ref is null while any route other than /code is mounted.
@@ -661,12 +692,53 @@ export function RootLayout() {
   const saveFile = useCallback(async (path: string) => {
     const content = fileContents[path];
     if (!content) return;
-    await fsWriteFile(path, content.text);
+
+    // Format-on-save: run CLI formatter before writing.
+    // NEVER blocks save — if format fails, save proceeds with original content.
+    // Uses CLI-only path (not LSP) because formatDocument is async-dispatch:
+    // reading view.state.doc immediately after would return pre-format content.
+    //
+    // Corruption guard: editorViewRef always points to the ACTIVE file's view.
+    // When saveAll() iterates dirty files, non-active files must NOT use the
+    // view — they would read the active file's content and write it to the
+    // wrong path. Two paths:
+    //   • isActiveFile  → view-based (LCS cursor preservation, then read doc)
+    //   • !isActiveFile → direct invoke on content.text (no view dispatch)
+    let textToWrite = content.text;
+    if (editorPrefs.formatOnSave) {
+      const isActiveFile = path === activeFile;
+      if (isActiveFile) {
+        const view = editorViewRef.current?.getView();
+        if (view) {
+          // formatCurrentDocumentCli never throws (contract: catches errors
+          // internally, returns boolean) — no try/catch needed. Reading
+          // view.state.doc after the await captures whichever of these cases
+          // applies: (a) format dispatched → formatted content; (b) format
+          // skipped (no formatter, race, error) → unchanged content; (c) user
+          // typed during format → formatCurrentDocumentCli bails out and the
+          // typing is preserved. In all three cases textToWrite is correct.
+          await formatCurrentDocumentCli(view, content.lang, path);
+          textToWrite = view.state.doc.toString();
+        }
+      } else {
+        // Non-active file: format directly without touching the editor view.
+        // formatCodeDirect respects the shared noCliFormatter cache and
+        // populates it on "no formatter" / "formatter not found" errors so
+        // repeated saveAll calls don't re-spawn a failing process.
+        const formatted = await formatCodeDirect(content.lang, content.text, path);
+        if (formatted !== null) textToWrite = formatted;
+      }
+    }
+
+    await fsWriteFile(path, textToWrite);
     setFileContents(c => ({
       ...c,
-      [path]: { ...c[path], dirty: false, original: content.text },
+      [path]: { ...c[path], text: textToWrite, dirty: false, original: textToWrite },
     }));
-  }, [fileContents]);
+    // LOT 3 — invalidate git HEAD cache for this file so that inline diff
+    // decorations reflect the new saved state vs HEAD immediately.
+    invalidateGitHead(path);
+  }, [fileContents, editorPrefs.formatOnSave, activeFile, editorViewRef]);
 
   const saveAll = useCallback(async () => {
     const dirty = openFiles.filter(p => fileContents[p]?.dirty);
@@ -751,6 +823,12 @@ export function RootLayout() {
     editorViewRef,
     // LOT 2 — Find-in-files panel
     setFindPanelOpen,
+    // LOT 1 — editor prefs
+    editorPrefs,
+    setEditorPref,
+    // LOT 3 — compare mode
+    compareFile,
+    setCompareFile,
   }), [
     navigateTo, view, setPaletteOpen,
     sideCollapsed, setSideCollapsed,
@@ -768,6 +846,11 @@ export function RootLayout() {
     editorViewRef,
     // LOT 2 — setFindPanelOpen est stable (setter useState), inclusion explicite.
     setFindPanelOpen,
+    // LOT 1 — editor prefs
+    editorPrefs,
+    setEditorPref,
+    // LOT 3 — compare mode
+    compareFile, setCompareFile,
   ]);
 
   // Global keybinding dispatcher — replaces the hardcoded Cmd+K useEffect.
@@ -870,6 +953,12 @@ export function RootLayout() {
     // LOT 2 — openFile (read+open+focus) lifted so FindPanel can open a
     // file from a grep result even if it isn't already in openFiles.
     openFile,
+    // LOT 1 — editor prefs
+    editorPrefs,
+    setEditorPref,
+    // LOT 3 — compare mode
+    compareFile,
+    setCompareFile,
   }), [
     openFiles, activeFile, fileContents, generations, agents,
     setOpenFiles, setActiveFile, setFileContents, setGenerationsPersisted,
@@ -879,6 +968,11 @@ export function RootLayout() {
     // LOT 2
     findPanelOpen, setFindPanelOpen,
     openFile,
+    // LOT 1 — editor prefs
+    editorPrefs,
+    setEditorPref,
+    // LOT 3 — compare mode
+    compareFile, setCompareFile,
   ]);
 
   // The per-view content (the routed <Outlet/> + the absolute annotation layer).

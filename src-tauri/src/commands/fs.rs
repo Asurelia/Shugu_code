@@ -603,6 +603,22 @@ pub fn fs_delete(
     }
 }
 
+/// Returns the current workspace root as an absolute, forward-slash path,
+/// or `null` when no workspace is open.
+///
+/// Used by the `compare-files` command to relativize the absolute path
+/// returned by the file-picker dialog (which operates in OS path space)
+/// back to a workspace-relative path that `fs_read_file` can accept.
+#[tauri::command]
+pub fn fs_get_workspace_root(
+    root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
+) -> Option<String> {
+    let guard = root_state.lock().ok()?;
+    guard.as_ref().map(|p| {
+        p.to_string_lossy().replace('\\', "/")
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Private helpers shared by the mutation commands
 // ---------------------------------------------------------------------------

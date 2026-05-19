@@ -306,35 +306,14 @@ pub fn run() {
                 &[&show_item, &separator, &quit_item],
             )?;
 
-            // ──────────────────────────────────────────────────────────────
-            // Auto-start llama-server if the default bundle model is on
-            // disk. Runs in a background task so the UI window opens
-            // immediately — the spawn takes seconds (binary launch + model
-            // mmap), and we don't want the user staring at a blank screen
-            // while it boots. The frontend's `llama_status` polling will
-            // pick up the running server once it's listening.
-            //
-            // Failures are silent: if the sidecar binary is missing, the
-            // model isn't installed, or something else goes wrong, the
-            // onboarding overlay on the frontend will catch the case and
-            // offer to download. No need to surface boot errors here.
-            let autostart_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                match commands::llama::llama_autostart(autostart_handle).await {
-                    Ok(s) if s.running => {
-                        eprintln!(
-                            "[autostart] llama-server running (pid={:?}, binary={:?})",
-                            s.pid, s.binary
-                        );
-                    }
-                    Ok(_) => {
-                        eprintln!("[autostart] skipped (no bundle model installed yet)");
-                    }
-                    Err(e) => {
-                        eprintln!("[autostart] failed: {e}");
-                    }
-                }
-            });
+            // llama autostart at boot was REMOVED — Option A of the
+            // "llama bundling" decision (2026-05-19). Local AI is now strictly
+            // opt-in: the user picks a `llamacpp/*` model in Settings → the
+            // `useLlamaLifecycle` hook fires `llama_start` on demand. The
+            // binary is no longer bundled (see tauri.conf.json externalBin
+            // emptied); users install via winget/scoop/release if they want
+            // local-first. Bundle weight ~-1.5 GB, boot time instant, no more
+            // 90s readiness-probe timeout polluting the dev console.
 
             let _tray = TrayIconBuilder::with_id("main-tray")
                 .icon(
@@ -408,6 +387,7 @@ pub fn run() {
             commands::fs::fs_create_dir,
             commands::fs::fs_rename,
             commands::fs::fs_delete,
+            commands::fs::fs_get_workspace_root,
             // LOT 2 — ripgrep workspace search (palette Cmd+Shift+F).
             commands::grep::fs_grep_workspace,
             // LOT 3 — Language Server Protocol bridge.
@@ -437,6 +417,11 @@ pub fn run() {
             commands::agents::agent_get_transcript,
             commands::agents::agent_list_by_conversation,
             commands::diag::js_diag,
+            // LOT 2b — format document via CLI formatter (rustfmt/black/prettier/gofmt).
+            commands::format::format_code,
+            // LOT 3 — git decorations backend (HEAD content for inline diff).
+            commands::git::git_is_repo,
+            commands::git::git_show_head,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

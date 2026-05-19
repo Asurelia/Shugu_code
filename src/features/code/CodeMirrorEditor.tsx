@@ -17,7 +17,6 @@ import {
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import {
   syntaxHighlighting,
-  HighlightStyle,
   bracketMatching,
   indentOnInput,
   foldGutter,
@@ -31,65 +30,18 @@ import {
   completeAnyWord,
 } from "@codemirror/autocomplete";
 import { lintGutter } from "@codemirror/lint";
-import { javascript } from "@codemirror/lang-javascript";
-import { json } from "@codemirror/lang-json";
-import { markdown } from "@codemirror/lang-markdown";
-import { python } from "@codemirror/lang-python";
-import { tags } from "@lezer/highlight";
 import { langFromPath } from "@/lib/fs";
+import { veilHighlight, veilTheme } from "./theme";
+import { langExtensionFor } from "./languages";
+import { wordWrapCompartment, wordWrapInitial, setWordWrap } from "./extensions/wordWrap";
+import { regionFoldingService } from "./extensions/regionFolding";
+import { stickyScrollCompartment, stickyScrollExtension } from "./extensions/stickyScroll";
+import { minimapCompartment, buildMinimap } from "./extensions/minimap";
 import { diag } from "@/lib/diag";
 import { bracketPairColors } from "./extensions/bracketPairColors";
 import { snippetCompletionSource } from "./snippets/loader";
 import { getLspClient, isLspSupported, fileUriForPath, fmtErr } from "./lsp/client";
-
-const veilHighlight = HighlightStyle.define([
-  { tag: tags.keyword,        color: "#d180ef" },
-  { tag: tags.controlKeyword, color: "#e08efe", fontWeight: "600" },
-  { tag: tags.string,         color: "#8aefc7" },
-  { tag: tags.number,         color: "#ffcf6b" },
-  { tag: tags.comment,        color: "#6e6a89", fontStyle: "italic" },
-  { tag: tags.function(tags.variableName), color: "#81ecff" },
-  { tag: tags.typeName,       color: "#fd6c9c" },
-  { tag: tags.propertyName,   color: "#c9b9ff" },
-  { tag: tags.operator,       color: "#a5a0bf" },
-  { tag: tags.variableName,   color: "#ece8f5" },
-  { tag: tags.bracket,        color: "#a5a0bf" },
-  { tag: tags.bool,           color: "#ffcf6b" },
-  { tag: tags.atom,           color: "#ffcf6b" },
-  { tag: tags.meta,           color: "#81ecff" },
-]);
-
-const veilTheme = EditorView.theme({
-  "&": { backgroundColor: "transparent", color: "#ece8f5", height: "100%" },
-  ".cm-content": {
-    caretColor: "#e08efe",
-    padding: "16px 0",
-    fontFamily: "JetBrains Mono, monospace",
-    fontSize: "13px",
-  },
-  ".cm-gutters": {
-    backgroundColor: "transparent",
-    color: "#6e6a89",
-    border: "none",
-    fontFamily: "JetBrains Mono, monospace",
-    fontSize: "12px",
-  },
-  ".cm-activeLineGutter": { backgroundColor: "rgba(224,142,254,0.06)", color: "#e08efe" },
-  ".cm-activeLine": { backgroundColor: "rgba(224,142,254,0.04)" },
-  ".cm-selectionBackground, ::selection": { backgroundColor: "rgba(224,142,254,0.22)" },
-  ".cm-cursor": { borderLeft: "2px solid #e08efe" },
-}, { dark: true });
-
-/** Derive the CodeMirror language extension from the file path extension. */
-function langExtForPath(path?: string): ReturnType<typeof javascript> | ReturnType<typeof json> | ReturnType<typeof markdown> | ReturnType<typeof python> {
-  const ext = path ? path.split(".").pop()?.toLowerCase() : undefined;
-  switch (ext) {
-    case "json":  return json();
-    case "md":    return markdown();
-    case "py":    return python();
-    default:      return javascript({ typescript: true, jsx: true });
-  }
-}
+import { gitDiffCompartment, buildGitDecorations } from "./git-decorations";
 
 /**
  * Keyword completion seed per language — minimal word list used by the
@@ -187,7 +139,21 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
   path?: string;
   /** @deprecated Pass `path` instead — kept for callers not yet sending a path. */
   language?: string;
-}>(function CodeMirrorEditor({ value, onChange, path, language = "typescript" }, ref) {
+  /** LOT 1 — enable line wrapping. Default: false. Reconfigured via Compartment
+   *  on change — does NOT re-mount the editor (cursor/scroll preserved). */
+  wordWrap?: boolean;
+  /** LOT 2a — show sticky scroll overlay at top of viewport. Default: false. */
+  stickyScroll?: boolean;
+  /** LOT 2a — show minimap in the right gutter. Default: false.
+   *  Forced off when wordWrap is true (package limitation). */
+  minimap?: boolean;
+  /** LOT 3 — HEAD content of the file (LF-normalized). When provided and
+   *  `gitDecorations` pref is on, drives the inline diff overlay via
+   *  `gitDiffCompartment`. Pass null to clear decorations. */
+  gitHeadOriginal?: string | null;
+  /** LOT 3 — whether git decorations are enabled (from editorPrefs). */
+  gitDecorations?: boolean;
+}>(function CodeMirrorEditor({ value, onChange, path, language = "typescript", wordWrap = false, stickyScroll = false, minimap = false, gitHeadOriginal = null, gitDecorations = true }, ref) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
@@ -215,17 +181,13 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
   const lspCompartment = useMemo(() => new Compartment(), []);
 
   // Re-compute language extension only when path (or legacy language) changes.
-  const langExt = useMemo(() => {
-    // If a full path is available, prefer path-based dispatch.
-    if (path) return langExtForPath(path);
-    // Fallback: honour the legacy `language` prop.
-    switch (language) {
-      case "json":     return json();
-      case "markdown": return markdown();
-      case "python":   return python();
-      default:         return javascript({ typescript: language === "typescript", jsx: true });
-    }
-  }, [path, language]);
+  // LOT 1: delegates to the central langExtensionFor mapper (languages.ts).
+  // Deps [path, language] unchanged — wordWrap must NOT be a dep here, as that
+  // would trigger a full editor re-mount on toggle (destroying cursor/scroll).
+  const langExt = useMemo(
+    () => langExtensionFor(path ? langFromPath(path) : (language ?? "")),
+    [path, language],
+  );
 
   // Expose getView(), openSearch(), getDocVersion(), getPath() to parent refs.
   // Dépendance [path] : le handle DOIT être recréé quand path change pour
@@ -316,6 +278,29 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
         // long identifiers et heading texts tronqués).
         ...(isLspSupported(langId) ? [] : [basicHoverTooltip]),
 
+        // ─── LOT 1 (this LOT) : Word wrap Compartment ──────────
+        // Singleton module-level — see extensions/wordWrap.ts.
+        // Reconfigured via setWordWrap() in the useEffect below, not here;
+        // the initial value seeds the Compartment slot so reconfigure works.
+        wordWrapCompartment.of(wordWrapInitial(wordWrap)),
+
+        // ─── LOT 1 (this LOT) : Region folding ─────────────────
+        // foldService.of(...) is registered here; the actual fold logic
+        // lives in extensions/regionFolding.ts.
+        regionFoldingService(langId),
+
+        // ─── LOT 2a : Sticky scroll overlay ────────────────────
+        // stickyScrollCompartment is a module-level singleton (not useMemo)
+        // because it is shared across all editor instances. Reconfigured by
+        // the useEffect below when the stickyScroll prop changes.
+        stickyScrollCompartment.of(stickyScroll ? stickyScrollExtension : []),
+
+        // ─── LOT 2a : Minimap ───────────────────────────────────
+        // minimapCompartment is a module-level singleton. The effective value
+        // is `minimap && !wordWrap` — both props are observed in a single
+        // useEffect below to prevent the two effects from fighting each other.
+        minimapCompartment.of(minimap && !wordWrap ? buildMinimap() : []),
+
         // ─── LOT 3 : LSP plugin compartment (vide initialement) ───
         // Reconfiguré dynamiquement après getLspClient() async ; voir le
         // useEffect ci-dessous. Si le LSP n'est pas dispo (binaire absent,
@@ -323,6 +308,12 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
         // fonctionne en mode LOT 1+2 (snippets + outline + breadcrumbs).
         lspCompartment.of([] as Extension[]),
         lintGutter(),
+
+        // ─── LOT 3 : Git inline diff (unifiedMergeView) ────────────
+        // Module-level singleton Compartment (see git-decorations.ts).
+        // Seeded empty here; reconfigured by the useEffect below when
+        // gitHeadOriginal or gitDecorations changes.
+        gitDiffCompartment.of([] as Extension[]),
 
         // ─── Keymap (étendu LOT 1.4) ────────────────────────────
         // Note : snippetKeymap est un Facet (extension point pour l'utilisateur),
@@ -333,6 +324,10 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
         // Mod-d → selectNextOccurrence est DÉJÀ dans searchKeymap (CodeMirror
         // 6.7+) ; pas besoin de le re-binder explicitement.
         keymap.of([
+          // Shift+Alt+F (format document) is handled by the global command
+          // in commands.ts (format-document), which uses LSP-first + CLI
+          // fallback via formatCurrentDocument(). formatKeymap (LSP-only,
+          // no CLI fallback) was removed to avoid a redundant double-binding.
           ...searchKeymap,
           ...defaultKeymap,
           ...historyKeymap,
@@ -362,6 +357,51 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
       v.dispatch({ changes: { from: 0, to: current.length, insert: value ?? "" } });
     }
   }, [value]);
+
+  // LOT 1 — Reconfigure word wrap without re-mounting the editor.
+  // Runs whenever the wordWrap prop changes (e.g. Settings toggle or Alt+Z).
+  // Cursor position, scroll offset, and undo history are all preserved.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    setWordWrap(view, wordWrap);
+  }, [wordWrap]);
+
+  // LOT 2a — Reconfigure sticky scroll overlay on pref change.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: stickyScrollCompartment.reconfigure(stickyScroll ? stickyScrollExtension : []),
+    });
+  }, [stickyScroll]);
+
+  // LOT 2a — Reconfigure minimap on pref change OR word wrap change.
+  // Single effect with both deps so there is ONE computed source for
+  // effectiveMinimap = minimap && !wordWrap. Two separate effects would
+  // race and produce momentary inconsistent states on simultaneous changes.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    const effective = minimap && !wordWrap;
+    view.dispatch({
+      effects: minimapCompartment.reconfigure(effective ? buildMinimap() : []),
+    });
+  }, [minimap, wordWrap]);
+
+  // LOT 3 — Reconfigure git diff decorations when HEAD content or pref changes.
+  // Runs after every render where gitHeadOriginal or gitDecorations changed.
+  // buildGitDecorations returns [] when disabled or original is null,
+  // which clears the overlay cleanly.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: gitDiffCompartment.reconfigure(
+        buildGitDecorations(gitHeadOriginal, gitDecorations),
+      ),
+    });
+  }, [gitHeadOriginal, gitDecorations]);
 
   // ── LOT 3 : Attach LSP plugin once the client is ready ──────────────
   //

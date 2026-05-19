@@ -2,9 +2,12 @@
 // Pure data module — no React imports. Safe to import from anywhere.
 // Pass 1: flat COMMANDS array with default keybindings, categories, run/when predicates.
 
-import { fsOpenFolder } from "@/lib/fs";
+import { fsOpenFolder, fsGetWorkspaceRoot } from "@/lib/fs";
+import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
 import { openSearchPanel } from "@codemirror/search";
 import type { CodeMirrorEditorHandle } from "@/features/code/CodeMirrorEditor";
+import type { EditorPrefs } from "@/routes/shell-context";
+import { formatCurrentDocument } from "@/features/code/format";
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -78,6 +81,18 @@ export interface CommandContext {
   // Utilisé par la commande `search-in-files` (Cmd+Shift+F) pour ouvrir
   // le panel grep textuel à la place de l'ancien semantic search.
   setFindPanelOpen?: (open: boolean) => void;
+
+  // ─── LOT 1 : Editor preferences ─────────────────────────────────────
+  // Required (not optional) — one instantiation site in RootLayout cmdCtx.
+  editorPrefs: EditorPrefs;
+  setEditorPref: <K extends keyof EditorPrefs>(key: K, value: EditorPrefs[K]) => void;
+
+  // ─── LOT 3 : Compare mode ────────────────────────────────────────────
+  // When non-null, the /code view shows a 2-pane MergeView instead of the
+  // CodeMirrorEditor. The `compare-files` command sets this; `close-compare`
+  // clears it.
+  compareFile?: { left: string; right: string } | null;
+  setCompareFile?: React.Dispatch<React.SetStateAction<{ left: string; right: string } | null>>;
 }
 
 // ─── Command interface ─────────────────────────────────────────
@@ -295,12 +310,118 @@ export const COMMANDS: Command[] = [
     run: (ctx) => ctx.navigateTo("gallery"),
   },
   {
-    id: "toggle-diff",
-    title: "Toggle diff view",
+    // LOT 3 — Compare two files side-by-side via MergeView.
+    // Opens the native file picker, then renders DiffView in the /code route.
+    // NOTE: Cmd+D is NOT used — CodeMirror searchKeymap already binds
+    // Mod-d → selectNextOccurrence and the editor would swallow it.
+    id: "compare-files",
+    title: "File: Compare with...",
+    category: "File",
+    keybinding: ["Cmd", "Shift", "D"],
+    when: (ctx) => ctx.currentView === "code" && ctx.activeFile !== null,
+    run: async (ctx) => {
+      if (!ctx.activeFile || !ctx.setCompareFile) return;
+
+      // Get workspace root so we can relativize the picked absolute path.
+      const wsRoot = await fsGetWorkspaceRoot();
+      if (!wsRoot) return;
+
+      // Ensure we are on the /code view so the DiffView renders.
+      ctx.navigateTo("code");
+
+      const picked = await dialogOpen({
+        multiple: false,
+        defaultPath: wsRoot,
+        filters: [{ name: "All files", extensions: ["*"] }],
+      });
+
+      if (typeof picked !== "string") return; // cancelled
+
+      // Relativize: strip workspace root prefix + leading slash.
+      // BUG fixed (user smoke): the picker returns native paths (\\) on
+      // Windows, the Rust workspace root returns native paths too, but the
+      // previous impl only normalized `picked` to forward-slash — leaving
+      // `wsRoot` with backslashes and breaking startsWith entirely.
+      // Also: Windows paths are case-insensitive (drive letter casing varies
+      // between picker output and workspace state) — comparison must be
+      // case-insensitive when running on Windows. We test platform via the
+      // simple heuristic of looking for a Windows drive letter in wsRoot
+      // (e.g. "C:" / "F:") since detecting platform in the browser without
+      // an extra plugin is awkward; on POSIX this regex never matches so
+      // the comparison stays case-sensitive.
+      // Normalize: backslashes → forward slashes, AND strip the Windows
+      // extended-length path prefix `\\?\` (after normalization: `//?/`).
+      // Rust's canonicalize() emits `\\?\F:\...` for safety, but the file
+      // picker returns plain `F:\...` — without stripping the prefix the
+      // startsWith check fails on every Windows pick. Encountered before
+      // in the LSP work (LOT 3 LSP commands) — same root cause.
+      const normalize = (p: string) =>
+        p.replace(/\\/g, "/").replace(/^\/\/\?\//, "");
+      const normalizedPicked = normalize(picked);
+      const normalizedRoot = normalize(wsRoot);
+      const rootWithSlash = normalizedRoot.endsWith("/")
+        ? normalizedRoot
+        : normalizedRoot + "/";
+      const isWindowsRoot = /^[A-Za-z]:/.test(normalizedRoot);
+      const matches = isWindowsRoot
+        ? normalizedPicked.toLowerCase().startsWith(rootWithSlash.toLowerCase())
+        : normalizedPicked.startsWith(rootWithSlash);
+      const relative = matches
+        ? normalizedPicked.slice(rootWithSlash.length)
+        : null;
+
+      if (!relative) {
+        // File is outside the workspace — cannot read via fs_read_file.
+        console.warn("[compare-files] picked file is outside workspace:", picked, "root:", wsRoot);
+        return;
+      }
+
+      ctx.setCompareFile({ left: ctx.activeFile, right: relative });
+    },
+  },
+  {
+    // LOT 3 — Close compare mode, return to single-editor view.
+    id: "close-compare",
+    title: "File: Close Compare",
+    category: "File",
+    keybinding: ["Escape"],
+    when: (ctx) => ctx.currentView === "code" && ctx.compareFile != null,
+    run: (ctx) => {
+      ctx.setCompareFile?.(null);
+    },
+  },
+  {
+    // LOT 3 — Toggle git inline diff decorations (added/modified/deleted lines).
+    id: "toggle-git-decorations",
+    title: "View: Toggle Git Decorations",
     category: "View",
-    keybinding: ["Cmd", "D"],
-    when: () => false,
-    run: () => { /* TODO: toggle diff view (requires git integration) */ },
+    when: (ctx) => ctx.currentView === "code",
+    run: (ctx) => ctx.setEditorPref("gitDecorations", !ctx.editorPrefs.gitDecorations),
+  },
+  {
+    // LOT 1 — Word wrap toggle. Mirrors VS Code Alt+Z.
+    id: "toggle-word-wrap",
+    title: "View: Toggle Word Wrap",
+    category: "View",
+    keybinding: ["Alt", "Z"],
+    when: (ctx) => ctx.currentView === "code",
+    run: (ctx) => ctx.setEditorPref("wordWrap", !ctx.editorPrefs.wordWrap),
+  },
+  {
+    // LOT 2a — Sticky scroll toggle. No standard VS Code keybinding.
+    id: "toggle-sticky-scroll",
+    title: "View: Toggle Sticky Scroll",
+    category: "View",
+    when: (ctx) => ctx.currentView === "code",
+    run: (ctx) => ctx.setEditorPref("stickyScroll", !ctx.editorPrefs.stickyScroll),
+  },
+  {
+    // LOT 2a — Minimap toggle. No standard VS Code keybinding.
+    id: "toggle-minimap",
+    title: "View: Toggle Minimap",
+    category: "View",
+    when: (ctx) => ctx.currentView === "code",
+    run: (ctx) => ctx.setEditorPref("minimap", !ctx.editorPrefs.minimap),
   },
 
   // ── Models (palette-only, no keybinding) ──────────────────
@@ -353,6 +474,40 @@ export const COMMANDS: Command[] = [
       // openSearchPanel also exposes the replace UI when called from a replace keybinding.
       const view = ctx.editorViewRef?.current?.getView();
       if (view) openSearchPanel(view);
+    },
+  },
+  {
+    // LOT 2b — Format document (Shift+Alt+F).
+    //
+    // Calls formatCurrentDocument with allowLsp=FALSE → CLI path only (prettier
+    // / rustfmt / gofmt / black via format_code Tauri command). LSP-first was
+    // tried initially but proved unreliable with typescript-language-server:
+    //   1. LSP's formatDocument returns true synchronously even when the
+    //      server has no formatter capability registered → editor receives
+    //      no edits visibly.
+    //   2. Duplicate textDocument/didOpen on CodeMirror remount triggers
+    //      tsserver's "Can't open already open document" warning; in some
+    //      paths this can desync tsserver's document view from the editor
+    //      buffer, causing formatting to operate on stale content.
+    // CLI path is consistent with format-on-save and yields reliable results.
+    // Future: implement a custom ref-counting Workspace to fix the LSP path
+    // and restore LSP-aware formatting for tsconfig/eslint-aware output.
+    id: "format-document",
+    title: "Format Document",
+    category: "Edit",
+    // Tokens MUST be in canonical order Cmd → Ctrl → Alt → Shift → KEY
+    // (matches eventToKey() in keybindings.ts). ["Shift", "Alt", "F"] would
+    // produce the string "Shift+Alt+F" via the naive bindingToKey join,
+    // but the user's keypress is normalized to "Alt+Shift+F" → keymap.get
+    // misses, the command silently never fires. User-visible symptom: press
+    // Shift+Alt+F → NOTHING in the console.
+    keybinding: ["Alt", "Shift", "F"],
+    when: (ctx) => ctx.currentView === "code" && ctx.activeFile !== null,
+    run: async (ctx) => {
+      const view = ctx.editorViewRef?.current?.getView();
+      if (!view || !ctx.activeFile) return;
+      const langId = ctx.fileContents[ctx.activeFile]?.lang ?? "";
+      await formatCurrentDocument(view, langId, ctx.activeFile, false);
     },
   },
   {

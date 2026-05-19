@@ -19,9 +19,9 @@ import type { FileNode, FileContent } from "@/lib/types";
 
 const LANG_MAP: Record<string, string> = {
   ts: "typescript",
-  tsx: "typescript",
+  tsx: "typescript", // JSX is enabled in langExtensionFor for all .tsx; LSP uses "typescript"
   js: "javascript",
-  jsx: "javascript",
+  jsx: "javascript", // JSX is enabled in langExtensionFor for all .jsx; LSP uses "javascript"
   mjs: "javascript",
   cjs: "javascript",
   rs: "rust",
@@ -33,6 +33,7 @@ const LANG_MAP: Record<string, string> = {
   css: "css",
   scss: "css",
   html: "html",
+  htm: "html",      // LOT 1: .htm alias
   toml: "toml",
   yaml: "yaml",
   yml: "yaml",
@@ -46,6 +47,8 @@ const LANG_MAP: Record<string, string> = {
   kt: "kotlin",
   swift: "swift",
   cpp: "cpp",
+  cc: "cpp",        // LOT 1: .cc alias for C++
+  cxx: "cpp",       // LOT 1: .cxx alias for C++
   c: "c",
   h: "c",
   hpp: "cpp",
@@ -53,9 +56,17 @@ const LANG_MAP: Record<string, string> = {
   rb: "ruby",
   php: "php",
   lua: "lua",
+  vue: "vue",       // LOT 1: Vue SFC
+  svelte: "svelte", // LOT 1: Svelte SFC
+  dockerfile: "dockerfile", // LOT 1: Dockerfile (extension-less handled by langFromPath)
 };
 
 export function langFromPath(path: string): string {
+  // Special case: Dockerfile has no extension — match on basename.
+  const basename = path.split("/").pop() ?? path;
+  if (basename === "Dockerfile" || basename.endsWith(".dockerfile")) {
+    return "dockerfile";
+  }
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
   return LANG_MAP[ext] ?? "text";
 }
@@ -125,6 +136,15 @@ function fsEntryToFileNode(entry: FsEntry): FileNode {
 /** Open a native folder picker; returns the absolute path or null on cancel. */
 export async function fsOpenFolder(): Promise<string | null> {
   return invoke<string | null>("fs_open_folder");
+}
+
+/**
+ * Returns the current workspace root as an absolute, forward-slash path,
+ * or null when no workspace is open.
+ * Used by `compare-files` to relativize dialog-picked absolute paths.
+ */
+export async function fsGetWorkspaceRoot(): Promise<string | null> {
+  return invoke<string | null>("fs_get_workspace_root");
 }
 
 /** Read the recursive directory tree rooted at the current workspace. */

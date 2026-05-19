@@ -1030,6 +1030,32 @@ body {
 .cm-selectionBackground { background: rgba(224,142,254,0.18) !important; }
 .cm-line { padding-left: 12px !important; }
 
+/* LOT 2a — Sticky scroll overlay */
+.cm-sticky-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 10;
+  pointer-events: none;
+  overflow: hidden; /* belt-and-suspenders; per-line .cm-sticky-line also clips */
+  backdrop-filter: blur(8px);
+  background: var(--surface-container-low);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--on-surface-variant);
+}
+
+.cm-sticky-overlay .cm-sticky-line {
+  padding-left: 12px;
+  padding-right: 12px;
+  line-height: 1.6;
+  white-space: pre;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* Status bar */
 .statusbar {
   display: flex; align-items: center;
