@@ -14,6 +14,8 @@ import { queryClient } from "@/lib/queryClient";
 import { useShell } from "@/routes/shell-context";
 import { useGitHead } from "@/features/git/queries";
 // LOT git-editor: add `import { useGitBlame } from "@/features/git/queries";` here
+import { BranchSwitcherCompact } from "@/features/git/components/BranchSwitcher";
+import { GitDiffStats } from "@/features/git/components/GitDiffStats";
 // LOT 3 — 2-pane compare view (MergeView). Aliased to avoid collision with
 // the existing simple DiffView below (which is used by FilesView for the
 // before/after split display in the files browser).
@@ -128,10 +130,10 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
           <OutlinePanel editorHandle={editorViewRef} filePath={activeFile} />
         </div>
         <div className="statusbar">
-          {/* LOT git-ui: replace hardcoded "main" with <BranchSwitcher compact /> here */}
-          <span className="item branch">main</span>
-          {/* LOT git-ui: replace hardcoded "+12 −4" with <GitDiffStats /> here */}
-          <span className="item git">+12 −4</span>
+          {/* LOT git-ui: live branch switcher (clickable) replaces the hardcoded "main" label. */}
+          <BranchSwitcherCompact />
+          {/* LOT git-ui: live diff stats (file counts) replace the hardcoded "+12 −4". */}
+          <GitDiffStats />
           <span className="item">UTF-8</span>
           <span className="item">{activeFile ? (fileContents[activeFile]?.lang || "text") : "—"}</span>
           <span className="spacer"></span>

@@ -54,7 +54,11 @@ export interface FileNode {
   name: string;
   path: string;
   open?: boolean;
-  git?: "M" | "A" | "D";
+  // Widened (LOT 3 git-ui) so SideFiles can carry the full headline status
+  // emitted by useGitStatusMap.computeStatusChar (`U` = conflicted,
+  // `?` = untracked). The tree node itself doesn't carry git info from
+  // Rust — it's stamped at render time by SideFiles via gitStatusMap.
+  git?: "M" | "A" | "D" | "U" | "?";
   children?: FileNode[];
 }
 
