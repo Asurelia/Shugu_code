@@ -53,13 +53,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": [
-      "binaries/cpu/llama-server-cpu",
-      "binaries/vulkan/llama-server-vulkan"
-    ],
-    "resources": [
-      "binaries/cpu/runtime/*",
-      "binaries/vulkan/runtime/*"
-    ]
+    "externalBin": [],
+    "resources": []
   }
 }
