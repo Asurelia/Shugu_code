@@ -1,6 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { PersistQueryClientProvider } from "@tanstack/react-query-persist-client";
+import { defaultShouldDehydrateQuery } from "@tanstack/react-query";
 import { ConvexProvider } from "convex/react";
 import { queryClient, queryPersister } from "./lib/queryClient";
 
@@ -8,6 +9,7 @@ import "./styles/styles.css";
 import "./styles/panels.css";
 import "./styles/chat-sidebar.css";
 import "./styles/settings-extras.css";
+import "./styles/ai-edit.css";
 
 import { RouterProvider } from "@tanstack/react-router";
 import { ThemeBootstrap } from "./lib/ThemeBootstrap";
@@ -85,7 +87,18 @@ void (async () => {
 const inner = (
   <PersistQueryClientProvider
     client={queryClient}
-    persistOptions={{ persister: queryPersister, buster: "v1" }}
+    persistOptions={{
+      persister: queryPersister,
+      buster: "v1",
+      // La session d'édition inline AI (queryKey ["ai-edit","session"]) est
+      // PUREMENT éphémère : la persister rehydraterait au boot un état
+      // "preview"/"streaming" périmé → widget cassé sans diff réel. On
+      // l'exclut de la dehydration (le reste du cache est persisté normalement).
+      dehydrateOptions: {
+        shouldDehydrateQuery: (q) =>
+          q.queryKey[0] !== "ai-edit" && defaultShouldDehydrateQuery(q),
+      },
+    }}
   >
     <ThemeBootstrap />
     <RouterProvider router={router} />

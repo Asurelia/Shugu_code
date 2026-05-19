@@ -19,6 +19,7 @@ import { GitDiffStats } from "@/features/git/components/GitDiffStats";
 // the existing simple DiffView below (which is used by FilesView for the
 // before/after split display in the files browser).
 import { DiffView as CompareDiffView } from "./DiffView";
+import { InlineEditWidget } from "./ai-edit/InlineEditWidget";
 
 // ─── Code view (editor + tabs + statusbar) ──────────────────
 export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, fileContents, setFileContents, editorViewRef }: any) {
@@ -130,6 +131,10 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
                 No file open. Pick one from the explorer.
               </div>
             )}
+            {/* LOT Éditeur⇄AI — widget inline (prompt Cmd+K + barre Accept/Reject).
+                Rendu en position:fixed (ancré à la sélection) ; ne rend rien
+                quand la session est idle. */}
+            <InlineEditWidget />
           </div>
           <OutlinePanel editorHandle={editorViewRef} filePath={activeFile} />
         </div>

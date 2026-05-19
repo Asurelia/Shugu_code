@@ -58,6 +58,7 @@ import { useAgentEvents } from "@/features/agents/useEvents";
 import { useActiveAgents, setSelectedAgentId } from "@/features/agents/queries";
 import { useChatEvents } from "@/features/chat/useEvents";
 import { useChatStreamListener } from "@/features/chat/useChatStream";
+import { runImmediate } from "@/features/code/ai-edit/aiEditController";
 import { useLlamaLifecycle } from "@/features/llama/useLlamaLifecycle";
 import { COMMANDS, getCommandById, fmtKbd, type CommandContext } from "@/lib/commands";
 import { useCommandKeybindings } from "@/lib/keybindings";
@@ -644,6 +645,31 @@ export function RootLayout() {
   }, []);
 
   const onAnnotate = useCallback(({ kind, payload, target }: any) => {
+    // LOT Éditeur⇄AI — "rewrite"/"fix" sur une sélection DANS l'éditeur =
+    // édition inline (diff + accept/reject), pas le chat. Hors éditeur,
+    // "rewrite" retombe sur le chat (comportement historique) ; "fix" n'a
+    // pas de chemin chat → no-op.
+    if (kind === "rewrite" || kind === "fix") {
+      const ev = editorViewRef.current?.getView();
+      const hasSel = !!ev && ev.state.selection.main.from !== ev.state.selection.main.to;
+      if (view === "code" && ev && hasSel) {
+        const fc = activeFile ? fileContents[activeFile] : null;
+        const coords = ev.coordsAtPos(ev.state.selection.main.from);
+        const anchor = coords
+          ? { x: coords.left, y: coords.bottom + 6 }
+          : { x: target?.x ?? 80, y: target?.y ?? 80 };
+        void runImmediate(ev, {
+          mode: kind === "fix" ? "fix" : "refactor",
+          path: activeFile,
+          lang: fc?.lang ?? "",
+          wasDirty: !!fc?.dirty,
+          anchor,
+        });
+        return;
+      }
+      if (kind === "fix") return; // pas de chemin chat pour "fix" hors éditeur
+      // "rewrite" hors éditeur : tombe dans le bloc chat ci-dessous.
+    }
     if (kind === "pin") { setPinnedAnno({ label: target?.label, text: target?.label }); return; }
     if (kind === "ask" || kind === "explain" || kind === "rewrite") {
       // Pin the short label for the mascot's "tu as épinglé X" overlay…
@@ -673,7 +699,7 @@ export function RootLayout() {
       setAnnotations(a => [...a, { id: Date.now(), kind, x: target.x, y: target.y, payload, label: target.label }]);
       return;
     }
-  }, [activeConvo]);
+  }, [activeConvo, view, activeFile, fileContents]);
 
   // LOT 2 — openFile est maintenant exposé via ShellContext (utilisé par
   // FindPanel pour ouvrir un fichier depuis un résultat grep). On évite
@@ -715,7 +741,12 @@ export function RootLayout() {
       const isActiveFile = path === activeFile;
       if (isActiveFile) {
         const view = editorViewRef.current?.getView();
-        if (view) {
+        // readOnly === inline AI-edit session active (aiEditCompartment lock):
+        // view.state.doc holds the partial-streamed / preview diff text, not a
+        // user-saveable doc. Skip the formatter branch so textToWrite stays
+        // content.text (pre-session value — onChange is suppressed during the
+        // stream) rather than persisting half-generated AI output to disk.
+        if (view && !view.state.readOnly) {
           // formatCurrentDocumentCli never throws (contract: catches errors
           // internally, returns boolean) — no try/catch needed. Reading
           // view.state.doc after the await captures whichever of these cases
@@ -1058,7 +1089,11 @@ export function RootLayout() {
                 </>}
                 {view === "code" && <>
                   <button className="lgb lgb-sm"><Icon name="git" size={11}/> Commit</button>
-                  <button className="lgb lgb-sm"><Icon name="sparkle" size={11}/> Ask Shugu</button>
+                  <button
+                    className="lgb lgb-sm"
+                    onClick={() => getCommandById("ai-inline-edit")?.run(cmdCtx)}
+                    title="Édition AI inline (Cmd+K)"
+                  ><Icon name="sparkle" size={11}/> Ask Shugu</button>
                   <DockToggleButton dockState={dockState} setDockState={setDockState}/>
                 </>}
                 {view === "image" && <>

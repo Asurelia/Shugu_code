@@ -1,0 +1,143 @@
+/* Shugu Forge — Lot 1 (Éditeur⇄AI) — widget d'édition inline + diff unifié.
+   Charte Celestial Veil (variables --primary / --surface / --lg-blur …). */
+
+.ai-edit-widget {
+  position: fixed;
+  z-index: 9000;
+  min-width: 320px;
+  max-width: 440px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 12px;
+  background: var(--lg-tint, rgba(18, 14, 30, 0.92));
+  backdrop-filter: blur(var(--lg-blur, 12px));
+  -webkit-backdrop-filter: blur(var(--lg-blur, 12px));
+  border: 1px solid rgba(224, 142, 254, 0.32);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(0, 0, 0, 0.2);
+  color: var(--on-surface, #ece8f5);
+  font-family: var(--font-sans, system-ui, sans-serif);
+}
+
+.ai-edit-widget.error {
+  border-color: rgba(255, 106, 138, 0.5);
+}
+
+.ai-edit-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.ai-edit-spark {
+  color: var(--primary, #e08efe);
+  font-size: 14px;
+  line-height: 1.4;
+  flex-shrink: 0;
+}
+
+.ai-edit-label {
+  font-size: 12px;
+  color: var(--on-surface-variant, #b9b2cc);
+  line-height: 1.5;
+  flex: 1;
+  min-width: 0;
+}
+
+.ai-edit-input {
+  flex: 1;
+  min-width: 0;
+  resize: none;
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid rgba(224, 142, 254, 0.2);
+  border-radius: 8px;
+  padding: 6px 8px;
+  color: var(--on-surface, #ece8f5);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  line-height: 1.5;
+  outline: none;
+}
+
+.ai-edit-input:focus {
+  border-color: var(--primary, #e08efe);
+  box-shadow: 0 0 0 2px rgba(224, 142, 254, 0.18);
+}
+
+.ai-edit-input::placeholder {
+  color: var(--on-surface-muted, #6f6885);
+}
+
+.ai-edit-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.ai-edit-btn {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  padding: 5px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--on-surface, #ece8f5);
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, opacity 0.12s ease;
+}
+
+.ai-edit-btn:hover {
+  background: rgba(255, 255, 255, 0.09);
+  border-color: rgba(255, 255, 255, 0.22);
+}
+
+.ai-edit-btn.primary {
+  background: var(--primary, #e08efe);
+  border-color: var(--primary, #e08efe);
+  color: #1a1226;
+  font-weight: 600;
+}
+
+.ai-edit-btn.primary:hover {
+  background: var(--primary-container, #cf76ef);
+}
+
+.ai-edit-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Spinner de génération (réutilise le rythme de .ring si présent ailleurs). */
+.ai-edit-spinner {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  border: 2px solid rgba(224, 142, 254, 0.25);
+  border-top-color: var(--primary, #e08efe);
+  animation: ai-edit-spin 0.7s linear infinite;
+}
+
+@keyframes ai-edit-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ── Overrides du diff inline (@codemirror/merge unifiedMergeView) ──────
+   Aligne les couleurs sur la charte (rose = supprimé, vert = ajouté), comme
+   le DiffView 2-volets de views-code.tsx. Si les classes internes changent
+   dans une future version, ces règles sont simplement inertes. */
+.cm-deletedChunk {
+  background: rgba(255, 106, 138, 0.10);
+}
+.cm-deletedChunk .cm-deletedText,
+.cm-deletedText {
+  background: rgba(255, 106, 138, 0.22);
+}
+.cm-changedLine,
+.cm-insertedLine {
+  background: rgba(138, 239, 199, 0.10);
+}
+.cm-changedText {
+  background: rgba(138, 239, 199, 0.24);
+}

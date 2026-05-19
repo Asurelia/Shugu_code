@@ -5,9 +5,11 @@
 import { fsOpenFolder, fsGetWorkspaceRoot } from "@/lib/fs";
 import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
 import { openSearchPanel } from "@codemirror/search";
+import type { EditorView } from "@codemirror/view";
 import type { CodeMirrorEditorHandle } from "@/features/code/CodeMirrorEditor";
 import type { EditorPrefs } from "@/routes/shell-context";
 import { formatCurrentDocument } from "@/features/code/format";
+import { openPrompt, runImmediate } from "@/features/code/ai-edit/aiEditController";
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -121,9 +123,51 @@ export interface Command {
   run: (ctx: CommandContext) => void | Promise<void>;
 }
 
+// ─── AI selection helpers (Lot Éditeur⇄AI) ────────────────────
+//
+// Résout la cible d'une action AI sur la sélection courante de l'éditeur :
+// la view CodeMirror, le chemin/lang du fichier actif, son état dirty (pour
+// le restaurer au Reject), et l'ancrage écran du widget (tête de sélection).
+// Retourne null si l'éditeur n'est pas monté / pas de fichier actif.
+function aiEditTarget(ctx: CommandContext): {
+  view: EditorView;
+  path: string;
+  lang: string;
+  wasDirty: boolean;
+  anchor: { x: number; y: number };
+} | null {
+  const view = ctx.editorViewRef?.current?.getView() ?? null;
+  if (!view || !ctx.activeFile) return null;
+  const fc = ctx.fileContents[ctx.activeFile] ?? {};
+  const sel = view.state.selection.main;
+  const coords = view.coordsAtPos(sel.from);
+  const anchor = coords ? { x: coords.left, y: coords.bottom + 6 } : { x: 80, y: 80 };
+  return { view, path: ctx.activeFile, lang: fc.lang ?? "", wasDirty: !!fc.dirty, anchor };
+}
+
 // ─── COMMANDS array ───────────────────────────────────────────
 
 export const COMMANDS: Command[] = [
+  // ── AI: inline edit (Cmd+K) — DÉCLARÉE EN PREMIER ────────────
+  // Le dispatcher (keybindings.ts) essaie les commandes d'un même chord dans
+  // l'ordre de déclaration et exécute la 1ʳᵉ dont `when` passe. En déclarant
+  // ai-inline-edit AVANT open-palette, Cmd+K = édition inline DANS /code (avec
+  // fichier actif), et = command palette PARTOUT ailleurs. La palette reste
+  // accessible en /code via le bouton recherche du Titlebar + Cmd+Shift+P.
+  {
+    id: "ai-inline-edit",
+    title: "AI: Edit selection (inline)",
+    category: "Selection",
+    icon: "sparkle",
+    description: "Cmd+K — instruction inline, preview diff, accept/reject",
+    keybinding: ["Cmd", "K"],
+    when: (ctx) => ctx.currentView === "code" && ctx.activeFile !== null,
+    run: (ctx) => {
+      const t = aiEditTarget(ctx);
+      if (!t) return;
+      openPrompt(t.view, { path: t.path, lang: t.lang, wasDirty: t.wasDirty, anchor: t.anchor });
+    },
+  },
   // ── Workbench ─────────────────────────────────────────────
   {
     id: "open-palette",
@@ -131,6 +175,16 @@ export const COMMANDS: Command[] = [
     category: "Workbench",
     icon: "search",
     keybinding: ["Cmd", "K"],
+    run: (ctx) => ctx.setPaletteOpen(true),
+  },
+  {
+    // Alias de la palette : garantit qu'elle reste atteignable au clavier en
+    // vue /code, où Cmd+K est capté par ai-inline-edit (cf. note ci-dessus).
+    id: "open-palette-alt",
+    title: "Open command palette (alt)",
+    category: "Workbench",
+    icon: "search",
+    keybinding: ["Cmd", "Shift", "P"],
     run: (ctx) => ctx.setPaletteOpen(true),
   },
   {
@@ -539,21 +593,68 @@ export const COMMANDS: Command[] = [
 
   // ── Selection ─────────────────────────────────────────────
   {
+    // Refactor inline (Cmd+E) — preview diff + accept/reject. Pas de prompt :
+    // l'instruction est implicite ("refactore, comportement préservé").
     id: "ai-rewrite",
-    title: "AI rewrite selection",
+    title: "AI: Refactor selection",
     category: "Selection",
+    icon: "sparkle",
     keybinding: ["Cmd", "E"],
-    when: () => false,
-    run: () => { /* TODO: AI rewrite selection (needs CodeMirror selection ref) */ },
+    when: (ctx) => ctx.currentView === "code" && ctx.activeFile !== null,
+    run: (ctx) => {
+      const t = aiEditTarget(ctx);
+      if (!t) return;
+      void runImmediate(t.view, {
+        mode: "refactor",
+        path: t.path,
+        lang: t.lang,
+        wasDirty: t.wasDirty,
+        anchor: t.anchor,
+      });
+    },
   },
   {
-    // Rebound from ⌘⇧E (collision with view-code) → ⌘⌥E per decision 2.
-    id: "ai-explain",
-    title: "Explain selection",
+    // Fix inline (palette + menu contextuel ; pas de chord par défaut pour
+    // éviter une collision). Corrige bugs/erreurs de la sélection.
+    id: "ai-fix",
+    title: "AI: Fix selection",
     category: "Selection",
+    icon: "sparkle",
+    when: (ctx) => ctx.currentView === "code" && ctx.activeFile !== null,
+    run: (ctx) => {
+      const t = aiEditTarget(ctx);
+      if (!t) return;
+      void runImmediate(t.view, {
+        mode: "fix",
+        path: t.path,
+        lang: t.lang,
+        wasDirty: t.wasDirty,
+        anchor: t.anchor,
+      });
+    },
+  },
+  {
+    // Explain (Cmd+Alt+E) — READ-ONLY : pas d'édit du fichier, la réponse part
+    // dans le chat via le handler onAnnotate partagé (même chemin que le clic
+    // droit "Explain this").
+    id: "ai-explain",
+    title: "AI: Explain selection",
+    category: "Selection",
+    icon: "chat",
     keybinding: ["Cmd", "Alt", "E"],
-    when: () => false,
-    run: () => { /* TODO: explain selection via AI (needs selection state) */ },
+    when: (ctx) => ctx.currentView === "code" && ctx.activeFile !== null,
+    run: (ctx) => {
+      const view = ctx.editorViewRef?.current?.getView();
+      if (!view) return;
+      const sel = view.state.selection.main;
+      const text = view.state.sliceDoc(sel.from, sel.to).trim();
+      if (!text) return;
+      ctx.onAnnotate({
+        kind: "explain",
+        payload: null,
+        target: { label: text.slice(0, 60), fullText: text.slice(0, 2000) },
+      });
+    },
   },
   {
     id: "anno-comment",

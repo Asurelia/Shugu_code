@@ -103,11 +103,15 @@ export function ContextMenu({ open, x, y, target, onClose, onAnnotate }: any) {
         <button className="ctx-item" onClick={() => onItem("ask")}>
           <span className="ico"><Icon name="sparkle" size={13}/></span>
           <span className="label">Ask Shugu about this</span>
-          <span className="kbd">⌘E</span>
         </button>
         <button className="ctx-item" onClick={() => onItem("rewrite")}>
           <span className="ico"><Icon name="sparkle" size={13}/></span>
-          <span className="label">Rewrite with Shugu…</span>
+          <span className="label">Refactor with Shugu</span>
+          <span className="kbd">⌘E</span>
+        </button>
+        <button className="ctx-item" onClick={() => onItem("fix")}>
+          <span className="ico"><Icon name="sparkle" size={13}/></span>
+          <span className="label">Fix with Shugu</span>
         </button>
         <button className="ctx-item" onClick={() => onItem("explain")}>
           <span className="ico"><Icon name="chat" size={13}/></span>

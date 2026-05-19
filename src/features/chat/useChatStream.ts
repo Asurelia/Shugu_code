@@ -18,6 +18,7 @@ import { useQuery } from "@tanstack/react-query";
 import { listen, invoke } from "@/lib/tauri";
 import { diag, diagEveryN } from "@/lib/diag";
 import { queryClient } from "@/lib/queryClient";
+import { AI_EDIT_CONV_PREFIX } from "@/features/code/ai-edit/types";
 
 interface ChatDelta {
   conversationId?: string;
@@ -59,6 +60,12 @@ export function useChatStreamListener(): void {
       try {
         unlisten = await listen<ChatDelta>("chat://delta", (delta) => {
           if (cancelled) return;
+          // LOT AI — les éditions inline réutilisent chat_send avec un convId
+          // synthétique `aiedit:*`. Ces deltas ont leur propre listener dédié
+          // (runAiEdit) ; on les ignore ICI pour ne pas clobber STREAM_KEY ni
+          // déclencher le reset sur `done` du stream du chat principal (le bug
+          // de concurrence chat↔inline-edit identifié en revue de plan).
+          if (delta.conversationId?.startsWith(AI_EDIT_CONV_PREFIX)) return;
           diagEveryN(
             "chat-stream",
             `chat:${delta.kind ?? "content"}`,

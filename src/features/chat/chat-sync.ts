@@ -205,6 +205,56 @@ export async function appendMessage(convId: string, msg: Message): Promise<void>
   }
 }
 
+// ─── resolveChatTarget — résolution provider/clé/endpoint partagée ─────
+// Extrait de sendChatMessage pour être réutilisé par l'édition inline AI
+// (src/features/code/ai-edit/runAiEdit.ts), qui appelle chat_send SANS
+// persister dans le chat. Retourne soit la cible résolue, soit une raison
+// d'échec que l'appelant traduit en UI (chat : message ⚠ ; inline : erreur widget).
+export interface ResolvedChatTarget {
+  providerId: string;
+  protocol: Protocol;
+  baseUrl: string;
+  apiKey: string | undefined;
+  model: string;
+}
+// NB tsconfig `strict:false` → pas de strictNullChecks → le narrowing des unions
+// discriminées (`if (!x.ok)`) n'est PAS fiable. On utilise une forme plate à
+// champs optionnels : l'appelant teste `ok` puis lit les champs pertinents.
+export interface ResolveChatTargetResult {
+  ok: boolean;
+  target?: ResolvedChatTarget;
+  reason?: "disabled" | "unconfigured";
+  providerId?: string;
+}
+
+export async function resolveChatTarget(modelId: string): Promise<ResolveChatTargetResult> {
+  // Default to anthropic if the caller passed a bare model id (no prefix).
+  const id = modelId?.includes("/") ? modelId : "anthropic/claude-haiku-4-5";
+  const { providerId, protocol: defaultProtocol, baseUrl: defaultBaseUrl, model } = resolveProvider(id);
+
+  // STRICT MODE — a provider must be explicitly enabled by the user (Save dans
+  // Settings → Connections) avant que le chat puisse y router. Pas d'auto-probe
+  // des endpoints par défaut.
+  const enabled = await getProviderEnabled(providerId);
+  if (enabled !== "true") {
+    return { ok: false, reason: enabled === "false" ? "disabled" : "unconfigured", providerId };
+  }
+
+  // Pull persisted credentials + endpoint overrides. For user-added "custom-*"
+  // providers, also pick up the stored protocol (not in the registry).
+  const cfg = await loadProviderConfig(providerId);
+  let protocol: Protocol = defaultProtocol;
+  if (defaultProtocol === "custom") {
+    const storedProtocol = await getConfig(providerId, "protocol");
+    if (storedProtocol === "anthropic" || storedProtocol === "openai" || storedProtocol === "ollama" || storedProtocol === "custom") {
+      protocol = storedProtocol;
+    }
+  }
+  const baseUrl: string = (cfg.baseUrl && cfg.baseUrl !== "") ? cfg.baseUrl : defaultBaseUrl;
+  const apiKey: string | undefined = (cfg.apiKey && cfg.apiKey !== "") ? cfg.apiKey : undefined;
+  return { ok: true, target: { providerId, protocol, baseUrl, apiKey, model } };
+}
+
 // ─── sendChatMessage — high-level user→provider→ai round-trip ──────────
 // Invariant: the user message is persisted BEFORE the invoke is made, so
 // it always appears in both windows even if the provider call hangs or
@@ -257,46 +307,24 @@ export async function sendChatMessage(
   // honours it without depending on the per-provider toggle.
   const forceThinkingOff = route === "chat-direct";
 
-  // Default to anthropic if the caller passed a bare model id (no prefix).
-  const id = modelId?.includes("/") ? modelId : "anthropic/claude-haiku-4-5";
-  const { providerId, protocol: defaultProtocol, baseUrl: defaultBaseUrl, model: realModel } = resolveProvider(id);
-
-  // STRICT MODE — a provider must be explicitly enabled by the user (i.e. a
-  // Save in Settings → Connections has happened) before chat can route to it.
-  // The previous "auto-probe local endpoints" behavior caused the bug where
-  // a llama.cpp marked DISCONNECTED in Settings still served chat requests
-  // because the registry's default baseUrl was reachable. Now: no Save → no
-  // chat, and the user gets a clear pointer to where to fix it.
-  const enabled = await getProviderEnabled(providerId);
-  if (enabled !== "true") {
-    const reason = enabled === "false"
+  // Résolution provider/clé/endpoint — partagée avec l'édition inline AI via
+  // resolveChatTarget (cf. ci-dessus). On garde ICI l'UI d'erreur propre au
+  // chat (message ⚠ appendé + pointeur Settings) ; le STRICT MODE (no Save →
+  // no chat) vit dans le helper.
+  const resolved = await resolveChatTarget(modelId);
+  if (!resolved.ok) {
+    const reason = resolved.reason === "disabled"
       ? `est désactivé (Disconnect dans Settings → Connections)`
       : `n'est pas configuré`;
     await appendMessage(convId, {
       id: newMessageId("e"),
       role: "ai",
-      body: `⚠ Le provider "${providerId}" ${reason}. Va dans Settings → Connections, ouvre la carte ${providerId}, renseigne ce qu'il faut puis clique Save — ou choisis un autre modèle dans le picker.`,
+      body: `⚠ Le provider "${resolved.providerId}" ${reason}. Va dans Settings → Connections, ouvre la carte ${resolved.providerId}, renseigne ce qu'il faut puis clique Save — ou choisis un autre modèle dans le picker.`,
       ts: nowHHMM(),
     });
     return;
   }
-
-  // Pull persisted credentials + endpoint overrides for this providerId.
-  // For built-in providers, only `apiKey` + an optional `baseUrl` override
-  // are meaningful. For user-added "custom-*" providers, also pick up the
-  // stored `protocol` (set at creation time by AddProviderModal) since
-  // those are NOT in the registry and resolveProvider returns "custom" by
-  // default — which Rust would reject.
-  const cfg = await loadProviderConfig(providerId);
-  let protocol: Protocol = defaultProtocol;
-  if (defaultProtocol === "custom") {
-    const storedProtocol = await getConfig(providerId, "protocol");
-    if (storedProtocol === "anthropic" || storedProtocol === "openai" || storedProtocol === "ollama" || storedProtocol === "custom") {
-      protocol = storedProtocol;
-    }
-  }
-  const baseUrl: string = (cfg.baseUrl && cfg.baseUrl !== "") ? cfg.baseUrl : defaultBaseUrl;
-  const apiKey: string | undefined = (cfg.apiKey && cfg.apiKey !== "") ? cfg.apiKey : undefined;
+  const { providerId, protocol, baseUrl, apiKey, model: realModel } = resolved.target;
 
   // Per-provider thinking-mode router. Three values:
   //   - "auto"  (default): run a cheap regex heuristic on `trimmed` to
@@ -773,6 +801,11 @@ function loadActive(): string {
 
 export function getActiveConv(): string {
   return loadActive();
+}
+
+/** Lecture non-hook du modèle actif — pour les appels hors React (édition inline AI). */
+export function getActiveModel(): string {
+  return loadActiveModel();
 }
 
 /**

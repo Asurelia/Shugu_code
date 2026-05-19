@@ -43,6 +43,7 @@ import { snippetCompletionSource } from "./snippets/loader";
 import { getLspClient, isLspSupported, fileUriForPath, fmtErr } from "./lsp/client";
 import { gitDiffCompartment, buildGitDecorations } from "./git-decorations";
 import { blameCompartment, buildBlameGutter } from "./blame-decorations";
+import { aiEditCompartment, aiEditStreamAnnotation } from "./ai-edit/unifiedDiffExtension";
 import type { GitBlameLine } from "@/lib/types";
 
 /**
@@ -218,7 +219,13 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
         // Breadcrumbs) avant le callback onChange. Hot path : ne pas
         // allouer (juste un increment).
         docVersionRef.current++;
-        if (onChangeRef.current) {
+        // LOT AI — ne PAS propager onChange (→ setFileContents) pour les
+        // transactions du stream d'édition inline : sinon chaque token
+        // déclencherait un setFileContents → re-render RootLayout (freeze
+        // WebView2 connu). Les transactions Accept/Reject finales ne portent
+        // pas l'annotation et propagent normalement vers l'état applicatif.
+        const isAiStream = u.transactions.some((tr) => tr.annotation(aiEditStreamAnnotation));
+        if (!isAiStream && onChangeRef.current) {
           onChangeRef.current(u.state.doc.toString());
         }
       }
@@ -329,6 +336,13 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
         // or `gitBlameEnabled` changes.
         blameCompartment.of([] as Extension[]),
 
+        // ─── LOT AI : édition inline (diff unifié + verrou read-only) ──
+        // Compartment singleton (cf. ai-edit/unifiedDiffExtension.ts), seedé
+        // vide ; reconfiguré DE L'EXTÉRIEUR par aiEditController au fil des
+        // phases (streaming → preview → idle). Pas de useEffect ici : c'est
+        // le contrôleur qui dispatch les reconfigure sur la view courante.
+        aiEditCompartment.of([] as Extension[]),
+
         // ─── Keymap (étendu LOT 1.4) ────────────────────────────
         // Note : snippetKeymap est un Facet (extension point pour l'utilisateur),
         // pas un array — les bindings par défaut de snippet (Tab/Esc pour
@@ -366,6 +380,12 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
   useEffect(() => {
     const v = viewRef.current;
     if (!v) return;
+    // LOT AI — pendant une session d'édition inline, l'éditeur est read-only et
+    // SON doc est la source de vérité (le diff vit dedans) ; la prop `value`
+    // (= fileContents.text) est volontairement périmée car le stream ne
+    // propage pas via onChange. Ne pas resync sinon un fs://changed externe
+    // (useRefreshOpenFiles) écraserait le doc et effacerait le diff.
+    if (v.state.readOnly) return;
     const current = v.state.doc.toString();
     if (current !== value) {
       v.dispatch({ changes: { from: 0, to: current.length, insert: value ?? "" } });
