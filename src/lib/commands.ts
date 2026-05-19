@@ -451,9 +451,21 @@ export const COMMANDS: Command[] = [
     },
   },
   {
-    // LOT 2b — Format document via LSP (Shift+Alt+F).
-    // LSP-first for interactive use; CLI fallback if LSP returns false or lang unsupported.
-    // For format-on-save the CLI-only path is used (see format.ts module header).
+    // LOT 2b — Format document (Shift+Alt+F).
+    //
+    // Calls formatCurrentDocument with allowLsp=FALSE → CLI path only (prettier
+    // / rustfmt / gofmt / black via format_code Tauri command). LSP-first was
+    // tried initially but proved unreliable with typescript-language-server:
+    //   1. LSP's formatDocument returns true synchronously even when the
+    //      server has no formatter capability registered → editor receives
+    //      no edits visibly.
+    //   2. Duplicate textDocument/didOpen on CodeMirror remount triggers
+    //      tsserver's "Can't open already open document" warning; in some
+    //      paths this can desync tsserver's document view from the editor
+    //      buffer, causing formatting to operate on stale content.
+    // CLI path is consistent with format-on-save and yields reliable results.
+    // Future: implement a custom ref-counting Workspace to fix the LSP path
+    // and restore LSP-aware formatting for tsconfig/eslint-aware output.
     id: "format-document",
     title: "Format Document",
     category: "Edit",
@@ -463,7 +475,7 @@ export const COMMANDS: Command[] = [
       const view = ctx.editorViewRef?.current?.getView();
       if (!view || !ctx.activeFile) return;
       const langId = ctx.fileContents[ctx.activeFile]?.lang ?? "";
-      await formatCurrentDocument(view, langId, ctx.activeFile, true);
+      await formatCurrentDocument(view, langId, ctx.activeFile, false);
     },
   },
   {
