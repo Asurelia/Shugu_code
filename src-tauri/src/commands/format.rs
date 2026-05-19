@@ -174,13 +174,28 @@ pub async fn format_code(
             format!("no formatter for lang: {lang}")
         })?;
 
-    // Check that the binary is in PATH
-    if which::which(&binary).is_err() {
-        return Err(format!("formatter not found: {binary}"));
-    }
+    // Resolve binary path. Prefer local `node_modules/.bin/<binary>` over
+    // PATH lookup: Node-based formatters (prettier, etc.) are usually project-
+    // local rather than globally installed. Falls back to `which::which` for
+    // system-installed formatters (rustfmt via rustup, gofmt via Go toolchain,
+    // black via pip).
+    let local_bin = {
+        let basename = if cfg!(windows) {
+            format!("{binary}.cmd")
+        } else {
+            binary.clone()
+        };
+        workspace_root.join("node_modules").join(".bin").join(basename)
+    };
+    let binary_path: PathBuf = if local_bin.exists() {
+        local_bin
+    } else {
+        which::which(&binary)
+            .map_err(|_| format!("formatter not found: {binary}"))?
+    };
 
     // Spawn the formatter child process
-    let mut child = Command::new(&binary)
+    let mut child = Command::new(&binary_path)
         .args(&args)
         .current_dir(&workspace_root)
         .stdin(Stdio::piped())
