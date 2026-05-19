@@ -317,6 +317,22 @@ export const COMMANDS: Command[] = [
     when: (ctx) => ctx.currentView === "code",
     run: (ctx) => ctx.setEditorPref("wordWrap", !ctx.editorPrefs.wordWrap),
   },
+  {
+    // LOT 2a — Sticky scroll toggle. No standard VS Code keybinding.
+    id: "toggle-sticky-scroll",
+    title: "View: Toggle Sticky Scroll",
+    category: "View",
+    when: (ctx) => ctx.currentView === "code",
+    run: (ctx) => ctx.setEditorPref("stickyScroll", !ctx.editorPrefs.stickyScroll),
+  },
+  {
+    // LOT 2a — Minimap toggle. No standard VS Code keybinding.
+    id: "toggle-minimap",
+    title: "View: Toggle Minimap",
+    category: "View",
+    when: (ctx) => ctx.currentView === "code",
+    run: (ctx) => ctx.setEditorPref("minimap", !ctx.editorPrefs.minimap),
+  },
 
   // ── Models (palette-only, no keybinding) ──────────────────
   {

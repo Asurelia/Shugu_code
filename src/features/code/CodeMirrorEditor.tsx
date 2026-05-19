@@ -36,6 +36,8 @@ import { langFromPath } from "@/lib/fs";
 import { langExtensionFor } from "./languages";
 import { wordWrapCompartment, wordWrapInitial, setWordWrap } from "./extensions/wordWrap";
 import { regionFoldingService } from "./extensions/regionFolding";
+import { stickyScrollCompartment, stickyScrollExtension } from "./extensions/stickyScroll";
+import { minimapCompartment, buildMinimap } from "./extensions/minimap";
 import { diag } from "@/lib/diag";
 import { bracketPairColors } from "./extensions/bracketPairColors";
 import { snippetCompletionSource } from "./snippets/loader";
@@ -178,7 +180,12 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
   /** LOT 1 — enable line wrapping. Default: false. Reconfigured via Compartment
    *  on change — does NOT re-mount the editor (cursor/scroll preserved). */
   wordWrap?: boolean;
-}>(function CodeMirrorEditor({ value, onChange, path, language = "typescript", wordWrap = false }, ref) {
+  /** LOT 2a — show sticky scroll overlay at top of viewport. Default: false. */
+  stickyScroll?: boolean;
+  /** LOT 2a — show minimap in the right gutter. Default: false.
+   *  Forced off when wordWrap is true (package limitation). */
+  minimap?: boolean;
+}>(function CodeMirrorEditor({ value, onChange, path, language = "typescript", wordWrap = false, stickyScroll = false, minimap = false }, ref) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
@@ -314,6 +321,18 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
         // lives in extensions/regionFolding.ts.
         regionFoldingService(langId),
 
+        // ─── LOT 2a : Sticky scroll overlay ────────────────────
+        // stickyScrollCompartment is a module-level singleton (not useMemo)
+        // because it is shared across all editor instances. Reconfigured by
+        // the useEffect below when the stickyScroll prop changes.
+        stickyScrollCompartment.of(stickyScroll ? stickyScrollExtension : []),
+
+        // ─── LOT 2a : Minimap ───────────────────────────────────
+        // minimapCompartment is a module-level singleton. The effective value
+        // is `minimap && !wordWrap` — both props are observed in a single
+        // useEffect below to prevent the two effects from fighting each other.
+        minimapCompartment.of(minimap && !wordWrap ? buildMinimap() : []),
+
         // ─── LOT 3 : LSP plugin compartment (vide initialement) ───
         // Reconfiguré dynamiquement après getLspClient() async ; voir le
         // useEffect ci-dessous. Si le LSP n'est pas dispo (binaire absent,
@@ -369,6 +388,28 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
     if (!view) return;
     setWordWrap(view, wordWrap);
   }, [wordWrap]);
+
+  // LOT 2a — Reconfigure sticky scroll overlay on pref change.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: stickyScrollCompartment.reconfigure(stickyScroll ? stickyScrollExtension : []),
+    });
+  }, [stickyScroll]);
+
+  // LOT 2a — Reconfigure minimap on pref change OR word wrap change.
+  // Single effect with both deps so there is ONE computed source for
+  // effectiveMinimap = minimap && !wordWrap. Two separate effects would
+  // race and produce momentary inconsistent states on simultaneous changes.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    const effective = minimap && !wordWrap;
+    view.dispatch({
+      effects: minimapCompartment.reconfigure(effective ? buildMinimap() : []),
+    });
+  }, [minimap, wordWrap]);
 
   // ── LOT 3 : Attach LSP plugin once the client is ready ──────────────
   //

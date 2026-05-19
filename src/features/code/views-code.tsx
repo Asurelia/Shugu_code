@@ -85,7 +85,7 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
         <div className="ide-main">
           <div className="ide-editor">
             {activeFile && fileContents[activeFile]
-              ? <CodeMirrorEditor ref={editorViewRef} key={activeFile} path={activeFile} value={fileContents[activeFile].text} onChange={onChange} language={fileContents[activeFile].lang} wordWrap={editorPrefs.wordWrap}/>
+              ? <CodeMirrorEditor ref={editorViewRef} key={activeFile} path={activeFile} value={fileContents[activeFile].text} onChange={onChange} language={fileContents[activeFile].lang} wordWrap={editorPrefs.wordWrap} stickyScroll={editorPrefs.stickyScroll} minimap={editorPrefs.minimap}/>
               : <div style={{position:"absolute", inset:0, display:"flex", alignItems:"center", justifyContent:"center", color:"var(--on-surface-muted)", fontFamily:"var(--font-mono)", fontSize:12}}>No file open. Pick one from the explorer.</div>
             }
           </div>
@@ -409,6 +409,17 @@ export function SettingsEditor() {
           </SettingRow>
           <SettingRow label="Word wrap" desc="Retour à la ligne automatique (Alt+Z). Désactive la minimap.">
             <Switch on={editorPrefs.wordWrap} onChange={(v) => setEditorPref("wordWrap", v)}/>
+          </SettingRow>
+          <SettingRow label="Sticky scroll" desc="Affiche les entêtes de scope enclosant en haut de l'éditeur lors du scroll.">
+            <Switch on={editorPrefs.stickyScroll} onChange={(v) => setEditorPref("stickyScroll", v)}/>
+          </SettingRow>
+          <SettingRow
+            label="Minimap"
+            desc={editorPrefs.wordWrap
+              ? "Vue miniature du fichier — désactivée tant que Word wrap est actif."
+              : "Vue miniature du fichier dans le gutter droit."}
+          >
+            <Switch on={editorPrefs.minimap} onChange={(v) => setEditorPref("minimap", v)}/>
           </SettingRow>
         </div>
       </div>
