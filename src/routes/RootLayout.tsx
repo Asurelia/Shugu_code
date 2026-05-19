@@ -50,6 +50,7 @@ import { loadOpenFiles, saveOpenFiles } from "@/lib/ide-state";
 import { fsReadFile, fsWriteFile, fsCreateDir, fsCreateFile, langToExt } from "@/lib/fs";
 import { useFileTree, invalidateFileTree } from "@/features/fs/queries";
 import { useFsEvents } from "@/features/fs/useEvents";
+import { useGitEvents } from "@/features/git/useEvents";
 import { useRefreshOpenFiles } from "@/features/fs/useRefreshOpenFiles";
 import { indexWorkspace } from "@/features/fs/workspaceIndexer";
 import { AgentsPanel } from "@/features/agents/AgentsPanel";
@@ -530,6 +531,9 @@ export function RootLayout() {
   // useFsEvents (Phase G migration TanStack). Le hook fetch au mount,
   // le listener invalide sur fs://changed.
   useFsEvents();
+  // LOT 3 git-ui — listen `git://changed` (`.git/HEAD`, `.git/index`,
+  // refs/*, MERGE_HEAD, ORIG_HEAD) and invalidate all git query keys.
+  useGitEvents();
   // Smoke test fix — auto-refresh des fichiers ouverts (non-dirty) quand
   // ils changent sur le disque depuis un éditeur externe.
   // NB : on passe openFiles/fileContents/setFileContents en arguments

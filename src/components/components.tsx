@@ -4,6 +4,8 @@
 import React, { useState, useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 import { fsCreateFile, fsCreateDir, fsRename, fsDelete } from "@/lib/fs";
+// LOT 3 git-ui — annotate the file tree with git status.
+import { useGitStatusMap, type GitStatusChar } from "@/features/git/useGitStatusMap";
 
 // ── Icons (24x24 stroke) ────────────────────────────────────
 export function Icon({ name, size = 18, className = "" }: { name: string; size?: number; className?: string }) {
@@ -244,6 +246,8 @@ export function SideHistory({ items, active, onPick, onNew }: any) {
 type FileCtxAction = "newFile" | "newFolder" | "rename" | "delete";
 
 export function SideFiles({ tree, active, onPick }: any) {
+  // LOT 3 git-ui — per-path git status char (no-op outside a git repo).
+  const gitStatusMap = useGitStatusMap();
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [renaming, setRenaming] = useState<string | null>(null); // path of node being renamed
   const [ctxMenu, setCtxMenu] = useState<{ node: any; x: number; y: number } | null>(null);
@@ -367,6 +371,7 @@ export function SideFiles({ tree, active, onPick }: any) {
             onCommitCreate={doCreate}
             onCancelCreate={() => setCreating(null)}
             onOpenCreatePopover={openCreatePopover}
+            gitStatusMap={gitStatusMap}
           />
         ))}
       </div>
@@ -421,6 +426,7 @@ export function FileNode({
   onContextMenu,
   creating, onCommitCreate, onCancelCreate,
   onOpenCreatePopover,
+  gitStatusMap,
 }: any) {
   const isDir = Array.isArray(node.children);
   // creating.parent === node.path keeps a folder force-open while the user
@@ -428,6 +434,12 @@ export function FileNode({
   const isOpen = !collapsed.has(node.path) || creating?.parent === node.path;
   const isRenaming = renaming === node.path;
   const pad = 10 + depth * 14;
+  // LOT 3 git-ui — stamp the node with its current git char if any.
+  // The legacy renderer below uses `node.git` so we expose it via a local
+  // variable instead of mutating the upstream node (mutations would
+  // poison the TanStack cache for `useFileTree`).
+  const gitChar: GitStatusChar | undefined =
+    !isDir && gitStatusMap ? gitStatusMap.get(node.path) : undefined;
 
   return (
     <>
@@ -457,9 +469,22 @@ export function FileNode({
               onCancel={onCancelRename}
             />
           : <span className="label">{node.name}</span>}
-        {!isRenaming && !isDir && node.git && (
-          <span className="meta" style={{color: node.git === "M" ? "var(--warn)" : node.git === "A" ? "var(--success)" : "var(--on-surface-muted)"}}>{node.git}</span>
-        )}
+        {!isRenaming && !isDir && (gitChar || node.git) && (() => {
+          // LOT 3 git-ui — gitChar (live status) takes precedence over the
+          // legacy static `node.git` field (mock data still ships in
+          // RootLayout for the demo workspace). Color map mirrors the
+          // VSCode SCM color tokens : warn = modified, success = added,
+          // tertiary = untracked, danger = conflicted / deleted, muted otherwise.
+          const ch = (gitChar ?? node.git) as string;
+          const color =
+            ch === "M" ? "var(--warn)"
+            : ch === "A" ? "var(--success)"
+            : ch === "?" ? "var(--tertiary)"
+            : ch === "U" ? "var(--danger)"
+            : ch === "D" ? "var(--danger)"
+            : "var(--on-surface-muted)";
+          return <span className="meta" style={{ color }}>{ch}</span>;
+        })()}
         {/* Hover-visible "+" — only on folders. Clicking opens the same
             file/folder choice popover used by the header "+", with this
             node's path as the parent. The popover's onPick will
@@ -501,6 +526,7 @@ export function FileNode({
               onCommitCreate={onCommitCreate}
               onCancelCreate={onCancelCreate}
               onOpenCreatePopover={onOpenCreatePopover}
+              gitStatusMap={gitStatusMap}
             />
           ))}
         </>
