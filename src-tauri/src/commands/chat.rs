@@ -806,3 +806,73 @@ pub fn chat_abort(
         }
     }
 }
+
+/// Lot 5 (scaffold) — complétion Fill-In-the-Middle non-streaming.
+///
+/// Le tab-autocomplete (ghost text) utilise l'endpoint LEGACY `/v1/completions`
+/// (format `prompt`, pas `messages`) car le FIM passe par des sentinelles dans
+/// un prompt brut, pas par un tour de chat. Le frontend construit le prompt FIM
+/// (cf. fimPrompt.ts) ; ici on poste + on retourne `choices[0].text`.
+///
+/// Seul le path openai-compatible est supporté (llama.cpp, vLLM, LM Studio,
+/// Together…). anthropic/ollama n'exposent pas d'API FIM comparable ici →
+/// erreur explicite. ⚠ QUALITÉ/LATENCE = réglage runtime (modèle FIM, taille de
+/// fenêtre, max_tokens) : ce lot livre le tuyau, pas le réglage fin.
+#[tauri::command]
+pub async fn fim_complete(
+    prompt: String,
+    model: String,
+    protocol: String,
+    base_url: String,
+    api_key: Option<String>,
+    max_tokens: Option<u32>,
+    stop: Option<Vec<String>>,
+) -> Result<String, String> {
+    if protocol != "openai" && protocol != "custom" {
+        return Err(format!(
+            "FIM completion not supported for protocol '{protocol}' — use an openai-compatible FIM endpoint"
+        ));
+    }
+    let key = resolve_key(&protocol, &api_key)?;
+    let base = base_url.trim_end_matches('/');
+    let url = if base.ends_with("/v1") {
+        format!("{}/completions", base)
+    } else {
+        format!("{}/v1/completions", base)
+    };
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "prompt": prompt,
+        "max_tokens": max_tokens.unwrap_or(128),
+        "stream": false,
+        "temperature": 0.2,
+    });
+    if let Some(s) = stop {
+        body["stop"] = serde_json::json!(s);
+    }
+
+    let client = reqwest::Client::new();
+    let mut req = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .json(&body);
+    if !key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", key));
+    }
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("FIM API error {}: {}", status, text));
+    }
+    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    // /v1/completions → choices[0].text (certains serveurs renvoient aussi
+    // "content" ; on tente text puis content en repli).
+    let text = v["choices"][0]["text"]
+        .as_str()
+        .or_else(|| v["choices"][0]["content"].as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok(text)
+}

@@ -377,6 +377,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::chat::chat_send,
             commands::chat::chat_abort,
+            commands::chat::fim_complete,
             commands::credentials::cred_set,
             commands::credentials::cred_get,
             commands::credentials::cred_delete,

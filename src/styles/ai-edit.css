@@ -161,3 +161,12 @@
 .code-apply-btn:hover {
   color: var(--on-surface, #ece8f5);
 }
+
+/* ── Lot 5 — ghost text (tab autocomplete) ──────────────────────────────── */
+.cm-ghost-text {
+  color: var(--on-surface-muted, #6f6885);
+  opacity: 0.6;
+  font-style: italic;
+  white-space: pre-wrap;
+  pointer-events: none;
+}
