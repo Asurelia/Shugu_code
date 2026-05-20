@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { chunkSource, chunkId } from "./chunker";
+import { chunkSource, chunkId, parseChunkId } from "./chunker";
 
 describe("chunkSource", () => {
   it("empty / whitespace → []", () => {
@@ -78,5 +78,22 @@ describe("chunkId", () => {
     expect(chunkId("src/foo.ts", { text: "x", startLine: 7, endLine: 12 })).toBe(
       "src/foo.ts#L7-12",
     );
+  });
+});
+
+describe("parseChunkId", () => {
+  it("round-trips with chunkId", () => {
+    const id = chunkId("src/a/b.ts", { text: "x", startLine: 3, endLine: 40 });
+    expect(parseChunkId(id)).toEqual({ path: "src/a/b.ts", startLine: 3, endLine: 40 });
+  });
+
+  it("returns null for a malformed id", () => {
+    expect(parseChunkId("src/foo.ts")).toBeNull();
+    expect(parseChunkId("garbage")).toBeNull();
+  });
+
+  it("keeps a path that itself contains a hash-like fragment", () => {
+    // Greedy prefix anchors on the final #L<n>-<n> suffix.
+    expect(parseChunkId("a#b/c.ts#L1-2")).toEqual({ path: "a#b/c.ts", startLine: 1, endLine: 2 });
   });
 });

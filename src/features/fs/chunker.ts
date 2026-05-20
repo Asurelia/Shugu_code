@@ -83,3 +83,12 @@ export function chunkSource(text: string): SourceChunk[] {
 export function chunkId(path: string, chunk: SourceChunk): string {
   return `${path}#L${chunk.startLine}-${chunk.endLine}`;
 }
+
+/** Inverse de chunkId : `path#Lstart-end` → {path, startLine, endLine} ou null. */
+export function parseChunkId(
+  id: string,
+): { path: string; startLine: number; endLine: number } | null {
+  const m = /^(.*)#L(\d+)-(\d+)$/.exec(id);
+  if (!m) return null;
+  return { path: m[1], startLine: parseInt(m[2], 10), endLine: parseInt(m[3], 10) };
+}

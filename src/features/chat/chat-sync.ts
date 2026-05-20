@@ -34,6 +34,7 @@ import { resolveProvider, type Protocol } from "@/lib/providers";
 import { loadProviderConfig, getConfig, getProviderEnabled } from "@/lib/credentials";
 import { parseAiReply } from "@/lib/markdown";
 import { parseMentions, resolveMentions, buildMentionContext } from "./mentions";
+import { resolveCodeContext, buildCodeContext } from "./codeContext";
 import { fireMoodReaction } from "@/features/mascot/moodReactionStore";
 import { parseThinkingMode, resolveThinking } from "@/lib/thinkingHeuristic";
 import { resolveRoute, parseDelegateOverride } from "@/lib/routingHeuristic";
@@ -402,6 +403,20 @@ export async function sendChatMessage(
       const lastUserIdx = apiMessages.map((m) => m.role).lastIndexOf("user");
       if (lastUserIdx >= 0) {
         apiMessages[lastUserIdx].content = `${ctx}\n\n---\n\n${apiMessages[lastUserIdx].content}`;
+      }
+    }
+  }
+
+  // Suite Lot 4 — auto-RAG (OPT-IN via db.settings "rag.autoCodeContext").
+  // Injecte des extraits de code sémantiquement proches de la question. Désactivé
+  // par défaut : consomme des tokens et la pertinence dépend de la qualité de
+  // l'index/embedding (réglage runtime). Indépendant des @-mentions explicites.
+  if ((await db.settings.get("rag.autoCodeContext")) === "true") {
+    const codeCtx = buildCodeContext(await resolveCodeContext(trimmed, 5));
+    if (codeCtx) {
+      const lastUserIdx = apiMessages.map((m) => m.role).lastIndexOf("user");
+      if (lastUserIdx >= 0) {
+        apiMessages[lastUserIdx].content = `${codeCtx}\n\n---\n\n${apiMessages[lastUserIdx].content}`;
       }
     }
   }

@@ -448,6 +448,34 @@ export function SettingsImage() {
   );
 }
 
+// Suite Lot 4 — toggle auto-RAG (stocké dans db.settings, pas dans editorPrefs
+// car c'est une préférence de chat, pas d'éditeur). Self-contained : charge au
+// mount, persiste au changement.
+function AutoRagToggle() {
+  const [on, setOn] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    void db.settings.get("rag.autoCodeContext").then((v) => {
+      if (alive) setOn(v === "true");
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+  const toggle = (v: boolean) => {
+    setOn(v);
+    void db.settings.set("rag.autoCodeContext", v ? "true" : "false");
+  };
+  return (
+    <SettingRow
+      label="Auto-contexte code (RAG)"
+      desc="EXPÉRIMENTAL : injecte automatiquement dans le chat des extraits de code du workspace sémantiquement proches de ta question. Nécessite l'indexation (automatique) ; la pertinence dépend du modèle d'embedding. Indépendant des @-mentions explicites."
+    >
+      <Switch on={on} onChange={toggle} />
+    </SettingRow>
+  );
+}
+
 export function SettingsEditor() {
   // LOT 1 — Source of truth: ShellContext editorPrefs (live-synced to the
   // mounted CodeMirrorEditor via the wordWrap prop → useEffect chain).
@@ -493,6 +521,8 @@ export function SettingsEditor() {
           <SettingRow label="Tab autocomplete (FIM)" desc="Complétion inline en texte fantôme (Tab pour accepter, Échap pour rejeter). EXPÉRIMENTAL : nécessite un modèle FIM openai-compatible (Qwen2.5-Coder, DeepSeek-Coder, StarCoder…) configuré ; la qualité et la latence dépendent du modèle.">
             <Switch on={editorPrefs.tabAutocomplete} onChange={(v) => setEditorPref("tabAutocomplete", v)}/>
           </SettingRow>
+          {/* Suite Lot 4 — auto-RAG code context dans le chat */}
+          <AutoRagToggle/>
         </div>
       </div>
     </div>
