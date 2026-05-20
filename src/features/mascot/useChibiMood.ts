@@ -27,6 +27,8 @@
 import { useMemo, useState, useCallback } from "react";
 import type { ChibiMood } from "@/features/mascot/Chibi";
 import { bumpInteract as bumpInteractStore, useIdleMs } from "@/features/mascot/idleStore";
+import { useMoodReaction } from "@/features/mascot/moodReactionStore";
+import { effectiveMood } from "@/features/mascot/moodReactions";
 
 const MOOD_CYCLE: ChibiMood[] = ["neutral", "smile", "joy", "sad", "cry"];
 const LONELY_MS = 60_000;
@@ -61,6 +63,8 @@ export interface UseChibiMoodResult {
 export function useChibiMood(input: UseChibiMoodInput): UseChibiMoodResult {
   const [override, setOverride] = useState<ChibiMood | null>(null);
   const idleMs = useIdleMs();
+  // Lot 6 — transient event reaction (agent done / edit accepted / error …).
+  const reaction = useMoodReaction();
 
   const derivedMood: ChibiMood = useMemo(() => {
     if (input.edge) return input.hasUnread ? "peek_open" : "peek_closed";
@@ -72,8 +76,12 @@ export function useChibiMood(input: UseChibiMoodInput): UseChibiMoodResult {
     return "neutral";
   }, [input.edge, input.hasUnread, input.busy, input.hasKey, input.pinnedAnno, input.hasMessages, idleMs]);
 
+  // Precedence (when not tucked): manual override > transient reaction > derived.
   // Override is ignored while tucked — peek pose is geometry, not expression.
-  const mood: ChibiMood = input.edge ? derivedMood : (override ?? derivedMood);
+  // A live event reaction (Lot 6) briefly overrides the derived expression.
+  const mood: ChibiMood = input.edge
+    ? derivedMood
+    : (override ?? effectiveMood(derivedMood, reaction, Date.now()));
 
   const cycleMood = useCallback(() => {
     setOverride((curr) => {

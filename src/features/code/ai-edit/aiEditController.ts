@@ -24,6 +24,7 @@ import {
   aiEditStreamAnnotation,
 } from "./unifiedDiffExtension";
 import { runAiEdit, abortAiEdit } from "./runAiEdit";
+import { fireMoodReaction } from "@/features/mascot/moodReactionStore";
 
 // ---------------------------------------------------------------------------
 // État de session (cache TanStack)
@@ -256,6 +257,7 @@ async function streamAndPreview(view: EditorView, p: StreamParams): Promise<void
   if (!result.ok) {
     teardownRestore(view, live);
     setSession((s) => ({ ...s, status: "error", error: result.error }));
+    fireMoodReaction("edit-error"); // Lot 6
     return;
   }
 
@@ -270,6 +272,7 @@ async function streamAndPreview(view: EditorView, p: StreamParams): Promise<void
       status: "error",
       error: "Le modèle n'a renvoyé aucun code. Réessaie, reformule l'instruction, ou désactive le mode raisonnement.",
     }));
+    fireMoodReaction("edit-error"); // Lot 6
     return;
   }
 
@@ -305,6 +308,7 @@ export function acceptSession(view: EditorView): void {
     selection: { anchor: s.insertedFrom + finalText.length },
   });
   resetSession();
+  fireMoodReaction("edit-accept"); // Lot 6 — la mascotte célèbre l'edit accepté
 }
 
 /** Rejette l'édit (phase preview) : restaure l'original. Retourne wasDirty. */
@@ -314,6 +318,7 @@ export function rejectSession(view: EditorView): boolean {
   teardownRestore(view, s);
   const wasDirty = s.wasDirty;
   resetSession();
+  fireMoodReaction("edit-reject"); // Lot 6
   return wasDirty;
 }
 
