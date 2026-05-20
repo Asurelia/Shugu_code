@@ -33,6 +33,7 @@ import { invoke } from "@/lib/tauri";
 import { resolveProvider, type Protocol } from "@/lib/providers";
 import { loadProviderConfig, getConfig, getProviderEnabled } from "@/lib/credentials";
 import { parseAiReply } from "@/lib/markdown";
+import { parseMentions, resolveMentions, buildMentionContext } from "./mentions";
 import { parseThinkingMode, resolveThinking } from "@/lib/thinkingHeuristic";
 import { resolveRoute, parseDelegateOverride } from "@/lib/routingHeuristic";
 import { spawnAgent, awaitAgentComplete } from "@/lib/agents";
@@ -386,6 +387,22 @@ export async function sendChatMessage(
   // since we just inserted the user message), at least send the current prompt.
   if (apiMessages.length === 0) {
     apiMessages.push({ role: "user", content: trimmed });
+  }
+
+  // Lot 4 — @-mentions : résout les fichiers @-mentionnés du message courant et
+  // injecte leur contenu dans le dernier message user ENVOYÉ au modèle. Le
+  // message persité (SQLite, affiché) garde le texte `@…` propre — l'injection
+  // est éphémère, uniquement dans l'appel API. Déterministe (lecture fichier,
+  // aucune dépendance à la qualité d'embedding).
+  const mentioned = parseMentions(trimmed);
+  if (mentioned.length > 0) {
+    const ctx = buildMentionContext(await resolveMentions(mentioned));
+    if (ctx) {
+      const lastUserIdx = apiMessages.map((m) => m.role).lastIndexOf("user");
+      if (lastUserIdx >= 0) {
+        apiMessages[lastUserIdx].content = `${ctx}\n\n---\n\n${apiMessages[lastUserIdx].content}`;
+      }
+    }
   }
 
   // Capture the reasoning trace for persistence. The streaming UI hooks

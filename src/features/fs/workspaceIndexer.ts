@@ -16,6 +16,7 @@
 
 import { fsReadDir, fsReadFile } from "@/lib/fs";
 import { vecIndex } from "@/lib/vector";
+import { chunkSource, chunkId } from "./chunker";
 import { db } from "@/lib/db";
 import type { FileNode } from "@/lib/types";
 
@@ -145,7 +146,14 @@ async function runIndex(): Promise<void> {
         const content = await fsReadFile(path);
         if (content.text.length > MAX_FILE_BYTES) continue; // too large
         if (!content.text.trim()) continue; // empty file
-        await vecIndex("code", path, content.text);
+        // Lot 4 — index per symbol-sized chunk instead of one embedding per
+        // whole file (coarse). The chunk id encodes the line range so a future
+        // retrieval can map a hit back to a location. NOTE: re-indexing a
+        // CHANGED file leaves its old chunk ids stale (different line ranges →
+        // not overwritten); acceptable until a prefix-delete on re-index lands.
+        for (const ch of chunkSource(content.text)) {
+          await vecIndex("code", chunkId(path, ch), ch.text);
+        }
       } catch (err) {
         console.warn("[workspaceIndexer] skipping", path, err);
       }
