@@ -34,6 +34,7 @@ import { resolveProvider, type Protocol } from "@/lib/providers";
 import { loadProviderConfig, getConfig, getProviderEnabled } from "@/lib/credentials";
 import { parseAiReply } from "@/lib/markdown";
 import { parseMentions, resolveMentions, buildMentionContext } from "./mentions";
+import { fireMoodReaction } from "@/features/mascot/moodReactionStore";
 import { parseThinkingMode, resolveThinking } from "@/lib/thinkingHeuristic";
 import { resolveRoute, parseDelegateOverride } from "@/lib/routingHeuristic";
 import { spawnAgent, awaitAgentComplete } from "@/lib/agents";
@@ -476,6 +477,7 @@ export async function sendChatMessage(
       reasoning: reasoningAcc || undefined,
       ts: nowHHMM(),
     });
+    fireMoodReaction("chat-error"); // Lot 6 — la mascotte compatit à l'échec
   } finally {
     unlistenReasoning?.();
   }

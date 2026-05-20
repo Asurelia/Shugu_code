@@ -24,6 +24,7 @@ import { diag, diagEveryN } from "@/lib/diag";
 import type { AgentEvent, AgentRow } from "@/lib/agents";
 import type { ParsedAgentTranscript } from "./queries";
 import { agentKeys } from "./keys";
+import { fireMoodReaction } from "@/features/mascot/moodReactionStore";
 
 export function useAgentEvents(): void {
   const qc = useQueryClient();
@@ -147,6 +148,11 @@ export function useAgentEvents(): void {
           // en mémoire avec les deltas, et un refetch wiperait le stream.
           if (event.kind === "spawn" || event.kind === "complete" || event.kind === "error") {
             void qc.invalidateQueries({ queryKey: agentKeys.lists() });
+            // Lot 6 — la mascotte réagit aux transitions d'agent (humeur
+            // transitoire). Fire per-window (chaque webview a son store).
+            if (event.kind === "spawn") fireMoodReaction("agent-start");
+            else if (event.kind === "complete") fireMoodReaction("agent-complete");
+            else fireMoodReaction("agent-error");
           }
         });
         diag("agent-events", `LISTEN ATTACHED cancelled=${cancelled}`);
