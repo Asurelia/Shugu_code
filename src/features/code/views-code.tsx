@@ -11,6 +11,8 @@ import { MascotCalibration } from "@/features/settings/MascotCalibration";
 import { ConnectionsView, ProfileView } from "@/features/panels/panels";
 import { db } from "@/lib/db";
 import { queryClient } from "@/lib/queryClient";
+import { reindexWorkspace } from "@/features/fs/workspaceIndexer";
+import { pushToast } from "@/components/toast";
 import { useShell } from "@/routes/shell-context";
 import { useGitHead, useGitBlame } from "@/features/git/queries";
 import { BranchSwitcherCompact } from "@/features/git/components/BranchSwitcher";
@@ -476,6 +478,36 @@ function AutoRagToggle() {
   );
 }
 
+// Suite Lot 4 — bouton « Réindexer le code » : reconstruit l'index sémantique
+// en chunks à la demande (purge + force, contourne le TTL 24h) → rend l'auto-RAG
+// vérifiable tout de suite après de gros changements.
+function ReindexCodeRow() {
+  const [busy, setBusy] = useState(false);
+  const run = async () => {
+    if (busy) return;
+    setBusy(true);
+    pushToast("Réindexation du code en cours…", "info", 3000);
+    try {
+      const n = await reindexWorkspace();
+      pushToast(`Index code reconstruit : ${n} chunks.`, "success", 5000);
+    } catch (err) {
+      pushToast("Échec de la réindexation : " + String(err), "error", 6000);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <SettingRow
+      label="Réindexer le code (RAG)"
+      desc="Reconstruit l'index sémantique du workspace en chunks (purge l'ancien index). Utile après de gros changements, ou pour activer l'auto-contexte immédiatement sans attendre le rafraîchissement automatique."
+    >
+      <button className="lgb lgb-sm" disabled={busy} onClick={run}>
+        <Icon name="search" size={11} /> {busy ? "Réindexation…" : "Réindexer"}
+      </button>
+    </SettingRow>
+  );
+}
+
 export function SettingsEditor() {
   // LOT 1 — Source of truth: ShellContext editorPrefs (live-synced to the
   // mounted CodeMirrorEditor via the wordWrap prop → useEffect chain).
@@ -523,6 +555,8 @@ export function SettingsEditor() {
           </SettingRow>
           {/* Suite Lot 4 — auto-RAG code context dans le chat */}
           <AutoRagToggle/>
+          {/* Suite Lot 4 — réindexation manuelle */}
+          <ReindexCodeRow/>
         </div>
       </div>
     </div>

@@ -258,3 +258,17 @@ pub fn vec_delete(
         .map_err(|e| format!("vec_delete: {e}"))?;
     Ok(())
 }
+
+/// Delete ALL entries from `vec_<collection>`. Used by "réindexer le code"
+/// (Lot 4 suite) pour purger les ids whole-file stale avant un rebuild en
+/// chunks. Ne supprime pas la table, juste ses lignes.
+#[tauri::command]
+pub fn vec_clear(app: tauri::AppHandle, collection: String) -> Result<(), String> {
+    validate_collection(&collection)?;
+    let guard = get_conn(&app)?.lock().map_err(|e| format!("lock: {e}"))?;
+    let sql = format!("DELETE FROM vec_{collection}");
+    guard
+        .execute(&sql, [])
+        .map_err(|e| format!("vec_clear: {e}"))?;
+    Ok(())
+}

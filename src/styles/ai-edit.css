@@ -162,6 +162,40 @@
   color: var(--on-surface, #ece8f5);
 }
 
+/* ── Toasts globaux (composants/ToastHost) ──────────────────────────────── */
+.toast-host {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 10000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 380px;
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto;
+  cursor: pointer;
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-family: var(--font-sans, system-ui, sans-serif);
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--on-surface, #ece8f5);
+  background: var(--lg-tint, rgba(18, 14, 30, 0.94));
+  backdrop-filter: blur(var(--lg-blur, 12px));
+  -webkit-backdrop-filter: blur(var(--lg-blur, 12px));
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+}
+.toast-error {
+  border-color: rgba(255, 106, 138, 0.5);
+}
+.toast-success {
+  border-color: rgba(138, 239, 199, 0.5);
+}
+
 /* ── Lot 5 — ghost text (tab autocomplete) ──────────────────────────────── */
 .cm-ghost-text {
   color: var(--on-surface-muted, #6f6885);

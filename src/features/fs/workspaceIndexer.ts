@@ -15,7 +15,7 @@
 //   - SIZE LIMIT: files > 200 KB are skipped (fastembed would time out).
 
 import { fsReadDir, fsReadFile } from "@/lib/fs";
-import { vecIndex } from "@/lib/vector";
+import { vecIndex, vecClear } from "@/lib/vector";
 import { chunkSource, chunkId } from "./chunker";
 import { db } from "@/lib/db";
 import type { FileNode } from "@/lib/types";
@@ -102,11 +102,11 @@ let indexInFlight: Promise<void> | null = null;
  *
  * Never throws — any failure is logged as a warning.
  */
-export async function indexWorkspace(): Promise<void> {
+export async function indexWorkspace(opts?: { force?: boolean }): Promise<void> {
   if (indexInFlight) return indexInFlight;
   indexInFlight = (async () => {
     try {
-      await runIndex();
+      await runIndex(opts?.force ?? false);
     } finally {
       indexInFlight = null;
     }
@@ -114,25 +114,60 @@ export async function indexWorkspace(): Promise<void> {
   return indexInFlight;
 }
 
-async function runIndex(): Promise<void> {
+/**
+ * Force un rebuild COMPLET de l'index "code" : purge la collection (supprime les
+ * ids whole-file stale d'avant le chunking) puis ré-indexe en chunks en
+ * contournant le TTL 24h. Utilisé par l'action « Réindexer le code » pour rendre
+ * l'auto-RAG vérifiable à la demande. Retourne le nombre de chunks indexés.
+ */
+export async function reindexWorkspace(): Promise<number> {
+  // Laisse un éventuel index de boot se terminer pour ne pas courser dessus.
+  if (indexInFlight) {
+    try {
+      await indexInFlight;
+    } catch {
+      /* ignore */
+    }
+  }
+  try {
+    await vecClear("code");
+  } catch (err) {
+    console.warn("[workspaceIndexer] vecClear failed:", err);
+  }
+  let count = 0;
+  indexInFlight = (async () => {
+    try {
+      count = await runIndex(true);
+    } finally {
+      indexInFlight = null;
+    }
+  })();
+  await indexInFlight;
+  return count;
+}
+
+async function runIndex(force = false): Promise<number> {
+  let count = 0;
   try {
     // 1. Read the file tree.
     const tree = await fsReadDir();
-    if (tree.length === 0) return; // no workspace open
+    if (tree.length === 0) return 0; // no workspace open
 
     // 2. Collect leaf paths and compute a lightweight hash.
     const paths = collectLeafPaths(tree);
-    if (paths.length === 0) return;
+    if (paths.length === 0) return 0;
 
     const rootHash = simpleHash(paths);
     const settingKey = `vec.workspace.indexed.${rootHash}`;
 
-    // 3. Check the TTL gate.
-    const lastIndexed = await db.settings.get(settingKey);
-    if (lastIndexed) {
-      const elapsed = Date.now() - Number(lastIndexed);
-      if (!Number.isNaN(elapsed) && elapsed < INDEX_TTL_MS) {
-        return; // already indexed within the TTL window
+    // 3. Check the TTL gate (skipped on a forced rebuild).
+    if (!force) {
+      const lastIndexed = await db.settings.get(settingKey);
+      if (lastIndexed) {
+        const elapsed = Date.now() - Number(lastIndexed);
+        if (!Number.isNaN(elapsed) && elapsed < INDEX_TTL_MS) {
+          return 0; // already indexed within the TTL window
+        }
       }
     }
 
@@ -148,11 +183,10 @@ async function runIndex(): Promise<void> {
         if (!content.text.trim()) continue; // empty file
         // Lot 4 — index per symbol-sized chunk instead of one embedding per
         // whole file (coarse). The chunk id encodes the line range so a future
-        // retrieval can map a hit back to a location. NOTE: re-indexing a
-        // CHANGED file leaves its old chunk ids stale (different line ranges →
-        // not overwritten); acceptable until a prefix-delete on re-index lands.
+        // retrieval can map a hit back to a location.
         for (const ch of chunkSource(content.text)) {
           await vecIndex("code", chunkId(path, ch), ch.text);
+          count++;
         }
       } catch (err) {
         console.warn("[workspaceIndexer] skipping", path, err);
@@ -168,4 +202,5 @@ async function runIndex(): Promise<void> {
   } catch (err) {
     console.warn("[workspaceIndexer] indexWorkspace failed:", err);
   }
+  return count;
 }

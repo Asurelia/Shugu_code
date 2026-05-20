@@ -42,3 +42,8 @@ export async function vecDelete(
 ): Promise<void> {
   await invoke<void>("vec_delete", { collection, id });
 }
+
+/** Remove ALL entries from the given collection (used by "réindexer le code"). */
+export async function vecClear(collection: VecCollection): Promise<void> {
+  await invoke<void>("vec_clear", { collection });
+}

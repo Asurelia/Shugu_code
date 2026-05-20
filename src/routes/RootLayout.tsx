@@ -61,6 +61,7 @@ import { useChatStreamListener } from "@/features/chat/useChatStream";
 import { runImmediate } from "@/features/code/ai-edit/aiEditController";
 import { setApplyRequest } from "@/features/code/ai-edit/applyController";
 import { detectBlockPath, stripPathComment } from "@/lib/markdown";
+import { ToastHost } from "@/components/ToastHost";
 import { useLlamaLifecycle } from "@/features/llama/useLlamaLifecycle";
 import { COMMANDS, getCommandById, fmtKbd, type CommandContext } from "@/lib/commands";
 import { useCommandKeybindings } from "@/lib/keybindings";
@@ -1251,6 +1252,9 @@ export function RootLayout() {
             overlay sits at z-index 5000 (above TweaksPanel) so it pre-empts
             the rest of the chrome while it's visible. */}
         <Onboarding/>
+
+        {/* Toasts globaux (échecs silencieux FIM, feedback réindexation…). */}
+        <ToastHost/>
       </>
     </ShellContext.Provider>
   );

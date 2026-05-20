@@ -10,6 +10,8 @@ import type { CodeMirrorEditorHandle } from "@/features/code/CodeMirrorEditor";
 import type { EditorPrefs } from "@/routes/shell-context";
 import { formatCurrentDocument } from "@/features/code/format";
 import { openPrompt, runImmediate } from "@/features/code/ai-edit/aiEditController";
+import { reindexWorkspace } from "@/features/fs/workspaceIndexer";
+import { pushToast } from "@/components/toast";
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -186,6 +188,23 @@ export const COMMANDS: Command[] = [
     icon: "search",
     keybinding: ["Cmd", "Shift", "P"],
     run: (ctx) => ctx.setPaletteOpen(true),
+  },
+  {
+    // Suite Lot 4 — rebuild de l'index sémantique en chunks à la demande.
+    id: "reindex-code",
+    title: "Reindex code (semantic / RAG)",
+    category: "Workbench",
+    icon: "search",
+    description: "Reconstruit l'index sémantique du workspace en chunks (RAG)",
+    run: async () => {
+      pushToast("Réindexation du code en cours…", "info", 3000);
+      try {
+        const n = await reindexWorkspace();
+        pushToast(`Index code reconstruit : ${n} chunks.`, "success", 5000);
+      } catch (err) {
+        pushToast("Échec de la réindexation : " + String(err), "error", 6000);
+      }
+    },
   },
   {
     id: "toggle-side",

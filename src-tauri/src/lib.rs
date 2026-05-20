@@ -413,6 +413,7 @@ pub fn run() {
             commands::vector::vec_index,
             commands::vector::vec_search,
             commands::vector::vec_delete,
+            commands::vector::vec_clear,
             commands::model_bundle::model_bundle_catalog,
             commands::model_bundle::model_bundle_status,
             commands::model_bundle::model_bundle_download,
