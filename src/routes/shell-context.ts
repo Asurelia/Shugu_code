@@ -32,6 +32,9 @@ export interface EditorPrefs {
   formatOnSave: boolean;
   gitDecorations: boolean;
   gitBlame: boolean;
+  /** Lot 5 — FIM tab-autocomplete (ghost text). Default OFF : nécessite un
+   *  modèle FIM openai-compatible configuré, qualité/latence à régler. */
+  tabAutocomplete: boolean;
 }
 
 export const DEFAULT_EDITOR_PREFS: EditorPrefs = {
@@ -41,6 +44,7 @@ export const DEFAULT_EDITOR_PREFS: EditorPrefs = {
   formatOnSave: true,
   gitDecorations: true,
   gitBlame: false,
+  tabAutocomplete: false,
 };
 
 // ─── Shape ────────────────────────────────────────────────────

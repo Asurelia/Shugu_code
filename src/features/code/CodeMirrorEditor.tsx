@@ -44,6 +44,8 @@ import { getLspClient, isLspSupported, fileUriForPath, fmtErr } from "./lsp/clie
 import { gitDiffCompartment, buildGitDecorations } from "./git-decorations";
 import { blameCompartment, buildBlameGutter } from "./blame-decorations";
 import { aiEditCompartment, aiEditStreamAnnotation } from "./ai-edit/unifiedDiffExtension";
+import { ghostTextExtension } from "./autocomplete/ghostText";
+import { fimCompartment, buildFimTrigger } from "./autocomplete/fimTrigger";
 import type { GitBlameLine } from "@/lib/types";
 
 /**
@@ -162,7 +164,11 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
   blame?: GitBlameLine[] | null;
   /** LOT 3 bis — whether inline blame is enabled (from editorPrefs.gitBlame). */
   gitBlameEnabled?: boolean;
-}>(function CodeMirrorEditor({ value, onChange, path, language = "typescript", wordWrap = false, stickyScroll = false, minimap = false, gitHeadOriginal = null, gitDecorations = true, blame = null, gitBlameEnabled = false }, ref) {
+  /** Lot 5 — enable FIM tab-autocomplete (ghost text). Default: false. The
+   *  trigger is mounted via `fimCompartment` only when true → no requests when
+   *  off. Reconfigured on change (no editor re-mount). */
+  tabAutocomplete?: boolean;
+}>(function CodeMirrorEditor({ value, onChange, path, language = "typescript", wordWrap = false, stickyScroll = false, minimap = false, gitHeadOriginal = null, gitDecorations = true, blame = null, gitBlameEnabled = false, tabAutocomplete = false }, ref) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
@@ -343,6 +349,14 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
         // le contrôleur qui dispatch les reconfigure sur la view courante.
         aiEditCompartment.of([] as Extension[]),
 
+        // ─── Lot 5 : tab autocomplete (FIM ghost text) ──────────
+        // ghostTextExtension est inerte sans suggestion → toujours montée (son
+        // keymap Tab/Échap retourne false quand aucun ghost, laissant indentWithTab
+        // agir). fimCompartment porte le déclencheur seulement si tabAutocomplete
+        // est ON (reconfiguré par l'effet plus bas) → aucune requête quand OFF.
+        ghostTextExtension(),
+        fimCompartment.of(tabAutocomplete ? buildFimTrigger() : []),
+
         // ─── Keymap (étendu LOT 1.4) ────────────────────────────
         // Note : snippetKeymap est un Facet (extension point pour l'utilisateur),
         // pas un array — les bindings par défaut de snippet (Tab/Esc pour
@@ -400,6 +414,15 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
     if (!view) return;
     setWordWrap(view, wordWrap);
   }, [wordWrap]);
+
+  // Lot 5 — (dé)monte le déclencheur FIM sur changement de pref tabAutocomplete.
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: fimCompartment.reconfigure(tabAutocomplete ? buildFimTrigger() : []),
+    });
+  }, [tabAutocomplete]);
 
   // LOT 2a — Reconfigure sticky scroll overlay on pref change.
   useEffect(() => {

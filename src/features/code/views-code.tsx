@@ -132,6 +132,7 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
                 gitDecorations={editorPrefs.gitDecorations}
                 blame={blame}
                 gitBlameEnabled={editorPrefs.gitBlame}
+                tabAutocomplete={editorPrefs.tabAutocomplete}
               />
             ) : (
               <div style={{position:"absolute", inset:0, display:"flex", alignItems:"center", justifyContent:"center", color:"var(--on-surface-muted)", fontFamily:"var(--font-mono)", fontSize:12}}>
@@ -487,6 +488,10 @@ export function SettingsEditor() {
           {/* LOT 3 bis — Inline git blame gutter */}
           <SettingRow label="Git blame inline" desc="Affiche l'auteur, le SHA court et l'âge du commit pour chaque ligne dans le gutter. Survol = popup détaillé (SHA complet, auteur, message de commit). Désactivé hors d'un repo git ou pour les fichiers non-trackés.">
             <Switch on={editorPrefs.gitBlame} onChange={(v) => setEditorPref("gitBlame", v)}/>
+          </SettingRow>
+          {/* Lot 5 — FIM tab autocomplete (ghost text) */}
+          <SettingRow label="Tab autocomplete (FIM)" desc="Complétion inline en texte fantôme (Tab pour accepter, Échap pour rejeter). EXPÉRIMENTAL : nécessite un modèle FIM openai-compatible (Qwen2.5-Coder, DeepSeek-Coder, StarCoder…) configuré ; la qualité et la latence dépendent du modèle.">
+            <Switch on={editorPrefs.tabAutocomplete} onChange={(v) => setEditorPref("tabAutocomplete", v)}/>
           </SettingRow>
         </div>
       </div>
