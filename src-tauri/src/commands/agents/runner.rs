@@ -77,17 +77,11 @@ enum AgentMessage {
 // Provider-specific message builders
 // ────────────────────────────────────────────────────────────────────
 
-/// Translate `AgentMessage` history into OpenAI Chat Completions format.
-/// Each `AgentMessage` becomes 1+ JSON objects in the returned vec.
-///
-/// **Not used in Phase 2** — we ship the text-projection variant
-/// ([`build_openai_text_projection`]) for now because `call_openai_compat`
-/// takes `&[ChatMessage]` (a flat role/content shape) and patching its
-/// signature to accept structured Value-array messages is a larger
-/// refactor than Phase 2 should carry. Phase 3 wires this up by adding
-/// a separate `call_openai_compat_structured` path that accepts the
-/// JSON-array body and forwards through the same SSE parser.
-#[allow(dead_code)]
+/// Translate `AgentMessage` history into OpenAI Chat Completions format
+/// (native `assistant.tool_calls` + one `role:"tool"` message per result,
+/// each carrying its `tool_call_id`). Lot 3 — now the active builder for the
+/// openai/custom agent path via `call_openai_compat_structured`, replacing the
+/// former text projection.
 fn build_openai_messages(history: &[AgentMessage]) -> Vec<serde_json::Value> {
     let mut out: Vec<serde_json::Value> = Vec::new();
     for msg in history {
@@ -129,53 +123,103 @@ fn build_openai_messages(history: &[AgentMessage]) -> Vec<serde_json::Value> {
     out
 }
 
-/// Translate `AgentMessage` history into Anthropic Messages API format.
-/// System messages are dropped here — the caller must pass them in the
-/// top-level `system` field (handled inside `call_anthropic`).
-#[allow(dead_code)] // wired by call_agent_llm_with_tools below
-fn build_anthropic_messages(history: &[AgentMessage]) -> Vec<ChatMessage> {
-    // Anthropic's `messages` array doesn't include system. Our `call_anthropic`
-    // already extracts system from a `&[ChatMessage]` input by filtering, so
-    // the easiest interop is to return a `Vec<ChatMessage>` here and let the
-    // existing extraction do its job. For AssistantWithTools / ToolResults
-    // we serialize the structured content blocks INTO the `content` field as
-    // a JSON string — Anthropic accepts content as either a string (text-only)
-    // or an array of blocks (mixed). To keep this simple, the runner uses the
-    // OpenAI dialect for both providers in Phase 2 by routing both through
-    // `build_openai_messages` for OpenAI-compat protocols and using a plain
-    // text-only ChatMessage list for Anthropic until a Phase 3 refactor adds
-    // structured-content support. See note below.
-    let mut out: Vec<ChatMessage> = Vec::new();
+/// Normalise an Anthropic message `content` field (a string OR an array of
+/// content blocks) to a Vec of blocks — used when coalescing same-role turns.
+fn value_to_blocks(content: &serde_json::Value) -> Vec<serde_json::Value> {
+    match content {
+        serde_json::Value::Array(a) => a.clone(),
+        serde_json::Value::String(s) => vec![serde_json::json!({ "type": "text", "text": s })],
+        _ => Vec::new(),
+    }
+}
+
+/// Append `blocks` as a `role` turn, MERGING into the previous turn when it has
+/// the same role (Anthropic forbids two consecutive same-role messages, and a
+/// single user turn may legally mix `tool_result` + `text` blocks).
+fn push_coalesced(out: &mut Vec<serde_json::Value>, role: &str, blocks: Vec<serde_json::Value>) {
+    if let Some(last) = out.last_mut() {
+        if last["role"].as_str() == Some(role) {
+            let mut merged = value_to_blocks(&last["content"]);
+            merged.extend(blocks);
+            last["content"] = serde_json::Value::Array(merged);
+            return;
+        }
+    }
+    out.push(serde_json::json!({ "role": role, "content": blocks }));
+}
+
+/// Translate `AgentMessage` history into NATIVE Anthropic Messages format:
+/// assistant turns carry `tool_use` blocks (with `input` parsed to a JSON
+/// OBJECT — Anthropic requires an object, not the raw arg string OpenAI uses);
+/// tool results become ONE user message of `tool_result` blocks. Returns
+/// `(messages, system)` — system is hoisted to the top-level field (Anthropic's
+/// `messages` array has no system role). Consecutive same-role turns are
+/// coalesced (the loop appends a system-nudge user message right after a
+/// tool_results user message; Anthropic rejects two consecutive user turns).
+/// Lot 3 — replaces the former JSON-in-text projection.
+fn build_anthropic_native(history: &[AgentMessage]) -> (Vec<serde_json::Value>, Option<String>) {
+    let mut system_parts: Vec<String> = Vec::new();
+    let mut out: Vec<serde_json::Value> = Vec::new();
+
     for msg in history {
         match msg {
             AgentMessage::Text { role, content } => {
-                out.push(ChatMessage { role: role.clone(), content: content.clone() });
+                if role == "system" {
+                    system_parts.push(content.clone());
+                } else {
+                    push_coalesced(
+                        &mut out,
+                        role,
+                        vec![serde_json::json!({ "type": "text", "text": content })],
+                    );
+                }
             }
             AgentMessage::AssistantWithTools { content, tool_calls } => {
-                // Phase 2 best-effort: serialize tool_calls into the
-                // assistant text. Anthropic native tool_use will come in
-                // Phase 3 via structured content blocks.
-                let mut s = content.clone();
-                for tc in tool_calls {
-                    s.push_str(&format!("\n[tool_call:{}] {}\n", tc.name, tc.arguments));
+                let mut blocks: Vec<serde_json::Value> = Vec::new();
+                if !content.trim().is_empty() {
+                    blocks.push(serde_json::json!({ "type": "text", "text": content }));
                 }
-                out.push(ChatMessage { role: "assistant".into(), content: s });
+                for tc in tool_calls {
+                    // Anthropic `tool_use.input` is a parsed JSON object, NOT the
+                    // raw argument string OpenAI uses. Bad/empty args → {} so the
+                    // request stays well-formed and the model sees its own error.
+                    let input: serde_json::Value =
+                        serde_json::from_str(&tc.arguments).unwrap_or_else(|_| serde_json::json!({}));
+                    blocks.push(serde_json::json!({
+                        "type": "tool_use",
+                        "id": tc.id,
+                        "name": tc.name,
+                        "input": input,
+                    }));
+                }
+                push_coalesced(&mut out, "assistant", blocks);
             }
             AgentMessage::ToolResults(results) => {
-                let mut s = String::new();
-                for r in results {
-                    s.push_str(&format!(
-                        "[tool_result:{}] {}{}\n",
-                        r.name,
-                        if r.is_error { "(error) " } else { "" },
-                        r.content
-                    ));
-                }
-                out.push(ChatMessage { role: "user".into(), content: s });
+                let blocks: Vec<serde_json::Value> = results
+                    .iter()
+                    .map(|r| {
+                        let mut b = serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": r.id,
+                            "content": r.content,
+                        });
+                        if r.is_error {
+                            b["is_error"] = serde_json::Value::Bool(true);
+                        }
+                        b
+                    })
+                    .collect();
+                push_coalesced(&mut out, "user", blocks);
             }
         }
     }
-    out
+
+    let system = if system_parts.is_empty() {
+        None
+    } else {
+        Some(system_parts.join("\n\n"))
+    };
+    (out, system)
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -563,45 +607,30 @@ async fn call_agent_llm_with_tools(
 
     match protocol {
         "anthropic" => {
-            let messages = build_anthropic_messages(history);
-            chat::call_anthropic(
-                client, base_url, model, &messages, api_key, /* with_tools */ true,
-                /* attached_image */ None,
+            // Lot 3 — native Anthropic multi-turn: tool_use / tool_result
+            // content blocks (was: tool_calls serialized into assistant text).
+            let (messages, system) = build_anthropic_native(history);
+            chat::call_anthropic_structured(
+                client, base_url, model, messages, system, api_key,
+                /* with_tools */ true,
                 /* abort */ None,
                 &mut on_chunk,
             )
             .await
         }
         "openai" | "custom" => {
-            // For OpenAI we build the full structured history (assistant+tool_calls,
-            // tool result messages with tool_call_id). We bypass the &[ChatMessage]
-            // input of `call_openai_compat` because that path can't carry tool_calls.
-            // Instead we build the messages JSON directly and call a small inline
-            // adapter that posts to the same endpoint with the same SSE parsing.
-            //
-            // Implementation note: rather than fork the helper, we project our
-            // AgentMessage history into a Vec<ChatMessage> text-only view for the
-            // helper signature, but we patch the messages_json INSIDE the helper.
-            // To minimize chat.rs surface changes, we use the text-projection here
-            // and accept that OpenAI sees a slightly degraded history (tool_calls
-            // serialized as text). The actual provider-native multi-turn fix lands
-            // in Phase 3.
-            //
-            // For Phase 2's smoke test (1 round of tool-use → answer) this is
-            // sufficient: the first round has only Text history (system+user),
-            // the tool result re-prompt sees the assistant text + tool result
-            // text — degraded but functional.
-            let messages = build_openai_text_projection(history);
-            chat::call_openai_compat(
+            // Lot 3 — native OpenAI multi-turn: assistant.tool_calls + per-result
+            // role:"tool" messages with tool_call_id (was: text projection).
+            let messages = build_openai_messages(history);
+            chat::call_openai_compat_structured(
                 client,
                 base_url,
                 model,
-                &messages,
+                messages,
                 api_key,
                 protocol,
                 chat_template_kwargs,
                 /* with_tools */ true,
-                /* attached_image */ None,
                 /* abort */ None,
                 &mut on_chunk,
             )
@@ -627,52 +656,6 @@ async fn call_agent_llm_with_tools(
         }
         other => Err(format!("unsupported protocol for agent: {other}")),
     }
-}
-
-/// Text-only projection of AgentMessage history for the existing
-/// `call_openai_compat` signature. AssistantWithTools is serialized
-/// inline (tool_calls become a `[tool_call:NAME] {ARGS}` text fragment),
-/// ToolResults become a synthetic user message. This is a Phase 2
-/// compromise — Phase 3 will pass the structured `tool_calls` field
-/// through to the OpenAI body for native multi-turn.
-fn build_openai_text_projection(history: &[AgentMessage]) -> Vec<ChatMessage> {
-    let mut out: Vec<ChatMessage> = Vec::new();
-    for msg in history {
-        match msg {
-            AgentMessage::Text { role, content } => {
-                out.push(ChatMessage {
-                    role: role.clone(),
-                    content: content.clone(),
-                });
-            }
-            AgentMessage::AssistantWithTools { content, tool_calls } => {
-                let mut s = content.clone();
-                for tc in tool_calls {
-                    s.push_str(&format!("\n[tool_call:{}] {}\n", tc.name, tc.arguments));
-                }
-                out.push(ChatMessage {
-                    role: "assistant".into(),
-                    content: s,
-                });
-            }
-            AgentMessage::ToolResults(results) => {
-                let mut s = String::from("[tool_results]\n");
-                for r in results {
-                    s.push_str(&format!(
-                        "{}{}: {}\n",
-                        if r.is_error { "(error) " } else { "" },
-                        r.name,
-                        r.content
-                    ));
-                }
-                out.push(ChatMessage {
-                    role: "user".into(),
-                    content: s,
-                });
-            }
-        }
-    }
-    out
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -755,4 +738,170 @@ fn mark_killed(app: &AppHandle, agent_id: &str) {
             error: "killed by user".to_string(),
         },
     );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Tests — native message builders (Lot 3). Pure functions, no I/O.
+// ────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tc(id: &str, name: &str, args: &str) -> ToolCall {
+        ToolCall { id: id.into(), name: name.into(), arguments: args.into() }
+    }
+    fn tr(id: &str, name: &str, is_error: bool, content: &str) -> ToolResult {
+        ToolResult { id: id.into(), name: name.into(), is_error, content: content.into() }
+    }
+
+    // ── OpenAI ────────────────────────────────────────────────────────
+    #[test]
+    fn openai_text_history() {
+        let h = vec![
+            AgentMessage::Text { role: "system".into(), content: "sys".into() },
+            AgentMessage::Text { role: "user".into(), content: "hi".into() },
+        ];
+        assert_eq!(
+            build_openai_messages(&h),
+            vec![
+                json!({ "role": "system", "content": "sys" }),
+                json!({ "role": "user", "content": "hi" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn openai_assistant_tool_calls() {
+        let h = vec![AgentMessage::AssistantWithTools {
+            content: "reading".into(),
+            tool_calls: vec![tc("call_1", "fs_read_file", r#"{"path":"a.ts"}"#)],
+        }];
+        assert_eq!(
+            build_openai_messages(&h)[0],
+            json!({
+                "role": "assistant",
+                "content": "reading",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "fs_read_file", "arguments": r#"{"path":"a.ts"}"# }
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn openai_tool_results_one_message_each() {
+        let h = vec![AgentMessage::ToolResults(vec![
+            tr("call_1", "fs_read_file", false, "FILE"),
+            tr("call_2", "fs_list_dir", false, "[]"),
+        ])];
+        let out = build_openai_messages(&h);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], json!({ "role": "tool", "tool_call_id": "call_1", "content": "FILE" }));
+        assert_eq!(out[1], json!({ "role": "tool", "tool_call_id": "call_2", "content": "[]" }));
+    }
+
+    // ── Anthropic ─────────────────────────────────────────────────────
+    #[test]
+    fn anthropic_system_hoisted_user_blocks() {
+        let h = vec![
+            AgentMessage::Text { role: "system".into(), content: "S".into() },
+            AgentMessage::Text { role: "user".into(), content: "U".into() },
+        ];
+        let (msgs, system) = build_anthropic_native(&h);
+        assert_eq!(system, Some("S".to_string()));
+        assert_eq!(msgs, vec![json!({ "role": "user", "content": [{ "type": "text", "text": "U" }] })]);
+    }
+
+    #[test]
+    fn anthropic_tool_use_input_is_parsed_object() {
+        let h = vec![AgentMessage::AssistantWithTools {
+            content: "".into(),
+            tool_calls: vec![tc("tu_1", "fs_read_file", r#"{"path":"a.ts"}"#)],
+        }];
+        let (msgs, _) = build_anthropic_native(&h);
+        assert_eq!(
+            msgs,
+            vec![json!({
+                "role": "assistant",
+                "content": [{ "type": "tool_use", "id": "tu_1", "name": "fs_read_file", "input": { "path": "a.ts" } }]
+            })]
+        );
+        // Landmine #1: input must be an OBJECT, not the raw arg string.
+        assert!(msgs[0]["content"][0]["input"].is_object());
+    }
+
+    #[test]
+    fn anthropic_tool_result_shape_and_error_flag() {
+        let h = vec![AgentMessage::ToolResults(vec![
+            tr("tu_1", "x", false, "ok"),
+            tr("tu_2", "y", true, "boom"),
+        ])];
+        let (msgs, _) = build_anthropic_native(&h);
+        // Landmine #2: ALL results batch into ONE user message.
+        assert_eq!(
+            msgs,
+            vec![json!({
+                "role": "user",
+                "content": [
+                    { "type": "tool_result", "tool_use_id": "tu_1", "content": "ok" },
+                    { "type": "tool_result", "tool_use_id": "tu_2", "content": "boom", "is_error": true }
+                ]
+            })]
+        );
+    }
+
+    #[test]
+    fn anthropic_coalesces_consecutive_user_turns() {
+        // tool_results (user) then a system-nudge user Text → ONE user message
+        // (Anthropic rejects two consecutive user turns).
+        let h = vec![
+            AgentMessage::ToolResults(vec![tr("tu_1", "x", false, "ok")]),
+            AgentMessage::Text { role: "user".into(), content: "[Shugu] final".into() },
+        ];
+        let (msgs, _) = build_anthropic_native(&h);
+        assert_eq!(msgs.len(), 1);
+        let blocks = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[1], json!({ "type": "text", "text": "[Shugu] final" }));
+    }
+
+    #[test]
+    fn anthropic_alternation_preserved_full_loop() {
+        // user → assistant(tool_use) → user(tool_result) → assistant(text)
+        let h = vec![
+            AgentMessage::Text { role: "user".into(), content: "task".into() },
+            AgentMessage::AssistantWithTools { content: "".into(), tool_calls: vec![tc("t", "n", "{}")] },
+            AgentMessage::ToolResults(vec![tr("t", "n", false, "r")]),
+            AgentMessage::Text { role: "assistant".into(), content: "done".into() },
+        ];
+        let (msgs, _) = build_anthropic_native(&h);
+        let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "user", "assistant"]);
+    }
+
+    #[test]
+    fn anthropic_empty_assistant_text_omitted() {
+        let h = vec![AgentMessage::AssistantWithTools {
+            content: "   ".into(),
+            tool_calls: vec![tc("t", "n", "{}")],
+        }];
+        let (msgs, _) = build_anthropic_native(&h);
+        let blocks = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_use");
+    }
+
+    #[test]
+    fn anthropic_bad_args_fallback_empty_object() {
+        let h = vec![AgentMessage::AssistantWithTools {
+            content: "".into(),
+            tool_calls: vec![tc("t", "n", "not valid json")],
+        }];
+        let (msgs, _) = build_anthropic_native(&h);
+        assert_eq!(msgs[0]["content"][0]["input"], json!({}));
+    }
 }

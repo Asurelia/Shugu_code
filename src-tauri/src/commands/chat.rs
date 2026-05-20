@@ -230,7 +230,10 @@ pub(crate) async fn call_anthropic(
     abort: Option<Arc<AtomicBool>>,
     on_chunk: &mut (dyn FnMut(&str, &str) + Send),
 ) -> Result<AssistantTurn, String> {
-    let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
+    // Flat-history entry: project `&[ChatMessage]` into the Anthropic wire
+    // shape (system extracted to the top-level field, last user message gets
+    // the optional image), then delegate to the structured core. Output is
+    // byte-identical to the pre-refactor body — chat_send is unaffected.
     let mut system_parts: Vec<String> = Vec::new();
     let mut convo: Vec<serde_json::Value> = Vec::new();
     // For vision: the image (if any) attaches to the LAST user message. We
@@ -259,6 +262,36 @@ pub(crate) async fn call_anthropic(
         }
         convo.push(serde_json::json!({ "role": m.role, "content": m.content }));
     }
+    let system = if system_parts.is_empty() {
+        None
+    } else {
+        Some(system_parts.join("\n\n"))
+    };
+    call_anthropic_structured(
+        client, base_url, model, convo, system, api_key, with_tools, abort, on_chunk,
+    )
+    .await
+}
+
+/// Structured Anthropic entry — takes a pre-built `messages` JSON array (native
+/// `tool_use` / `tool_result` content blocks for the agent loop) + an explicit
+/// `system` string. Shares the exact body assembly + SSE state machine with the
+/// flat `call_anthropic` wrapper above (which builds `messages` from
+/// `&[ChatMessage]`). Lot 3 — replaces the agent runner's degraded text
+/// projection with native multi-turn tool messages.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_anthropic_structured(
+    client: &reqwest::Client,
+    base_url: &str,
+    model: &str,
+    messages: Vec<serde_json::Value>,
+    system: Option<String>,
+    api_key: &str,
+    with_tools: bool,
+    abort: Option<Arc<AtomicBool>>,
+    on_chunk: &mut (dyn FnMut(&str, &str) + Send),
+) -> Result<AssistantTurn, String> {
+    let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
     // Tool-use turns produce more output (tool_call JSON + commentary);
     // bump the cap. Non-tool turns keep the 1024 default to preserve
     // chat_send's existing latency profile.
@@ -267,10 +300,12 @@ pub(crate) async fn call_anthropic(
         "model": model,
         "max_tokens": max_tokens,
         "stream": true,
-        "messages": convo,
+        "messages": messages,
     });
-    if !system_parts.is_empty() {
-        body["system"] = serde_json::Value::String(system_parts.join("\n\n"));
+    if let Some(sys) = system {
+        if !sys.is_empty() {
+            body["system"] = serde_json::Value::String(sys);
+        }
     }
     if with_tools {
         body["tools"] = tools_json_anthropic();
@@ -406,16 +441,10 @@ pub(crate) async fn call_openai_compat(
     abort: Option<Arc<AtomicBool>>,
     on_chunk: &mut (dyn FnMut(&str, &str) + Send),
 ) -> Result<AssistantTurn, String> {
-    // Normalise: strip trailing slash, then decide whether to append /v1.
-    let base = base_url.trim_end_matches('/');
-    let url = if base.ends_with("/v1") {
-        format!("{}/chat/completions", base)
-    } else {
-        format!("{}/v1/chat/completions", base)
-    };
-
-    // For vision: image attaches to the LAST user message. Pre-locate its
-    // index so we can branch into the multimodal content shape only there.
+    // Flat-history entry: project `&[ChatMessage]` into the OpenAI wire shape
+    // (last user message gets the optional image), then delegate to the
+    // structured core. Output is byte-identical to the pre-refactor body —
+    // chat_send is unaffected.
     let last_user_idx = messages.iter().rposition(|m| m.role == "user");
     let messages_json: Vec<serde_json::Value> = messages
         .iter()
@@ -440,10 +469,43 @@ pub(crate) async fn call_openai_compat(
             serde_json::json!({ "role": m.role, "content": m.content })
         })
         .collect();
+    call_openai_compat_structured(
+        client, base_url, model, messages_json, api_key, protocol, chat_template_kwargs,
+        with_tools, abort, on_chunk,
+    )
+    .await
+}
+
+/// Structured OpenAI-compat entry — takes a pre-built `messages` JSON array
+/// (native `assistant.tool_calls` + `role:"tool"` result messages for the
+/// agent loop). Shares the body assembly + SSE parser with the flat
+/// `call_openai_compat` wrapper above. Lot 3 — replaces the agent runner's
+/// degraded text projection with native multi-turn tool messages.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_openai_compat_structured(
+    client: &reqwest::Client,
+    base_url: &str,
+    model: &str,
+    messages: Vec<serde_json::Value>,
+    api_key: &str,
+    protocol: &str,
+    chat_template_kwargs: &Option<serde_json::Value>,
+    with_tools: bool,
+    abort: Option<Arc<AtomicBool>>,
+    on_chunk: &mut (dyn FnMut(&str, &str) + Send),
+) -> Result<AssistantTurn, String> {
+    // Normalise: strip trailing slash, then decide whether to append /v1.
+    let base = base_url.trim_end_matches('/');
+    let url = if base.ends_with("/v1") {
+        format!("{}/chat/completions", base)
+    } else {
+        format!("{}/v1/chat/completions", base)
+    };
+
     let mut body = serde_json::json!({
         "model": model,
         "stream": true,
-        "messages": messages_json,
+        "messages": messages,
     });
     if let Some(kwargs) = chat_template_kwargs {
         body["chat_template_kwargs"] = kwargs.clone();
