@@ -20,6 +20,7 @@ import { GitDiffStats } from "@/features/git/components/GitDiffStats";
 // before/after split display in the files browser).
 import { DiffView as CompareDiffView } from "./DiffView";
 import { InlineEditWidget } from "./ai-edit/InlineEditWidget";
+import { useApplyRunner } from "./ai-edit/applyController";
 
 // ─── Code view (editor + tabs + statusbar) ──────────────────
 export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, fileContents, setFileContents, editorViewRef }: any) {
@@ -27,6 +28,12 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
   // useShell() is safe here: CodeView is rendered inside the <Outlet> which is
   // inside <ShellContext.Provider> in RootLayout.tsx.
   const { editorPrefs, compareFile, setCompareFile } = useShell();
+
+  // Lot 2 — apply-to-file runner. Watches the pending ApplyRequest (set by
+  // RootLayout::applyCodeToFile) and mounts the inline diff once this view's
+  // CodeMirror instance is ready for the target file. Lives here because the
+  // editor view lifecycle is owned by CodeView (key={activeFile} remount).
+  useApplyRunner({ activeFile, editorViewRef, fileContents });
 
   // LOT 3 — HEAD content for the active file. Used by gitDiffCompartment to
   // render inline diff decorations (added/modified/deleted line markers).

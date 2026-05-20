@@ -10,6 +10,7 @@ import { ModelPicker } from "@/features/panels/panels";
 import { resolveImageProvider } from "@/lib/imageProviders";
 import { revealAgent } from "@/lib/agents";
 import { useMessageDisplay } from "./useMessageDisplay";
+import { detectBlockPath } from "@/lib/markdown";
 
 type ImageResult = {
   id: number | string;
@@ -36,6 +37,7 @@ export function ChatView({
   activeConv,
   model: modelProp,
   onOpenSnippet,
+  onApplyToFile,
 }: {
   activeConv: string;
   // Legacy prop — accepted as the FIRST-EVER default if nothing has been
@@ -44,6 +46,7 @@ export function ChatView({
   // Routes are encouraged to omit this and let the hook decide.
   model?: string;
   onOpenSnippet?: (code: string, lang: string) => void;
+  onApplyToFile?: (code: string, lang: string, path: string) => void;
 }) {
   const [input, setInput] = useState("");
   const [typing, setTyping] = useState(false);
@@ -136,7 +139,7 @@ export function ChatView({
     <div className="chat-shell">
       <div className="chat-feed scroll" ref={feedRef}>
         <div className="chat-feed-inner">
-          {messages.map((m: any) => <ChatMessage key={m.id} m={m} onOpenSnippet={onOpenSnippet}/>)}
+          {messages.map((m: any) => <ChatMessage key={m.id} m={m} onOpenSnippet={onOpenSnippet} onApplyToFile={onApplyToFile}/>)}
           {typing && (
             <div className="msg ai">
               <div className="avatar">S</div>
@@ -291,9 +294,11 @@ export function ChatView({
 export function ChatMessage({
   m,
   onOpenSnippet,
+  onApplyToFile,
 }: {
   m: any;
   onOpenSnippet?: (code: string, lang: string) => void;
+  onApplyToFile?: (code: string, lang: string, path: string) => void;
 }) {
   // Hook partagé avec le ChatPanel mascotte — détecte les placeholders
   // agent encore "au travail" et y branche le streaming live (depuis
@@ -412,7 +417,7 @@ export function ChatMessage({
           ) : (
             <>
               {displayBody && <p style={{whiteSpace: "pre-wrap"}}>{displayBody}</p>}
-              {m.code && <CodeBlock lang={m.code.lang} text={m.code.text} onOpenInEditor={onOpenSnippet}/>}
+              {m.code && <CodeBlock lang={m.code.lang} text={m.code.text} onOpenInEditor={onOpenSnippet} onApplyToFile={onApplyToFile}/>}
             </>
           )}
         </div>
@@ -425,11 +430,18 @@ export function CodeBlock({
   lang,
   text,
   onOpenInEditor,
+  onApplyToFile,
 }: {
   lang: string;
   text: string;
   onOpenInEditor?: (code: string, lang: string) => void;
+  onApplyToFile?: (code: string, lang: string, path: string) => void;
 }) {
+  // Lot 2 — a block that declares a target path (info-string or `// path:`
+  // comment) gets an "Apply" affordance. Detection runs on `text` so it works
+  // both live and after the message round-trips through SQLite.
+  const detectedPath = detectBlockPath(text);
+  const fileName = detectedPath ? detectedPath.split("/").pop() : null;
   const copyToClipboard = () => {
     if (typeof navigator !== "undefined" && navigator.clipboard) {
       void navigator.clipboard.writeText(text).catch(() => {});
@@ -438,8 +450,22 @@ export function CodeBlock({
   return (
     <div className="code-block">
       <div className="code-block-head">
-        <span className="lang"><span className="dot"></span> {lang}</span>
+        <span className="lang">
+          <span className="dot"></span> {lang}
+          {detectedPath && (
+            <span className="code-block-path" title={detectedPath}> · {fileName}</span>
+          )}
+        </span>
         <span style={{display:"flex", gap:6}}>
+          {detectedPath && onApplyToFile && (
+            <button
+              className="composer-tool code-apply-btn"
+              title={`Apply to ${detectedPath}`}
+              onClick={() => onApplyToFile(text, lang, detectedPath)}
+            >
+              <Icon name="sparkle" size={12}/> Apply
+            </button>
+          )}
           <button className="composer-tool" title="Copy" onClick={copyToClipboard}><Icon name="copy" size={12}/></button>
           <button
             className="composer-tool"

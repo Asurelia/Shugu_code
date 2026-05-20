@@ -90,13 +90,18 @@ const inner = (
     persistOptions={{
       persister: queryPersister,
       buster: "v1",
-      // La session d'édition inline AI (queryKey ["ai-edit","session"]) est
-      // PUREMENT éphémère : la persister rehydraterait au boot un état
-      // "preview"/"streaming" périmé → widget cassé sans diff réel. On
-      // l'exclut de la dehydration (le reste du cache est persisté normalement).
+      // Les états AI inline sont PUREMENT éphémères et ne doivent JAMAIS être
+      // persistés/rehydratés :
+      //   • ["ai-edit","session"]  → rehydrater un "preview"/"streaming" périmé
+      //     casserait le widget (pas de diff réel sous-jacent).
+      //   • ["ai-apply","request"] → rehydrater une requête d'apply périmée la
+      //     rejouerait au 1er mount /code (diff surprise / fichier disparu).
+      // Le reste du cache est persisté normalement.
       dehydrateOptions: {
         shouldDehydrateQuery: (q) =>
-          q.queryKey[0] !== "ai-edit" && defaultShouldDehydrateQuery(q),
+          q.queryKey[0] !== "ai-edit" &&
+          q.queryKey[0] !== "ai-apply" &&
+          defaultShouldDehydrateQuery(q),
       },
     }}
   >

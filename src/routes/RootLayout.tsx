@@ -59,6 +59,8 @@ import { useActiveAgents, setSelectedAgentId } from "@/features/agents/queries";
 import { useChatEvents } from "@/features/chat/useEvents";
 import { useChatStreamListener } from "@/features/chat/useChatStream";
 import { runImmediate } from "@/features/code/ai-edit/aiEditController";
+import { setApplyRequest } from "@/features/code/ai-edit/applyController";
+import { detectBlockPath, stripPathComment } from "@/lib/markdown";
 import { useLlamaLifecycle } from "@/features/llama/useLlamaLifecycle";
 import { COMMANDS, getCommandById, fmtKbd, type CommandContext } from "@/lib/commands";
 import { useCommandKeybindings } from "@/lib/keybindings";
@@ -805,6 +807,41 @@ export function RootLayout() {
     }
   }, [openFile, navigate]);
 
+  // Lot 2 — applyCodeToFile : applique un bloc de code du chat à un fichier,
+  // avec preview diff inline (réutilise la primitive du Lot 1 via startApply).
+  //
+  // Découpage du flux : ICI on résout + ouvre + active le fichier cible (cross-
+  // route, on a openFile + navigate), puis on POSE une ApplyRequest dans le
+  // cache. useApplyRunner (monté dans CodeView) attend que la view du fichier
+  // soit prête et démarre le diff. Sans chemin déclaré → repli non destructif
+  // vers openSnippetInEditor (jamais de remplacement fichier-entier implicite).
+  const applyCodeToFile = useCallback(async (code: string, lang: string) => {
+    const detected = detectBlockPath(code);
+    if (!detected) {
+      await openSnippetInEditor(code, lang);
+      return;
+    }
+    const path = detected;
+    const proposed = stripPathComment(code);
+    try {
+      // openFile lit le disque (fsReadFile throw si absent) puis active le tab.
+      // Fichier neuf → on le crée vide d'abord pour que le diff aille de vide
+      // au contenu proposé (Accept écrit alors le fichier).
+      try {
+        await openFile(path);
+      } catch {
+        const slash = path.lastIndexOf("/");
+        if (slash > 0) await fsCreateDir(path.slice(0, slash));
+        await fsCreateFile(path, "");
+        await openFile(path);
+      }
+      navigate({ to: "/code" });
+      setApplyRequest({ path, text: proposed, lang });
+    } catch (err) {
+      console.warn("[applyCodeToFile] failed:", err);
+    }
+  }, [openFile, openSnippetInEditor, navigate]);
+
   // newChat creates a fresh conversation row in SQLite and switches the
   // active conv to it. The empty-messages render falls out naturally:
   // useMessages(newId) returns [] for a conv with no rows. The active
@@ -991,6 +1028,7 @@ export function RootLayout() {
     generations, setGenerations: setGenerationsPersisted,
     agents,
     openSnippetInEditor,
+    applyCodeToFile,
     editorViewRef,
     // LOT 2 — Find-in-files panel state piped to /code route components.
     findPanelOpen, setFindPanelOpen,
@@ -1007,6 +1045,7 @@ export function RootLayout() {
     openFiles, activeFile, fileContents, generations, agents,
     setOpenFiles, setActiveFile, setFileContents, setGenerationsPersisted,
     openSnippetInEditor,
+    applyCodeToFile,
     // editorViewRef is a stable ref object; included for explicit dependency tracking
     editorViewRef,
     // LOT 2

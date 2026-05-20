@@ -141,3 +141,23 @@
 .cm-changedText {
   background: rgba(138, 239, 199, 0.24);
 }
+
+/* ── Lot 2 — chat code-block "Apply to file" affordance ─────────────────── */
+.code-block-path {
+  color: var(--on-surface-muted, #6f6885);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+}
+.code-apply-btn {
+  width: auto !important;
+  padding: 0 8px !important;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 11px;
+  color: var(--tertiary, #8aefc7);
+}
+.code-apply-btn:hover {
+  color: var(--on-surface, #ece8f5);
+}

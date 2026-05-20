@@ -63,6 +63,14 @@ export interface ShellContextValue {
    */
   openSnippetInEditor: (code: string, lang: string) => Promise<void>;
   /**
+   * Lot 2 — apply a chat code block to a file with inline diff preview. The
+   * target path is detected from the block (info-string or `// path:` comment);
+   * the file is opened/created + activated, then a full-file diff is mounted
+   * (Accept replaces the file with one undo step, Reject restores). Falls back
+   * to openSnippetInEditor when the block declares no path.
+   */
+  applyCodeToFile: (code: string, lang: string) => Promise<void>;
+  /**
    * Ref to the active CodeMirror editor. Only populated while the /code route
    * is mounted. Used by find-in-file / replace-in-file commands to open the
    * search panel programmatically.

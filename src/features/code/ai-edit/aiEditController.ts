@@ -173,8 +173,9 @@ export function cancelPrompt(view: EditorView): void {
 }
 
 // Options pour les modes immédiats (refactor / fix), sans phase de prompt.
+// "apply" est exclu : il ne passe PAS par le runner AI (cf. startApply).
 export interface RunImmediateOpts {
-  mode: Exclude<AiEditMode, "edit">;
+  mode: "refactor" | "fix";
   path: string | null;
   lang?: string;
   diagnostics?: string;
@@ -346,4 +347,63 @@ export function discardSession(): void {
   const s = getSession();
   if (s.convId) void abortAiEdit(s.convId);
   resetSession();
+}
+
+// ---------------------------------------------------------------------------
+// Lot 2 — apply-to-file (réutilise la machine preview/accept/reject)
+// ---------------------------------------------------------------------------
+
+export interface StartApplyOpts {
+  /** Chemin workspace-relatif du fichier cible (pour le state dirty). */
+  path: string | null;
+  /** Contenu proposé (commentaire de chemin déjà retiré par l'appelant). */
+  proposedText: string;
+  lang?: string;
+  /** Dirty du fichier AVANT l'apply (restauré au Reject par le widget). */
+  wasDirty?: boolean;
+}
+
+/**
+ * Monte un diff inline FICHIER-ENTIER entre le doc courant et `proposedText`,
+ * SANS appel AI. La session entre directement en phase "preview" : la barre
+ * Accept/Reject de l'InlineEditWidget (et son restoreDirty au Reject) pilote
+ * la suite, exactement comme un édit Cmd+K. `view` = la view du fichier cible,
+ * déjà ouvert + actif par l'appelant (cf. useApplyRunner).
+ *
+ * Range = doc entier ([0, len]) ; originalSelection = doc entier → acceptSession
+ * fait restore-then-reapply → 1 seule entrée d'undo (original → proposé), et
+ * onChange propage le contenu final vers fileContents (dirty). Reject restaure
+ * l'original.
+ */
+export function startApply(view: EditorView, opts: StartApplyOpts): boolean {
+  // Garde re-entrance : ne pas clobber une session active (cf. openPrompt).
+  // Retourne false → l'appelant (useApplyRunner) garde la requête en attente
+  // et réessaiera quand la session courante redeviendra idle.
+  if (getSession().status !== "idle") return false;
+  const originalDoc = view.state.doc.toString();
+  const docLen = view.state.doc.length;
+  setSession(() => ({
+    ...INITIAL_AI_EDIT_SESSION,
+    status: "preview",
+    mode: "apply",
+    path: opts.path,
+    lang: opts.lang ?? "",
+    originalDoc,
+    originalSelection: originalDoc,
+    insertedFrom: 0,
+    insertedTo: docLen,
+    convId: null,
+    wasDirty: opts.wasDirty ?? false,
+  }));
+  // Verrou read-only + injection du proposé (hors historique, onChange supprimé
+  // via aiEditStreamAnnotation → fileContents reste à l'original tant que l'on
+  // n'a pas accepté), puis affichage du diff unifié vs l'original.
+  enterStreaming(view);
+  view.dispatch({
+    changes: { from: 0, to: docLen, insert: opts.proposedText },
+    annotations: [aiEditStreamAnnotation.of(true), Transaction.addToHistory.of(false)],
+  });
+  setSession((s) => ({ ...s, insertedTo: opts.proposedText.length, partial: opts.proposedText }));
+  enterPreview(view, originalDoc);
+  return true;
 }

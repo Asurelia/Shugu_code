@@ -11,8 +11,10 @@
  *   - "edit"     : instruction libre de l'utilisateur (Cmd+K).
  *   - "refactor" : "refactore pour la clarté/qualité, comportement préservé".
  *   - "fix"      : "corrige bugs/erreurs" (peut être seedé de diagnostics LSP).
+ *   - "apply"    : Lot 2 — applique un bloc de code du chat à un fichier
+ *                  (diff fichier-entier, AUCUN appel AI, va direct en preview).
  */
-export type AiEditMode = "edit" | "refactor" | "fix";
+export type AiEditMode = "edit" | "refactor" | "fix" | "apply";
 
 /**
  * Phase de la session d'édition inline.
@@ -74,3 +76,25 @@ export const INITIAL_AI_EDIT_SESSION: AiEditSession = {
 
 /** Préfixe des conversationId synthétiques pour isoler le stream inline du chat. */
 export const AI_EDIT_CONV_PREFIX = "aiedit:";
+
+// ---------------------------------------------------------------------------
+// Lot 2 — apply-to-file
+// ---------------------------------------------------------------------------
+
+/**
+ * Requête d'application d'un bloc de code du chat vers un fichier. Posée dans
+ * le cache TanStack (AI_APPLY_KEY) par RootLayout::applyCodeToFile, consommée
+ * par useApplyRunner (monté dans CodeView) une fois le fichier cible ouvert +
+ * actif + sa view CodeMirror prête. Découple l'ouverture de fichier (cross-
+ * route, RootLayout) du démarrage du diff (view-level, CodeView).
+ */
+export interface ApplyRequest {
+  /** Chemin workspace-relatif du fichier cible (forward-slash). */
+  path: string;
+  /** Contenu proposé — commentaire de chemin DÉJÀ retiré (stripPathComment). */
+  text: string;
+  /** Identifiant de langage (coloration sur un fichier neuf). */
+  lang: string;
+}
+
+export const AI_APPLY_KEY = ["ai-apply", "request"] as const;
