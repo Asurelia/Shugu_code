@@ -96,11 +96,14 @@ const inner = (
       //     casserait le widget (pas de diff réel sous-jacent).
       //   • ["ai-apply","request"] → rehydrater une requête d'apply périmée la
       //     rejouerait au 1er mount /code (diff surprise / fichier disparu).
+      //   • ["ai-review","dialog"] → rehydrater open:true rouvrirait le dialog
+      //     de review tout seul au reload.
       // Le reste du cache est persisté normalement.
       dehydrateOptions: {
         shouldDehydrateQuery: (q) =>
           q.queryKey[0] !== "ai-edit" &&
           q.queryKey[0] !== "ai-apply" &&
+          q.queryKey[0] !== "ai-review" &&
           defaultShouldDehydrateQuery(q),
       },
     }}

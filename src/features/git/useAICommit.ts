@@ -20,8 +20,7 @@
 import { useCallback, useState } from "react";
 import { invoke } from "@/lib/tauri";
 import { gitDiffFile } from "@/lib/git";
-import { resolveProvider, type Protocol } from "@/lib/providers";
-import { loadProviderConfig, getConfig, getProviderEnabled } from "@/lib/credentials";
+import { resolveActiveChatProvider } from "@/features/chat/resolveProvider";
 import { useActiveModel } from "@/features/chat/chat-sync";
 import { useGitStatus } from "./queries";
 
@@ -102,32 +101,15 @@ export function useAICommit(): UseAICommitResult {
       const truncated = truncateDiff(diff);
       const prompt = PROMPT_TEMPLATE(truncated);
 
-      // Résolution du provider — même schéma que `sendChatMessage`.
-      const fullId = modelId?.includes("/") ? modelId : `anthropic/${modelId ?? "claude-haiku-4-5"}`;
-      const {
-        providerId,
-        protocol: defaultProtocol,
-        baseUrl: defaultBaseUrl,
-        model: realModel,
-      } = resolveProvider(fullId);
-
-      const enabled = await getProviderEnabled(providerId);
-      if (enabled !== "true") {
+      // Résolution du provider — partagée avec l'AI code review via
+      // `resolveActiveChatProvider`. `null` = aucun provider activé.
+      const resolved = await resolveActiveChatProvider(modelId);
+      if (!resolved) {
         const msg = "no LLM provider configured";
         setError(msg);
         return null;
       }
-
-      const cfg = await loadProviderConfig(providerId);
-      let protocol: Protocol = defaultProtocol;
-      if (defaultProtocol === "custom") {
-        const stored = await getConfig(providerId, "protocol");
-        if (stored === "anthropic" || stored === "openai" || stored === "ollama" || stored === "custom") {
-          protocol = stored;
-        }
-      }
-      const baseUrl: string = cfg.baseUrl && cfg.baseUrl !== "" ? cfg.baseUrl : defaultBaseUrl;
-      const apiKey: string | undefined = cfg.apiKey && cfg.apiKey !== "" ? cfg.apiKey : undefined;
+      const { protocol, baseUrl, apiKey, model: realModel } = resolved;
 
       // One-shot `chat_send` — pas de `conversationId` (la mascotte
       // streame son chat ailleurs ; on ne veut PAS polluer ce flux UI

@@ -12,6 +12,7 @@ import { formatCurrentDocument } from "@/features/code/format";
 import { openPrompt, runImmediate } from "@/features/code/ai-edit/aiEditController";
 import { reindexWorkspace } from "@/features/fs/workspaceIndexer";
 import { pushToast } from "@/components/toast";
+import { openReviewDialog } from "@/features/git/reviewDialogStore";
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -205,6 +206,17 @@ export const COMMANDS: Command[] = [
         pushToast("Échec de la réindexation : " + String(err), "error", 6000);
       }
     },
+  },
+  {
+    // Lot 7 — AI code review : ouvre le ReviewDialog (état dans
+    // reviewDialogStore). Sans `when` → toujours dispo ; le dialog gère le cas
+    // "pas de repo / rien à reviewer" via son erreur.
+    id: "ai-code-review",
+    title: "AI: Review changes (code review)",
+    category: "Workbench",
+    icon: "shield",
+    description: "L'AI relit le diff (staged ou toutes modifs) et signale bugs / sécurité / style",
+    run: () => openReviewDialog("index"),
   },
   {
     id: "toggle-side",

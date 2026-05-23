@@ -62,6 +62,7 @@ import { runImmediate } from "@/features/code/ai-edit/aiEditController";
 import { setApplyRequest } from "@/features/code/ai-edit/applyController";
 import { detectBlockPath, stripPathComment } from "@/lib/markdown";
 import { ToastHost } from "@/components/ToastHost";
+import { ReviewDialog } from "@/features/git/components/ReviewDialog";
 import { useLlamaLifecycle } from "@/features/llama/useLlamaLifecycle";
 import { COMMANDS, getCommandById, fmtKbd, type CommandContext } from "@/lib/commands";
 import { useCommandKeybindings } from "@/lib/keybindings";
@@ -1255,6 +1256,10 @@ export function RootLayout() {
 
         {/* Toasts globaux (échecs silencieux FIM, feedback réindexation…). */}
         <ToastHost/>
+
+        {/* AI code review (Lot 7) — monté globalement : ouvrable depuis la
+            palette (ai-code-review) ET le bouton Review de SideGit. */}
+        <ReviewDialog/>
       </>
     </ShellContext.Provider>
   );

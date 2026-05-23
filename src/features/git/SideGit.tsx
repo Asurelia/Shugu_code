@@ -35,6 +35,7 @@ import {
 import { useAICommit } from "./useAICommit";
 import { BranchSwitcher } from "./components/BranchSwitcher";
 import { CommitDialog } from "./components/CommitDialog";
+import { openReviewDialog } from "./reviewDialogStore";
 import { StashList } from "./components/StashList";
 import { RemoteManager } from "./components/RemoteManager";
 import type { GitFileStatus } from "@/lib/types";
@@ -374,6 +375,15 @@ function CommitBox(): JSX.Element {
         >
           <Icon name="sparkle" size={11} />
           {ai.isLoading ? "AI…" : "AI"}
+        </button>
+        <button
+          className="lgb lgb-sm"
+          title="AI code review du diff (staged / toutes modifs)"
+          disabled={changed.length === 0}
+          onClick={() => openReviewDialog("index")}
+        >
+          <Icon name="shield" size={11} />
+          Review
         </button>
         <label
           style={{
