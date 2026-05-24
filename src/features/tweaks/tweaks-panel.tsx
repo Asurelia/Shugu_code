@@ -3,7 +3,10 @@
 
 import React, { useState, useCallback, useEffect, useRef, useMemo } from "react";
 
-const __TWEAKS_STYLE = `
+// Exported so other surfaces (e.g. the Studio Tweaks panel) can reuse the same
+// control kit: inject <style>{TWEAKS_STYLE}</style> once, then render the Tweak*
+// components. Without it the `.twk-*` classes are unstyled outside <TweaksPanel>.
+export const TWEAKS_STYLE = `
   .twk-panel{position:fixed;right:16px;bottom:16px;z-index:2147483646;width:280px;
     max-height:calc(100vh - 32px);display:flex;flex-direction:column;
     transform:scale(var(--dc-inv-zoom,1));transform-origin:bottom right;
@@ -200,7 +203,7 @@ export function TweaksPanel({ title = "Tweaks", children }: { title?: string; ch
   if (!open) return null;
   return (
     <>
-      <style>{__TWEAKS_STYLE}</style>
+      <style>{TWEAKS_STYLE}</style>
       <div ref={dragRef} className="twk-panel tweaks-panel" data-noncommentable=""
            style={{ right: offsetRef.current.x, bottom: offsetRef.current.y }}>
         <div className="twk-hd" onMouseDown={onDragStart}>

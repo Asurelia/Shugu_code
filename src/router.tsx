@@ -22,6 +22,7 @@ const LazyImageRoute       = lazy(() => import("./routes/image"));
 const LazyInspirationRoute = lazy(() => import("./routes/design"));        // catalogue (systems-only) → /studio/inspiration
 const LazyStudioShell      = lazy(() => import("./routes/studio"));        // unified Studio shell (sub-tabs + Outlet)
 const LazyStudioCreate     = lazy(() => import("./routes/studio.create")); // /studio index → the assistant
+const LazyStudioProjects   = lazy(() => import("./routes/studio.projects")); // /studio/projects → saved-projects grid
 const LazyAgentsRoute      = lazy(() => import("./routes/agents"));
 const LazyHarnessRoute     = lazy(() => import("./routes/harness"));
 const LazyGalleryRoute     = lazy(() => import("./routes/gallery"));
@@ -90,6 +91,12 @@ const studioCreateRoute = createRoute({
   path: "/",
   component: () => <LazyStudioCreate />,
 });
+// /studio/projects → the saved-projects grid (Projets tab)
+const studioProjectsRoute = createRoute({
+  getParentRoute: () => studioRoute,
+  path: "projects",
+  component: () => <LazyStudioProjects />,
+});
 // /studio/inspiration → the catalogue (systems as a starting base)
 const studioInspirationRoute = createRoute({
   getParentRoute: () => studioRoute,
@@ -154,7 +161,7 @@ const routeTree = rootRoute.addChildren([
   gitRoute,
   imageRoute,
   designRedirectRoute,
-  studioRoute.addChildren([studioCreateRoute, studioInspirationRoute]),
+  studioRoute.addChildren([studioCreateRoute, studioProjectsRoute, studioInspirationRoute]),
   agentsRoute,
   harnessRoute,
   galleryRoute,

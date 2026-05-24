@@ -31,6 +31,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { Icon } from "@/components/components";
 import { useDesignSystems, useDesignSystemFiles, type DesignSystemMeta } from "./queries";
 import { useActiveDesignSystem, setActiveDesignSystem } from "./activeDesignSystem";
+import { setStudioDraft } from "@/features/studio/studioDraft";
 
 // ─── Minimal markdown renderer (no deps, XSS-safe) ────────────
 
@@ -209,6 +210,7 @@ function SystemDetail({ system }: { system: DesignSystemMeta }) {
       designMd: files.data.designMd,
       tokensCss: files.data.tokensCss,
     });
+    setStudioDraft({ startingNew: true }); // land on the wizard with this base, even if a project exists on disk
     navigate({ to: "/studio" });
   };
 

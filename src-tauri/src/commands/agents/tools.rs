@@ -135,6 +135,38 @@ fn agent_tools() -> &'static [ToolDef] {
                     "required": ["path"]
                 }),
             },
+            ToolDef {
+                name: "todo_write",
+                description: "Record or update your short plan for this task as a checklist. Call this \
+                              FIRST to lay out the steps, then again to update statuses as you progress. \
+                              Pass the FULL current list each time — the latest call replaces the previous. \
+                              Purely advisory: it surfaces your plan to the user and never touches files.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "todos": {
+                            "type": "array",
+                            "description": "The full current checklist, in order.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "text": {
+                                        "type": "string",
+                                        "description": "Short imperative step, e.g. \"Write index.html\"."
+                                    },
+                                    "status": {
+                                        "type": "string",
+                                        "enum": ["pending", "in_progress", "completed"],
+                                        "description": "Step state."
+                                    }
+                                },
+                                "required": ["text", "status"]
+                            }
+                        }
+                    },
+                    "required": ["todos"]
+                }),
+            },
         ]
     })
 }
@@ -300,6 +332,13 @@ fn dispatch_inner(call: &ToolCall, root: &Path) -> Result<String, String> {
         "fs_list_dir" => {
             let path = args["path"].as_str().unwrap_or(".");
             crate::commands::fs::list_dir_inner(root, path)
+        }
+        "todo_write" => {
+            // No-op: the plan lives in the persisted toolCall args; the UI reads
+            // the latest call. We just acknowledge with a count so the model
+            // continues its loop.
+            let n = args["todos"].as_array().map(|a| a.len()).unwrap_or(0);
+            Ok(format!("recorded {n} todo(s)"))
         }
         other => Err(format!("unknown tool: {other}")),
     }

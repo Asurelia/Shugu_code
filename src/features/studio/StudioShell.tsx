@@ -14,18 +14,28 @@ import { Icon } from "@/components/components";
 export function StudioShell() {
   const navigate = useNavigate();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
+  const onProjects = pathname.startsWith("/studio/projects");
   const onInspiration = pathname.startsWith("/studio/inspiration");
+  const onCreate = !onProjects && !onInspiration;
 
   return (
     <div className="studio-root">
       <div className="studio-subnav" role="tablist">
         <button
-          className={"studio-subtab" + (!onInspiration ? " is-active" : "")}
+          className={"studio-subtab" + (onCreate ? " is-active" : "")}
           onClick={() => navigate({ to: "/studio" })}
           role="tab"
-          aria-selected={!onInspiration}
+          aria-selected={onCreate}
         >
           <Icon name="sparkle" size={13} /> Créer
+        </button>
+        <button
+          className={"studio-subtab" + (onProjects ? " is-active" : "")}
+          onClick={() => navigate({ to: "/studio/projects" })}
+          role="tab"
+          aria-selected={onProjects}
+        >
+          <Icon name="folder" size={13} /> Projets
         </button>
         <button
           className={"studio-subtab" + (onInspiration ? " is-active" : "")}

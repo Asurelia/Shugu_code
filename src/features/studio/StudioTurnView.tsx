@@ -23,6 +23,12 @@ function toolPath(e: Extract<AgentEvent, { kind: "toolCall" }>): string | null {
   return a && typeof a.path === "string" ? a.path : null;
 }
 
+function fmtDuration(ms: number): string {
+  if (ms < 1000) return `${ms} ms`;
+  const s = ms / 1000;
+  return `${s < 10 ? s.toFixed(1) : Math.round(s)} s`;
+}
+
 export function StudioTurnView({
   turn,
   onOpenFile,
@@ -35,9 +41,10 @@ export function StudioTurnView({
   const status = data?.agent.status ?? "pending";
   const isActive = status === "running" || status === "pending";
 
-  // Curated activity: unique files written + count of reads.
+  // Curated activity: unique files written + count of reads + latest plan.
   const writeSet = new Set<string>();
   let reads = 0;
+  let todos: { text: string; status?: string }[] = [];
   for (const e of events) {
     if (e.kind !== "toolCall") continue;
     if (e.tool === "fs_write_file") {
@@ -45,6 +52,15 @@ export function StudioTurnView({
       if (p) writeSet.add(relPath(p));
     } else if (e.tool === "fs_read_file" || e.tool === "fs_list_dir") {
       reads++;
+    } else if (e.tool === "todo_write") {
+      // The latest todo_write call wins (the agent re-sends the full list).
+      const t = (e.args as { todos?: unknown } | null)?.todos;
+      if (Array.isArray(t)) {
+        todos = t
+          .filter((x): x is { text: string; status?: string } =>
+            !!x && typeof (x as { text?: unknown }).text === "string")
+          .map((x) => ({ text: x.text, status: (x as { status?: string }).status }));
+      }
     }
   }
   const writes = [...writeSet];
@@ -52,6 +68,8 @@ export function StudioTurnView({
   const completeEv = events.find((e) => e.kind === "complete");
   const errorEv = events.find((e) => e.kind === "error");
   const reply = completeEv && completeEv.kind === "complete" ? completeEv.output.trim() : "";
+  const reasoning = completeEv && completeEv.kind === "complete" ? (completeEv.reasoning ?? "").trim() : "";
+  const ms = completeEv && completeEv.kind === "complete" ? completeEv.ms : 0;
   const errMsg = errorEv && errorEv.kind === "error" ? errorEv.error : "";
 
   return (
@@ -62,6 +80,18 @@ export function StudioTurnView({
       </div>
 
       <div className="studio-turn-agent">
+        {todos.length > 0 && (
+          <div className="studio-turn-todos">
+            {todos.map((t, i) => (
+              <div key={i} className={"studio-todo is-" + (t.status ?? "pending")}>
+                <span className="studio-todo-mark">
+                  {t.status === "completed" ? <Icon name="check" size={10} /> : null}
+                </span>
+                <span className="studio-todo-text">{t.text}</span>
+              </div>
+            ))}
+          </div>
+        )}
         {(isActive || writes.length > 0) && (
           <div className="studio-turn-work">
             <div className="studio-turn-work-head">
@@ -69,6 +99,9 @@ export function StudioTurnView({
               <span>{isActive ? "L'agent compose le projet…" : "Projet mis à jour"}</span>
               {reads > 0 && (
                 <span className="studio-turn-reads">· {reads} lecture{reads > 1 ? "s" : ""}</span>
+              )}
+              {!isActive && ms > 0 && (
+                <span className="studio-turn-reads">· {fmtDuration(ms)}</span>
               )}
             </div>
             {writes.length > 0 && (
@@ -86,6 +119,13 @@ export function StudioTurnView({
               </div>
             )}
           </div>
+        )}
+
+        {reasoning && (
+          <details className="studio-turn-reasoning">
+            <summary>Raisonnement</summary>
+            <div className="studio-turn-reasoning-body">{reasoning}</div>
+          </details>
         )}
 
         {reply && <div className="studio-turn-reply">{reply}</div>}

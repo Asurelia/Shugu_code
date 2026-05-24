@@ -11,6 +11,7 @@ pub mod llama;
 pub mod lsp;
 pub mod model_bundle;
 pub mod preview;
+pub mod studio;
 pub mod terminal;
 pub mod image;
 pub mod models;

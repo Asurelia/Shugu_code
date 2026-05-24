@@ -327,7 +327,7 @@ pub(super) async fn run_agent_task(
     );
 
     match loop_result {
-        Ok(output) => {
+        Ok((output, reasoning)) => {
             if let Ok(conn_mutex) = get_conn(&app) {
                 if let Ok(conn) = conn_mutex.lock() {
                     let _ = conn.execute(
@@ -346,6 +346,7 @@ pub(super) async fn run_agent_task(
                     agent_id: agent_id.clone(),
                     output,
                     tokens_used: None,
+                    reasoning: if reasoning.trim().is_empty() { None } else { Some(reasoning) },
                     ms,
                 },
             );
@@ -390,7 +391,7 @@ async fn tool_use_loop(
     role: &str,
     history: &mut Vec<AgentMessage>,
     metrics: &mut LoopMetrics,
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     // Stall-detection state (P1): repeated identical tool-call signatures and
     // consecutive tool-error rounds are the two cheap "stuck" signals; the
     // third (budget exhaustion) is handled in the `last_iteration` branch.
@@ -429,7 +430,7 @@ async fn tool_use_loop(
         }
 
         // ── 1. Call the LLM with the current history + tools manifest ──
-        let turn =
+        let (turn, reasoning) =
             call_agent_llm_with_tools(app, client, protocol, base_url, model, history, api_key, chat_template_kwargs, agent_id).await?;
 
         // ── 2. Persist Message event for this assistant turn ───────────
@@ -447,7 +448,7 @@ async fn tool_use_loop(
         //    modèle produit, même s'il a tenté plus de tool calls. Mieux
         //    vaut un answer partiel qu'une erreur "exceeded iterations".
         if turn.tool_calls.is_empty() {
-            return Ok(turn.content);
+            return Ok((turn.content, reasoning));
         }
         if last_iteration {
             // Budget exhausted with the model still wanting tools = stuck.
@@ -463,7 +464,7 @@ async fn tool_use_loop(
             } else {
                 turn.content
             };
-            return Ok(content);
+            return Ok((content, reasoning));
         }
 
         // Stall signal #1 — same tool-call signature repeated across rounds.
@@ -708,7 +709,7 @@ async fn call_agent_llm_with_tools(
     api_key: &str,
     chat_template_kwargs: &Option<serde_json::Value>,
     agent_id: &str,
-) -> Result<AssistantTurn, String> {
+) -> Result<(AssistantTurn, String), String> {
     // Live streaming restauré post-migration TanStack (2026-05-17).
     //
     // L'ancien bug (cascade de re-renders → freeze WebView2) venait du
@@ -724,6 +725,12 @@ async fn call_agent_llm_with_tools(
     // sont émis comme Delta events.
     let app_for_chunks = app.clone();
     let aid = agent_id.to_string();
+    // Accumulate reasoning chunks (hot-path-safe: one push_str per chunk) so the
+    // final turn's thinking can ride on the durable Complete event. Arc<Mutex>
+    // (not &mut) because the closure lives across the streaming .await and must
+    // be Send. The live Delta emit below is unchanged.
+    let reasoning_acc = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let reasoning_for_chunks = reasoning_acc.clone();
     let mut on_chunk = move |kind: &str, chunk: &str| {
         match kind {
             "tool_call_delta" | "tool_use_block" => {
@@ -733,6 +740,9 @@ async fn call_agent_llm_with_tools(
             }
             _ => {
                 let delta_kind = if kind == "reasoning" {
+                    if let Ok(mut g) = reasoning_for_chunks.lock() {
+                        g.push_str(chunk);
+                    }
                     "reasoning".to_string()
                 } else {
                     "content".to_string()
@@ -749,7 +759,7 @@ async fn call_agent_llm_with_tools(
         }
     };
 
-    match protocol {
+    let turn = match protocol {
         "anthropic" => {
             let messages = build_anthropic_messages(history);
             chat::call_anthropic(
@@ -814,7 +824,9 @@ async fn call_agent_llm_with_tools(
             chat::call_ollama(client, base_url, model, &messages, None, &mut on_chunk).await
         }
         other => Err(format!("unsupported protocol for agent: {other}")),
-    }
+    }?;
+    let reasoning = reasoning_acc.lock().map(|g| g.clone()).unwrap_or_default();
+    Ok((turn, reasoning))
 }
 
 /// One-shot LLM call for the harness Refiner (Continual Harness P2). No tools,
@@ -1006,7 +1018,7 @@ fn build_openai_text_projection(history: &[AgentMessage]) -> Vec<ChatMessage> {
 /// complete static project to `.shugu-forge/preview/` so the live preview
 /// (`preview://` protocol) can render it. Kept as a const so the large role
 /// strings in `seed_prompt` stay untouched.
-const GENERATION_MODE_PROMPT: &str = "=== GENERATION MODE (a design system is active) ===\nWhen the task asks you to build, generate, create, or design a page, site, landing page, dashboard, component, or any UI, you MUST produce a COMPLETE, SELF-CONTAINED static web project WRITTEN TO DISK using `fs_write_file` — NOT a chat answer and NOT a single fenced code block.\n\nRules:\n1. Write the entry point at `.shugu-forge/preview/index.html`.\n2. Put CSS in `.shugu-forge/preview/styles.css` and JS in `.shugu-forge/preview/script.js`, linked from index.html with RELATIVE paths (href=\"styles.css\", src=\"script.js\").\n3. Apply the design context below (a design system and/or a colour direction): declare its color / typography / spacing tokens as CSS custom properties in `:root { ... }`, and follow the visual direction, component patterns, and anti-patterns.\n4. Produce real, polished, responsive markup with enough sections to demonstrate the design (e.g. hero, content sections, footer). No placeholder-only output.\n5. Always (over)write the files under `.shugu-forge/preview/` so the live preview reflects the latest version; read existing files first when iterating.\n6. After writing, reply with ONE short line: what you built, which design skill(s) you applied, + the entry path `.shugu-forge/preview/index.html`.";
+const GENERATION_MODE_PROMPT: &str = "=== GENERATION MODE (a design system is active) ===\nWhen the task asks you to build, generate, create, or design a page, site, landing page, dashboard, component, or any UI, you MUST produce a COMPLETE, SELF-CONTAINED static web project WRITTEN TO DISK using `fs_write_file` — NOT a chat answer and NOT a single fenced code block.\n\nBefore writing files, call `todo_write` with a short checklist (3-6 steps) of your plan, then update the statuses as you complete each step.\n\nRules:\n1. Write the entry point at `.shugu-forge/preview/index.html`.\n2. Put CSS in `.shugu-forge/preview/styles.css` and JS in `.shugu-forge/preview/script.js`, linked from index.html with RELATIVE paths (href=\"styles.css\", src=\"script.js\").\n3. Apply the design context below (a design system and/or a colour direction): declare its color / typography / spacing tokens as CSS custom properties in `:root { ... }`, and follow the visual direction, component patterns, and anti-patterns.\n4. Produce real, polished, responsive markup with enough sections to demonstrate the design (e.g. hero, content sections, footer). No placeholder-only output.\n5. Always (over)write the files under `.shugu-forge/preview/` so the live preview reflects the latest version; read existing files first when iterating.\n6. After writing, reply with ONE short line: what you built, which design skill(s) you applied, + the entry path `.shugu-forge/preview/index.html`.";
 
 /// Seed harness prompt (generation 0) for a role. Continual Harness serves the
 /// ACTIVE generation from the DB via `load_active_harness`; this hard-coded text

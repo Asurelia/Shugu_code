@@ -229,6 +229,26 @@ CREATE TABLE IF NOT EXISTS agent_outcomes (
 CREATE INDEX IF NOT EXISTS idx_outcomes_role_gen ON agent_outcomes(role, generation);
 ";
 
+// V8 — Studio projects (Projets tab). One row per saved/auto design snapshot;
+// the files live under `<workspace>/.shugu-forge/projects/<id>/`. `conversation_id`
+// links to the chat that produced it — the turn log is rebuilt from
+// agents/agent_events (no turns table, DRY). `workspace_root` scopes rows to the
+// workspace they belong to. `deleted_at` = soft-delete (never a hard removal).
+const MIGRATION_V8: &str = "
+CREATE TABLE IF NOT EXISTS studio_projects (
+    id              TEXT    PRIMARY KEY,
+    name            TEXT    NOT NULL,
+    conversation_id TEXT,
+    workspace_root  TEXT    NOT NULL,
+    dir             TEXT    NOT NULL,
+    kind            TEXT    NOT NULL DEFAULT 'auto',
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    deleted_at      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_studio_projects_ws ON studio_projects(workspace_root, updated_at);
+";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = vec![
@@ -272,6 +292,12 @@ pub fn run() {
             version: 7,
             description: "harness_generations_outcomes",
             sql: MIGRATION_V7,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 8,
+            description: "studio_projects",
+            sql: MIGRATION_V8,
             kind: MigrationKind::Up,
         },
     ];
@@ -492,6 +518,13 @@ pub fn run() {
             commands::agents::harness::harness_get_refiner,
             commands::agents::harness::harness_set_refiner,
             commands::agents::harness::outcome_set_feedback,
+            // Design Studio — project snapshots (Projets tab).
+            commands::studio::studio_project_upsert_auto,
+            commands::studio::studio_project_save_as,
+            commands::studio::studio_project_list,
+            commands::studio::studio_project_load,
+            commands::studio::studio_project_rename,
+            commands::studio::studio_project_delete,
             commands::diag::js_diag,
             // LOT 2b — format document via CLI formatter (rustfmt/black/prettier/gofmt).
             commands::format::format_code,

@@ -113,6 +113,7 @@ export type AgentEvent =
       agentId: string;
       output: string;
       tokensUsed?: number;
+      reasoning?: string;
       ms: number;
     }
   | { kind: "error"; agentId: string; error: string }

@@ -76,17 +76,23 @@ fn not_found() -> Response<Cow<'static, [u8]>> {
 }
 
 /// A tiny controller injected into every served HTML page so the Studio can
-/// drive element selection across the cross-origin iframe boundary. It is inert
-/// until the parent app turns on select-mode via `postMessage`; on a click it
-/// reports the chosen element's descriptor back to the parent. It never alters
-/// the generated markup/styles — only a temporary outline while hovering in
-/// select-mode.
+/// reach into the cross-origin iframe. Two jobs, both inert until the parent
+/// asks via `postMessage`:
+///   1. Element selection — on `shugu:setSelectMode`, a click reports the
+///      chosen element's descriptor back; only a temporary hover outline is
+///      drawn, never a markup/style change.
+///   2. Live Tweaks — on `shugu:getTokens` it reports the `:root` custom
+///      properties (`--*`) it discovers; on `shugu:setToken` it applies one via
+///      `style.setProperty` on the root for instant preview. These inline
+///      overrides are runtime-only (gone on reload) until the user bakes them.
 ///
-/// Security note: the controller posts the selected element back to the parent
-/// with `targetOrigin: "*"` because an injected script cannot know the host
-/// app's origin. This is acceptable here — the payload is a non-sensitive
-/// element descriptor from the user's own generated page — and the parent side
-/// verifies `event.origin` before acting on it.
+/// Security note: the controller posts back to the parent with
+/// `targetOrigin: "*"` because an injected script cannot know the host app's
+/// origin. This is acceptable here — payloads are non-sensitive (an element
+/// descriptor or `--*` design tokens, both from the user's own generated page)
+/// and the parent verifies `event.origin` before acting. Inbound `setToken`
+/// only writes `--*` custom properties on `:root`, so it cannot escalate beyond
+/// restyling the preview.
 const CONTROLLER_SCRIPT: &str = r##"<script>
 (function(){
   if(window.__shuguStudio)return;window.__shuguStudio=true;
@@ -101,9 +107,29 @@ const CONTROLLER_SCRIPT: &str = r##"<script>
     var oh=el.outerHTML||"";var gt=oh.indexOf(">");var open=gt>=0?oh.slice(0,gt+1):oh.slice(0,120);
     return{tag:tag,selector:(tag+id+cls).slice(0,160),text:text,open:open.slice(0,200)};
   }
+  function tok(){
+    var names={};
+    for(var i=0;i<document.styleSheets.length;i++){
+      var sheet=document.styleSheets[i],rules;
+      try{rules=sheet.cssRules||sheet.rules;}catch(e){continue;}
+      if(!rules)continue;
+      for(var j=0;j<rules.length;j++){
+        var r=rules[j];if(!r||!r.style||!r.selectorText)continue;
+        var st=(r.selectorText||"").toLowerCase();
+        if(st.indexOf(":root")<0&&st.indexOf("html")<0)continue;
+        for(var k=0;k<r.style.length;k++){var p=r.style[k];if(p&&p.indexOf("--")===0)names[p]=true;}
+      }
+    }
+    var cs=getComputedStyle(document.documentElement),out=[];
+    for(var name in names){if(!names.hasOwnProperty(name))continue;out.push({name:name,value:(cs.getPropertyValue(name)||"").trim()});}
+    out.sort(function(a,b){return a.name<b.name?-1:(a.name>b.name?1:0);});
+    return out;
+  }
   window.addEventListener("message",function(e){
     var d=e.data||{};
     if(d.type==="shugu:setSelectMode"){sel=!!d.on;try{document.body.style.cursor=sel?"crosshair":"";}catch(e2){}if(!sel)setHov(null);}
+    else if(d.type==="shugu:getTokens"){try{parent.postMessage({type:"shugu:tokens",tokens:tok()},"*");}catch(e4){}}
+    else if(d.type==="shugu:setToken"&&d.name&&d.name.indexOf("--")===0){try{document.documentElement.style.setProperty(d.name,d.value);}catch(e5){}}
   });
   document.addEventListener("mouseover",function(e){if(sel)setHov(e.target);},true);
   document.addEventListener("click",function(e){

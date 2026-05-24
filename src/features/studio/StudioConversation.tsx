@@ -14,6 +14,7 @@ export function StudioConversation({
   busy,
   onSend,
   onNew,
+  onSaveAs,
   onOpenFile,
   selectedElement,
   onClearSelected,
@@ -22,6 +23,7 @@ export function StudioConversation({
   busy: boolean;
   onSend: (instruction: string) => void;
   onNew: () => void;
+  onSaveAs?: () => void;
   onOpenFile?: (rel: string) => void;
   selectedElement?: SelectedElement | null;
   onClearSelected?: () => void;
@@ -46,12 +48,29 @@ export function StudioConversation({
       <div className="studio-conv-head">
         <span className="studio-disco-label">Conversation</span>
         <span style={{ flex: 1 }} />
+        {onSaveAs && (
+          <button
+            className="lgb lgb-sm"
+            onClick={onSaveAs}
+            disabled={busy || turns.length === 0}
+            title="Sauvegarder une copie figée dans Projets"
+          >
+            <Icon name="copy" size={12} /> Sauvegarder
+          </button>
+        )}
         <button className="lgb lgb-sm" onClick={onNew} disabled={busy} title="Repartir d'un nouveau brief">
           <Icon name="plus" size={12} /> Nouveau
         </button>
       </div>
 
       <div className="studio-conv-thread scroll">
+        {turns.length === 0 && (
+          <div className="studio-conv-empty">
+            <Icon name="sparkle" size={18} />
+            <div className="studio-conv-empty-title">Projet existant chargé</div>
+            <p>Demande un ajustement ci-dessous — ou « Nouveau » pour repartir d'un brief vierge.</p>
+          </div>
+        )}
         {turns.map((t) => (
           <StudioTurnView key={t.id} turn={t} onOpenFile={onOpenFile} />
         ))}

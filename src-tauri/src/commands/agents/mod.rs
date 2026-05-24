@@ -231,6 +231,11 @@ pub enum AgentEvent {
         output: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         tokens_used: Option<u32>,
+        /// The model's accumulated reasoning/thinking for the final turn, if any.
+        /// Deltas are live-only (not persisted); this is the durable copy that
+        /// rides on the terminal event so the UI can show it after a reload too.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
         ms: u64,
     },
     Error {
