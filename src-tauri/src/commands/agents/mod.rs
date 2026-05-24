@@ -68,6 +68,9 @@ mod runner;
 // (the `pub(super)` items) from here.
 mod tools;
 
+/// Continual Harness — harness evolution / Refiner (lot 1 P2).
+mod harness;
+
 // Re-export the crate-visible items from `tools` so `chat.rs` can reach
 // them via `crate::commands::agents::*` without poking into the private
 // submodule path. The streaming helpers in `chat.rs` consume:
@@ -234,6 +237,23 @@ pub enum AgentEvent {
         agent_id: String,
         error: String,
     },
+    /// Continual Harness (P2) — the harness Refiner is running or has applied a
+    /// new generation for this agent's role. Two-stage so the UI never looks
+    /// hung during the 5-30s Refiner call: `status = "evolving"` when the call
+    /// starts, `status = "applied"` (with generations + summary) on success.
+    HarnessEvolved {
+        agent_id: String,
+        role: String,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        from_generation: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        to_generation: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
 }
 
 impl AgentEvent {
@@ -248,6 +268,7 @@ impl AgentEvent {
             AgentEvent::Delta { .. } => "delta",
             AgentEvent::Complete { .. } => "complete",
             AgentEvent::Error { .. } => "error",
+            AgentEvent::HarnessEvolved { .. } => "harnessEvolved",
         }
     }
 
@@ -261,7 +282,8 @@ impl AgentEvent {
             | AgentEvent::ToolResult { agent_id, .. }
             | AgentEvent::Delta { agent_id, .. }
             | AgentEvent::Complete { agent_id, .. }
-            | AgentEvent::Error { agent_id, .. } => agent_id,
+            | AgentEvent::Error { agent_id, .. }
+            | AgentEvent::HarnessEvolved { agent_id, .. } => agent_id,
         }
     }
 }
@@ -286,6 +308,11 @@ pub struct SpawnArgs {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Phase A (Design Studio) — when set, appended to the agent's system
+    /// prompt to drive design-system-styled project generation to disk.
+    /// Only the Studio "Generate" passes it; chat delegation leaves it None
+    /// (zero impact on the existing delegate path).
+    pub design_context: Option<String>,
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -555,6 +582,7 @@ pub async fn agent_spawn(
     let base_url_for_task = args.base_url.clone();
     let api_key_for_task = args.api_key.clone();
     let chat_template_kwargs_for_task = args.chat_template_kwargs.clone();
+    let design_context_for_task = args.design_context.clone();
     tauri::async_runtime::spawn(async move {
         runner::run_agent_task(
             app_for_task,
@@ -567,6 +595,7 @@ pub async fn agent_spawn(
             base_url_for_task,
             api_key_for_task,
             chat_template_kwargs_for_task,
+            design_context_for_task,
             abort_token,
         )
         .await;

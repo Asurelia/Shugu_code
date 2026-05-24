@@ -181,6 +181,54 @@ CREATE INDEX IF NOT EXISTS idx_agent_events_agent_ts ON agent_events(agent_id, t
 CREATE INDEX IF NOT EXISTS idx_agent_events_ts      ON agent_events(ts);
 ";
 
+// V7 — auto-evolving harness (Continual Harness, lot 1 P0).
+//
+// `harness_generations` stores one IMMUTABLE snapshot per (role, generation)
+// of the agent harness: the system prompt `p`, plus memory `M`, subagents `G`
+// and skills `K` as JSON. In lot 1 only `system_prompt` (P2) and `memory`
+// (P3) are written; `subagents`/`skills` stay '[]' (wired for lot 2). Exactly
+// one row per role has `active = 1` — the snapshot `load_active_harness`
+// serves. Generation 0 is SEEDED from the hard-coded role prompts on first
+// use, so behaviour is byte-identical to today until a Refiner writes a new
+// generation. Rollback = flip `active` to an earlier generation; nothing is
+// mutated in place, so the audit trail is the table itself.
+//
+// `agent_outcomes` is one row per agent run: success / stuck_reason + the
+// iteration & tool-error counters, tied to the `generation` that produced
+// the run. Per-generation metrics are therefore a GROUP BY (no
+// denormalization), and a later anti-regression audit can compare a new
+// generation's outcomes against its parent's.
+const MIGRATION_V7: &str = "
+CREATE TABLE IF NOT EXISTS harness_generations (
+    id                TEXT    PRIMARY KEY,
+    role              TEXT    NOT NULL,
+    generation        INTEGER NOT NULL,
+    parent_generation INTEGER,
+    trigger_reason    TEXT,
+    created_by        TEXT,
+    system_prompt     TEXT    NOT NULL,
+    memory            TEXT    NOT NULL DEFAULT '[]',
+    subagents         TEXT    NOT NULL DEFAULT '[]',
+    skills            TEXT    NOT NULL DEFAULT '[]',
+    active            INTEGER NOT NULL DEFAULT 0,
+    created_at        INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_harness_role_gen ON harness_generations(role, generation);
+CREATE INDEX        IF NOT EXISTS idx_harness_active   ON harness_generations(role, active);
+CREATE TABLE IF NOT EXISTS agent_outcomes (
+    agent_id      TEXT    PRIMARY KEY,
+    role          TEXT    NOT NULL,
+    generation    INTEGER,
+    success       INTEGER,
+    stuck_reason  TEXT,
+    iterations    INTEGER NOT NULL DEFAULT 0,
+    tool_errors   INTEGER NOT NULL DEFAULT 0,
+    user_feedback TEXT,
+    ts            INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_outcomes_role_gen ON agent_outcomes(role, generation);
+";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = vec![
@@ -220,6 +268,12 @@ pub fn run() {
             sql: MIGRATION_V6,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 7,
+            description: "harness_generations_outcomes",
+            sql: MIGRATION_V7,
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
@@ -231,6 +285,13 @@ pub fn run() {
                 .add_migrations("sqlite:shugu.db", migrations)
                 .build(),
         )
+        // `preview://` — Design Studio live preview (Phase B). Serves
+        // <workspace>/.shugu-forge/preview/ so the iframe renders a real
+        // multi-file project (relative imports resolve under one origin).
+        // No HTTP server, no new dependency. See commands/preview.rs.
+        .register_uri_scheme_protocol("preview", |ctx, request| {
+            commands::preview::serve(ctx.app_handle(), request.uri().path())
+        })
         // Workspace root — set by fs_open_folder, read by all other fs commands.
         .manage(Mutex::new(None::<std::path::PathBuf>))
         .manage(commands::terminal::PtyRegistry::default())
