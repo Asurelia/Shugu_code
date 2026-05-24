@@ -305,6 +305,7 @@ pub(super) async fn run_agent_task(
             &role,
             &mut history,
             &mut loop_metrics,
+            None,
         ) => r,
         _ = abort.notified() => {
             mark_killed(&app, &agent_id);
@@ -379,7 +380,7 @@ struct LoopMetrics {
 /// produces a turn without tool_calls. Returns Err when the iteration
 /// budget is exhausted or any underlying call fails.
 #[allow(clippy::too_many_arguments)]
-async fn tool_use_loop(
+pub(super) async fn tool_use_loop(
     app: &AppHandle,
     client: &reqwest::Client,
     protocol: &str,
@@ -391,6 +392,10 @@ async fn tool_use_loop(
     role: &str,
     history: &mut Vec<AgentMessage>,
     metrics: &mut LoopMetrics,
+    // When `Some`, tool calls resolve against THIS root instead of the global
+    // open workspace — the measurement bench points it at a copied fixture so a
+    // run never touches the user's real project. `None` = current behaviour.
+    workspace_override: Option<PathBuf>,
 ) -> Result<(String, String), String> {
     // Stall-detection state (P1): repeated identical tool-call signatures and
     // consecutive tool-error rounds are the two cheap "stuck" signals; the
@@ -505,7 +510,10 @@ async fn tool_use_loop(
         }
 
         // ── 5. Resolve workspace + execute tools in parallel ───────────
-        let workspace_root = get_workspace_root(app);
+        let workspace_root = workspace_override
+            .as_ref()
+            .cloned()
+            .or_else(|| get_workspace_root(app));
         let results: Vec<ToolResult> = if let Some(root) = workspace_root {
             let root_arc = Arc::new(root);
             let futures = turn.tool_calls.iter().map(|tc| {
@@ -1051,12 +1059,12 @@ fn seed_prompt(role: &str) -> String {
 }
 
 /// One active harness generation, as served to a running agent.
-struct ActiveHarness {
+pub(super) struct ActiveHarness {
     /// Generation number — recorded against the run's outcome (P1) so
     /// per-generation metrics can be computed.
-    generation: i64,
+    pub(super) generation: i64,
     /// Assembled system prompt `p` for this generation.
-    system_prompt: String,
+    pub(super) system_prompt: String,
 }
 
 /// Format the long-term memory JSON (array of `{title, content}`) as a compact
@@ -1156,6 +1164,42 @@ fn load_active_harness(app: &AppHandle, role: &str) -> ActiveHarness {
         generation: 0,
         system_prompt: seed_prompt(role),
     }
+}
+
+/// Load a SPECIFIC harness generation for `role` (not necessarily the active
+/// one) — used by the measurement bench to replay a fixed task against gen 0,
+/// gen N, … for A/B comparison. Returns `None` when that (role, generation) row
+/// does not exist; the bench caller decides how to handle a missing generation
+/// (skip + report). Memory is assembled into the prompt exactly like
+/// `load_active_harness`, so a pinned run is byte-identical to how that
+/// generation actually ran.
+#[allow(dead_code)] // consumed by the bench runner (agents::bench), landing next.
+pub(super) fn load_harness_generation(
+    app: &AppHandle,
+    role: &str,
+    generation: i64,
+) -> Option<ActiveHarness> {
+    let conn_mutex = get_conn(app).ok()?;
+    let conn = conn_mutex.lock().ok()?;
+    conn.query_row(
+        "SELECT generation, system_prompt, memory
+           FROM harness_generations
+          WHERE role = ?1 AND generation = ?2
+          LIMIT 1",
+        params![role, generation],
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        },
+    )
+    .ok()
+    .map(|(generation, system_prompt, memory)| ActiveHarness {
+        generation,
+        system_prompt: assemble_prompt(&system_prompt, &memory),
+    })
 }
 
 /// Persist the per-run outcome row consumed by per-generation metrics (P1).

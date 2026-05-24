@@ -249,6 +249,52 @@ CREATE TABLE IF NOT EXISTS studio_projects (
 CREATE INDEX IF NOT EXISTS idx_studio_projects_ws ON studio_projects(workspace_root, updated_at);
 ";
 
+// V9 — measurement bench (banc de mesure) for the self-evolving harness.
+//
+// `bench_tasks` is the registry of FIXED tasks — the "milestones" of Forge — one
+// row per task. The task's fixture workspace (a small reproducible project the
+// agent acts on) lives under `<workspace>/.shugu-forge/bench/<id>/`. `verifier_kind`
+// selects how success is judged WITHOUT executing agent-generated code in v1
+// (files | text | ast | cargo_check | claude_judge); `verifier_spec` is its JSON
+// config.
+//
+// `bench_runs` is one row per (task × generation) execution. `suite_run_id` groups
+// a whole suite pass so a later generation can be A/B-compared against gen 0 on the
+// SAME task set (apples-to-apples — the gap `agent_outcomes` could not fill, since
+// it has no task identity). `passed` is the boolean verdict; `score` is reserved
+// for graded verifiers (Claude-judge, /N) and stays NULL for boolean checks.
+// `agent_id` links back to the underlying agent run in `agents`/`agent_outcomes`.
+const MIGRATION_V9: &str = "
+CREATE TABLE IF NOT EXISTS bench_tasks (
+    id            TEXT    PRIMARY KEY,
+    role          TEXT    NOT NULL,
+    domain        TEXT    NOT NULL DEFAULT 'code',
+    title         TEXT    NOT NULL DEFAULT '',
+    prompt        TEXT    NOT NULL,
+    fixture_dir   TEXT,
+    verifier_kind TEXT    NOT NULL DEFAULT 'files',
+    verifier_spec TEXT    NOT NULL DEFAULT '{}',
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    created_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bench_tasks_role ON bench_tasks(role, enabled);
+CREATE TABLE IF NOT EXISTS bench_runs (
+    run_id        TEXT    PRIMARY KEY,
+    suite_run_id  TEXT    NOT NULL,
+    task_id       TEXT    NOT NULL,
+    role          TEXT    NOT NULL,
+    generation    INTEGER NOT NULL,
+    agent_id      TEXT,
+    passed        INTEGER NOT NULL DEFAULT 0,
+    score         REAL,
+    detail        TEXT,
+    ms            INTEGER NOT NULL DEFAULT 0,
+    ts            INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bench_runs_task_gen ON bench_runs(task_id, generation);
+CREATE INDEX IF NOT EXISTS idx_bench_runs_suite    ON bench_runs(suite_run_id);
+";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = vec![
@@ -298,6 +344,12 @@ pub fn run() {
             version: 8,
             description: "studio_projects",
             sql: MIGRATION_V8,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 9,
+            description: "bench_tasks_runs",
+            sql: MIGRATION_V9,
             kind: MigrationKind::Up,
         },
     ];
