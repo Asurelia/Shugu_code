@@ -105,6 +105,34 @@ const EXAMPLE_TASKS: Array<{
       contains: [{ path: "config.json", substring: "version" }],
     }),
   },
+  {
+    // Tâche-stress : beaucoup de contraintes interdépendantes + un test à écrire,
+    // jugée durement par le Claude-juge (note /10 selon les contraintes tenues).
+    // Pousse le PLAFOND du modèle ; ne s'exécute pas (le juge LIT le code/les
+    // tests, il ne les RUN pas — l'exécution réelle = lot sandbox).
+    id: "stress-lru",
+    domain: "code",
+    title: "Stress : cache LRU O(1) + tests",
+    prompt:
+      "Implémente un cache LRU en TypeScript dans `lru.ts`, exportant `class LRUCache<K, V>` avec " +
+      "`constructor(capacity: number)`, `get(key): V | undefined`, `set(key, value): void`. " +
+      "CONTRAINTES STRICTES : (1) get ET set en O(1) amorti — Map + liste doublement chaînée, " +
+      "JAMAIS un scan de tableau ; (2) éviction du moins récemment utilisé quand capacity est " +
+      "dépassée ; (3) get() rafraîchit la récence ; (4) set() sur une clé existante met à jour " +
+      "sans dupliquer ; (5) capacity 0 ne stocke rien. Écris AUSSI `lru.test.ts` avec ≥6 cas " +
+      "couvrant : éviction, mise à jour de clé, get-rafraîchit, capacity 0, miss, ordre d'éviction. " +
+      "Aucune dépendance externe. Explore avec fs_list_dir/fs_search au besoin, écris avec fs_write_file.",
+    verifierKind: "claude",
+    verifierSpec: JSON.stringify({
+      rubric:
+        "PASS UNIQUEMENT si lru.ts réalise get/set en O(1) via Map + liste doublement chaînée " +
+        "(refuse tout scan O(n) ou recherche linéaire), gère l'éviction LRU, le rafraîchissement " +
+        "sur get, la mise à jour sans doublon, et capacity 0 ; ET si lru.test.ts contient ≥6 cas " +
+        "distincts couvrant réellement ces aspects. Note /10 = nombre de contraintes réellement " +
+        "satisfaites (sois STRICT : un scan de tableau = échec de la contrainte O(1)).",
+      files: ["lru.ts", "lru.test.ts"],
+    }),
+  },
 ];
 
 // ── Tokens (fallbacks mirror the dark Celestial Veil theme) ──────────
