@@ -473,3 +473,21 @@ export async function benchCompareGenerations(
     generationB,
   });
 }
+
+/** One reusable skill the agent has learned (Voyager/Hermes), mirror of SkillRow. */
+export interface SkillRow {
+  name: string;
+  whenToUse: string;
+  body: string;
+  createdAt: number;
+}
+
+/** List the skills a role has learned + saved (loaded into its context each run). */
+export async function skillsList(role: string): Promise<SkillRow[]> {
+  return invoke<SkillRow[]>("skills_list", { role });
+}
+
+/** Wipe a role's learned skills (demo reset / cleanup). */
+export async function skillsClear(role: string): Promise<void> {
+  return invoke<void>("skills_clear", { role });
+}

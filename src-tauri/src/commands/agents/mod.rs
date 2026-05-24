@@ -82,6 +82,11 @@ pub(crate) mod bench;
 /// user's real project.
 pub(crate) mod sandbox;
 
+/// Skill library (Voyager / Hermes) — the agent saves reusable skills it learns
+/// (`skill_save` tool) and loads them into context on future runs. Persistent,
+/// per-role, compounding learning.
+pub(crate) mod skills;
+
 // Re-export the crate-visible items from `tools` so `chat.rs` can reach
 // them via `crate::commands::agents::*` without poking into the private
 // submodule path. The streaming helpers in `chat.rs` consume:

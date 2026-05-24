@@ -11,9 +11,11 @@ import {
   listHarnessGenerations,
   harnessMetrics,
   benchList,
+  skillsList,
   type HarnessGeneration,
   type HarnessMetric,
   type BenchTaskRow,
+  type SkillRow,
 } from "@/lib/agents";
 
 export const harnessKeys = {
@@ -21,6 +23,7 @@ export const harnessKeys = {
   generations: (role: string) => ["harness", "generations", role] as const,
   metrics: (role: string) => ["harness", "metrics", role] as const,
   benchTasks: (role: string) => ["harness", "bench", role] as const,
+  skills: (role: string) => ["harness", "skills", role] as const,
 };
 
 /** Every generation of a role's harness, newest first (evolution log). */
@@ -59,4 +62,18 @@ export function useBenchList(role: string) {
 /** Refetch the bench task list for a role (after seeding / adding tasks). */
 export function invalidateBench(role: string): void {
   void queryClient.invalidateQueries({ queryKey: harnessKeys.benchTasks(role) });
+}
+
+/** Skills a role has learned + saved (Voyager/Hermes), newest first. */
+export function useSkillsList(role: string) {
+  return useQuery<SkillRow[]>({
+    queryKey: harnessKeys.skills(role),
+    queryFn: () => skillsList(role),
+    staleTime: 5_000,
+  });
+}
+
+/** Refetch a role's skill library (after a run that may have saved skills). */
+export function invalidateSkills(role: string): void {
+  void queryClient.invalidateQueries({ queryKey: harnessKeys.skills(role) });
 }

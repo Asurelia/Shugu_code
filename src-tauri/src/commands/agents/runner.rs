@@ -416,6 +416,23 @@ pub(super) async fn tool_use_loop(
     // mechanism would silently break after a budget bump.
     let mut budget = MAX_ITERATIONS;
     let mut iteration: u32 = 0;
+
+    // Load this role's learned skills (Voyager/Hermes) into context, right after
+    // the system prompt — so the agent applies what it has already figured out
+    // instead of re-deriving it. No-op when the role has no skills yet. This is
+    // the reuse half of skill-learning; `skill_save` is the capture half.
+    let skills_block = super::skills::skills_prompt_block(app, role);
+    if !skills_block.is_empty() {
+        let pos = history.len().min(1);
+        history.insert(
+            pos,
+            AgentMessage::Text {
+                role: "system".to_string(),
+                content: skills_block,
+            },
+        );
+    }
+
     while iteration < budget {
         metrics.iterations = iteration + 1;
         // ── 0. Inject "approaching budget" nudge messages — aide les
@@ -532,13 +549,17 @@ pub(super) async fn tool_use_loop(
                 let fallback_id = tc_clone.id.clone();
                 let fallback_name = tc_clone.name.clone();
                 let root_clone = root_arc.clone();
+                let app_clone = app.clone();
+                let role_clone = role.to_string();
                 async move {
                     // `spawn_blocking` because the fs ops are synchronous —
                     // running them on the async runtime thread would starve
                     // other tokio tasks. `unwrap_or_else` defends against
                     // a JoinError (panic in the closure); `execute_tool`
                     // itself never panics for normal fs failures.
-                    tokio::task::spawn_blocking(move || execute_tool(&tc_clone, &root_clone, allow_exec))
+                    tokio::task::spawn_blocking(move || {
+                        execute_tool(&tc_clone, &root_clone, allow_exec, &app_clone, &role_clone)
+                    })
                         .await
                         .unwrap_or_else(|join_err| ToolResult {
                             id: fallback_id,

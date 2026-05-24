@@ -28,6 +28,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use tauri::AppHandle;
 
 // ────────────────────────────────────────────────────────────────────
 // Types
@@ -243,6 +244,33 @@ fn agent_tools() -> &'static [ToolDef] {
                     "required": ["command"]
                 }),
             },
+            ToolDef {
+                name: "skill_save",
+                description: "Save a REUSABLE skill you've just figured out so future runs apply it \
+                              instantly — a learned procedure, recipe, or hard-won project fact. Call \
+                              it after solving something non-trivial worth remembering. Your saved \
+                              skills are loaded into your context automatically on every future run \
+                              for this role (this is how you LEARN and get faster over time). Saving \
+                              the same name again refines that skill.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Short unique skill name, e.g. \"add_canvas_tool\"."
+                        },
+                        "when_to_use": {
+                            "type": "string",
+                            "description": "One line: the situation where this skill applies."
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": "The reusable procedure / recipe / knowledge — concise and directly actionable."
+                        }
+                    },
+                    "required": ["name", "body"]
+                }),
+            },
         ]
     })
 }
@@ -362,8 +390,14 @@ impl ToolCallAccumulator {
 /// `workspace_root` is pre-resolved by the caller (one lock acquisition
 /// per iteration, NOT per tool call — avoids contention with the fs
 /// watcher and other workspace consumers).
-pub(super) fn execute_tool(call: &ToolCall, workspace_root: &Path, allow_exec: bool) -> ToolResult {
-    match dispatch_inner(call, workspace_root, allow_exec) {
+pub(super) fn execute_tool(
+    call: &ToolCall,
+    workspace_root: &Path,
+    allow_exec: bool,
+    app: &AppHandle,
+    role: &str,
+) -> ToolResult {
+    match dispatch_inner(call, workspace_root, allow_exec, app, role) {
         Ok(content) => ToolResult {
             id: call.id.clone(),
             name: call.name.clone(),
@@ -379,7 +413,13 @@ pub(super) fn execute_tool(call: &ToolCall, workspace_root: &Path, allow_exec: b
     }
 }
 
-fn dispatch_inner(call: &ToolCall, root: &Path, allow_exec: bool) -> Result<String, String> {
+fn dispatch_inner(
+    call: &ToolCall,
+    root: &Path,
+    allow_exec: bool,
+    app: &AppHandle,
+    role: &str,
+) -> Result<String, String> {
     let args: serde_json::Value = serde_json::from_str(&call.arguments)
         .map_err(|e| format!("argument parse error: {e}"))?;
 
@@ -495,6 +535,22 @@ fn dispatch_inner(call: &ToolCall, root: &Path, allow_exec: bool) -> Result<Stri
             Ok(format!(
                 "[{status}]\n--- stdout ---\n{}\n--- stderr ---\n{}",
                 res.stdout, res.stderr
+            ))
+        }
+        "skill_save" => {
+            let name = args["name"]
+                .as_str()
+                .ok_or_else(|| "missing required field: name".to_string())?;
+            let body = args["body"]
+                .as_str()
+                .ok_or_else(|| "missing required field: body".to_string())?;
+            let when_to_use = args["when_to_use"].as_str().unwrap_or("");
+            if name.trim().is_empty() || body.trim().is_empty() {
+                return Err("skill_save needs a non-empty name and body".to_string());
+            }
+            super::skills::save_skill(app, role, name, when_to_use, body)?;
+            Ok(format!(
+                "skill '{name}' saved for role '{role}' — it will load automatically in future runs"
             ))
         }
         other => Err(format!("unknown tool: {other}")),

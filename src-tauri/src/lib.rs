@@ -295,6 +295,22 @@ CREATE INDEX IF NOT EXISTS idx_bench_runs_task_gen ON bench_runs(task_id, genera
 CREATE INDEX IF NOT EXISTS idx_bench_runs_suite    ON bench_runs(suite_run_id);
 ";
 
+// Skill library (Voyager / Hermes style): the agent SAVES reusable skills it
+// learns, scoped per role; future runs LOAD them into context → measurable,
+// persistent learning without needing to trick the model into stalling.
+// `id = '<role>:<name>'` so re-saving a skill REFINES it (INSERT OR REPLACE).
+const MIGRATION_V10: &str = "
+CREATE TABLE IF NOT EXISTS agent_skills (
+    id          TEXT    PRIMARY KEY,
+    role        TEXT    NOT NULL,
+    name        TEXT    NOT NULL,
+    when_to_use TEXT    NOT NULL DEFAULT '',
+    body        TEXT    NOT NULL,
+    created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_skills_role ON agent_skills(role);
+";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = vec![
@@ -350,6 +366,12 @@ pub fn run() {
             version: 9,
             description: "bench_tasks_runs",
             sql: MIGRATION_V9,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 10,
+            description: "agent_skills_library",
+            sql: MIGRATION_V10,
             kind: MigrationKind::Up,
         },
     ];
@@ -574,6 +596,9 @@ pub fn run() {
             commands::agents::bench::bench_compare_generations,
             commands::agents::bench::bench_list,
             commands::agents::bench::bench_add_task,
+            // Skill library (Voyager / Hermes) — learned reusable skills.
+            commands::agents::skills::skills_list,
+            commands::agents::skills::skills_clear,
             // Design Studio — project snapshots (Projets tab).
             commands::studio::studio_project_upsert_auto,
             commands::studio::studio_project_save_as,

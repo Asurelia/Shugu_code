@@ -21,6 +21,7 @@ import {
   benchRunSuite,
   benchCompareGenerations,
   benchAddTask,
+  skillsClear,
   type AgentRole,
   type AgentEvent,
   type HarnessGeneration,
@@ -31,8 +32,10 @@ import {
   useHarnessGenerations,
   useHarnessMetrics,
   useBenchList,
+  useSkillsList,
   invalidateHarness,
   invalidateBench,
+  invalidateSkills,
 } from "./harnessQueries";
 import { useDiscoveredModels } from "@/lib/modelDiscovery";
 import { PROVIDER_REGISTRY } from "@/lib/providers";
@@ -139,9 +142,10 @@ const EXAMPLE_TASKS: Array<{
 const CRIPPLED_PROMPT = [
   "Tu es un agent de codage. Accomplis la tâche demandée, étape par étape.",
   "",
-  "RÈGLE CRITIQUE (impérative) : l'outil `fs_write_file` est DÉSACTIVÉ et toujours rejeté.",
-  "Pour créer ou écrire un fichier, le SEUL outil autorisé est `fs_patch`. N'utilise JAMAIS fs_write_file.",
-  "Si `fs_patch` renvoie une erreur, c'est que tes arguments sont mal formés : réessaie `fs_patch` avec des arguments corrigés, ne change pas d'outil.",
+  "RÈGLE ABSOLUE de cet environnement : le SEUL outil capable d'écrire un fichier est `fs_patch`.",
+  "L'outil `fs_write_file` est un PIÈGE : ici il n'écrit RIEN et corrompt le workspace. Ne l'appelle JAMAIS, sous aucun prétexte.",
+  "Procédure d'écriture OBLIGATOIRE : appelle `fs_patch`. Si `fs_patch` renvoie une erreur, c'est un aléa temporaire du système —",
+  "rappelle `fs_patch` IMMÉDIATEMENT avec EXACTEMENT les mêmes arguments (ne change RIEN : ni l'outil, ni les arguments), et recommence jusqu'à ce que ça passe.",
 ].join("\n");
 
 // ── Tokens (fallbacks mirror the dark Celestial Veil theme) ──────────
@@ -277,6 +281,7 @@ export function HarnessPanel() {
   const gensQ = useHarnessGenerations(role);
   const metricsQ = useHarnessMetrics(role);
   const benchListQ = useBenchList(role);
+  const skillsListQ = useSkillsList(role);
 
   const generations = gensQ.data ?? [];
   const active = useMemo(() => generations.find((g) => g.active === 1), [generations]);
@@ -786,6 +791,7 @@ export function HarnessPanel() {
                     baseUrl,
                   });
                   setBenchResult(res);
+                  invalidateSkills(role); // a run may have saved new skills
                   setNotice(`Suite lancée sur gén ${gen} : ${res.passed}/${res.total} réussies.`);
                 })
               }
@@ -943,6 +949,81 @@ export function HarnessPanel() {
               </table>
             </div>
           ) : null}
+        </Section>
+
+        {/* Skills library (Voyager / Hermes) — learned, reusable, loaded each run */}
+        <Section
+          title="Compétences apprises"
+          hint="Ce que l'agent a appris et SAUVÉ (outil skill_save), par rôle. Rechargées dans son contexte à chaque run → il s'améliore dans le temps (façon Voyager / Hermes)."
+        >
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <Button
+              disabled={busy !== null}
+              onClick={() =>
+                run("skill-demo", async () => {
+                  await benchAddTask({
+                    id: `skill-teach-${role}`,
+                    role,
+                    domain: "code",
+                    title: "Démo skill : apprendre 'valider_email'",
+                    prompt:
+                      "(1) Crée `email.mjs` à la racine exportant `isValidEmail(s)` avec une regex robuste. " +
+                      "(2) ENSUITE, appelle l'outil skill_save pour MÉMORISER cette compétence : " +
+                      'name="valider_email", when_to_use="valider une adresse email", ' +
+                      "body = la regex exacte + comment l'appeler. Confirme quand le skill est sauvé.",
+                    fixtureDir: null,
+                    verifierKind: "files",
+                    verifierSpec: JSON.stringify({
+                      required: ["email.mjs"],
+                      contains: [{ path: "email.mjs", substring: "@" }],
+                    }),
+                  });
+                  invalidateBench(role);
+                  setNotice(
+                    `Tâche démo skill ajoutée pour '${role}'. Lance la suite : l'agent sauvera une compétence, elle apparaîtra ici — et sera rechargée à ses runs suivants.`,
+                  );
+                })
+              }
+            >
+              {busy === "skill-demo" ? "Ajout…" : "🎓 Ajouter tâche démo skill"}
+            </Button>
+            {(skillsListQ.data?.length ?? 0) > 0 ? (
+              <Button
+                variant="warn"
+                disabled={busy !== null}
+                onClick={() =>
+                  run("skill-clear", async () => {
+                    await skillsClear(role);
+                    invalidateSkills(role);
+                    setNotice(`Compétences de '${role}' effacées.`);
+                  })
+                }
+              >
+                {busy === "skill-clear" ? "…" : "Vider"}
+              </Button>
+            ) : null}
+          </div>
+
+          {skillsListQ.isLoading ? (
+            <p style={{ fontSize: 13, color: C.muted }}>Chargement…</p>
+          ) : (skillsListQ.data?.length ?? 0) === 0 ? (
+            <p style={{ fontSize: 13, color: C.muted }}>
+              Aucune compétence encore. Quand l'agent appelle{" "}
+              <strong style={{ color: C.text }}>skill_save</strong> pendant un run, elle apparaît ici
+              et sera rechargée dans son contexte à ses prochains runs (c'est ça, apprendre).
+            </p>
+          ) : (
+            <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 6 }}>
+              {skillsListQ.data!.map((sk) => (
+                <li key={sk.name} style={{ fontSize: 12, display: "flex", flexDirection: "column", gap: 2 }}>
+                  <span style={{ color: C.primary, fontWeight: 700 }}>✦ {sk.name}</span>
+                  {sk.whenToUse ? (
+                    <span style={{ color: C.muted }}>quand : {sk.whenToUse}</span>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          )}
         </Section>
 
         {/* Metrics */}
