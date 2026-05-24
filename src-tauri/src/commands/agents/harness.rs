@@ -9,7 +9,8 @@
 //! Lot 1 (P2) evolves the system prompt only; memory (P3) is carried forward
 //! unchanged here. Subagents/skills (lot 2) are carried over as-is.
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
+use serde::Serialize;
 use serde_json::Value;
 use tauri::AppHandle;
 
@@ -264,4 +265,249 @@ pub(super) async fn evolve_harness(
         to_generation: to_gen,
         summary,
     })
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Tauri commands — read/edit the harness from the UI (lot 1 UI layer)
+// ────────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessGenerationRow {
+    pub id: String,
+    pub role: String,
+    pub generation: i64,
+    pub parent_generation: Option<i64>,
+    pub trigger_reason: Option<String>,
+    pub created_by: Option<String>,
+    pub system_prompt: String,
+    pub memory: String,
+    pub active: i64,
+    pub created_at: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessMetricRow {
+    pub generation: Option<i64>,
+    pub runs: i64,
+    pub successes: i64,
+    pub stuck_count: i64,
+    pub avg_iterations: f64,
+}
+
+/// Every generation of a role's harness, newest first (evolution log + diff).
+#[tauri::command]
+pub async fn harness_list_generations(
+    app: AppHandle,
+    role: String,
+) -> Result<Vec<HarnessGenerationRow>, String> {
+    let conn_mutex = get_conn(&app)?;
+    let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, role, generation, parent_generation, trigger_reason,
+                    created_by, system_prompt, memory, active, created_at
+               FROM harness_generations
+              WHERE role = ?1
+              ORDER BY generation DESC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![role], |r| {
+            Ok(HarnessGenerationRow {
+                id: r.get(0)?,
+                role: r.get(1)?,
+                generation: r.get(2)?,
+                parent_generation: r.get(3)?,
+                trigger_reason: r.get(4)?,
+                created_by: r.get(5)?,
+                system_prompt: r.get(6)?,
+                memory: r.get(7)?,
+                active: r.get(8)?,
+                created_at: r.get(9)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+/// Per-generation outcome metrics for a role (success rate, stalls, avg iters).
+#[tauri::command]
+pub async fn harness_metrics(
+    app: AppHandle,
+    role: String,
+) -> Result<Vec<HarnessMetricRow>, String> {
+    let conn_mutex = get_conn(&app)?;
+    let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT generation,
+                    COUNT(*),
+                    SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN stuck_reason IS NOT NULL THEN 1 ELSE 0 END),
+                    AVG(iterations)
+               FROM agent_outcomes
+              WHERE role = ?1
+              GROUP BY generation
+              ORDER BY generation ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![role], |r| {
+            Ok(HarnessMetricRow {
+                generation: r.get(0)?,
+                runs: r.get(1)?,
+                successes: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                stuck_count: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                avg_iterations: r.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+/// Rollback: make an earlier generation `active` again (atomic flip).
+#[tauri::command]
+pub async fn harness_rollback(
+    app: AppHandle,
+    role: String,
+    generation: i64,
+) -> Result<(), String> {
+    let conn_mutex = get_conn(&app)?;
+    let mut conn = conn_mutex.lock().map_err(|e| e.to_string())?;
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM harness_generations WHERE role = ?1 AND generation = ?2",
+            params![role, generation],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if exists == 0 {
+        return Err(format!("generation {generation} not found for role {role}"));
+    }
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE harness_generations SET active = 0 WHERE role = ?1 AND active = 1",
+        params![role],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE harness_generations SET active = 1 WHERE role = ?1 AND generation = ?2",
+        params![role, generation],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Manual edit: persist a user-authored harness as a new active generation.
+#[tauri::command]
+pub async fn harness_save_manual(
+    app: AppHandle,
+    role: String,
+    system_prompt: String,
+    memory: String,
+) -> Result<(), String> {
+    if system_prompt.trim().len() < 10 {
+        return Err("system prompt too short".to_string());
+    }
+    let memory = if memory.trim().is_empty() {
+        "[]".to_string()
+    } else {
+        serde_json::from_str::<Value>(&memory)
+            .map_err(|e| format!("memory must be valid JSON: {e}"))?;
+        memory
+    };
+    let conn_mutex = get_conn(&app)?;
+    let mut conn = conn_mutex.lock().map_err(|e| e.to_string())?;
+    let next_gen: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(generation), -1) + 1 FROM harness_generations WHERE role = ?1",
+            params![role],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let parent: Option<i64> = conn
+        .query_row(
+            "SELECT generation FROM harness_generations WHERE role = ?1 AND active = 1 LIMIT 1",
+            params![role],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "UPDATE harness_generations SET active = 0 WHERE role = ?1 AND active = 1",
+        params![role],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "INSERT INTO harness_generations
+            (id, role, generation, parent_generation, trigger_reason, created_by,
+             system_prompt, memory, subagents, skills, active, created_at)
+         VALUES (?1, ?2, ?3, ?4, 'manual', 'user', ?5, ?6, '[]', '[]', 1, ?7)",
+        params![
+            format!("{role}-gen{next_gen}"),
+            role,
+            next_gen,
+            parent,
+            system_prompt,
+            memory,
+            now_ms(),
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Read the configured Refiner provider JSON (or None = self-fallback).
+#[tauri::command]
+pub async fn harness_get_refiner(app: AppHandle) -> Result<Option<String>, String> {
+    let conn_mutex = get_conn(&app)?;
+    let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = 'harness.refiner'",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+/// Set the Refiner provider config (JSON `{protocol, baseUrl, model, apiKey?}`).
+#[tauri::command]
+pub async fn harness_set_refiner(app: AppHandle, value: String) -> Result<(), String> {
+    serde_json::from_str::<Value>(&value).map_err(|e| format!("invalid JSON: {e}"))?;
+    let conn_mutex = get_conn(&app)?;
+    let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO settings (key, value, updated_at) VALUES ('harness.refiner', ?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = ?1, updated_at = ?2",
+        params![value, now_ms()],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Record the user's accept/reject feedback on a run's outcome.
+#[tauri::command]
+pub async fn outcome_set_feedback(
+    app: AppHandle,
+    agent_id: String,
+    feedback: Option<String>,
+) -> Result<(), String> {
+    let conn_mutex = get_conn(&app)?;
+    let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE agent_outcomes SET user_feedback = ?1 WHERE agent_id = ?2",
+        params![feedback, agent_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }

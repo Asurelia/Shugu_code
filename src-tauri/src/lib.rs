@@ -484,6 +484,14 @@ pub fn run() {
             commands::agents::agent_list_active,
             commands::agents::agent_get_transcript,
             commands::agents::agent_list_by_conversation,
+            // Continual Harness (lot 1 UI layer)
+            commands::agents::harness::harness_list_generations,
+            commands::agents::harness::harness_metrics,
+            commands::agents::harness::harness_rollback,
+            commands::agents::harness::harness_save_manual,
+            commands::agents::harness::harness_get_refiner,
+            commands::agents::harness::harness_set_refiner,
+            commands::agents::harness::outcome_set_feedback,
             commands::diag::js_diag,
             // LOT 2b — format document via CLI formatter (rustfmt/black/prettier/gofmt).
             commands::format::format_code,

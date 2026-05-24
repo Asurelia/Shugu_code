@@ -29,7 +29,8 @@ export type AgentEventKind =
   | "toolResult"
   | "delta"
   | "complete"
-  | "error";
+  | "error"
+  | "harnessEvolved";
 
 // ────────────────────────────────────────────────────────────────────
 // DB row shapes (mirror Rust AgentRow / AgentEventRow)
@@ -114,7 +115,19 @@ export type AgentEvent =
       tokensUsed?: number;
       ms: number;
     }
-  | { kind: "error"; agentId: string; error: string };
+  | { kind: "error"; agentId: string; error: string }
+  | {
+      kind: "harnessEvolved";
+      agentId: string;
+      role: string;
+      /** "evolving" = Refiner call started (5-30s); "applied" = new generation
+       * active; "failed" = Refiner errored, current harness kept. */
+      status: "evolving" | "applied" | "failed";
+      reason?: string;
+      fromGeneration?: number;
+      toGeneration?: number;
+      summary?: string;
+    };
 
 // ────────────────────────────────────────────────────────────────────
 // Command wrappers
@@ -138,6 +151,11 @@ export interface SpawnArgs {
    * mainly used to toggle `{enable_thinking: false}` per request on
    * Qwen 3.5 / DeepSeek-R1 templates. */
   chatTemplateKwargs?: Record<string, unknown>;
+  /** Phase A (Design Studio) — design-system context prepended to the agent's
+   * system prompt so it generates a styled project on disk. Only the Studio
+   * "Generate" sets this; chat delegation leaves it undefined (no impact on
+   * the normal delegate path). Serializes to the Rust `design_context` field. */
+  designContext?: string;
 }
 
 /** Spawn an agent. Returns the freshly minted agent id (UUID v4 string).
@@ -279,4 +297,78 @@ export async function revealAgent(agentId: string): Promise<void> {
   } catch (err) {
     console.warn("[agents] revealAgent emit failed:", err);
   }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Continual Harness (lot 1) — generation log, metrics, edit/rollback,
+// Refiner config, run feedback. Mirrors commands::agents::harness.
+// ────────────────────────────────────────────────────────────────────
+
+/** One immutable snapshot of a role's harness (mirror HarnessGenerationRow). */
+export interface HarnessGeneration {
+  id: string;
+  role: string;
+  generation: number;
+  parentGeneration: number | null;
+  /** "seed" | "manual" | "stuck:<reason>" — why this generation exists. */
+  triggerReason: string | null;
+  /** "seed" | "user" | "refiner:<model>" | "fallback:<model>". */
+  createdBy: string | null;
+  systemPrompt: string;
+  /** JSON array string of memory entries. */
+  memory: string;
+  /** 1 = the generation currently served to the agent. */
+  active: number;
+  createdAt: number;
+}
+
+/** Per-generation outcome metrics (mirror HarnessMetricRow). */
+export interface HarnessMetric {
+  generation: number | null;
+  runs: number;
+  successes: number;
+  stuckCount: number;
+  avgIterations: number;
+}
+
+/** Every generation of a role's harness, newest first. */
+export async function listHarnessGenerations(role: string): Promise<HarnessGeneration[]> {
+  return invoke<HarnessGeneration[]>("harness_list_generations", { role });
+}
+
+/** Per-generation metrics for a role. */
+export async function harnessMetrics(role: string): Promise<HarnessMetric[]> {
+  return invoke<HarnessMetric[]>("harness_metrics", { role });
+}
+
+/** Make an earlier generation active again (rollback). */
+export async function rollbackHarness(role: string, generation: number): Promise<void> {
+  return invoke<void>("harness_rollback", { role, generation });
+}
+
+/** Persist a user-authored harness as a new active generation. */
+export async function saveManualHarness(
+  role: string,
+  systemPrompt: string,
+  memory: string,
+): Promise<void> {
+  return invoke<void>("harness_save_manual", { role, systemPrompt, memory });
+}
+
+/** Read the configured Refiner provider JSON (null = self-fallback). */
+export async function getHarnessRefiner(): Promise<string | null> {
+  return invoke<string | null>("harness_get_refiner");
+}
+
+/** Set the Refiner provider config JSON `{protocol, baseUrl, model, apiKey?}`. */
+export async function setHarnessRefiner(value: string): Promise<void> {
+  return invoke<void>("harness_set_refiner", { value });
+}
+
+/** Record accept/reject feedback on a run's outcome (null clears it). */
+export async function setOutcomeFeedback(
+  agentId: string,
+  feedback: string | null,
+): Promise<void> {
+  return invoke<void>("outcome_set_feedback", { agentId, feedback });
 }

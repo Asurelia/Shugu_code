@@ -68,8 +68,8 @@ mod runner;
 // (the `pub(super)` items) from here.
 mod tools;
 
-/// Continual Harness — harness evolution / Refiner (lot 1 P2).
-mod harness;
+/// Continual Harness — harness evolution / Refiner (lot 1 P2) + UI commands.
+pub(crate) mod harness;
 
 // Re-export the crate-visible items from `tools` so `chat.rs` can reach
 // them via `crate::commands::agents::*` without poking into the private
