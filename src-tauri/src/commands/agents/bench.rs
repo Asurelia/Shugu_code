@@ -27,7 +27,9 @@ use serde_json::Value;
 use tauri::AppHandle;
 use uuid::Uuid;
 
-use super::runner::{load_harness_generation, tool_use_loop, AgentMessage, LoopMetrics};
+use super::runner::{
+    load_active_harness, load_harness_generation, tool_use_loop, AgentMessage, LoopMetrics,
+};
 use super::{get_conn, now_ms};
 
 // ────────────────────────────────────────────────────────────────────
@@ -394,6 +396,12 @@ pub async fn bench_run_suite(
     base_url: Option<String>,
 ) -> Result<BenchSuiteResult, String> {
     let tasks = load_tasks(&app, &role)?;
+    // Ensure generation 0 exists for this role. Gen 0 is seeded LAZILY on the
+    // first real agent run (via load_active_harness); a user may open the bench
+    // before any agent of this role has run. Calling it here makes the bench
+    // self-bootstrapping so "run suite on gen 0" never fails with
+    // "generation not found" on a fresh install — the #1 first-run footgun.
+    let _ = load_active_harness(&app, &role);
     let suite_run_id = Uuid::new_v4().to_string();
     let protocol = protocol.unwrap_or_else(|| "openai".to_string());
     let base_url = base_url.unwrap_or_default();

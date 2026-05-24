@@ -1107,7 +1107,7 @@ fn assemble_prompt(prompt: &str, memory_json: &str) -> String {
 /// Any DB error degrades gracefully to an in-memory seed WITHOUT persisting —
 /// we never block an agent run on harness storage, and not persisting means the
 /// next run retries the seed rather than masking the failure.
-fn load_active_harness(app: &AppHandle, role: &str) -> ActiveHarness {
+pub(super) fn load_active_harness(app: &AppHandle, role: &str) -> ActiveHarness {
     if let Ok(conn_mutex) = get_conn(app) {
         if let Ok(conn) = conn_mutex.lock() {
             let existing = conn.query_row(
