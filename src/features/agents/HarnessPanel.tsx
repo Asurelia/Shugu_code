@@ -22,6 +22,7 @@ import {
   benchCompareGenerations,
   benchAddTask,
   type AgentRole,
+  type AgentEvent,
   type HarnessGeneration,
   type BenchSuiteResult,
   type BenchComparison,
@@ -36,8 +37,22 @@ import {
 import { useDiscoveredModels } from "@/lib/modelDiscovery";
 import { PROVIDER_REGISTRY } from "@/lib/providers";
 import { loadProviderConfig, getConfig } from "@/lib/credentials";
+import { listen } from "@/lib/tauri";
 
 const ROLES: AgentRole[] = ["orchestrator", "coder", "researcher", "tester", "mascot"];
+
+/** Mirror of the Rust `bench://progress` event (one per task, twice: running → done). */
+type BenchProgressEvent = {
+  suiteRunId: string;
+  taskId: string;
+  index: number;
+  total: number;
+  title: string;
+  phase: "running" | "done";
+  passed: boolean | null;
+  detail: string | null;
+  ms: number | null;
+};
 
 // Example bench tasks (the "milestones" of Forge). Create-from-scratch file
 // tasks judged by the NON-executing `files` verifier — enough to prove the bench
@@ -266,6 +281,20 @@ export function HarnessPanel() {
   const [benchModelId, setBenchModelId] = useState("");
   const [benchResult, setBenchResult] = useState<BenchSuiteResult | null>(null);
   const [comparison, setComparison] = useState<BenchComparison | null>(null);
+  // Live per-task progress during a suite run (keyed by taskId). Reset at the
+  // start of each run; only shown WHILE busy === "bench-run" so it never
+  // duplicates the post-run benchResult list (which takes over once busy clears).
+  const [liveProgress, setLiveProgress] = useState<Record<string, BenchProgressEvent>>({});
+  // Evolutions seen live during a run (APPLIED, bench-* agents only). Shown so
+  // the user SEES generations climb in real time — the "watch it learn" payoff
+  // of an always-evolving bench.
+  const [liveEvolutions, setLiveEvolutions] = useState<
+    Array<{ fromGeneration?: number; toGeneration?: number; reason?: string; summary?: string }>
+  >([]);
+  // Ticking elapsed seconds while a suite runs — the cheapest "it's alive"
+  // signal so a long task (1-3 min) never looks frozen. Driven purely by busy:
+  // resets to 0 whenever no run is in flight.
+  const [elapsedSec, setElapsedSec] = useState(0);
 
   async function run(tag: string, fn: () => Promise<void>) {
     setBusy(tag);
@@ -279,6 +308,57 @@ export function HarnessPanel() {
       setBusy(null);
     }
   }
+
+  // Live bench progress — subscribe once to the per-task running/done events the
+  // Rust suite emits, so a run shows motion instead of a frozen "Exécution…"
+  // button (mirrors the agent-events listener in useEvents.ts). The callback
+  // receives the event payload directly (see @/lib/tauri listen).
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenProg: (() => void) | null = null;
+    let unlistenEvo: (() => void) | null = null;
+    void (async () => {
+      unlistenProg = await listen<BenchProgressEvent>("bench://progress", (p) => {
+        if (cancelled) return;
+        setLiveProgress((prev) => ({ ...prev, [p.taskId]: p }));
+      });
+      // Same channel the agents use; keep only APPLIED evolutions from bench
+      // agents so the live panel shows generations climbing during the run.
+      unlistenEvo = await listen<AgentEvent>("agent://lifecycle", (e) => {
+        if (cancelled) return;
+        if (
+          e.kind === "harnessEvolved" &&
+          e.status === "applied" &&
+          e.agentId.startsWith("bench-")
+        ) {
+          setLiveEvolutions((prev) => [
+            ...prev,
+            {
+              fromGeneration: e.fromGeneration,
+              toGeneration: e.toGeneration,
+              reason: e.reason,
+              summary: e.summary,
+            },
+          ]);
+        }
+      });
+    })();
+    return () => {
+      cancelled = true;
+      unlistenProg?.();
+      unlistenEvo?.();
+    };
+  }, []);
+
+  // Elapsed-seconds ticker, active only during a run.
+  useEffect(() => {
+    if (busy !== "bench-run") {
+      setElapsedSec(0);
+      return;
+    }
+    const id = setInterval(() => setElapsedSec((s) => s + 1), 1000);
+    return () => clearInterval(id);
+  }, [busy]);
 
   const promptDirty = !!active && draftPrompt !== active.systemPrompt;
   const memoryDirty = !!active && draftMemory !== active.memory;
@@ -531,20 +611,53 @@ export function HarnessPanel() {
                 ? "Chargement des tâches…"
                 : `${benchListQ.data?.length ?? 0} tâche(s) pour ${role}`}
             </span>
-            <Button
-              disabled={busy !== null}
-              onClick={() =>
-                run("bench-seed", async () => {
-                  for (const t of EXAMPLE_TASKS) {
-                    await benchAddTask({ ...t, role, fixtureDir: null });
-                  }
-                  invalidateBench(role);
-                  setNotice(`Tâches d'exemple ajoutées pour ${role}.`);
-                })
-              }
-            >
-              {busy === "bench-seed" ? "Ajout…" : "Seed exemples"}
-            </Button>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <Button
+                disabled={busy !== null}
+                onClick={() =>
+                  run("bench-seed", async () => {
+                    for (const t of EXAMPLE_TASKS) {
+                      await benchAddTask({ ...t, role, fixtureDir: null });
+                    }
+                    invalidateBench(role);
+                    setNotice(`Tâches d'exemple ajoutées pour ${role}.`);
+                  })
+                }
+              >
+                {busy === "bench-seed" ? "Ajout…" : "Seed exemples"}
+              </Button>
+              <Button
+                variant="primary"
+                disabled={busy !== null}
+                onClick={() =>
+                  run("bench-mirror", async () => {
+                    // fixtureDir "@project" = the bench snapshot-copies the OPEN
+                    // project into a throwaway sandbox at run time (Rust side).
+                    // The agent trains on real code; the real project is untouched.
+                    await benchAddTask({
+                      id: `mirror-architecture-${role}`,
+                      role,
+                      domain: "code",
+                      title: "Miroir : décrire l'architecture du projet",
+                      prompt:
+                        "Le projet ouvert a été COPIÉ dans ton workspace (une copie jetable, PAS le vrai projet). Explore-le avec fs_list_dir et fs_read_file, puis crée à la racine un fichier `ARCHITECTURE.md` décrivant l'organisation des dossiers principaux et le rôle des modules clés (avec des titres en `##`). Termine en confirmant que le fichier est écrit.",
+                      fixtureDir: "@project",
+                      verifierKind: "files",
+                      verifierSpec: JSON.stringify({
+                        required: ["ARCHITECTURE.md"],
+                        contains: [{ path: "ARCHITECTURE.md", substring: "##" }],
+                      }),
+                    });
+                    invalidateBench(role);
+                    setNotice(
+                      "Tâche miroir ajoutée : l'agent s'entraînera sur une COPIE jetable de ton projet ouvert.",
+                    );
+                  })
+                }
+              >
+                {busy === "bench-mirror" ? "Ajout…" : "+ Tâche miroir (projet ouvert)"}
+              </Button>
+            </div>
           </div>
 
           {(benchListQ.data?.length ?? 0) > 0 ? (
@@ -582,6 +695,11 @@ export function HarnessPanel() {
               disabled={busy !== null || !benchModelId || (benchListQ.data?.length ?? 0) === 0}
               onClick={() =>
                 run("bench-run", async () => {
+                  // Fresh live panel each run; the previous benchResult hides
+                  // until this run produces a new one.
+                  setLiveProgress({});
+                  setLiveEvolutions([]);
+                  setBenchResult(null);
                   const m = discovered.data.find((x) => x.id === benchModelId);
                   if (!m) throw new Error("Modèle introuvable — rafraîchis la liste (section Refiner).");
                   const reg = PROVIDER_REGISTRY[m.providerId];
@@ -621,6 +739,71 @@ export function HarnessPanel() {
             </Button>
           </div>
 
+          {/* Live panel — only while a run is in flight, so it never duplicates
+              the post-run benchResult list below (which takes over once busy
+              clears). This is the cure for the "chambre noire": per-task status
+              flips in real time, and evolutions appear as the agent learns. */}
+          {busy === "bench-run" ? (
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: 8,
+                padding: 10,
+                borderRadius: 8,
+                background: "rgba(124,58,237,0.06)",
+                border: `1px solid ${C.border}`,
+              }}
+            >
+              {(() => {
+                const total = benchListQ.data?.length ?? 0;
+                const done = Object.values(liveProgress).filter((p) => p.phase === "done").length;
+                return (
+                  <div style={{ fontSize: 13, fontWeight: 700, color: C.text, display: "flex", gap: 12, flexWrap: "wrap" }}>
+                    <span>Suite en cours — {done}/{total} terminées</span>
+                    <span style={{ color: C.muted, fontWeight: 400 }}>⏱ {elapsedSec}s</span>
+                    {liveEvolutions.length > 0 ? (
+                      <span style={{ color: C.primary }}>✦ {liveEvolutions.length} évolution(s) en direct</span>
+                    ) : null}
+                  </div>
+                );
+              })()}
+              <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 4 }}>
+                {(benchListQ.data ?? []).map((t) => {
+                  const p = liveProgress[t.id];
+                  const status =
+                    p?.phase === "done" ? (p.passed ? "pass" : "fail") : p?.phase === "running" ? "running" : "pending";
+                  const icon =
+                    status === "pass" ? "✓" : status === "fail" ? "✗" : status === "running" ? "⟳" : "•";
+                  const color =
+                    status === "pass" ? C.success : status === "fail" ? C.error : status === "running" ? C.primary : C.muted;
+                  return (
+                    <li key={t.id} style={{ fontSize: 12, display: "flex", gap: 8, alignItems: "baseline" }}>
+                      <span style={{ color, fontWeight: 700, width: 12, display: "inline-block" }}>{icon}</span>
+                      <span style={{ color: C.text }}>{t.title}</span>
+                      {status === "running" ? (
+                        <span style={{ color: C.muted }}>… en cours (1-3 min possibles)</span>
+                      ) : null}
+                      {(status === "pass" || status === "fail") && p?.detail ? (
+                        <span style={{ color: C.muted }}>— {p.detail}</span>
+                      ) : null}
+                    </li>
+                  );
+                })}
+              </ul>
+              {liveEvolutions.length > 0 ? (
+                <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 2 }}>
+                  {liveEvolutions.map((e, i) => (
+                    <li key={i} style={{ fontSize: 11, color: C.primary }}>
+                      ✦ gén {e.fromGeneration ?? "?"} → {e.toGeneration ?? "?"}
+                      {e.reason ? ` (${e.reason})` : ""}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
+          ) : null}
+
           {benchResult ? (
             <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
               <div
@@ -632,6 +815,11 @@ export function HarnessPanel() {
               >
                 Gén {benchResult.generation} : {benchResult.passed}/{benchResult.total} réussies
               </div>
+              {liveEvolutions.length > 0 ? (
+                <div style={{ fontSize: 12, color: C.primary }}>
+                  ✦ {liveEvolutions.length} évolution(s) pendant ce run — l'agent a appris en direct
+                </div>
+              ) : null}
               <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 4 }}>
                 {benchResult.results.map((r) => (
                   <li key={r.taskId} style={{ fontSize: 12, display: "flex", gap: 8, alignItems: "baseline" }}>
