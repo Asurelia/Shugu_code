@@ -28,8 +28,8 @@ use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
 
 use super::runner::{
-    get_workspace_root, load_active_harness, load_harness_generation, tool_use_loop, AgentMessage,
-    LoopMetrics,
+    call_refiner, get_workspace_root, load_active_harness, load_harness_generation, tool_use_loop,
+    AgentMessage, LoopMetrics,
 };
 use super::{get_conn, now_ms};
 
@@ -55,6 +55,9 @@ pub struct BenchRunSummary {
     pub task_id: String,
     pub title: String,
     pub passed: bool,
+    /// Graded score (0-10) when judged by the `claude` verifier; `None` for the
+    /// boolean `files` verifier.
+    pub score: Option<f64>,
     pub detail: String,
     pub ms: i64,
 }
@@ -285,6 +288,7 @@ fn record_bench_run(
     generation: i64,
     agent_id: &str,
     passed: bool,
+    score: Option<f64>,
     detail: &str,
     ms: i64,
 ) {
@@ -294,7 +298,7 @@ fn record_bench_run(
                 "INSERT INTO bench_runs
                     (run_id, suite_run_id, task_id, role, generation, agent_id,
                      passed, score, detail, ms, ts)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?9, ?10)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     Uuid::new_v4().to_string(),
                     suite_run_id,
@@ -303,6 +307,7 @@ fn record_bench_run(
                     generation,
                     agent_id,
                     passed as i64,
+                    score,
                     detail,
                     ms,
                     now_ms(),
@@ -325,16 +330,17 @@ async fn run_one(
 ) -> BenchRunSummary {
     let start = std::time::Instant::now();
     let agent_id = format!("bench-{}", Uuid::new_v4());
-    let (passed, detail) =
+    let (passed, score, detail) =
         run_one_inner(app, task, generation, model, protocol, base_url, api_key, &agent_id).await;
     let ms = start.elapsed().as_millis() as i64;
     record_bench_run(
-        app, suite_run_id, &task.id, &task.role, generation, &agent_id, passed, &detail, ms,
+        app, suite_run_id, &task.id, &task.role, generation, &agent_id, passed, score, &detail, ms,
     );
     BenchRunSummary {
         task_id: task.id.clone(),
         title: task.title.clone(),
         passed,
+        score,
         detail,
         ms,
     }
@@ -350,12 +356,13 @@ async fn run_one_inner(
     base_url: &str,
     api_key: &str,
     agent_id: &str,
-) -> (bool, String) {
+) -> (bool, Option<f64>, String) {
     let harness = match load_harness_generation(app, &task.role, generation) {
         Some(h) => h,
         None => {
             return (
                 false,
+                None,
                 format!("generation {generation} not found for role {}", task.role),
             )
         }
@@ -365,7 +372,7 @@ async fn run_one_inner(
     // user's real project (axis 1 containment).
     let ws_raw: PathBuf = std::env::temp_dir().join(format!("shugu_bench_{}", Uuid::new_v4()));
     if let Err(e) = std::fs::create_dir_all(&ws_raw) {
-        return (false, format!("cannot create fixture workspace: {e}"));
+        return (false, None, format!("cannot create fixture workspace: {e}"));
     }
     // CRITICAL: the path guard (`safe_resolve` / `safe_resolve_for_write`)
     // requires a PRE-CANONICALIZED root, exactly like `fs_open_folder`. Without
@@ -377,7 +384,7 @@ async fn run_one_inner(
         Ok(p) => p,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&ws_raw);
-            return (false, format!("cannot canonicalize fixture workspace: {e}"));
+            return (false, None, format!("cannot canonicalize fixture workspace: {e}"));
         }
     };
     if let Some(raw) = task.fixture_dir.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -393,6 +400,7 @@ async fn run_one_inner(
                     let _ = std::fs::remove_dir_all(&ws);
                     return (
                         false,
+                        None,
                         "no project open to mirror — open a project, then run the @project task"
                             .to_string(),
                     );
@@ -405,6 +413,7 @@ async fn run_one_inner(
             let _ = std::fs::remove_dir_all(&ws);
             return (
                 false,
+                None,
                 format!("project mirror copy failed from {}: {e}", src.display()),
             );
         }
@@ -439,25 +448,146 @@ async fn run_one_inner(
     )
     .await;
 
-    let verdict = match loop_result {
+    let verdict: (bool, Option<f64>, String) = match loop_result {
         Ok(_) => {
-            let (passed, detail) = run_verifier(&task.verifier_kind, &ws, &task.verifier_spec);
-            // Legibility: if the run hit a stall (stuck_reason set) and STILL
-            // failed the verifier — even after the agent tried to self-evolve —
-            // surface WHY next to the verdict. "stuck:repeat — missing file
-            // foo.ts" reads very differently from a bare "missing file foo.ts"
-            // (which looks like the verifier is wrong, rather than the agent
-            // being genuinely weak on this task).
-            match (&metrics.stuck_reason, passed) {
-                (Some(reason), false) => (passed, format!("stuck:{reason} — {detail}")),
-                _ => (passed, detail),
+            if task.verifier_kind == "claude" {
+                // Fuzzy / meaning-based grading by a judge model. It only READS the
+                // produced files (non-executing) → safe in v1. Async (network).
+                judge_with_claude(&client, protocol, base_url, model, api_key, task, &ws).await
+            } else {
+                let (passed, detail) =
+                    run_verifier(&task.verifier_kind, &ws, &task.verifier_spec);
+                // Legibility: a stalled-then-failed run reads as "stuck:reason — …"
+                // rather than a bare verifier failure (which looks like the verifier
+                // is wrong rather than the agent being genuinely weak).
+                let detail = match (&metrics.stuck_reason, passed) {
+                    (Some(reason), false) => format!("stuck:{reason} — {detail}"),
+                    _ => detail,
+                };
+                (passed, None, detail)
             }
         }
-        Err(e) => (false, format!("agent run error: {e}")),
+        Err(e) => (false, None, format!("agent run error: {e}")),
     };
 
     let _ = std::fs::remove_dir_all(&ws);
     verdict
+}
+
+/// Bounded recursive listing (relative file paths) of the sandbox, for the judge
+/// prompt — capped so a mirrored real project doesn't blow the context window.
+fn bounded_tree(ws: &Path, max_entries: usize) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for entry in walkdir::WalkDir::new(ws).into_iter().flatten() {
+        if entry.file_type().is_file() {
+            if let Ok(rel) = entry.path().strip_prefix(ws) {
+                lines.push(rel.to_string_lossy().replace('\\', "/"));
+                if lines.len() >= max_entries {
+                    lines.push("… (tronqué)".to_string());
+                    break;
+                }
+            }
+        }
+    }
+    lines.sort();
+    lines.join("\n")
+}
+
+/// Parse the judge's reply leniently. The VERDICT line decides pass/fail (FAIL
+/// wins ties); SCORE is the first number on a line mentioning "score"; REASON is
+/// the reason line (or a trimmed snippet as fallback).
+fn parse_verdict(reply: &str) -> (bool, Option<f64>, String) {
+    let passed = match reply.lines().find(|l| l.to_uppercase().contains("VERDICT")) {
+        Some(l) => {
+            let u = l.to_uppercase();
+            u.contains("PASS") && !u.contains("FAIL")
+        }
+        None => {
+            let u = reply.to_uppercase();
+            u.contains("PASS") && !u.contains("FAIL")
+        }
+    };
+    let score = reply.lines().find_map(|l| {
+        if l.to_lowercase().contains("score") {
+            let num: String = l
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            num.parse::<f64>().ok()
+        } else {
+            None
+        }
+    });
+    let reason = reply
+        .lines()
+        .find(|l| {
+            let u = l.to_uppercase();
+            u.contains("RAISON") || u.contains("REASON")
+        })
+        .map(|l| l.trim().to_string())
+        .unwrap_or_else(|| reply.trim().chars().take(200).collect());
+    (passed, score, reason)
+}
+
+/// `claude` verifier — a judge model grades the agent's output against a rubric.
+/// NON-executing (only reads produced files) → safe in v1. Reuses the Refiner's
+/// single-completion helper. v1 reuses the bench run's own model as the judge.
+/// ⚠ A weak model judges weakly — pick a strong model in the bench dropdown, or
+/// wire a dedicated judge model later (follow-up).
+async fn judge_with_claude(
+    client: &reqwest::Client,
+    protocol: &str,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+    task: &LoadedTask,
+    ws: &Path,
+) -> (bool, Option<f64>, String) {
+    let spec: Value = serde_json::from_str(&task.verifier_spec).unwrap_or(Value::Null);
+    let rubric = spec
+        .get("rubric")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Le travail accomplit-il la tâche correctement et complètement ?");
+
+    // Show the judge the artifacts named in spec.files (capped), plus a bounded
+    // tree for context. A missing file → read error the judge will see and fail.
+    let mut produced = String::new();
+    if let Some(files) = spec.get("files").and_then(|v| v.as_array()) {
+        for f in files {
+            if let Some(rel) = f.as_str() {
+                let body = match crate::commands::fs::read_file_inner(ws, rel, Some(4000)) {
+                    Ok(c) => c,
+                    Err(e) => format!("(impossible de lire {rel}: {e})"),
+                };
+                produced.push_str(&format!("\n--- {rel} ---\n{body}\n"));
+            }
+        }
+    }
+    if produced.is_empty() {
+        produced.push_str("(aucun fichier listé dans la rubrique ; juge d'après l'arborescence)");
+    }
+
+    let tree = bounded_tree(ws, 150);
+    let system = "Tu es un correcteur STRICT et concis. Évalue si le travail satisfait la rubrique. \
+                  Réponds EXACTEMENT dans ce format, rien d'autre :\n\
+                  VERDICT: PASS ou FAIL\n\
+                  SCORE: <entier 0 à 10>\n\
+                  RAISON: <une phrase>";
+    let user = format!(
+        "TÂCHE:\n{}\n\nRUBRIQUE:\n{}\n\nARBORESCENCE (workspace):\n{}\n\nFICHIERS PRODUITS:{}",
+        task.prompt, rubric, tree, produced
+    );
+
+    match call_refiner(client, protocol, base_url, model, api_key, &None, system, &user).await {
+        Ok(reply) => {
+            let (passed, score, reason) = parse_verdict(&reply);
+            let score_str = score.map(|s| format!(" {s}/10")).unwrap_or_default();
+            let verdict = if passed { "PASS" } else { "FAIL" };
+            (passed, score, format!("juge:{verdict}{score_str} — {reason}"))
+        }
+        Err(e) => (false, None, format!("juge indisponible: {e}")),
+    }
 }
 
 /// Resolve the API key for a bench run WITHOUT a key ever crossing the

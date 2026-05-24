@@ -167,6 +167,59 @@ fn agent_tools() -> &'static [ToolDef] {
                     "required": ["todos"]
                 }),
             },
+            ToolDef {
+                name: "fs_search",
+                description: "Search the whole workspace for a pattern (ripgrep-style) and return \
+                              matching lines as `path:line: preview`. Use this FIRST to LOCATE where \
+                              something is defined or used — far faster and more reliable than listing \
+                              and reading files one by one. Literal substring by default; set regex=true \
+                              for a Rust regex. Capped at 80 matches.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Text to find. Literal substring unless `regex` is true."
+                        },
+                        "regex": {
+                            "type": "boolean",
+                            "description": "If true, treat `query` as a Rust regex. Default false."
+                        },
+                        "case_sensitive": {
+                            "type": "boolean",
+                            "description": "Case-sensitive match. Default false (case-insensitive)."
+                        }
+                    },
+                    "required": ["query"]
+                }),
+            },
+            ToolDef {
+                name: "fs_edit",
+                description: "Surgically edit an EXISTING file: replace one exact, unique snippet with \
+                              new text, leaving everything else untouched. PREFER this over fs_write_file \
+                              for changes to existing files — no need to reproduce the whole file. \
+                              `old_string` must match EXACTLY and appear EXACTLY ONCE (include enough \
+                              surrounding lines to be unique), otherwise the edit is rejected so you can \
+                              retry with more context.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Workspace-relative POSIX path of the file to edit."
+                        },
+                        "old_string": {
+                            "type": "string",
+                            "description": "Exact text to find — must be unique in the file. Copy it verbatim (with context)."
+                        },
+                        "new_string": {
+                            "type": "string",
+                            "description": "Replacement text for that snippet."
+                        }
+                    },
+                    "required": ["path", "old_string", "new_string"]
+                }),
+            },
         ]
     })
 }
@@ -339,6 +392,59 @@ fn dispatch_inner(call: &ToolCall, root: &Path) -> Result<String, String> {
             // continues its loop.
             let n = args["todos"].as_array().map(|a| a.len()).unwrap_or(0);
             Ok(format!("recorded {n} todo(s)"))
+        }
+        "fs_search" => {
+            let query = args["query"]
+                .as_str()
+                .ok_or_else(|| "missing required field: query".to_string())?;
+            // Reuse the workspace grep engine, but anchored at the AGENT's root
+            // (the bench's sandbox copy when overridden) — never the global state.
+            let opts = crate::commands::grep::GrepOpts {
+                case_sensitive: args["case_sensitive"].as_bool().unwrap_or(false),
+                regex: args["regex"].as_bool().unwrap_or(false),
+                max_results: 80,
+            };
+            let matches = crate::commands::grep::grep_inner(root, query, &opts)?;
+            if matches.is_empty() {
+                return Ok(format!("no matches for {query:?}"));
+            }
+            let n = matches.len();
+            let body = matches
+                .iter()
+                .map(|m| format!("{}:{}: {}", m.path, m.line, m.preview))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(format!("{n} match(es):\n{body}"))
+        }
+        "fs_edit" => {
+            let path = args["path"]
+                .as_str()
+                .ok_or_else(|| "missing required field: path".to_string())?;
+            let old = args["old_string"]
+                .as_str()
+                .ok_or_else(|| "missing required field: old_string".to_string())?;
+            let new = args["new_string"]
+                .as_str()
+                .ok_or_else(|| "missing required field: new_string".to_string())?;
+            if old.is_empty() {
+                return Err("old_string must not be empty — use fs_write_file to create a file".to_string());
+            }
+            // Read the FULL file (no cap) so a truncated read can never corrupt it.
+            let content = crate::commands::fs::read_file_inner(root, path, None)?;
+            let count = content.matches(old).count();
+            if count == 0 {
+                return Err(format!(
+                    "old_string not found in {path} — read the file (fs_read_file) and copy an exact snippet"
+                ));
+            }
+            if count > 1 {
+                return Err(format!(
+                    "old_string appears {count} times in {path} — add surrounding context to make it unique"
+                ));
+            }
+            let updated = content.replacen(old, new, 1);
+            let bytes = crate::commands::fs::write_file_inner(root, path, &updated)?;
+            Ok(format!("edited {path} ({bytes} bytes written)"))
         }
         other => Err(format!("unknown tool: {other}")),
     }

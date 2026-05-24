@@ -392,6 +392,8 @@ export interface BenchRunSummary {
   taskId: string;
   title: string;
   passed: boolean;
+  /** Graded score (0-10) from the `claude` verifier; null for the `files` verifier. */
+  score: number | null;
   detail: string;
   ms: number;
 }

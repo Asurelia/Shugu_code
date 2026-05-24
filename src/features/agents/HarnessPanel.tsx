@@ -642,10 +642,11 @@ export function HarnessPanel() {
                       prompt:
                         "Le projet ouvert a été COPIÉ dans ton workspace (une copie jetable, PAS le vrai projet). Explore-le avec fs_list_dir et fs_read_file, puis crée à la racine un fichier `ARCHITECTURE.md` décrivant l'organisation des dossiers principaux et le rôle des modules clés (avec des titres en `##`). Termine en confirmant que le fichier est écrit.",
                       fixtureDir: "@project",
-                      verifierKind: "files",
+                      verifierKind: "claude",
                       verifierSpec: JSON.stringify({
-                        required: ["ARCHITECTURE.md"],
-                        contains: [{ path: "ARCHITECTURE.md", substring: "##" }],
+                        rubric:
+                          "ARCHITECTURE.md décrit FIDÈLEMENT les dossiers principaux et le rôle des modules clés du vrai projet (pas un squelette générique). Juge le fond, pas la présence du fichier.",
+                        files: ["ARCHITECTURE.md"],
                       }),
                     });
                     invalidateBench(role);
@@ -825,6 +826,9 @@ export function HarnessPanel() {
                   <li key={r.taskId} style={{ fontSize: 12, display: "flex", gap: 8, alignItems: "baseline" }}>
                     <span style={{ color: r.passed ? C.success : C.error, fontWeight: 700 }}>{r.passed ? "✓" : "✗"}</span>
                     <span style={{ color: C.text }}>{r.title}</span>
+                    {r.score !== null ? (
+                      <span style={{ color: C.primary, fontWeight: 700 }}>{r.score}/10</span>
+                    ) : null}
                     <span style={{ color: C.muted }}>— {r.detail}</span>
                   </li>
                 ))}
