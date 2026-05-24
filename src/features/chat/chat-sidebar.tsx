@@ -50,13 +50,14 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
   // NOT TanStack because:
   //   1. searchQuery is ephemeral local UI state (input value for a single
   //      component), not shared across windows or routes.
-  //   2. searchMode is a toggle that only affects which list to display
-  //      in this component — no other consumer needs it.
+  //   2. searchOpen toggles the vector-search bar (loupe in the header) —
+  //      purely local presentation state.
   // SI un jour searchQuery doit être synced cross-window ou persisted,
   // on basculerait vers une synthetic query + setQueryData pattern.
   // ─────────────────────────────────────────────────────────────────
   const [searchQuery, setSearchQuery] = useState("");
-  const [searchMode, setSearchMode] = useState<"text" | "semantic">("text");
+  const [searchOpen, setSearchOpen] = useState(false);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
 
   const [filters, setFilters] = useState({
     status: "active",
@@ -113,25 +114,24 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
     });
   }, [convos, filters]);
 
-  // VEC2 — TanStack semantic search query.
-  // staleTime: Infinity + refetchOnMount: false because the query is driven
-  // entirely by the searchQuery key change — no background refetch needed.
+  // VEC2 — TanStack vector search over message embeddings (fastembed
+  // AllMiniLM-L6-v2, see src-tauri/src/commands/vector.rs). Driven entirely by
+  // the searchQuery key — staleTime Infinity, no background refetch.
   const trimmedQuery = searchQuery.trim();
-  const { data: semanticHits = [] } = useQuery<{ convId: string; messageId: string }[]>({
+  const SEARCH_K = 12;
+  const { data: semanticHits = [] } = useQuery<{ convId: string }[]>({
     queryKey: ["chat-sidebar", "semantic-search", trimmedQuery],
     queryFn: async () => {
       if (!trimmedQuery) return [];
-      const hits = await vecSearch("messages", trimmedQuery, 10);
-      const results: { convId: string; messageId: string }[] = [];
+      const hits = await vecSearch("messages", trimmedQuery, SEARCH_K);
+      const results: { convId: string }[] = [];
       for (const hit of hits) {
         const row = await db.messages.get(hit.id);
-        if (row?.conversation_id) {
-          results.push({ convId: row.conversation_id, messageId: hit.id });
-        }
+        if (row?.conversation_id) results.push({ convId: row.conversation_id });
       }
       return results;
     },
-    enabled: searchMode === "semantic" && trimmedQuery.length > 0,
+    enabled: searchOpen && trimmedQuery.length > 0,
     staleTime: Infinity,
     refetchOnMount: false,
     refetchOnWindowFocus: false,
@@ -143,15 +143,22 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
     [semanticHits],
   );
 
+  // Conversation set after applying the active search: a title text match OR a
+  // semantic (vector) hit on the conversation's messages. Empty query → the
+  // unfiltered `visible` list. Single source of truth for both the grouped
+  // render and the result-count hint.
+  const searchedSource = useMemo(() => {
+    if (!searchOpen || !trimmedQuery) return visible;
+    const q = trimmedQuery.toLowerCase();
+    return visible.filter(
+      (c: any) => c.title?.toLowerCase().includes(q) || semanticConvIds.has(c.id),
+    );
+  }, [visible, searchOpen, trimmedQuery, semanticConvIds]);
+
   const groupsForRender = useMemo(() => {
-    // When a search is active, apply the appropriate filter before grouping.
-    let source = visible;
-    if (trimmedQuery && searchMode === "text") {
-      const q = trimmedQuery.toLowerCase();
-      source = visible.filter((c: any) => c.title?.toLowerCase().includes(q));
-    } else if (trimmedQuery && searchMode === "semantic") {
-      source = visible.filter((c: any) => semanticConvIds.has(c.id));
-    }
+    // searchedSource already applied the active search (or is `visible` when
+    // the search bar is closed / empty).
+    const source = searchedSource;
 
     if (filters.groupBy === "none") return [{ id: "_all", label: null, items: source } as any];
     if (filters.groupBy === "env") {
@@ -179,7 +186,7 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
       id: g.id, label: g.label, pinnedSection: g.pinnedSection,
       items: source.filter((c: any) => g.pinnedSection ? c.pinned : (!c.pinned && c.group === g.id))
     })).filter((g: any) => g.items.length || !g.pinnedSection);
-  }, [visible, filters.groupBy, groups, trimmedQuery, searchMode, semanticConvIds]);
+  }, [searchedSource, filters.groupBy, groups]);
 
   const patch = (id: string, p: any) => setConvos(cs => cs.map((c: any) => c.id === id ? { ...c, ...p, updated: p.updated ?? c.updated } : c));
   const remove = (id: string) => {
@@ -311,6 +318,13 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
         <div className="side-title">Conversations</div>
         <button className="side-new" title="New conversation" onClick={newConvo}><Icon name="plus" size={11}/></button>
         <button
+          className={"side-filter-btn" + (searchOpen ? " on" : "")}
+          onClick={() => { setSearchOpen(o => !o); setTimeout(() => searchInputRef.current?.focus(), 60); }}
+          title="Recherche vectorielle"
+        >
+          <Icon name="search" size={12}/>
+        </button>
+        <button
           className={"side-filter-btn" + (filtersOpen ? " on" : "")}
           onClick={() => setFiltersOpen(o => !o)}
           title="Filters & sort"
@@ -325,35 +339,37 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
         </button>
       </div>
 
-      {/* VEC2 — Search bar with text / semantic toggle */}
-      <div className="side-search">
-        <input
-          className="side-search-input"
-          type="text"
-          placeholder={searchMode === "semantic" ? "Semantic search…" : "Filter conversations…"}
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-          aria-label="Search conversations"
-        />
-        <button
-          className={"side-search-mode-btn" + (searchMode === "semantic" ? " on" : "")}
-          title={searchMode === "semantic" ? "Switch to text search" : "Switch to semantic search"}
-          onClick={() => setSearchMode(m => m === "text" ? "semantic" : "text")}
-          aria-pressed={searchMode === "semantic"}
-        >
-          {searchMode === "semantic" ? (
-            /* Neural/wave icon for semantic mode */
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M2 12 Q6 4 10 12 Q14 20 18 12 Q22 4 24 12"/>
-            </svg>
-          ) : (
-            /* ABC icon for text mode */
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <text x="2" y="17" fontSize="13" fontFamily="sans-serif" fill="currentColor" stroke="none">abc</text>
-            </svg>
-          )}
-        </button>
-      </div>
+      {/* VEC2 — vector search bar, revealed by the header loupe. Real semantic
+          search over message embeddings; the meta-row shows the actual model
+          and top-k (no mock values). Esc clears + closes. */}
+      {searchOpen && (
+        <div className="side-search">
+          <div className="side-search-row">
+            <span className="ico"><Icon name="sparkle" size={11}/></span>
+            <input
+              ref={searchInputRef}
+              type="text"
+              className="side-search-input"
+              placeholder="Recherche sémantique…"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Escape") { setSearchQuery(""); setSearchOpen(false); } }}
+              aria-label="Recherche sémantique des conversations"
+            />
+            {searchQuery && (
+              <button className="side-search-clear" title="Effacer" onClick={() => setSearchQuery("")}>
+                <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+              </button>
+            )}
+          </div>
+          <div className="side-search-meta">
+            <span className="chip-mode">vector</span>
+            <span className="chip-mode subtle">all-MiniLM-L6</span>
+            <span style={{ flex: 1 }} />
+            <span className="hint">{trimmedQuery ? `${searchedSource.length} résultat${searchedSource.length > 1 ? "s" : ""}` : `top-k ${SEARCH_K}`}</span>
+          </div>
+        </div>
+      )}
 
       {filtersOpen && <FiltersPanel filters={filters} setFilters={setFilters} groups={groups} onClose={() => setFiltersOpen(false)}/>}
 

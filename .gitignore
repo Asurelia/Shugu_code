@@ -64,3 +64,7 @@ src-tauri/binaries/**/llama-server-*
 
 # Fastembed local model cache (87+ MB ONNX model — downloaded on first use)
 src-tauri/.fastembed_cache/
+
+# Design Studio — agent-generated preview project (when shugu_code itself is
+# the open workspace, e.g. dogfooding). Disposable output served by preview://.
+.shugu-forge/

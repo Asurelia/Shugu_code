@@ -1,0 +1,565 @@
+/* ============================================================
+   Shugu Forge — Chat (agent-style layout, "Codex/Claude-Code")
+   Recréé depuis le design handoff (chat5). N'utilise QUE les
+   tokens Celestial Veil déjà définis dans styles.css — aucun
+   nouveau token de couleur ni de police.
+   ============================================================ */
+
+.cx { position: absolute; inset: 0; display: flex; flex-direction: column; min-height: 0; }
+
+/* ── Feed ─────────────────────────────────────────────────── */
+.cx-feed { flex: 1; overflow-y: auto; padding: 28px 32px 12px; min-height: 0; }
+.cx-feed-inner { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 22px; }
+
+/* ── Empty state (no messages) ────────────────────────────── */
+.cx-empty {
+  flex: 1; min-height: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  padding: 24px 32px 64px;
+  gap: 26px;
+}
+.cx-empty-spark {
+  width: 28px; height: 28px;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--primary);
+  filter: drop-shadow(0 0 12px rgba(224,142,254,0.55));
+}
+.cx-empty-title {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 30px;
+  letter-spacing: -0.01em;
+  color: var(--on-surface);
+  text-align: center;
+  max-width: 720px;
+  line-height: 1.2;
+  text-wrap: balance;
+}
+.cx-empty-title .acc {
+  background: linear-gradient(120deg, var(--primary), var(--secondary), var(--tertiary));
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.cx-empty-composer { width: 100%; max-width: 760px; }
+
+/* ── Message block ────────────────────────────────────────── */
+.cx-msg { animation: cx-fade 350ms ease-out both; }
+@keyframes cx-fade {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Tiny meta header above each message */
+.cx-meta {
+  display: flex; align-items: center; gap: 8px;
+  font-family: var(--font-mono); font-size: 10.5px;
+  text-transform: uppercase; letter-spacing: 0.14em;
+  color: var(--on-surface-muted);
+  margin-bottom: 8px;
+}
+.cx-meta .mark {
+  width: 14px; height: 14px;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--on-surface-variant);
+}
+.cx-meta .mark.user { color: var(--tertiary); }
+.cx-meta .mark.ai { color: var(--primary); filter: drop-shadow(0 0 6px rgba(224,142,254,0.45)); }
+.cx-meta .who { color: var(--on-surface); letter-spacing: 0.16em; font-weight: 600; }
+.cx-meta .sep { color: var(--on-surface-muted); opacity: 0.5; }
+.cx-meta .ts { color: var(--on-surface-muted); }
+.cx-meta .pill {
+  font-family: var(--font-mono); font-size: 9.5px;
+  text-transform: uppercase; letter-spacing: 0.14em;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(224,142,254,0.08);
+  border: 1px solid rgba(224,142,254,0.22);
+  color: var(--primary);
+}
+/* "via orchestrator" relay badge inside the meta row */
+.cx-meta .via-agent {
+  font-family: var(--font-mono); font-size: 9px;
+  text-transform: uppercase; letter-spacing: 0.1em;
+  padding: 2px 7px; border-radius: 999px;
+  background: rgba(124,58,237,0.16);
+  border: 1px solid rgba(124,58,237,0.35);
+  color: var(--primary);
+  cursor: pointer;
+}
+
+/* User message — quieter, "›" mark + plain body, slightly indented */
+.cx-msg.user .cx-body {
+  font-size: 14.5px;
+  line-height: 1.65;
+  color: var(--on-surface);
+  padding: 10px 14px;
+  border-left: 2px solid rgba(129,236,255,0.4);
+  background: linear-gradient(90deg, rgba(129,236,255,0.05), transparent 70%);
+  border-radius: 0 10px 10px 0;
+  white-space: pre-wrap;
+}
+.cx-msg.user .cx-body img { max-width: 100%; max-height: 300px; border-radius: 6px; display: block; }
+
+/* AI message — open body, structured */
+.cx-msg.ai .cx-body {
+  font-size: 14.5px;
+  line-height: 1.7;
+  color: var(--on-surface);
+}
+.cx-msg.ai .cx-body p { margin: 0 0 12px; white-space: pre-wrap; }
+.cx-msg.ai .cx-body p:last-child { margin: 0; }
+.cx-msg.ai .cx-body ul { margin: 4px 0 12px; padding-left: 18px; }
+.cx-msg.ai .cx-body ul li { margin: 4px 0; }
+.cx-msg.ai .cx-body strong { color: var(--on-surface); font-weight: 600; }
+.cx-msg.ai .cx-body img { max-width: 100%; max-height: 300px; border-radius: 6px; display: block; margin-top: 4px; }
+
+/* Reasoning / thinking trace (collapsible). Reuses the existing inline-styled
+   <details> from views-chat; this class is a hook for future extraction. */
+.cx-think {
+  margin: 4px 0 10px; padding: 6px 10px;
+  border-left: 2px solid rgba(124,58,237,0.35);
+  background: rgba(124,58,237,0.04);
+  border-radius: 4px; font-size: 12px;
+}
+.cx-think summary {
+  cursor: pointer; color: var(--on-surface-muted);
+  font-family: var(--font-mono); font-size: 10px;
+  letter-spacing: 0.5px; text-transform: uppercase;
+}
+.cx-think .body { margin-top: 6px; font-style: italic; color: var(--on-surface-muted); white-space: pre-wrap; }
+
+/* Inline code chip — JetBrains Mono pill, monospace */
+.cx-code-inline {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 2px 7px;
+  background: rgba(10,10,18,0.65);
+  border: 1px solid rgba(255,255,255,0.05);
+  border-radius: 5px;
+  color: var(--tertiary);
+  white-space: nowrap;
+}
+.cx-code-inline.primary { color: var(--primary); border-color: rgba(224,142,254,0.22); background: rgba(224,142,254,0.06); }
+.cx-code-inline.warn    { color: var(--warn);    border-color: rgba(255,207,107,0.22); background: rgba(255,207,107,0.06); }
+.cx-code-inline.success { color: var(--success); border-color: rgba(138,239,199,0.22); background: rgba(138,239,199,0.06); }
+
+/* AI action card — "N files modified" agent-style block */
+.cx-action {
+  margin: 12px 0 4px;
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,0.07);
+  background: linear-gradient(180deg, rgba(20,18,32,0.62), rgba(14,13,24,0.62));
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturation));
+  overflow: hidden;
+}
+.cx-action-head {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px;
+}
+.cx-action-ico {
+  width: 30px; height: 30px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, rgba(224,142,254,0.18), rgba(129,236,255,0.10));
+  border: 1px solid rgba(255,255,255,0.06);
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--primary);
+  flex-shrink: 0;
+}
+.cx-action-title {
+  font-family: var(--font-display);
+  font-weight: 600; font-size: 13.5px;
+  color: var(--on-surface);
+}
+.cx-action-sub {
+  font-family: var(--font-mono); font-size: 10.5px;
+  color: var(--on-surface-muted);
+  margin-top: 2px;
+  display: flex; gap: 6px; align-items: center;
+}
+.cx-action-sub .plus { color: var(--success); }
+.cx-action-sub .minus { color: var(--danger); }
+.cx-action-actions {
+  margin-left: auto;
+  display: flex; gap: 6px; align-items: center;
+}
+.cx-action-btn {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 5px 11px;
+  font-family: var(--font-display); font-weight: 600; font-size: 11px;
+  letter-spacing: 0.02em;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.08);
+  color: var(--on-surface-variant);
+  cursor: pointer;
+  transition: all 160ms ease;
+}
+.cx-action-btn:hover { color: var(--on-surface); background: rgba(255,255,255,0.07); border-color: rgba(255,255,255,0.16); }
+.cx-action-btn.primary {
+  color: #1a0a24;
+  background: linear-gradient(135deg, var(--primary), var(--primary-container));
+  border-color: transparent;
+  box-shadow: 0 8px 22px -10px rgba(224,142,254,0.55);
+}
+.cx-action-btn.primary:hover { background: linear-gradient(135deg, #e8a2ff, #d886f5); }
+.cx-action-files {
+  border-top: 1px solid rgba(255,255,255,0.05);
+  padding: 6px 8px 8px;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.cx-action-file {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  font-family: var(--font-mono); font-size: 12px;
+  color: var(--on-surface-variant);
+  cursor: pointer;
+  transition: background 140ms ease;
+}
+.cx-action-file:hover { background: rgba(255,255,255,0.04); color: var(--on-surface); }
+.cx-action-file:hover .open-hint { opacity: 1; }
+.cx-action-file .name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--on-surface); }
+.cx-action-file .stats { display: inline-flex; gap: 6px; font-size: 10.5px; }
+.cx-action-file .stats .add { color: var(--success); }
+.cx-action-file .stats .rem { color: var(--danger); opacity: 0.85; }
+.cx-action-file .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--tertiary); flex-shrink: 0; }
+.cx-action-file .dot.add { background: var(--success); }
+.cx-action-file .dot.mod { background: var(--warn); }
+.cx-action-file .dot.del { background: var(--danger); }
+.cx-action-file .open-hint { font-size: 10px; color: var(--primary); opacity: 0; transition: opacity 140ms ease; }
+
+/* AI inline reactions row (copy / thumb up / down / retry) */
+.cx-react {
+  margin-top: 10px;
+  display: flex; align-items: center; gap: 4px;
+  color: var(--on-surface-muted);
+}
+.cx-react button {
+  width: 26px; height: 26px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; border: 0; cursor: pointer;
+  border-radius: 6px;
+  color: var(--on-surface-muted);
+  transition: all 140ms ease;
+}
+.cx-react button:hover { background: rgba(255,255,255,0.05); color: var(--on-surface-variant); }
+.cx-react .flip { transform: scaleY(-1); }
+
+/* Working-on indicator (replaces typing dots) */
+.cx-working {
+  display: inline-flex; align-items: center; gap: 10px;
+  padding: 8px 14px 8px 12px;
+  border-radius: 999px;
+  border: 1px solid rgba(224,142,254,0.22);
+  background: rgba(224,142,254,0.06);
+  color: var(--on-surface-variant);
+  font-family: var(--font-mono); font-size: 11.5px;
+}
+.cx-working .ring {
+  width: 12px; height: 12px;
+  border-radius: 50%;
+  border: 1.5px solid transparent;
+  border-top-color: var(--primary);
+  border-right-color: var(--secondary);
+  animation: spin 1s linear infinite;
+}
+
+/* ── Composer (full agent-style) ──────────────────────────── */
+.cx-composer-wrap {
+  padding: 10px 24px 22px;
+  flex-shrink: 0;
+  display: flex; flex-direction: column; align-items: center;
+}
+.cx-composer-wrap.full { padding-top: 0; }
+.cx-composer {
+  width: 100%;
+  max-width: 760px;
+  background: rgba(16, 14, 28, 0.7);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 16px;
+  padding: 4px;
+  transition: border-color 180ms ease, box-shadow 240ms ease;
+}
+.cx-composer:focus-within {
+  border-color: rgba(224,142,254,0.35);
+  box-shadow: 0 0 0 4px rgba(224,142,254,0.10), 0 24px 60px -24px rgba(224,142,254,0.35);
+}
+.cx-composer-input {
+  width: 100%;
+  background: transparent;
+  border: 0; outline: 0;
+  color: var(--on-surface);
+  font-family: var(--font-body);
+  font-size: 14px;
+  padding: 14px 16px 6px;
+  resize: none;
+  min-height: 56px;
+  max-height: 240px;
+  line-height: 1.55;
+}
+.cx-composer-input::placeholder { color: var(--on-surface-muted); }
+.cx-composer-bar {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 10px 8px;
+}
+.cx-tool {
+  width: 28px; height: 28px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; border: 0; cursor: pointer;
+  border-radius: 8px;
+  color: var(--on-surface-variant);
+  transition: all 160ms ease;
+}
+.cx-tool:hover { background: rgba(255,255,255,0.06); color: var(--on-surface); }
+.cx-tool.on { color: var(--primary); background: rgba(224,142,254,0.10); }
+.cx-spacer { flex: 1; }
+/* Host slot for the existing <ModelPicker> so it inherits the bar layout. */
+.cx-composer-bar .composer-model { margin: 0; }
+.cx-send {
+  width: 30px; height: 30px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: rgba(255,255,255,0.06);
+  color: var(--on-surface-variant);
+  border: 1px solid rgba(255,255,255,0.08);
+  cursor: pointer; border-radius: 8px;
+  transition: all 200ms ease;
+}
+.cx-send:not(:disabled) {
+  background: linear-gradient(135deg, var(--primary), var(--secondary));
+  color: #1a0a24;
+  border-color: transparent;
+  box-shadow: 0 8px 20px -8px rgba(224,142,254,0.7), inset 0 1px 0 rgba(255,255,255,0.35);
+}
+.cx-send:not(:disabled):hover { transform: translateY(-1px); box-shadow: 0 10px 24px -8px rgba(224,142,254,0.9), inset 0 1px 0 rgba(255,255,255,0.45); }
+.cx-send:disabled { cursor: default; opacity: 0.55; }
+.cx-send.stop { background: rgba(224,82,82,0.14); color: var(--danger); border-color: rgba(224,82,82,0.35); }
+
+/* Pending attachment thumbnail inside the composer */
+.cx-pending { padding: 6px 10px 0; display: flex; align-items: center; gap: 6px; }
+.cx-pending img { height: 40px; border-radius: 4px; object-fit: cover; border: 1px solid rgba(255,255,255,0.1); }
+.cx-pending button { background: none; border: 0; cursor: pointer; color: var(--on-surface-muted); font-size: 14px; }
+
+/* Context chips row under composer */
+.cx-ctx-row {
+  width: 100%;
+  max-width: 760px;
+  margin-top: 10px;
+  display: flex; align-items: center; gap: 8px;
+  flex-wrap: wrap;
+}
+.cx-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 10px;
+  font-family: var(--font-mono); font-size: 11px;
+  background: rgba(20,18,32,0.55);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 999px;
+  color: var(--on-surface-variant);
+  cursor: default;
+  transition: all 160ms ease;
+}
+.cx-chip svg { opacity: 0.85; }
+.cx-chip.status {
+  border-color: rgba(255,207,107,0.32);
+  color: var(--warn);
+  background: rgba(255,207,107,0.06);
+}
+.cx-chip.status .dot {
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--warn);
+  box-shadow: 0 0 6px var(--warn);
+}
+.cx-chip.branch { color: var(--tertiary); border-color: rgba(129,236,255,0.22); background: rgba(129,236,255,0.05); }
+.cx-chip.branch .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--tertiary); }
+.cx-chip-spacer { flex: 1; }
+
+/* ── Code block (inside AI body) ──────────────────────────── */
+.cx-code-block {
+  margin: 12px 0 6px;
+  border-radius: 12px;
+  border: 1px solid rgba(255,255,255,0.06);
+  background: rgba(7,7,16,0.85);
+  overflow: hidden;
+}
+.cx-code-block-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px;
+  background: rgba(255,255,255,0.025);
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+  font-family: var(--font-mono); font-size: 11px;
+  color: var(--on-surface-variant);
+}
+.cx-code-block-head .lang { display: inline-flex; align-items: center; gap: 6px; }
+.cx-code-block-head .dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--tertiary);
+  box-shadow: 0 0 6px var(--tertiary);
+}
+.cx-code-block pre {
+  margin: 0; padding: 14px 16px;
+  font-family: var(--font-mono); font-size: 12.5px; line-height: 1.6;
+  color: var(--on-surface);
+  overflow-x: auto;
+}
+.cx-code-block pre .k { color: #d180ef; }
+.cx-code-block pre .s { color: #8aefc7; }
+.cx-code-block pre .n { color: #ffcf6b; }
+.cx-code-block pre .c { color: var(--on-surface-muted); font-style: italic; }
+.cx-code-block pre .f { color: #81ecff; }
+.cx-code-block pre .p { color: var(--secondary); }
+
+/* ── HTML "Aperçu" overlay (srcdoc preview of a generated code block) ── */
+.cx-preview-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 6000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+  background: rgba(6, 5, 12, 0.62);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  animation: cx-preview-in 140ms ease;
+}
+@keyframes cx-preview-in { from { opacity: 0; } to { opacity: 1; } }
+.cx-preview-modal {
+  width: min(1100px, 92vw);
+  height: min(760px, 88vh);
+  display: flex;
+  flex-direction: column;
+  border-radius: 16px;
+  overflow: hidden;
+  background: var(--lg-tint-strong, rgba(22, 18, 38, 0.78));
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.5);
+}
+.cx-preview-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 10px 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  flex-shrink: 0;
+}
+.cx-preview-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--on-surface);
+}
+.cx-preview-frame {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  border: 0;
+  background: #ffffff;
+}
+
+/* ── Conversation head (replaces big content-head when in chat) ── */
+.cx-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 28px;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+  flex-shrink: 0;
+  font-family: var(--font-mono); font-size: 11.5px;
+  color: var(--on-surface-variant);
+}
+.cx-head .title {
+  font-family: var(--font-display);
+  font-size: 13px; font-weight: 600;
+  color: var(--on-surface);
+}
+.cx-head .dot {
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--success); box-shadow: 0 0 8px var(--success);
+  flex-shrink: 0;
+}
+.cx-head .cx-head-spacer { flex: 1; }
+.cx-head .more {
+  width: 26px; height: 26px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 0; background: transparent; cursor: pointer;
+  color: var(--on-surface-muted); border-radius: 6px;
+}
+.cx-head .more:hover { background: rgba(255,255,255,0.06); color: var(--on-surface); }
+
+/* ── Chat ↔ Editor handoff split (Phase 2) ────────────────── */
+.chat-split {
+  position: absolute; inset: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 45fr) minmax(0, 55fr);
+  min-height: 0;
+}
+.chat-split-left {
+  position: relative; min-width: 0; min-height: 0;
+  border-right: 1px solid rgba(255,255,255,0.06);
+}
+.chat-split-right {
+  position: relative; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column;
+}
+.chat-split-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+  font-family: var(--font-mono); font-size: 11px;
+  color: var(--on-surface-variant);
+  flex-shrink: 0;
+}
+.chat-split-head .dot.ide { width: 6px; height: 6px; border-radius: 50%; background: var(--primary); box-shadow: 0 0 8px var(--primary); flex-shrink: 0; }
+.chat-split-head .label { font-family: var(--font-display); font-weight: 600; color: var(--on-surface); }
+.chat-split-head .sep { opacity: 0.4; }
+.chat-split-head .path { color: var(--on-surface-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chat-split-head .split-close {
+  width: 26px; height: 26px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 0; background: transparent; cursor: pointer;
+  color: var(--on-surface-muted); border-radius: 6px;
+}
+.chat-split-head .split-close:hover { background: rgba(255,255,255,0.06); color: var(--on-surface); }
+.chat-split-editor { flex: 1; min-height: 0; position: relative; overflow: hidden; }
+.chat-split-editor .cm-host { position: absolute; inset: 0; }
+.chat-split-editor .cm-host, .chat-split-editor .cm-editor { height: 100%; }
+
+/* Git diff in the right pane (GitDiffView). .diff-view ships no CSS of its own
+   (its /code usage relies on its container), so it's laid out here, scoped to
+   the chat split to avoid touching /code. The MergeView needs an explicit
+   height or it collapses. */
+.chat-split-right .diff-view { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.chat-split-right .diff-view__header {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px; flex-shrink: 0;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+  font-family: var(--font-mono); font-size: 11px; color: var(--on-surface-variant);
+}
+.chat-split-right .diff-view__header-left { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; }
+.chat-split-right .diff-view__path { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chat-split-right .diff-view__path:last-child { color: var(--on-surface-muted); }
+.chat-split-right .diff-view__separator { opacity: 0.5; flex-shrink: 0; }
+.chat-split-right .diff-view__close {
+  flex-shrink: 0; width: 26px; height: 26px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 0; background: transparent; cursor: pointer;
+  color: var(--on-surface-muted); border-radius: 6px;
+}
+.chat-split-right .diff-view__close:hover { background: rgba(255,255,255,0.06); color: var(--on-surface); }
+.chat-split-right .diff-view__container { flex: 1; min-height: 0; overflow: hidden; }
+.chat-split-right .diff-view__container .cm-mergeView,
+.chat-split-right .diff-view__container .cm-editor { height: 100%; }
+.chat-split-right .diff-view__loading { flex: 1; display: flex; align-items: center; justify-content: center; }
+
+/* Responsive */
+@media (max-width: 900px) {
+  .cx-feed { padding: 22px 18px 10px; }
+  .cx-composer-wrap { padding: 8px 18px 14px; }
+  .cx-empty-title { font-size: 24px; }
+  .cx-head { padding: 10px 16px; }
+  .chat-split { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+  .chat-split-left { border-right: 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
+}

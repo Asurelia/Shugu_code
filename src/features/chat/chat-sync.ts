@@ -36,6 +36,7 @@ import { parseAiReply } from "@/lib/markdown";
 import { parseThinkingMode, resolveThinking } from "@/lib/thinkingHeuristic";
 import { resolveRoute, parseDelegateOverride } from "@/lib/routingHeuristic";
 import { spawnAgent, awaitAgentComplete } from "@/lib/agents";
+import { getActiveDesignSystem, buildDesignSystemPrompt } from "@/features/design/activeDesignSystem";
 import { queryClient } from "@/lib/queryClient";
 import { diag } from "@/lib/diag";
 import { chatKeys } from "./keys";
@@ -360,6 +361,19 @@ export async function sendChatMessage(
     apiMessages.push({ role: "user", content: trimmed });
   }
 
+  // Design-system context (open-design). When the user activated a system in
+  // the Design view ("Utiliser dans le chat"), prepend it as a leading system
+  // message so generated UIs follow that style. INVOKE-ONLY: this is NEVER
+  // written to db.messages — it's rebuilt per send from the active-system
+  // store and truncated to fit modest local context windows. chat_send folds
+  // role:"system" into Anthropic's top-level `system` param (chat.rs:241/273)
+  // and passes it inline for OpenAI-compat (chat.rs:440), so no Rust change is
+  // needed. Absent an active system this is a no-op (zero impact on chat).
+  const activeDs = getActiveDesignSystem();
+  if (activeDs && (activeDs.designMd.trim() || activeDs.tokensCss.trim())) {
+    apiMessages.unshift({ role: "system", content: buildDesignSystemPrompt(activeDs) });
+  }
+
   // Capture the reasoning trace for persistence. The streaming UI hooks
   // (useChatStream in ChatView / ChatPanel) already consume `chat://delta`
   // events for live rendering — we attach a SECOND, persistence-oriented
@@ -450,47 +464,31 @@ export async function sendChatMessage(
 // associated provider is disabled), we append a short instructional
 // message instead and emit `app://navigate` so the main IDE jumps to
 // Settings → Connections.
-async function handleDelegate(convId: string, task: string): Promise<void> {
+/**
+ * Resolve the configured orchestrator's model + provider config. Shared by
+ * the chat delegate path (handleDelegate) and the Design Studio "Generate"
+ * (StudioView) so both spawn agents through the SAME provider resolution.
+ * Returns a discriminated result; callers map the failure reasons to their
+ * own UX (chat message vs Studio banner).
+ */
+export type OrchestratorResolution =
+  | { kind: "ok"; model: string; protocol: Protocol; baseUrl: string; apiKey?: string }
+  | { kind: "no-orchestrator" }
+  | { kind: "disabled"; providerId: string };
+
+export async function resolveOrchestrator(): Promise<OrchestratorResolution> {
   const orchestratorModelRaw = await db.settings.get("routing.orchestratorModel");
   const orchestratorModel = orchestratorModelRaw && orchestratorModelRaw.trim();
+  if (!orchestratorModel) return { kind: "no-orchestrator" };
 
-  if (!orchestratorModel) {
-    await appendMessage(convId, {
-      id: newMessageId("e"),
-      role: "ai",
-      body:
-        "⚠ Cette demande ressemble à une tâche de développement, mais aucun **orchestrator** n'est configuré.\n\n" +
-        "Configure-le dans **Settings → Connections** (section Routing) pour activer la délégation — par exemple un Claude Sonnet via API, ou un OpenCode/Codex local.",
-      ts: nowHHMM(),
-    });
-    try {
-      const mod = await import("@tauri-apps/api/event");
-      await mod.emit("app://navigate", { path: "/connections" });
-    } catch (err) {
-      console.warn("[chat-sync] navigate emit failed", err);
-    }
-    return;
-  }
-
-  // Resolve provider config for the orchestrator. Same path as the chat
-  // model — prefix the id with `openai/` if no slash so resolveProvider
-  // doesn't fall through to "unknown provider".
-  const fullId = orchestratorModel.includes("/")
-    ? orchestratorModel
-    : `openai/${orchestratorModel}`;
+  // Prefix the id with `openai/` if no slash so resolveProvider doesn't fall
+  // through to "unknown provider".
+  const fullId = orchestratorModel.includes("/") ? orchestratorModel : `openai/${orchestratorModel}`;
   const { providerId, protocol: defaultProtocol, baseUrl: defaultBaseUrl, model: realModel } =
     resolveProvider(fullId);
 
   const enabled = await getProviderEnabled(providerId);
-  if (enabled !== "true") {
-    await appendMessage(convId, {
-      id: newMessageId("e"),
-      role: "ai",
-      body: `⚠ Le provider orchestrator "${providerId}" n'est pas activé. Ouvre Settings → Connections, configure-le et clique Save.`,
-      ts: nowHHMM(),
-    });
-    return;
-  }
+  if (enabled !== "true") return { kind: "disabled", providerId };
 
   const cfg = await loadProviderConfig(providerId);
   let protocol: Protocol = defaultProtocol;
@@ -507,6 +505,39 @@ async function handleDelegate(convId: string, task: string): Promise<void> {
   }
   const baseUrl: string = cfg.baseUrl && cfg.baseUrl !== "" ? cfg.baseUrl : defaultBaseUrl;
   const apiKey: string | undefined = cfg.apiKey && cfg.apiKey !== "" ? cfg.apiKey : undefined;
+  return { kind: "ok", model: realModel, protocol, baseUrl, apiKey };
+}
+
+async function handleDelegate(convId: string, task: string): Promise<void> {
+  const orch = await resolveOrchestrator();
+  if (orch.kind !== "ok") {
+    if (orch.kind === "no-orchestrator") {
+      await appendMessage(convId, {
+        id: newMessageId("e"),
+        role: "ai",
+        body:
+          "⚠ Cette demande ressemble à une tâche de développement, mais aucun **orchestrator** n'est configuré.\n\n" +
+          "Configure-le dans **Settings → Connections** (section Routing) pour activer la délégation — par exemple un Claude Sonnet via API, ou un OpenCode/Codex local.",
+        ts: nowHHMM(),
+      });
+      try {
+        const mod = await import("@tauri-apps/api/event");
+        await mod.emit("app://navigate", { path: "/connections" });
+      } catch (err) {
+        console.warn("[chat-sync] navigate emit failed", err);
+      }
+    } else {
+      await appendMessage(convId, {
+        id: newMessageId("e"),
+        role: "ai",
+        body: `⚠ Le provider orchestrator "${orch.providerId}" n'est pas activé. Ouvre Settings → Connections, configure-le et clique Save.`,
+        ts: nowHHMM(),
+      });
+    }
+    return;
+  }
+
+  const { model: realModel, protocol, baseUrl, apiKey } = orch;
 
   // Spawn the agent FIRST. We need the agentId to attach to the placeholder
   // so the reconciler (on mount) can match an orphan placeholder back to

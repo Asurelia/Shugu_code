@@ -109,3 +109,46 @@ export function useShell(): ShellContextValue {
   if (!ctx) throw new Error("useShell must be used inside RootLayout");
   return ctx;
 }
+
+// ─── Detached shell (mascot window) ───────────────────────────
+//
+// The mascot is a SEPARATE webview window (mascot.tsx) with no RootLayout, so
+// it has no ShellContext provider. Panels embedded via the contextual cards
+// that read useShell() — notably SideGit (Git card) and ConflictResolver —
+// would throw "useShell must be used inside RootLayout" and unmount the whole
+// mascot tree (observed: the Git card "closed" the mascot).
+//
+// This factory builds a minimal, inert ShellContextValue for that window:
+// there is no editor in the mascot, so editor state is empty and the setters
+// are no-ops; file opening is wired to cross the window boundary via the
+// provided opener (which emits app://open-file → the main window's RootLayout
+// opens the file in its editor). A compare request has no meaning without an
+// editor, so it degrades to opening the file in the main window rather than a
+// silent no-op (clicking a changed file in the mascot's git card is far more
+// useful as "reveal it in the editor" than as a dead click).
+export function createDetachedShell(openInMain: (path: string) => void): ShellContextValue {
+  const noop = () => {};
+  const openFile = async (path: string) => { openInMain(path); };
+  return {
+    openFiles: [],
+    setOpenFiles: noop,
+    activeFile: null,
+    setActiveFile: noop,
+    fileContents: {},
+    setFileContents: noop,
+    generations: [],
+    setGenerations: noop,
+    agents: [],
+    openSnippetInEditor: async () => {},
+    findPanelOpen: false,
+    setFindPanelOpen: noop,
+    openFile,
+    editorPrefs: DEFAULT_EDITOR_PREFS,
+    setEditorPref: (<K extends keyof EditorPrefs>(_k: K, _v: EditorPrefs[K]) => {}),
+    compareFile: null,
+    setCompareFile: (v) => {
+      const next = typeof v === "function" ? null : v;
+      if (next) void openFile(next.right).catch(() => {});
+    },
+  };
+}

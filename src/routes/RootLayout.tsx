@@ -55,7 +55,7 @@ import { useRefreshOpenFiles } from "@/features/fs/useRefreshOpenFiles";
 import { indexWorkspace } from "@/features/fs/workspaceIndexer";
 import { AgentsPanel } from "@/features/agents/AgentsPanel";
 import { useAgentEvents } from "@/features/agents/useEvents";
-import { useActiveAgents, setSelectedAgentId } from "@/features/agents/queries";
+import { setSelectedAgentId } from "@/features/agents/queries";
 import { useChatEvents } from "@/features/chat/useEvents";
 import { useChatStreamListener } from "@/features/chat/useChatStream";
 import { useLlamaLifecycle } from "@/features/llama/useLlamaLifecycle";
@@ -76,7 +76,7 @@ import { formatCurrentDocumentCli, formatCodeDirect } from "@/features/code/form
 // ─── Path → view string (derived navigation) ─────────────────
 
 type ViewKey =
-  | "chat" | "code" | "git" | "image" | "agents"
+  | "chat" | "code" | "git" | "image" | "studio" | "agents"
   | "gallery" | "settings" | "profile" | "connections";
 
 function pathToView(pathname: string): ViewKey {
@@ -84,6 +84,7 @@ function pathToView(pathname: string): ViewKey {
   if (pathname === "/code")         return "code";
   if (pathname === "/git")          return "git";
   if (pathname === "/image")        return "image";
+  if (pathname.startsWith("/studio")) return "studio";
   if (pathname === "/agents")       return "agents";
   if (pathname === "/gallery")      return "gallery";
   if (pathname.startsWith("/settings")) return "settings";
@@ -95,8 +96,8 @@ function pathToView(pathname: string): ViewKey {
 function railTargetFor(v: string): string {
   const map: Record<string, string> = {
     chat: "/chat", code: "/code", git: "/git", image: "/image",
-    agents: "/agents", gallery: "/gallery", settings: "/settings",
-    profile: "/profile", connections: "/connections",
+    studio: "/studio", agents: "/agents", gallery: "/gallery",
+    settings: "/settings", profile: "/profile", connections: "/connections",
   };
   return map[v] ?? "/chat";
 }
@@ -354,15 +355,11 @@ export function RootLayout() {
   // Auto-stop/start llama-server quand le model chat passe local↔API.
   // Restauré après diagnostic — innocent du freeze (testé Plan v2 Step C).
   useLlamaLifecycle();
-  // Count via TanStack — re-render uniquement quand le nombre change
-  // (TanStack fait un compare structurel sur le résultat, et data?.length
-  // est une primitive number). Renommé `activeAgents` pour éviter le
-  // conflit avec une autre variable `agents` dans le scope.
-  const { data: activeAgents } = useActiveAgents();
-  const agentsCount = activeAgents?.length ?? 0;
-  // Local toggle for the agents side overlay. Phase 0: chat view only —
-  // Phase 1+ may extend to code/image views once the orchestrator can
-  // run alongside other workflows.
+  // Agents side overlay (chat view). Opened on demand via `revealAgent`
+  // (the "via orchestrator" chat badge → app://reveal-agent) and closed by
+  // its own × button. The manual header toggle was removed when the chat
+  // content-head was suppressed for the Codex layout; the dedicated
+  // "Tâches" contextual card (Phase 3) is the first-class manual entry point.
   const [showAgentsPanel, setShowAgentsPanel] = useState(false);
 
   // Phase 1 — cross-component "open this agent" trigger. When the user
@@ -774,6 +771,30 @@ export function RootLayout() {
     }
   }, [openFile, navigate]);
 
+  // Cross-window "open this file" — the mascot's contextual cards
+  // (Sources / Env) emit `app://open-file` with a workspace-relative path.
+  // The mascot window has no ShellContext/editor, so the actual open happens
+  // here in the main IDE: read+open the tab, then navigate to /code.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const mod = await import("@tauri-apps/api/event");
+        unlisten = await mod.listen<{ path?: string }>("app://open-file", (e) => {
+          if (cancelled) return;
+          const path = e.payload?.path;
+          if (!path) return;
+          void openFile(path);
+          navigate({ to: "/code" });
+        });
+      } catch (err) {
+        console.warn("[RootLayout] open-file listen failed:", err);
+      }
+    })();
+    return () => { cancelled = true; unlisten?.(); };
+  }, [openFile, navigate]);
+
   // newChat creates a fresh conversation row in SQLite and switches the
   // active conv to it. The empty-messages render falls out naturally:
   // useMessages(newId) returns [] for a conv with no rows. The active
@@ -938,6 +959,7 @@ export function RootLayout() {
       case "code":     return { title: "Editor",        sub: activeFile };
       case "git":      return { title: "Source Control", sub: activeFile || "" };
       case "image":    return { title: <span><span className="acc">Image Studio</span></span>, sub: "flux.1 · sdxl · lcm-fast" };
+      case "studio":   return { title: <span><span className="acc">Studio</span></span>, sub: "inspiration · génération · aperçu live" };
       case "agents":   return { title: "Agents",        sub: `${agents.filter((a: any) => a.status === "running").length} running · ${agents.length} total` };
       case "gallery":  return { title: "Gallery",       sub: `${generations.length} generations` };
       case "settings": return { title: "Settings",      sub: settingsSection };
@@ -1022,7 +1044,7 @@ export function RootLayout() {
             onSettings={() => getCommandById("open-settings")?.run(cmdCtx)}
             sideCollapsed={sideCollapsed}
             onToggleSide={() => setSideCollapsed(c => !c)}
-            menu={<MenuBar ctx={cmdCtx}/>}
+            menu={view === "code" ? <MenuBar ctx={cmdCtx}/> : null}
           />
           <div className="main">
             <Rail view={view} setView={navigateTo}/>
@@ -1030,42 +1052,25 @@ export function RootLayout() {
               {sidePanel}
             </SidePanel>
             <div className="content">
-              <div className="content-head">
-                <div className="content-title">{heading.title}</div>
-                <div className="content-sub">{heading.sub}</div>
-                <div style={{ flex: 1 }}/>
-                {view === "chat" && <>
-                  <button className="lgb lgb-sm"><Icon name="copy" size={11}/> Share</button>
-                  <button className="lgb lgb-sm"><Icon name="sparkle" size={11}/> Compact</button>
-                  {/* Agents observability toggle. Inline SVG (org-chart glyph) so
-                      we don't have to invent a new Icon name in the design kit
-                      just for Phase 0. `lgb-primary` lights up when the panel
-                      is visible so the user has a visual cue of which surface
-                      is on top. */}
-                  <button
-                    className={"lgb lgb-sm" + (showAgentsPanel ? " lgb-primary" : "")}
-                    onClick={() => setShowAgentsPanel(o => !o)}
-                    title={showAgentsPanel ? "Hide agents panel" : "Show agents panel"}
-                  >
-                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <rect x="9" y="2" width="6" height="5" rx="1"/>
-                      <rect x="2" y="17" width="6" height="5" rx="1"/>
-                      <rect x="16" y="17" width="6" height="5" rx="1"/>
-                      <path d="M12 7v4M5 17v-2a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v2"/>
-                    </svg>
-                    Agents{agentsCount > 0 ? ` (${agentsCount})` : ""}
-                  </button>
-                </>}
-                {view === "code" && <>
-                  <button className="lgb lgb-sm"><Icon name="git" size={11}/> Commit</button>
-                  <button className="lgb lgb-sm"><Icon name="sparkle" size={11}/> Ask Shugu</button>
-                  <DockToggleButton dockState={dockState} setDockState={setDockState}/>
-                </>}
-                {view === "image" && <>
-                  <button className="lgb lgb-sm"><Icon name="thumbs" size={11}/> Variations</button>
-                  <button className="lgb lgb-sm"><Icon name="download" size={11}/> Export</button>
-                </>}
-              </div>
+              {/* The chat view owns its own header (cx-head inside ChatView),
+                  so the shared content-head is suppressed for it — matches the
+                  Codex layout where the empty state has no chrome at all. */}
+              {view !== "chat" && (
+                <div className="content-head">
+                  <div className="content-title">{heading.title}</div>
+                  <div className="content-sub">{heading.sub}</div>
+                  <div style={{ flex: 1 }}/>
+                  {view === "code" && <>
+                    <button className="lgb lgb-sm"><Icon name="git" size={11}/> Commit</button>
+                    <button className="lgb lgb-sm"><Icon name="sparkle" size={11}/> Ask Shugu</button>
+                    <DockToggleButton dockState={dockState} setDockState={setDockState}/>
+                  </>}
+                  {view === "image" && <>
+                    <button className="lgb lgb-sm"><Icon name="thumbs" size={11}/> Variations</button>
+                    <button className="lgb lgb-sm"><Icon name="download" size={11}/> Export</button>
+                  </>}
+                </div>
+              )}
               {isCode ? (
                 <DockWorkspace
                   dockState={dockState}
@@ -1099,6 +1104,19 @@ export function RootLayout() {
                         zIndex: 10,
                       }}
                     >
+                      <button
+                        onClick={() => setShowAgentsPanel(false)}
+                        title="Fermer le panneau agents"
+                        style={{
+                          position: "absolute", top: 8, right: 8, zIndex: 1,
+                          width: 24, height: 24, borderRadius: 6,
+                          display: "inline-flex", alignItems: "center", justifyContent: "center",
+                          background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)",
+                          color: "var(--on-surface-muted)", cursor: "pointer",
+                        }}
+                      >
+                        <Icon name="x" size={13}/>
+                      </button>
                       <AgentsPanel />
                     </div>
                   )}

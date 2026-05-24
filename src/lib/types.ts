@@ -4,6 +4,27 @@ export type Role = "user" | "ai" | "system";
 
 export interface CodeAttachment { lang: string; text: string }
 
+/** One file inside a message's "files modified" action card. */
+export interface MessageActionFile {
+  /** Workspace-relative path. */
+  name: string;
+  /** "add" | "mod" | "del" — drives the colored status dot. */
+  st: "add" | "mod" | "del";
+  add: number;
+  rem: number;
+}
+
+/** Structured "N files modified" action card attached to an AI message.
+ * Renderer-ready field; precise per-message attribution requires agent-level
+ * diff capture (deferred). The chat currently surfaces a live workspace-diff
+ * card on the latest agent message instead (see views-chat WorkspaceDiffCard). */
+export interface MessageAction {
+  title: string;
+  add: number;
+  rem: number;
+  files: MessageActionFile[];
+}
+
 export interface Message {
   id: number | string;
   role: Role;
@@ -23,6 +44,9 @@ export interface Message {
   viaAgent?: boolean;
   /** Agent id for the badge click handler (open the transcript drawer). */
   agentId?: string;
+  /** Optional "files modified" action card (Codex-style). Present only when a
+   * producer attaches it; the renderer never fabricates it. */
+  action?: MessageAction;
 }
 
 export interface Conversation {

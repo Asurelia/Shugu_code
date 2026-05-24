@@ -50,6 +50,10 @@ export function Icon({ name, size = 18, className = "" }: { name: string; size?:
     case "thumbs": return p(<><path d="M7 22V11"/><path d="M14 4l-1 7h6a2 2 0 0 1 2 2.2l-1 6A2 2 0 0 1 18 21H8.5"/></>);
     case "history":return p(<><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/></>);
     case "shield": return p(<><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/></>);
+    case "palette": return p(<><circle cx="13.5" cy="6.5" r="1.3" fill="currentColor" stroke="none"/><circle cx="17.5" cy="10.5" r="1.3" fill="currentColor" stroke="none"/><circle cx="8.5" cy="7.5" r="1.3" fill="currentColor" stroke="none"/><circle cx="6.5" cy="12.5" r="1.3" fill="currentColor" stroke="none"/><path d="M12 2a10 10 0 1 0 0 20 2.5 2.5 0 0 0 2-4 2.5 2.5 0 0 1 2-4h2a4 4 0 0 0 4-4c0-4.4-4.5-8-10-8Z"/></>);
+    case "check":  return p(<><path d="M20 6 9 17l-5-5"/></>);
+    case "chevron-left":  return p(<><path d="m15 18-6-6 6-6"/></>);
+    case "chevron-right": return p(<><path d="m9 18 6-6-6-6"/></>);
     default: return p(<circle cx="12" cy="12" r="6"/>);
   }
 }
@@ -143,6 +147,11 @@ export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettin
         <span className="kbd">⌘K</span>
       </div>
       <div className="tb-spacer"></div>
+      {/* Portal target for the chat ContextBubble trigger (ChatView portals its
+          small context icon-button here so it sits with History/Bell/Settings).
+          display:contents — the span vanishes from layout, the button becomes a
+          direct flex child of .titlebar. */}
+      <span id="tb-ctx-slot" className="tb-ctx-slot" />
       {/* TODO(Pass 2): wire to command */}
       <button className="tb-action" title="History"><Icon name="history" size={15}/></button>
       {/* TODO(Pass 2): wire to command */}
@@ -163,6 +172,7 @@ export function Rail({ view, setView }: any) {
     { id: "code",    icon: "code",    label: "Editor" },
     { id: "git",     icon: "git",     label: "Source Control" },
     { id: "image",   icon: "image",   label: "Image" },
+    { id: "studio",  icon: "palette", label: "Studio" },
     { id: "agents",  icon: "agent",   label: "Agents" },
     { id: "gallery", icon: "gallery", label: "Gallery" },
   ];

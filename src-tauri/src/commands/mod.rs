@@ -10,6 +10,7 @@ pub mod grep;
 pub mod llama;
 pub mod lsp;
 pub mod model_bundle;
+pub mod preview;
 pub mod terminal;
 pub mod image;
 pub mod models;

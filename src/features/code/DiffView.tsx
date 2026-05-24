@@ -13,6 +13,7 @@ import type { Extension } from "@codemirror/state";
 import { EditorView, lineNumbers, highlightActiveLine } from "@codemirror/view";
 import { syntaxHighlighting } from "@codemirror/language";
 import { useFileContent } from "@/features/fs/queries";
+import { useGitHead } from "@/features/git/queries";
 import { langFromPath } from "@/lib/fs";
 import { diag } from "@/lib/diag";
 import { langExtensionFor } from "./languages";
@@ -124,6 +125,80 @@ export function DiffView({ left, right, onClose }: DiffViewProps): JSX.Element {
       </div>
 
       {isLoading ? (
+        <div className="diff-view__loading">
+          <div className="ring" />
+        </div>
+      ) : (
+        <div className="diff-view__container" ref={containerRef} />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Git diff — working tree vs HEAD
+// ---------------------------------------------------------------------------
+
+/**
+ * Read-only 2-pane git diff for a single workspace-relative `path`: its HEAD
+ * (committed) content on the left, its working-tree content on the right.
+ * Reuses the same MergeView + per-pane extensions as DiffView.
+ *
+ * Sources: useGitHead (HEAD, LF-normalized; null when untracked / no commits)
+ * and useFileContent (working tree). An untracked file has no HEAD → the left
+ * pane is empty and every line renders as an addition, which is correct.
+ */
+export function GitDiffView({ path, onClose }: { path: string; onClose: () => void }): JSX.Element {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const mergeViewRef = useRef<MergeView | null>(null);
+
+  const working = useFileContent(path); // FileContent | null (null = loading)
+  const head = useGitHead(path);        // string | null (null = untracked / loading)
+
+  const ready = working !== null;
+  const headText = head ?? "";
+  const workText = working?.text ?? "";
+
+  useEffect(() => {
+    if (!containerRef.current || !ready) return;
+    mergeViewRef.current?.destroy();
+    try {
+      mergeViewRef.current = new MergeView({
+        parent: containerRef.current,
+        a: { doc: headText, extensions: paneExtensions(path) }, // original = HEAD
+        b: { doc: workText, extensions: paneExtensions(path) }, // modified = working tree
+        highlightChanges: true,
+        gutter: true,
+      });
+    } catch (err) {
+      diag("diff-view", `git MergeView construction failed for ${path}: ${String(err)}`);
+    }
+    return () => {
+      mergeViewRef.current?.destroy();
+      mergeViewRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [headText, workText, path, ready]);
+
+  return (
+    <div className="diff-view">
+      <div className="diff-view__header">
+        <div className="diff-view__header-left">
+          <span className="diff-view__path">{head === null ? "(nouveau)" : "HEAD"}</span>
+          <span className="diff-view__separator">↔</span>
+          <span className="diff-view__path">{path}</span>
+        </div>
+        <button
+          className="diff-view__close"
+          onClick={onClose}
+          aria-label="Fermer le diff"
+          title="Fermer (Esc)"
+        >
+          x
+        </button>
+      </div>
+
+      {!ready ? (
         <div className="diff-view__loading">
           <div className="ring" />
         </div>
