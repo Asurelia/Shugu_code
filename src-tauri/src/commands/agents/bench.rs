@@ -453,7 +453,7 @@ async fn run_one_inner(
             if task.verifier_kind == "claude" {
                 // Fuzzy / meaning-based grading by a judge model. It only READS the
                 // produced files (non-executing) → safe in v1. Async (network).
-                judge_with_claude(&client, protocol, base_url, model, api_key, task, &ws).await
+                judge_with_claude(app, &client, protocol, base_url, model, api_key, task, &ws).await
             } else {
                 let (passed, detail) =
                     run_verifier(&task.verifier_kind, &ws, &task.verifier_spec);
@@ -531,11 +531,13 @@ fn parse_verdict(reply: &str) -> (bool, Option<f64>, String) {
 }
 
 /// `claude` verifier — a judge model grades the agent's output against a rubric.
-/// NON-executing (only reads produced files) → safe in v1. Reuses the Refiner's
-/// single-completion helper. v1 reuses the bench run's own model as the judge.
-/// ⚠ A weak model judges weakly — pick a strong model in the bench dropdown, or
-/// wire a dedicated judge model later (follow-up).
+/// NON-executing (only reads produced files) → safe. Judges on the **Refiner**
+/// model (a strong, SEPARATE model — e.g. DeepSeek V4 Pro) resolved via
+/// `load_refiner_config`, EXACTLY like `evolve_harness` — so the agent never
+/// grades its own work (no self-grading bias). Falls back to the agent's model
+/// only when no Refiner is configured.
 async fn judge_with_claude(
+    app: &AppHandle,
     client: &reqwest::Client,
     protocol: &str,
     base_url: &str,
@@ -579,12 +581,28 @@ async fn judge_with_claude(
         task.prompt, rubric, tree, produced
     );
 
-    match call_refiner(client, protocol, base_url, model, api_key, &None, system, &user).await {
+    // Judge on the Refiner model (separate + strong, e.g. DeepSeek V4 Pro) —
+    // never the agent grading itself. Falls back to the agent model if unset.
+    let cfg = super::harness::load_refiner_config(app, protocol, base_url, model, api_key);
+    match call_refiner(
+        client,
+        &cfg.protocol,
+        &cfg.base_url,
+        &cfg.model,
+        &cfg.api_key,
+        &None,
+        system,
+        &user,
+    )
+    .await
+    {
         Ok(reply) => {
             let (passed, score, reason) = parse_verdict(&reply);
             let score_str = score.map(|s| format!(" {s}/10")).unwrap_or_default();
             let verdict = if passed { "PASS" } else { "FAIL" };
-            (passed, score, format!("juge:{verdict}{score_str} — {reason}"))
+            // Surface WHICH model judged, so a self-graded run is never mistaken
+            // for an independent one.
+            (passed, score, format!("juge[{}]:{verdict}{score_str} — {reason}", cfg.model))
         }
         Err(e) => (false, None, format!("juge indisponible: {e}")),
     }

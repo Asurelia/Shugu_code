@@ -21,12 +21,12 @@ use super::{get_conn, now_ms};
 /// present, otherwise falls back to the stuck agent's OWN provider/model (likely
 /// at the capability floor — `created_by` records `fallback:<model>` so a
 /// confusing "gen N+1 made things worse" can be traced to self-refinement).
-struct RefinerConfig {
-    protocol: String,
-    base_url: String,
-    model: String,
-    api_key: String,
-    created_by: String,
+pub(super) struct RefinerConfig {
+    pub(super) protocol: String,
+    pub(super) base_url: String,
+    pub(super) model: String,
+    pub(super) api_key: String,
+    pub(super) created_by: String,
 }
 
 /// Resolve the Refiner's API key WITHOUT storing it: first the OS keychain
@@ -51,7 +51,7 @@ fn resolve_refiner_key(provider_id: &str, protocol: &str, agent_api_key: &str) -
     agent_api_key.to_string()
 }
 
-fn load_refiner_config(
+pub(super) fn load_refiner_config(
     app: &AppHandle,
     agent_protocol: &str,
     agent_base_url: &str,
