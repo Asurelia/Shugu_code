@@ -570,6 +570,10 @@ pub fn run() {
             commands::agents::harness::harness_get_refiner,
             commands::agents::harness::harness_set_refiner,
             commands::agents::harness::outcome_set_feedback,
+            commands::agents::bench::bench_run_suite,
+            commands::agents::bench::bench_compare_generations,
+            commands::agents::bench::bench_list,
+            commands::agents::bench::bench_add_task,
             // Design Studio — project snapshots (Projets tab).
             commands::studio::studio_project_upsert_auto,
             commands::studio::studio_project_save_as,

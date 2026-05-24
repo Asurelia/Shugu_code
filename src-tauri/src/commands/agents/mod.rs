@@ -71,6 +71,11 @@ mod tools;
 /// Continual Harness — harness evolution / Refiner (lot 1 P2) + UI commands.
 pub(crate) mod harness;
 
+/// Measurement bench (banc de mesure) — replays fixed tasks against PINNED
+/// harness generations on COPIED fixtures, judges with non-executing verifiers,
+/// records `bench_runs`, and A/B-compares generations. The legibility spine.
+pub(crate) mod bench;
+
 // Re-export the crate-visible items from `tools` so `chat.rs` can reach
 // them via `crate::commands::agents::*` without poking into the private
 // submodule path. The streaming helpers in `chat.rs` consume:

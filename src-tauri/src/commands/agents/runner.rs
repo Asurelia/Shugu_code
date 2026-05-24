@@ -71,7 +71,7 @@ const EVOLVE_BONUS_ITERATIONS: u32 = 4;
 ///     `role: "tool"` per result; Anthropic packs all results into a
 ///     single `role: "user"` message with `content: [tool_result, ...]`.
 #[allow(dead_code)] // variants used in match arms but rustc sees only construction
-enum AgentMessage {
+pub(super) enum AgentMessage {
     Text { role: String, content: String },
     AssistantWithTools { content: String, tool_calls: Vec<ToolCall> },
     ToolResults(Vec<ToolResult>),
@@ -370,10 +370,10 @@ pub(super) async fn run_agent_task(
 /// keeps the FIRST stall signature detected; in lot 1 it is purely
 /// observational, in P2 it becomes the trigger for harness evolution.
 #[derive(Default)]
-struct LoopMetrics {
-    iterations: u32,
-    tool_errors: u32,
-    stuck_reason: Option<String>,
+pub(super) struct LoopMetrics {
+    pub(super) iterations: u32,
+    pub(super) tool_errors: u32,
+    pub(super) stuck_reason: Option<String>,
 }
 
 /// Multi-turn loop body. Returns the final answer text when the LLM
