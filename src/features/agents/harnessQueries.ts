@@ -10,14 +10,17 @@ import { queryClient } from "@/lib/queryClient";
 import {
   listHarnessGenerations,
   harnessMetrics,
+  benchList,
   type HarnessGeneration,
   type HarnessMetric,
+  type BenchTaskRow,
 } from "@/lib/agents";
 
 export const harnessKeys = {
   all: ["harness"] as const,
   generations: (role: string) => ["harness", "generations", role] as const,
   metrics: (role: string) => ["harness", "metrics", role] as const,
+  benchTasks: (role: string) => ["harness", "bench", role] as const,
 };
 
 /** Every generation of a role's harness, newest first (evolution log). */
@@ -42,4 +45,18 @@ export function useHarnessMetrics(role: string) {
 export function invalidateHarness(role: string): void {
   void queryClient.invalidateQueries({ queryKey: harnessKeys.generations(role) });
   void queryClient.invalidateQueries({ queryKey: harnessKeys.metrics(role) });
+}
+
+/** Enabled bench tasks for a role (the suite the panel can run / seed). */
+export function useBenchList(role: string) {
+  return useQuery<BenchTaskRow[]>({
+    queryKey: harnessKeys.benchTasks(role),
+    queryFn: () => benchList(role),
+    staleTime: 5_000,
+  });
+}
+
+/** Refetch the bench task list for a role (after seeding / adding tasks). */
+export function invalidateBench(role: string): void {
+  void queryClient.invalidateQueries({ queryKey: harnessKeys.benchTasks(role) });
 }

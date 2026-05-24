@@ -18,19 +18,79 @@ import {
   saveManualHarness,
   getHarnessRefiner,
   setHarnessRefiner,
+  benchRunSuite,
+  benchCompareGenerations,
+  benchAddTask,
   type AgentRole,
   type HarnessGeneration,
+  type BenchSuiteResult,
+  type BenchComparison,
 } from "@/lib/agents";
 import {
   useHarnessGenerations,
   useHarnessMetrics,
+  useBenchList,
   invalidateHarness,
+  invalidateBench,
 } from "./harnessQueries";
 import { useDiscoveredModels } from "@/lib/modelDiscovery";
 import { PROVIDER_REGISTRY } from "@/lib/providers";
 import { loadProviderConfig, getConfig } from "@/lib/credentials";
 
 const ROLES: AgentRole[] = ["orchestrator", "coder", "researcher", "tester", "mascot"];
+
+// Example bench tasks (the "milestones" of Forge). Create-from-scratch file
+// tasks judged by the NON-executing `files` verifier — enough to prove the bench
+// runs + measures; harder edge-of-capability tasks come later. Seeded against the
+// CURRENTLY selected role (role overridden at insert time).
+const EXAMPLE_TASKS: Array<{
+  id: string;
+  domain: string;
+  title: string;
+  prompt: string;
+  verifierKind: string;
+  verifierSpec: string;
+}> = [
+  {
+    id: "ex-fizzbuzz",
+    domain: "code",
+    title: "FizzBuzz (JS)",
+    prompt:
+      'Crée un fichier `fizzbuzz.js` à la racine du workspace qui exporte une fonction `fizzbuzz(n)` retournant le tableau des chaînes FizzBuzz de 1 à n (multiple de 3 → "Fizz", de 5 → "Buzz", des deux → "FizzBuzz", sinon le nombre). Utilise l\'outil fs_write_file.',
+    verifierKind: "files",
+    verifierSpec: JSON.stringify({
+      required: ["fizzbuzz.js"],
+      contains: [
+        { path: "fizzbuzz.js", substring: "Fizz" },
+        { path: "fizzbuzz.js", substring: "Buzz" },
+      ],
+    }),
+  },
+  {
+    id: "ex-readme",
+    domain: "code",
+    title: "README + section Usage",
+    prompt:
+      "Crée un fichier `README.md` à la racine décrivant un projet nommé Demo, avec un titre et une section `## Usage`. Utilise l'outil fs_write_file.",
+    verifierKind: "files",
+    verifierSpec: JSON.stringify({
+      required: ["README.md"],
+      contains: [{ path: "README.md", substring: "Usage" }],
+    }),
+  },
+  {
+    id: "ex-config",
+    domain: "code",
+    title: "config.json",
+    prompt:
+      'Crée un fichier `config.json` à la racine : un objet JSON valide avec les clés "name" (chaîne) et "version" (chaîne). Utilise l\'outil fs_write_file.',
+    verifierKind: "files",
+    verifierSpec: JSON.stringify({
+      required: ["config.json"],
+      contains: [{ path: "config.json", substring: "version" }],
+    }),
+  },
+];
 
 // ── Tokens (fallbacks mirror the dark Celestial Veil theme) ──────────
 const C = {
@@ -164,6 +224,7 @@ export function HarnessPanel() {
   const [role, setRole] = useState<AgentRole>("orchestrator");
   const gensQ = useHarnessGenerations(role);
   const metricsQ = useHarnessMetrics(role);
+  const benchListQ = useBenchList(role);
 
   const generations = gensQ.data ?? [];
   const active = useMemo(() => generations.find((g) => g.active === 1), [generations]);
@@ -200,6 +261,11 @@ export function HarnessPanel() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+
+  // Bench (banc de mesure) local state.
+  const [benchModelId, setBenchModelId] = useState("");
+  const [benchResult, setBenchResult] = useState<BenchSuiteResult | null>(null);
+  const [comparison, setComparison] = useState<BenchComparison | null>(null);
 
   async function run(tag: string, fn: () => Promise<void>) {
     setBusy(tag);
@@ -452,6 +518,170 @@ export function HarnessPanel() {
               Rafraîchir
             </Button>
           </div>
+        </Section>
+
+        {/* Bench — banc de mesure (legibility spine) */}
+        <Section
+          title="Banc de mesure"
+          hint="Rejoue une suite de tâches fixes contre une génération, sur une COPIE jetable du workspace (jamais ton vrai projet). Tu vois combien réussissent — et l'écart entre générations."
+        >
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 12, color: C.muted }}>
+              {benchListQ.isLoading
+                ? "Chargement des tâches…"
+                : `${benchListQ.data?.length ?? 0} tâche(s) pour ${role}`}
+            </span>
+            <Button
+              disabled={busy !== null}
+              onClick={() =>
+                run("bench-seed", async () => {
+                  for (const t of EXAMPLE_TASKS) {
+                    await benchAddTask({ ...t, role, fixtureDir: null });
+                  }
+                  invalidateBench(role);
+                  setNotice(`Tâches d'exemple ajoutées pour ${role}.`);
+                })
+              }
+            >
+              {busy === "bench-seed" ? "Ajout…" : "Seed exemples"}
+            </Button>
+          </div>
+
+          {(benchListQ.data?.length ?? 0) > 0 ? (
+            <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 4 }}>
+              {benchListQ.data!.map((t) => (
+                <li key={t.id} style={{ fontSize: 12, color: C.muted, display: "flex", gap: 8 }}>
+                  <span style={{ color: C.text }}>{t.title}</span>
+                  <span>· {t.verifierKind}</span>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <label style={labelStyle} htmlFor="bench-model">Modèle qui exécute l'agent (pour le banc)</label>
+            <select
+              id="bench-model"
+              value={benchModelId}
+              onChange={(e) => setBenchModelId(e.target.value)}
+              style={fieldStyle}
+              disabled={discovered.isLoading}
+            >
+              <option value="">{discovered.isLoading ? "Détection…" : "(choisir un modèle)"}</option>
+              {discovered.data.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.label} — {m.providerLabel}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <Button
+              variant="primary"
+              disabled={busy !== null || !benchModelId || (benchListQ.data?.length ?? 0) === 0}
+              onClick={() =>
+                run("bench-run", async () => {
+                  const m = discovered.data.find((x) => x.id === benchModelId);
+                  if (!m) throw new Error("Modèle introuvable — rafraîchis la liste (section Refiner).");
+                  const reg = PROVIDER_REGISTRY[m.providerId];
+                  const cfg = await loadProviderConfig(m.providerId);
+                  const protocol = reg?.protocol ?? (await getConfig(m.providerId, "protocol")) ?? "custom";
+                  const baseUrl = cfg.baseUrl || reg?.baseUrl || "";
+                  const gen = active?.generation ?? 0;
+                  const res = await benchRunSuite({
+                    role,
+                    generation: gen,
+                    model: m.modelId,
+                    providerId: m.providerId,
+                    protocol,
+                    baseUrl,
+                  });
+                  setBenchResult(res);
+                  setNotice(`Suite lancée sur gén ${gen} : ${res.passed}/${res.total} réussies.`);
+                })
+              }
+            >
+              {busy === "bench-run" ? "Exécution…" : `Lancer la suite sur gén ${active?.generation ?? 0}`}
+            </Button>
+            <Button
+              disabled={busy !== null}
+              onClick={() =>
+                run("bench-compare", async () => {
+                  const gen = active?.generation ?? 0;
+                  const cmp = await benchCompareGenerations(role, 0, gen);
+                  setComparison(cmp);
+                  setNotice(
+                    `Comparaison gén 0 → gén ${gen} : ${cmp.aPassed}/${cmp.total} → ${cmp.bPassed}/${cmp.total}, ${cmp.regressions} régression(s).`,
+                  );
+                })
+              }
+            >
+              {busy === "bench-compare" ? "…" : "Comparer gén 0 ↔ active"}
+            </Button>
+          </div>
+
+          {benchResult ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <div
+                style={{
+                  fontSize: 13,
+                  fontWeight: 700,
+                  color: benchResult.passed === benchResult.total ? C.success : C.text,
+                }}
+              >
+                Gén {benchResult.generation} : {benchResult.passed}/{benchResult.total} réussies
+              </div>
+              <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 4 }}>
+                {benchResult.results.map((r) => (
+                  <li key={r.taskId} style={{ fontSize: 12, display: "flex", gap: 8, alignItems: "baseline" }}>
+                    <span style={{ color: r.passed ? C.success : C.error, fontWeight: 700 }}>{r.passed ? "✓" : "✗"}</span>
+                    <span style={{ color: C.text }}>{r.title}</span>
+                    <span style={{ color: C.muted }}>— {r.detail}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+
+          {comparison ? (
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                <thead>
+                  <tr style={{ color: C.muted, textAlign: "left" }}>
+                    <th style={{ padding: "6px 8px" }}>Tâche</th>
+                    <th style={{ padding: "6px 8px" }}>Gén {comparison.generationA}</th>
+                    <th style={{ padding: "6px 8px" }}>Gén {comparison.generationB}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {comparison.tasks.map((t) => (
+                    <tr
+                      key={t.taskId}
+                      style={{ borderTop: `1px solid ${C.border}`, background: t.regression ? "rgba(255,107,107,0.10)" : "transparent" }}
+                    >
+                      <td style={{ padding: "6px 8px", color: C.text }}>{t.title || t.taskId}</td>
+                      <td style={{ padding: "6px 8px" }}>
+                        {t.passedA === null ? (
+                          <span style={{ color: C.muted }}>—</span>
+                        ) : (
+                          <span style={{ color: t.passedA ? C.success : C.error, fontWeight: 700 }}>{t.passedA ? "✓" : "✗"}</span>
+                        )}
+                      </td>
+                      <td style={{ padding: "6px 8px" }}>
+                        {t.passedB === null ? (
+                          <span style={{ color: C.muted }}>—</span>
+                        ) : (
+                          <span style={{ color: t.passedB ? C.success : C.error, fontWeight: 700 }}>{t.passedB ? "✓" : "✗"}</span>
+                        )}
+                        {t.regression ? <span style={{ color: C.error, marginLeft: 6 }}>↓ régression</span> : null}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
         </Section>
 
         {/* Metrics */}

@@ -373,3 +373,101 @@ export async function setOutcomeFeedback(
 ): Promise<void> {
   return invoke<void>("outcome_set_feedback", { agentId, feedback });
 }
+
+// ── Measurement bench (banc de mesure) — mirrors commands::agents::bench ──
+
+/** A registered bench task (mirror BenchTaskRow). */
+export interface BenchTaskRow {
+  id: string;
+  role: string;
+  domain: string;
+  title: string;
+  prompt: string;
+  verifierKind: string;
+  enabled: boolean;
+}
+
+/** One task's verdict in a suite run (mirror BenchRunSummary). */
+export interface BenchRunSummary {
+  taskId: string;
+  title: string;
+  passed: boolean;
+  detail: string;
+  ms: number;
+}
+
+/** Result of running a whole suite against one generation (mirror BenchSuiteResult). */
+export interface BenchSuiteResult {
+  suiteRunId: string;
+  role: string;
+  generation: number;
+  total: number;
+  passed: number;
+  results: BenchRunSummary[];
+}
+
+/** Per-task A/B between two generations (mirror BenchTaskCompare). */
+export interface BenchTaskCompare {
+  taskId: string;
+  title: string;
+  passedA: boolean | null;
+  passedB: boolean | null;
+  regression: boolean;
+}
+
+/** A/B comparison of two generations on the same suite (mirror BenchComparison). */
+export interface BenchComparison {
+  role: string;
+  generationA: number;
+  generationB: number;
+  aPassed: number;
+  bPassed: number;
+  total: number;
+  regressions: number;
+  tasks: BenchTaskCompare[];
+}
+
+/** List the enabled bench tasks for a role. */
+export async function benchList(role: string): Promise<BenchTaskRow[]> {
+  return invoke<BenchTaskRow[]>("bench_list", { role });
+}
+
+/** Register (or replace) a bench task. */
+export async function benchAddTask(args: {
+  id: string;
+  role: string;
+  domain: string;
+  title: string;
+  prompt: string;
+  fixtureDir: string | null;
+  verifierKind: string;
+  verifierSpec: string;
+}): Promise<void> {
+  return invoke<void>("bench_add_task", args);
+}
+
+/** Run a role's suite against a pinned generation. The API key is resolved
+ *  Rust-side from the keychain by `providerId` — never passed in cleartext. */
+export async function benchRunSuite(args: {
+  role: string;
+  generation: number;
+  model: string;
+  providerId: string;
+  protocol?: string;
+  baseUrl?: string;
+}): Promise<BenchSuiteResult> {
+  return invoke<BenchSuiteResult>("bench_run_suite", args);
+}
+
+/** A/B two generations on the same suite (regression = passed in A, fails in B). */
+export async function benchCompareGenerations(
+  role: string,
+  generationA: number,
+  generationB: number,
+): Promise<BenchComparison> {
+  return invoke<BenchComparison>("bench_compare_generations", {
+    role,
+    generationA,
+    generationB,
+  });
+}
