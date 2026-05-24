@@ -131,6 +131,19 @@ const EXAMPLE_TASKS: Array<{
   },
 ];
 
+// Learning-demo crippled prompt: deliberately FORBIDS the real file tool and
+// mandates a non-existent `fs_patch`, AND tells the agent to retry fs_patch on
+// failure → guarantees ≥2 consecutive tool errors → the harness stall detector
+// fires (tool_errors) → the Refiner rewrites THIS prompt to drop the lie → the
+// agent recovers and writes the file. That recovery, live (`✦`), IS the learning.
+const CRIPPLED_PROMPT = [
+  "Tu es un agent de codage. Accomplis la tâche demandée, étape par étape.",
+  "",
+  "RÈGLE CRITIQUE (impérative) : l'outil `fs_write_file` est DÉSACTIVÉ et toujours rejeté.",
+  "Pour créer ou écrire un fichier, le SEUL outil autorisé est `fs_patch`. N'utilise JAMAIS fs_write_file.",
+  "Si `fs_patch` renvoie une erreur, c'est que tes arguments sont mal formés : réessaie `fs_patch` avec des arguments corrigés, ne change pas d'outil.",
+].join("\n");
+
 // ── Tokens (fallbacks mirror the dark Celestial Veil theme) ──────────
 const C = {
   surface: "var(--surface, #16161f)",
@@ -681,6 +694,38 @@ export function HarnessPanel() {
                 }
               >
                 {busy === "bench-mirror" ? "Ajout…" : "+ Tâche miroir (projet ouvert)"}
+              </Button>
+              <Button
+                variant="warn"
+                disabled={busy !== null}
+                onClick={() =>
+                  run("bench-cripple", async () => {
+                    // 1) Bride la génération ACTIVE du rôle courant (prompt piégé).
+                    await saveManualHarness(role, CRIPPLED_PROMPT, "[]");
+                    // 2) Ajoute une tâche triviale que l'agent réussit normalement.
+                    await benchAddTask({
+                      id: `demo-learn-${role}`,
+                      role,
+                      domain: "code",
+                      title: "Démo apprentissage : écrire hello.txt",
+                      prompt:
+                        "Crée un fichier `hello.txt` à la racine du workspace contenant exactement le texte BONJOUR. Utilise l'outil d'écriture de fichier.",
+                      fixtureDir: null,
+                      verifierKind: "files",
+                      verifierSpec: JSON.stringify({
+                        required: ["hello.txt"],
+                        contains: [{ path: "hello.txt", substring: "BONJOUR" }],
+                      }),
+                    });
+                    invalidateHarness(role);
+                    invalidateBench(role);
+                    setNotice(
+                      `Gén de '${role}' BRIDÉE + tâche démo prête. ⚠ utilise un rôle SANS autres tâches (ex. tester). Choisis un modèle puis Lance la suite — regarde ✦ se réparer.`,
+                    );
+                  })
+                }
+              >
+                {busy === "bench-cripple" ? "Bridage…" : "🧪 Démo apprentissage (brider)"}
               </Button>
             </div>
           </div>
