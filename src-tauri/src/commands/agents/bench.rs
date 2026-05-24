@@ -35,6 +35,7 @@ use super::{get_conn, now_ms};
 // ────────────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BenchTaskRow {
     pub id: String,
     pub role: String,
@@ -46,6 +47,7 @@ pub struct BenchTaskRow {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BenchRunSummary {
     pub task_id: String,
     pub title: String,
@@ -55,6 +57,7 @@ pub struct BenchRunSummary {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BenchSuiteResult {
     pub suite_run_id: String,
     pub role: String,
@@ -65,6 +68,7 @@ pub struct BenchSuiteResult {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BenchTaskCompare {
     pub task_id: String,
     pub title: String,
@@ -76,6 +80,7 @@ pub struct BenchTaskCompare {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BenchComparison {
     pub role: String,
     pub generation_a: i64,
@@ -256,12 +261,12 @@ async fn run_one(
     model: &str,
     protocol: &str,
     base_url: &str,
-    api_key_opt: &Option<String>,
+    api_key: &str,
 ) -> BenchRunSummary {
     let start = std::time::Instant::now();
     let agent_id = format!("bench-{}", Uuid::new_v4());
     let (passed, detail) =
-        run_one_inner(app, task, generation, model, protocol, base_url, api_key_opt, &agent_id).await;
+        run_one_inner(app, task, generation, model, protocol, base_url, api_key, &agent_id).await;
     let ms = start.elapsed().as_millis() as i64;
     record_bench_run(
         app, suite_run_id, &task.id, &task.role, generation, &agent_id, passed, &detail, ms,
@@ -283,7 +288,7 @@ async fn run_one_inner(
     model: &str,
     protocol: &str,
     base_url: &str,
-    api_key_opt: &Option<String>,
+    api_key: &str,
     agent_id: &str,
 ) -> (bool, String) {
     let harness = match load_harness_generation(app, &task.role, generation) {
@@ -309,14 +314,6 @@ async fn run_one_inner(
         }
     }
 
-    let api_key = match crate::commands::chat::resolve_key(protocol, api_key_opt) {
-        Ok(k) => k,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&ws);
-            return (false, format!("provider key error: {e}"));
-        }
-    };
-
     let mut history = vec![
         AgentMessage::Text {
             role: "system".to_string(),
@@ -336,7 +333,7 @@ async fn run_one_inner(
         protocol,
         base_url,
         model,
-        &api_key,
+        api_key,
         &None,
         agent_id,
         &task.role,
@@ -355,6 +352,29 @@ async fn run_one_inner(
     verdict
 }
 
+/// Resolve the API key for a bench run WITHOUT a key ever crossing the
+/// frontend: OS keychain (where Connections saves `provider.<id>.apiKey`) →
+/// env-var fallback (`resolve_key`) → empty (the LLM call then fails cleanly and
+/// the task is reported as a provider error, never a false pass). Mirrors the
+/// Refiner's `resolve_refiner_key`.
+fn resolve_bench_key(provider_id: &str, protocol: &str) -> String {
+    if !provider_id.is_empty() {
+        if let Ok(Some(k)) =
+            crate::commands::credentials::cred_get(format!("provider.{provider_id}.apiKey"))
+        {
+            if !k.is_empty() {
+                return k;
+            }
+        }
+    }
+    if let Ok(k) = crate::commands::chat::resolve_key(protocol, &None) {
+        if !k.is_empty() {
+            return k;
+        }
+    }
+    String::new()
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Tauri commands
 // ────────────────────────────────────────────────────────────────────
@@ -369,14 +389,16 @@ pub async fn bench_run_suite(
     role: String,
     generation: i64,
     model: String,
+    provider_id: String,
     protocol: Option<String>,
     base_url: Option<String>,
-    api_key: Option<String>,
 ) -> Result<BenchSuiteResult, String> {
     let tasks = load_tasks(&app, &role)?;
     let suite_run_id = Uuid::new_v4().to_string();
     let protocol = protocol.unwrap_or_else(|| "openai".to_string());
     let base_url = base_url.unwrap_or_default();
+    // Key resolved Rust-side from the keychain by provider — never crosses the FE.
+    let api_key = resolve_bench_key(&provider_id, &protocol);
 
     let mut results = Vec::with_capacity(tasks.len());
     for task in &tasks {
