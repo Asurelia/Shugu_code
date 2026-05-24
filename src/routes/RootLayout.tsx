@@ -76,7 +76,7 @@ import { formatCurrentDocumentCli, formatCodeDirect } from "@/features/code/form
 // ─── Path → view string (derived navigation) ─────────────────
 
 type ViewKey =
-  | "chat" | "code" | "git" | "image" | "studio" | "agents"
+  | "chat" | "code" | "git" | "image" | "studio" | "agents" | "harness"
   | "gallery" | "settings" | "profile" | "connections";
 
 function pathToView(pathname: string): ViewKey {
@@ -86,6 +86,7 @@ function pathToView(pathname: string): ViewKey {
   if (pathname === "/image")        return "image";
   if (pathname.startsWith("/studio")) return "studio";
   if (pathname === "/agents")       return "agents";
+  if (pathname === "/harness")      return "harness";
   if (pathname === "/gallery")      return "gallery";
   if (pathname.startsWith("/settings")) return "settings";
   if (pathname === "/profile")      return "profile";
@@ -96,7 +97,7 @@ function pathToView(pathname: string): ViewKey {
 function railTargetFor(v: string): string {
   const map: Record<string, string> = {
     chat: "/chat", code: "/code", git: "/git", image: "/image",
-    studio: "/studio", agents: "/agents", gallery: "/gallery",
+    studio: "/studio", agents: "/agents", harness: "/harness", gallery: "/gallery",
     settings: "/settings", profile: "/profile", connections: "/connections",
   };
   return map[v] ?? "/chat";

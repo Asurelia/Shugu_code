@@ -29,6 +29,28 @@ struct RefinerConfig {
     created_by: String,
 }
 
+/// Resolve the Refiner's API key WITHOUT storing it: first the OS keychain
+/// (where Connections saves provider keys, account `provider.<id>.apiKey`),
+/// then env-var fallback (`resolve_key`), then the stuck agent's own key as a
+/// last resort. This is why `harness.refiner` only stores non-secret fields.
+fn resolve_refiner_key(provider_id: &str, protocol: &str, agent_api_key: &str) -> String {
+    if !provider_id.is_empty() {
+        if let Ok(Some(k)) =
+            crate::commands::credentials::cred_get(format!("provider.{provider_id}.apiKey"))
+        {
+            if !k.is_empty() {
+                return k;
+            }
+        }
+    }
+    if let Ok(k) = crate::commands::chat::resolve_key(protocol, &None) {
+        if !k.is_empty() {
+            return k;
+        }
+    }
+    agent_api_key.to_string()
+}
+
 fn load_refiner_config(
     app: &AppHandle,
     agent_protocol: &str,
@@ -36,40 +58,41 @@ fn load_refiner_config(
     agent_model: &str,
     agent_api_key: &str,
 ) -> RefinerConfig {
-    if let Ok(conn_mutex) = get_conn(app) {
-        if let Ok(conn) = conn_mutex.lock() {
-            let raw: Option<String> = conn
-                .query_row(
-                    "SELECT value FROM settings WHERE key = 'harness.refiner'",
-                    [],
-                    |r| r.get::<_, String>(0),
-                )
-                .ok();
-            if let Some(json) = raw {
-                if let Ok(v) = serde_json::from_str::<Value>(&json) {
-                    let protocol = v.get("protocol").and_then(|x| x.as_str()).unwrap_or("");
-                    let model = v.get("model").and_then(|x| x.as_str()).unwrap_or("");
-                    if !protocol.is_empty() && !model.is_empty() {
-                        return RefinerConfig {
-                            protocol: protocol.to_string(),
-                            base_url: v
-                                .get("baseUrl")
-                                .and_then(|x| x.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            model: model.to_string(),
-                            api_key: v
-                                .get("apiKey")
-                                .and_then(|x| x.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            created_by: format!("refiner:{model}"),
-                        };
-                    }
-                }
+    // Read the (non-secret) Refiner setting, releasing the DB lock before any
+    // keychain I/O.
+    let raw: Option<String> = get_conn(app).ok().and_then(|m| {
+        m.lock().ok().and_then(|c| {
+            c.query_row(
+                "SELECT value FROM settings WHERE key = 'harness.refiner'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+        })
+    });
+
+    if let Some(json) = raw {
+        if let Ok(v) = serde_json::from_str::<Value>(&json) {
+            let protocol = v.get("protocol").and_then(|x| x.as_str()).unwrap_or("");
+            let model = v.get("model").and_then(|x| x.as_str()).unwrap_or("");
+            let provider_id = v.get("providerId").and_then(|x| x.as_str()).unwrap_or("");
+            if !protocol.is_empty() && !model.is_empty() {
+                return RefinerConfig {
+                    protocol: protocol.to_string(),
+                    base_url: v
+                        .get("baseUrl")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    model: model.to_string(),
+                    // Key resolved from the keychain, never read from settings.
+                    api_key: resolve_refiner_key(provider_id, protocol, agent_api_key),
+                    created_by: format!("refiner:{model}"),
+                };
             }
         }
     }
+
     RefinerConfig {
         protocol: agent_protocol.to_string(),
         base_url: agent_base_url.to_string(),
