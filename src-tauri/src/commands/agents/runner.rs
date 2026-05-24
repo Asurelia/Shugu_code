@@ -191,7 +191,7 @@ fn build_anthropic_messages(history: &[AgentMessage]) -> Vec<ChatMessage> {
 /// is open — the dispatcher then returns an "is_error: true" ToolResult
 /// for every call this iteration so the model sees the situation and
 /// can ask the user to open a workspace.
-fn get_workspace_root(app: &AppHandle) -> Option<PathBuf> {
+pub(super) fn get_workspace_root(app: &AppHandle) -> Option<PathBuf> {
     let state = app.state::<Mutex<Option<PathBuf>>>();
     let guard = state.lock().ok()?;
     guard.clone()

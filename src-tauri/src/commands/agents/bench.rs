@@ -24,11 +24,12 @@ use std::path::{Path, PathBuf};
 use rusqlite::params;
 use serde::Serialize;
 use serde_json::Value;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 use uuid::Uuid;
 
 use super::runner::{
-    load_active_harness, load_harness_generation, tool_use_loop, AgentMessage, LoopMetrics,
+    get_workspace_root, load_active_harness, load_harness_generation, tool_use_loop, AgentMessage,
+    LoopMetrics,
 };
 use super::{get_conn, now_ms};
 
@@ -94,6 +95,32 @@ pub struct BenchComparison {
     pub tasks: Vec<BenchTaskCompare>,
 }
 
+/// Live per-task progress, broadcast on the `bench://progress` channel while a
+/// suite runs so the panel is never a dark room: each task fires `running` when
+/// it starts and `done` (with the verdict) when it finishes. Deliberately
+/// per-TASK, not per-tool-call — each task is minutes of a reasoning model, and
+/// streaming every tool call would bury the only signal that matters (which
+/// task, pass or fail) under noise.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BenchProgress {
+    suite_run_id: String,
+    index: usize,
+    total: usize,
+    task_id: String,
+    title: String,
+    /// "running" | "done"
+    phase: String,
+    passed: Option<bool>,
+    detail: Option<String>,
+    ms: Option<i64>,
+}
+
+/// Best-effort emit — a dropped progress event must never fail a bench run.
+fn emit_progress(app: &AppHandle, p: &BenchProgress) {
+    let _ = app.emit("bench://progress", p);
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Internal: a task loaded from `bench_tasks`
 // ────────────────────────────────────────────────────────────────────
@@ -141,10 +168,41 @@ fn load_tasks(app: &AppHandle, role: &str) -> Result<Vec<LoadedTask>, String> {
 // Fixture copy + verifiers (NON-executing in v1)
 // ────────────────────────────────────────────────────────────────────
 
-/// Recursively copy a fixture directory into a throwaway workspace. Uses the
-/// `walkdir` crate already vendored for find-in-files.
+/// Recursively copy a fixture (or a project snapshot) into a throwaway
+/// workspace, PRUNING version-control, dependency caches and build outputs.
+/// Skipping these is what makes mirroring a real project viable — a raw copy of
+/// `node_modules/` or `target/` would be gigabytes — and it keeps `.git` (and
+/// thus history) entirely out of the agent's reach. Uses the `walkdir` crate
+/// already vendored for find-in-files.
 fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
-    for entry in walkdir::WalkDir::new(src) {
+    const SKIP_DIRS: &[&str] = &[
+        ".git",
+        "node_modules",
+        "target",
+        "dist",
+        "build",
+        "out",
+        ".next",
+        ".turbo",
+        ".svelte-kit",
+        ".cache",
+        "coverage",
+        ".venv",
+    ];
+    let walker = walkdir::WalkDir::new(src).into_iter().filter_entry(|e| {
+        if e.depth() == 0 {
+            return true; // never prune the root itself
+        }
+        if e.file_type().is_dir() {
+            return e
+                .file_name()
+                .to_str()
+                .map(|n| !SKIP_DIRS.contains(&n))
+                .unwrap_or(true);
+        }
+        true
+    });
+    for entry in walker {
         let entry = entry.map_err(std::io::Error::other)?;
         let rel = entry
             .path()
@@ -305,14 +363,50 @@ async fn run_one_inner(
 
     // Throwaway workspace under the OS temp dir — the agent never touches the
     // user's real project (axis 1 containment).
-    let ws: PathBuf = std::env::temp_dir().join(format!("shugu_bench_{}", Uuid::new_v4()));
-    if let Err(e) = std::fs::create_dir_all(&ws) {
+    let ws_raw: PathBuf = std::env::temp_dir().join(format!("shugu_bench_{}", Uuid::new_v4()));
+    if let Err(e) = std::fs::create_dir_all(&ws_raw) {
         return (false, format!("cannot create fixture workspace: {e}"));
     }
-    if let Some(src) = task.fixture_dir.as_deref().filter(|s| !s.trim().is_empty()) {
-        if let Err(e) = copy_dir(Path::new(src), &ws) {
+    // CRITICAL: the path guard (`safe_resolve` / `safe_resolve_for_write`)
+    // requires a PRE-CANONICALIZED root, exactly like `fs_open_folder`. Without
+    // this, on Windows the agent's canonicalized write targets (`\\?\C:\…`) fail
+    // the `starts_with(root)` check against a raw temp path → EVERY file tool
+    // errors with "outside the workspace" → every task fails. Canonicalize after
+    // creation (canonicalize requires the path to already exist).
+    let ws = match std::fs::canonicalize(&ws_raw) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&ws_raw);
+            return (false, format!("cannot canonicalize fixture workspace: {e}"));
+        }
+    };
+    if let Some(raw) = task.fixture_dir.as_deref().filter(|s| !s.trim().is_empty()) {
+        // "@project" = mirror the user's CURRENTLY OPEN project: snapshot-copy it
+        // into the throwaway workspace so the agent practises on REAL code without
+        // ever being able to touch the real project. Any other value is a literal
+        // fixture directory. Either way the real source is only READ (copied out);
+        // the agent works exclusively in `ws`, which is deleted after the run.
+        let src: PathBuf = if raw == "@project" {
+            match get_workspace_root(app) {
+                Some(root) => root,
+                None => {
+                    let _ = std::fs::remove_dir_all(&ws);
+                    return (
+                        false,
+                        "no project open to mirror — open a project, then run the @project task"
+                            .to_string(),
+                    );
+                }
+            }
+        } else {
+            PathBuf::from(raw)
+        };
+        if let Err(e) = copy_dir(&src, &ws) {
             let _ = std::fs::remove_dir_all(&ws);
-            return (false, format!("fixture copy failed from {src}: {e}"));
+            return (
+                false,
+                format!("project mirror copy failed from {}: {e}", src.display()),
+            );
         }
     }
 
@@ -346,7 +440,19 @@ async fn run_one_inner(
     .await;
 
     let verdict = match loop_result {
-        Ok(_) => run_verifier(&task.verifier_kind, &ws, &task.verifier_spec),
+        Ok(_) => {
+            let (passed, detail) = run_verifier(&task.verifier_kind, &ws, &task.verifier_spec);
+            // Legibility: if the run hit a stall (stuck_reason set) and STILL
+            // failed the verifier — even after the agent tried to self-evolve —
+            // surface WHY next to the verdict. "stuck:repeat — missing file
+            // foo.ts" reads very differently from a bare "missing file foo.ts"
+            // (which looks like the verifier is wrong, rather than the agent
+            // being genuinely weak on this task).
+            match (&metrics.stuck_reason, passed) {
+                (Some(reason), false) => (passed, format!("stuck:{reason} — {detail}")),
+                _ => (passed, detail),
+            }
+        }
         Err(e) => (false, format!("agent run error: {e}")),
     };
 
@@ -408,8 +514,25 @@ pub async fn bench_run_suite(
     // Key resolved Rust-side from the keychain by provider — never crosses the FE.
     let api_key = resolve_bench_key(&provider_id, &protocol);
 
-    let mut results = Vec::with_capacity(tasks.len());
-    for task in &tasks {
+    let total = tasks.len();
+    let mut results = Vec::with_capacity(total);
+    for (idx, task) in tasks.iter().enumerate() {
+        // "running" — light up the current task BEFORE its (minutes-long) agent
+        // run so the panel shows motion instead of a frozen "Exécution…" button.
+        emit_progress(
+            &app,
+            &BenchProgress {
+                suite_run_id: suite_run_id.clone(),
+                index: idx + 1,
+                total,
+                task_id: task.id.clone(),
+                title: task.title.clone(),
+                phase: "running".to_string(),
+                passed: None,
+                detail: None,
+                ms: None,
+            },
+        );
         let summary = run_one(
             &app,
             task,
@@ -421,6 +544,22 @@ pub async fn bench_run_suite(
             &api_key,
         )
         .await;
+        // "done" — carries the verdict so the row flips to ✓/✗ the instant the
+        // task finishes, without waiting for the whole suite to return.
+        emit_progress(
+            &app,
+            &BenchProgress {
+                suite_run_id: suite_run_id.clone(),
+                index: idx + 1,
+                total,
+                task_id: task.id.clone(),
+                title: task.title.clone(),
+                phase: "done".to_string(),
+                passed: Some(summary.passed),
+                detail: Some(summary.detail.clone()),
+                ms: Some(summary.ms),
+            },
+        );
         results.push(summary);
     }
     let passed = results.iter().filter(|r| r.passed).count();
