@@ -220,6 +220,29 @@ fn agent_tools() -> &'static [ToolDef] {
                     "required": ["path", "old_string", "new_string"]
                 }),
             },
+            ToolDef {
+                name: "run_command",
+                description: "Run a shell command in a SANDBOXED, network-isolated container with the \
+                              workspace mounted (e.g. `node --test`, `node script.mjs`). Returns the \
+                              REAL exit code + stdout + stderr — use it to actually RUN your code/tests, \
+                              see what fails, and fix it before finishing. No network access; available \
+                              only on the measurement bench (a disposable copy), disabled on the live \
+                              project.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command, run in the workspace root. E.g. \"node --test\"."
+                        },
+                        "timeoutSecs": {
+                            "type": "integer",
+                            "description": "Wall-clock cap in seconds (default 60, max 300)."
+                        }
+                    },
+                    "required": ["command"]
+                }),
+            },
         ]
     })
 }
@@ -339,8 +362,8 @@ impl ToolCallAccumulator {
 /// `workspace_root` is pre-resolved by the caller (one lock acquisition
 /// per iteration, NOT per tool call — avoids contention with the fs
 /// watcher and other workspace consumers).
-pub(super) fn execute_tool(call: &ToolCall, workspace_root: &Path) -> ToolResult {
-    match dispatch_inner(call, workspace_root) {
+pub(super) fn execute_tool(call: &ToolCall, workspace_root: &Path, allow_exec: bool) -> ToolResult {
+    match dispatch_inner(call, workspace_root, allow_exec) {
         Ok(content) => ToolResult {
             id: call.id.clone(),
             name: call.name.clone(),
@@ -356,7 +379,7 @@ pub(super) fn execute_tool(call: &ToolCall, workspace_root: &Path) -> ToolResult
     }
 }
 
-fn dispatch_inner(call: &ToolCall, root: &Path) -> Result<String, String> {
+fn dispatch_inner(call: &ToolCall, root: &Path, allow_exec: bool) -> Result<String, String> {
     let args: serde_json::Value = serde_json::from_str(&call.arguments)
         .map_err(|e| format!("argument parse error: {e}"))?;
 
@@ -445,6 +468,34 @@ fn dispatch_inner(call: &ToolCall, root: &Path) -> Result<String, String> {
             let updated = content.replacen(old, new, 1);
             let bytes = crate::commands::fs::write_file_inner(root, path, &updated)?;
             Ok(format!("edited {path} ({bytes} bytes written)"))
+        }
+        "run_command" => {
+            // Safety gate: execution runs arbitrary code, which a path-guard can't
+            // contain. Only the bench (workspace = disposable copy) sets allow_exec.
+            if !allow_exec {
+                return Err("run_command is disabled here (safety): execution runs only on the \
+                            measurement bench's disposable copy, never the live project"
+                    .to_string());
+            }
+            let command = args["command"]
+                .as_str()
+                .ok_or_else(|| "missing required field: command".to_string())?;
+            let timeout_secs = args["timeoutSecs"].as_u64().unwrap_or(60).clamp(1, 300);
+            let res = super::sandbox::run_in_sandbox(root, command, timeout_secs);
+            // ALWAYS Ok: a non-zero exit (failing test) is DATA the agent must see
+            // and react to, not a tool error — and a docker-unavailable result must
+            // NOT count as a tool_error (that would drive evolution on an infra
+            // problem, exactly the canonicalize-bug trap). The agent reads the
+            // full picture and decides.
+            let status = if res.timed_out {
+                format!("TIMED OUT after {timeout_secs}s")
+            } else {
+                format!("exit {}", res.exit_code)
+            };
+            Ok(format!(
+                "[{status}]\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                res.stdout, res.stderr
+            ))
         }
         other => Err(format!("unknown tool: {other}")),
     }

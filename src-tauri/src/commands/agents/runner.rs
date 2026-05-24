@@ -306,6 +306,7 @@ pub(super) async fn run_agent_task(
             &mut history,
             &mut loop_metrics,
             None,
+            false, // chat agents never execute — bench-only, on disposable copies
         ) => r,
         _ = abort.notified() => {
             mark_killed(&app, &agent_id);
@@ -396,6 +397,10 @@ pub(super) async fn tool_use_loop(
     // open workspace — the measurement bench points it at a copied fixture so a
     // run never touches the user's real project. `None` = current behaviour.
     workspace_override: Option<PathBuf>,
+    // When `false`, the `run_command` tool is REFUSED. Executing code runs
+    // arbitrary commands a path-guard can't contain, so only the bench (which
+    // works on a disposable copy) passes `true`; real chat agents pass `false`.
+    allow_exec: bool,
 ) -> Result<(String, String), String> {
     // Stall-detection state (P1): repeated identical tool-call signatures and
     // consecutive tool-error rounds are the two cheap "stuck" signals; the
@@ -533,7 +538,7 @@ pub(super) async fn tool_use_loop(
                     // other tokio tasks. `unwrap_or_else` defends against
                     // a JoinError (panic in the closure); `execute_tool`
                     // itself never panics for normal fs failures.
-                    tokio::task::spawn_blocking(move || execute_tool(&tc_clone, &root_clone))
+                    tokio::task::spawn_blocking(move || execute_tool(&tc_clone, &root_clone, allow_exec))
                         .await
                         .unwrap_or_else(|join_err| ToolResult {
                             id: fallback_id,

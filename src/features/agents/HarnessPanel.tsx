@@ -106,32 +106,28 @@ const EXAMPLE_TASKS: Array<{
     }),
   },
   {
-    // Tâche-stress : beaucoup de contraintes interdépendantes + un test à écrire,
-    // jugée durement par le Claude-juge (note /10 selon les contraintes tenues).
-    // Pousse le PLAFOND du modèle ; ne s'exécute pas (le juge LIT le code/les
-    // tests, il ne les RUN pas — l'exécution réelle = lot sandbox).
+    // Tâche-stress EXÉCUTÉE : l'agent écrit le code + les tests, puis les LANCE
+    // dans la sandbox Docker (run_command) et itère jusqu'au vert. Le verdict du
+    // banc = `node --test` réel (exit 0), pas une opinion. C'est la boucle
+    // d'environnement (agir → observer la vraie conséquence → corriger).
     id: "stress-lru",
     domain: "code",
-    title: "Stress : cache LRU O(1) + tests",
+    title: "Stress : cache LRU O(1) + tests exécutés",
     prompt:
-      "Implémente un cache LRU en TypeScript dans `lru.ts`, exportant `class LRUCache<K, V>` avec " +
-      "`constructor(capacity: number)`, `get(key): V | undefined`, `set(key, value): void`. " +
+      "Implémente un cache LRU dans `lru.mjs` (module ES), exportant `class LRUCache` avec " +
+      "`constructor(capacity)`, `get(key)` (renvoie la valeur ou undefined), `set(key, value)`. " +
       "CONTRAINTES STRICTES : (1) get ET set en O(1) amorti — Map + liste doublement chaînée, " +
-      "JAMAIS un scan de tableau ; (2) éviction du moins récemment utilisé quand capacity est " +
-      "dépassée ; (3) get() rafraîchit la récence ; (4) set() sur une clé existante met à jour " +
-      "sans dupliquer ; (5) capacity 0 ne stocke rien. Écris AUSSI `lru.test.ts` avec ≥6 cas " +
-      "couvrant : éviction, mise à jour de clé, get-rafraîchit, capacity 0, miss, ordre d'éviction. " +
-      "Aucune dépendance externe. Explore avec fs_list_dir/fs_search au besoin, écris avec fs_write_file.",
-    verifierKind: "claude",
-    verifierSpec: JSON.stringify({
-      rubric:
-        "PASS UNIQUEMENT si lru.ts réalise get/set en O(1) via Map + liste doublement chaînée " +
-        "(refuse tout scan O(n) ou recherche linéaire), gère l'éviction LRU, le rafraîchissement " +
-        "sur get, la mise à jour sans doublon, et capacity 0 ; ET si lru.test.ts contient ≥6 cas " +
-        "distincts couvrant réellement ces aspects. Note /10 = nombre de contraintes réellement " +
-        "satisfaites (sois STRICT : un scan de tableau = échec de la contrainte O(1)).",
-      files: ["lru.ts", "lru.test.ts"],
-    }),
+      "JAMAIS un scan de tableau ; (2) éviction du moins récemment utilisé au dépassement de " +
+      "capacity ; (3) get() rafraîchit la récence ; (4) set() sur clé existante met à jour sans " +
+      "dupliquer ; (5) capacity 0 ne stocke rien. Écris AUSSI `lru.test.mjs` qui importe depuis " +
+      "'./lru.mjs' et utilise le runner intégré de Node : `import { test } from 'node:test';` + " +
+      "`import assert from 'node:assert/strict';`, avec ≥6 tests couvrant éviction, mise à jour, " +
+      "get-rafraîchit, capacity 0, miss, ordre d'éviction. " +
+      "ENSUITE, LANCE `node --test` via l'outil run_command : lis les échecs, corrige le code, " +
+      "et relance jusqu'à ce que TOUS les tests passent (exit 0). Aucune dépendance externe " +
+      "(uniquement des modules `node:` intégrés).",
+    verifierKind: "exec",
+    verifierSpec: JSON.stringify({ command: "node --test", timeoutSecs: 90 }),
   },
 ];
 

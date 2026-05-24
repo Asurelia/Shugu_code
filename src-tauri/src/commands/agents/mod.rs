@@ -76,6 +76,12 @@ pub(crate) mod harness;
 /// records `bench_runs`, and A/B-compares generations. The legibility spine.
 pub(crate) mod bench;
 
+/// Sandboxed execution — runs agent-written code/tests inside a throwaway,
+/// network-isolated Docker container (the "environment" that gives real
+/// pass/fail feedback). Gated by `allow_exec`: bench copies only, never the
+/// user's real project.
+pub(crate) mod sandbox;
+
 // Re-export the crate-visible items from `tools` so `chat.rs` can reach
 // them via `crate::commands::agents::*` without poking into the private
 // submodule path. The streaming helpers in `chat.rs` consume:

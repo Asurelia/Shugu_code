@@ -228,11 +228,70 @@ fn run_verifier(kind: &str, ws: &Path, spec_json: &str) -> (bool, String) {
     let spec: Value = serde_json::from_str(spec_json).unwrap_or(Value::Null);
     match kind {
         "files" => verify_files(ws, &spec),
+        // "exec" and "claude" are async (sandbox / network) → handled in
+        // `run_one_inner`, never reach this sync dispatcher.
         other => (
             false,
-            format!("unknown verifier kind '{other}' (v1 supports: files)"),
+            format!("unknown verifier kind '{other}' (supported: files, exec, claude)"),
         ),
     }
+}
+
+/// `exec` verifier — GROUND TRUTH. Runs `spec.command` (e.g. `node --test`) in
+/// the Docker sandbox over the produced files; exit 0 = pass. The only verifier
+/// that proves the code RUNS, not just that it looks right. A docker-level
+/// failure (daemon down) is reported as "indisponible" — never a false FAIL on
+/// the agent. Spec: `{ "command": "node --test", "timeoutSecs": 60 }`.
+async fn verify_exec(ws: &Path, spec_json: &str) -> (bool, Option<f64>, String) {
+    let spec: Value = serde_json::from_str(spec_json).unwrap_or(Value::Null);
+    let command = spec
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if command.trim().is_empty() {
+        return (false, None, "verifier 'exec' has no 'command'".to_string());
+    }
+    let timeout_secs = spec
+        .get("timeoutSecs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(60)
+        .clamp(1, 300);
+
+    // run_in_sandbox blocks (spawns docker) → off the async runtime.
+    let ws_owned = ws.to_path_buf();
+    let cmd_owned = command.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        super::sandbox::run_in_sandbox(&ws_owned, &cmd_owned, timeout_secs)
+    })
+    .await;
+
+    let r = match res {
+        Ok(r) => r,
+        Err(e) => return (false, None, format!("exec join error: {e}")),
+    };
+
+    if r.exit_code == 0 {
+        (true, None, format!("exec ok — `{command}` exit 0"))
+    } else if r.timed_out {
+        (false, None, format!("exec TIMEOUT ({timeout_secs}s) — `{command}`"))
+    } else if r.exit_code == -1 {
+        // Docker-level failure (daemon down, image missing) — NOT the code's fault.
+        (false, None, format!("exec indisponible — {}", snippet(&r.stderr)))
+    } else {
+        let why = if !r.stderr.trim().is_empty() { &r.stderr } else { &r.stdout };
+        (
+            false,
+            None,
+            format!("exec FAIL (exit {}) — {}", r.exit_code, snippet(why)),
+        )
+    }
+}
+
+/// First few lines of a command's output, capped — for a legible one-line detail.
+fn snippet(s: &str) -> String {
+    let joined = s.lines().take(4).collect::<Vec<_>>().join(" ⏎ ");
+    joined.chars().take(240).collect()
 }
 
 /// `files` verifier — fully static, never executes anything. Spec shape:
@@ -445,12 +504,18 @@ async fn run_one_inner(
         &mut history,
         &mut metrics,
         Some(ws.clone()),
+        true, // bench runs on a disposable COPY → execution (run_command) allowed
     )
     .await;
 
     let verdict: (bool, Option<f64>, String) = match loop_result {
         Ok(_) => {
-            if task.verifier_kind == "claude" {
+            if task.verifier_kind == "exec" {
+                // GROUND TRUTH: actually run the produced code/tests in the Docker
+                // sandbox. exit 0 = pass. The only verifier that proves the code
+                // RUNS, not just that it looks right.
+                verify_exec(&ws, &task.verifier_spec).await
+            } else if task.verifier_kind == "claude" {
                 // Fuzzy / meaning-based grading by a judge model. It only READS the
                 // produced files (non-executing) → safe in v1. Async (network).
                 judge_with_claude(app, &client, protocol, base_url, model, api_key, task, &ws).await
