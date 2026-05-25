@@ -10,12 +10,11 @@ import { useShell } from "@/routes/shell-context";
 
 export default function ChatRouteComponent() {
   const [activeConv] = useActiveConv();
-  const { openSnippetInEditor, applyCodeToFile } = useShell();
+  const { openSnippetInEditor } = useShell();
   return (
     <ChatView
       activeConv={activeConv}
       onOpenSnippet={openSnippetInEditor}
-      onApplyToFile={applyCodeToFile}
     />
   );
 }

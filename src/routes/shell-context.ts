@@ -152,6 +152,7 @@ export function createDetachedShell(openInMain: (path: string) => void): ShellCo
     setGenerations: noop,
     agents: [],
     openSnippetInEditor: async () => {},
+    applyCodeToFile: async () => {},
     findPanelOpen: false,
     setFindPanelOpen: noop,
     openFile,
