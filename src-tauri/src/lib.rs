@@ -311,6 +311,17 @@ CREATE TABLE IF NOT EXISTS agent_skills (
 CREATE INDEX IF NOT EXISTS idx_agent_skills_role ON agent_skills(role);
 ";
 
+// Lot « agent ancré » (2026-05-25): retire l'auto-évolution par réécriture de
+// prompt (le Refiner) ET le banc de mesure. La table `agent_skills` est conservée :
+// les skills deviennent le SEUL mécanisme d'apprentissage, et un skill n'est gardé
+// que si le vrai test l'a validé (gate exit 0). On dépose les tables devenues
+// mortes (générations + banc). `agent_outcomes` reste (télémétrie par run).
+const MIGRATION_V11: &str = "
+DROP TABLE IF EXISTS harness_generations;
+DROP TABLE IF EXISTS bench_runs;
+DROP TABLE IF EXISTS bench_tasks;
+";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = vec![
@@ -372,6 +383,12 @@ pub fn run() {
             version: 10,
             description: "agent_skills_library",
             sql: MIGRATION_V10,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 11,
+            description: "drop_harness_bench_keep_skills",
+            sql: MIGRATION_V11,
             kind: MigrationKind::Up,
         },
     ];
@@ -584,18 +601,7 @@ pub fn run() {
             commands::agents::agent_list_active,
             commands::agents::agent_get_transcript,
             commands::agents::agent_list_by_conversation,
-            // Continual Harness (lot 1 UI layer)
-            commands::agents::harness::harness_list_generations,
-            commands::agents::harness::harness_metrics,
-            commands::agents::harness::harness_rollback,
-            commands::agents::harness::harness_save_manual,
-            commands::agents::harness::harness_get_refiner,
-            commands::agents::harness::harness_set_refiner,
-            commands::agents::harness::outcome_set_feedback,
-            commands::agents::bench::bench_run_suite,
-            commands::agents::bench::bench_compare_generations,
-            commands::agents::bench::bench_list,
-            commands::agents::bench::bench_add_task,
+            commands::agents::agent_atelier_run,
             // Skill library (Voyager / Hermes) — learned reusable skills.
             commands::agents::skills::skills_list,
             commands::agents::skills::skills_clear,

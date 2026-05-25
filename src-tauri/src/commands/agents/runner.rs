@@ -50,9 +50,10 @@ use crate::commands::chat::{self, AssistantTurn, ChatMessage};
 /// signal instead of "agent exceeded MAX_ITERATIONS" with no output.
 const MAX_ITERATIONS: u32 = 8;
 
-/// Extra tool-use iterations granted once, after a successful mid-run harness
-/// evolution, so the freshly-evolved prompt is actually exercised this run.
-const EVOLVE_BONUS_ITERATIONS: u32 = 4;
+/// Iteration budget for the Atelier (exec) path. Higher than chat because each
+/// write→run-test→fix cycle costs one iteration; the agent needs room to see a
+/// real failure, fix it, and re-run before producing its final answer.
+const MAX_ITERATIONS_EXEC: u32 = 16;
 
 // ────────────────────────────────────────────────────────────────────
 // Internal conversation history shape
@@ -219,19 +220,27 @@ pub(super) async fn run_agent_task(
     chat_template_kwargs: Option<serde_json::Value>,
     design_context: Option<String>,
     abort: Arc<tokio::sync::Notify>,
+    // Atelier additions: when set, the agent works on a disposable mirror with
+    // execution enabled and a task-specific prompt. Chat passes (None, false, None).
+    workspace_override: Option<PathBuf>,
+    allow_exec: bool,
+    system_prompt_override: Option<String>,
 ) {
     let start = std::time::Instant::now();
     let protocol = protocol.unwrap_or_else(|| "openai".to_string());
     let base_url = base_url.unwrap_or_default();
 
-    // Continual Harness (lot 1) — load the active harness generation for this
-    // role instead of a hard-coded prompt. First use of a role seeds
-    // generation 0 from `seed_prompt`, so behaviour is unchanged until a
-    // Refiner evolves the harness. `active_generation` is recorded against the
-    // run's outcome (P1) so per-generation metrics can be computed.
-    let harness = load_active_harness(&app, &role);
-    let active_generation = harness.generation;
-    let mut system_prompt = harness.system_prompt;
+    // System prompt: the Atelier passes a task-specific override; chat loads the
+    // role's static seed via `load_active_harness`. `active_generation` (always 0
+    // now that the Refiner is retired) is still recorded against the run outcome
+    // for telemetry.
+    let (active_generation, mut system_prompt) = match system_prompt_override {
+        Some(p) => (0, p),
+        None => {
+            let harness = load_active_harness(&app, &role);
+            (harness.generation, harness.system_prompt)
+        }
+    };
     // Phase A (Design Studio) — when the Studio passes a design-system context,
     // append GENERATION MODE so the agent writes a complete styled project to
     // `.shugu-forge/preview/` (served live by the preview:// protocol). Chat
@@ -305,8 +314,8 @@ pub(super) async fn run_agent_task(
             &role,
             &mut history,
             &mut loop_metrics,
-            None,
-            false, // chat agents never execute — bench-only, on disposable copies
+            workspace_override,
+            allow_exec,
         ) => r,
         _ = abort.notified() => {
             mark_killed(&app, &agent_id);
@@ -402,19 +411,16 @@ pub(super) async fn tool_use_loop(
     // works on a disposable copy) passes `true`; real chat agents pass `false`.
     allow_exec: bool,
 ) -> Result<(String, String), String> {
-    // Stall-detection state (P1): repeated identical tool-call signatures and
-    // consecutive tool-error rounds are the two cheap "stuck" signals; the
-    // third (budget exhaustion) is handled in the `last_iteration` branch.
+    // Stall-detection state: repeated identical tool-call signatures and
+    // consecutive tool-error rounds are the two cheap "stuck" signals, recorded
+    // as telemetry on `metrics.stuck_reason`; budget exhaustion is handled in the
+    // `last_iteration` branch.
     let mut last_sig: Option<String> = None;
     let mut repeat_count: u32 = 0;
     let mut err_streak: u32 = 0;
-    let mut evolved = false;
-    // Dynamic budget (Continual Harness P2): a successful mid-run evolution adds
-    // bonus iterations so the freshly-evolved harness is actually exercised in
-    // THIS run (reset-free resumption). Every budget comparison below uses
-    // `budget`, NEVER the MAX_ITERATIONS const — otherwise the force-answer
-    // mechanism would silently break after a budget bump.
-    let mut budget = MAX_ITERATIONS;
+    // Iteration budget. The Atelier (exec) path gets more room because each
+    // write→run-test→fix cycle costs one iteration; chat stays tight.
+    let budget = if allow_exec { MAX_ITERATIONS_EXEC } else { MAX_ITERATIONS };
     let mut iteration: u32 = 0;
 
     // Load this role's learned skills (Voyager/Hermes) into context, right after
@@ -432,6 +438,13 @@ pub(super) async fn tool_use_loop(
             },
         );
     }
+
+    // Env-verified skill gate: `run_command` writes its exit code here; the
+    // `skill_save` tool refuses unless the LAST run was exit 0. A skill is thus
+    // only ever born from a test the REAL environment confirmed — never an LLM
+    // opinion. Sentinel i64::MIN = "no command run yet" (so chat, which can't
+    // exec, never saves a skill). Shared (Arc) into each parallel tool task.
+    let last_exec_exit = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN));
 
     while iteration < budget {
         metrics.iterations = iteration + 1;
@@ -551,6 +564,7 @@ pub(super) async fn tool_use_loop(
                 let root_clone = root_arc.clone();
                 let app_clone = app.clone();
                 let role_clone = role.to_string();
+                let last_exec_clone = last_exec_exit.clone();
                 async move {
                     // `spawn_blocking` because the fs ops are synchronous —
                     // running them on the async runtime thread would starve
@@ -558,7 +572,7 @@ pub(super) async fn tool_use_loop(
                     // a JoinError (panic in the closure); `execute_tool`
                     // itself never panics for normal fs failures.
                     tokio::task::spawn_blocking(move || {
-                        execute_tool(&tc_clone, &root_clone, allow_exec, &app_clone, &role_clone)
+                        execute_tool(&tc_clone, &root_clone, allow_exec, &app_clone, &role_clone, &last_exec_clone)
                     })
                         .await
                         .unwrap_or_else(|join_err| ToolResult {
@@ -617,100 +631,44 @@ pub(super) async fn tool_use_loop(
                 .get_or_insert_with(|| "tool_errors".to_string());
         }
 
+        // Skill captured — emit SkillLearned for each `skill_save` the gate
+        // ACCEPTED (env-verified: the last run_command exited 0), so the chat UI
+        // shows the inline "🎓 appris" badge. A surfaced skill was confirmed by a
+        // real passing test, not an LLM opinion. Done here (loop has agent_id +
+        // role) while `turn.tool_calls` is still in scope, before it moves below.
+        for tc in &turn.tool_calls {
+            if tc.name != "skill_save" {
+                continue;
+            }
+            let accepted = results.iter().any(|r| r.id == tc.id && !r.is_error);
+            if !accepted {
+                continue;
+            }
+            if let Some(name) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                .ok()
+                .and_then(|v| {
+                    v.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string())
+                })
+            {
+                let _ = persist_and_emit(
+                    app,
+                    &AgentEvent::SkillLearned {
+                        agent_id: agent_id.to_string(),
+                        role: role.to_string(),
+                        name,
+                    },
+                );
+            }
+        }
+
         // ── 7. Append to history for the next iteration ────────────────
         history.push(AgentMessage::AssistantWithTools {
             content: turn.content,
             tool_calls: turn.tool_calls,
         });
         history.push(AgentMessage::ToolResults(results));
-
-        // ── 8. Continual Harness (P2) — on the FIRST in-loop stall with budget
-        //       to spare, evolve the harness and resume (reset-free). Only
-        //       `repeat`/`tool_errors` are handled here; `max_iterations` is
-        //       caught at last_iteration (too late to re-plan this run). Capped
-        //       at one evolution per run to avoid a stuck→evolve→stuck cascade.
-        if !evolved {
-            if let Some(reason) = metrics.stuck_reason.clone() {
-                let evolvable = reason == "repeat" || reason == "tool_errors";
-                let budget_left = budget.saturating_sub(iteration + 1);
-                if evolvable && budget_left >= 3 {
-                    // Stage 1 — signal the (5-30s) Refiner call has started so
-                    // the UI never looks hung.
-                    let _ = persist_and_emit(
-                        app,
-                        &AgentEvent::HarnessEvolved {
-                            agent_id: agent_id.to_string(),
-                            role: role.to_string(),
-                            status: "evolving".to_string(),
-                            reason: Some(reason.clone()),
-                            from_generation: None,
-                            to_generation: None,
-                            summary: None,
-                        },
-                    );
-                    let digest = build_trajectory_digest(history);
-                    match super::harness::evolve_harness(
-                        app,
-                        client,
-                        role,
-                        &reason,
-                        &digest,
-                        protocol,
-                        base_url,
-                        model,
-                        api_key,
-                        chat_template_kwargs,
-                    )
-                    .await
-                    {
-                        Ok(outcome) => {
-                            // Stage 2 — applied. Inject a corrective system
-                            // message (NOT a rewrite of history[0]) + grant
-                            // bonus iterations so the new harness gets used.
-                            let _ = persist_and_emit(
-                                app,
-                                &AgentEvent::HarnessEvolved {
-                                    agent_id: agent_id.to_string(),
-                                    role: role.to_string(),
-                                    status: "applied".to_string(),
-                                    reason: Some(reason.clone()),
-                                    from_generation: Some(outcome.from_generation),
-                                    to_generation: Some(outcome.to_generation),
-                                    summary: Some(outcome.summary.clone()),
-                                },
-                            );
-                            history.push(AgentMessage::Text {
-                                role: "system".to_string(),
-                                content: format!(
-                                    "[Shugu] {} Applique cette guidance révisée et reprends la tâche au lieu de répéter la même action.",
-                                    outcome.summary
-                                ),
-                            });
-                            budget += EVOLVE_BONUS_ITERATIONS;
-                            evolved = true;
-                        }
-                        Err(e) => {
-                            // Evolution failed — never block the run. Flag the
-                            // attempt and carry on with the current harness; set
-                            // `evolved` so we don't retry every iteration.
-                            let _ = persist_and_emit(
-                                app,
-                                &AgentEvent::HarnessEvolved {
-                                    agent_id: agent_id.to_string(),
-                                    role: role.to_string(),
-                                    status: "failed".to_string(),
-                                    reason: Some(format!("{reason}: {e}")),
-                                    from_generation: None,
-                                    to_generation: None,
-                                    summary: None,
-                                },
-                            );
-                            evolved = true;
-                        }
-                    }
-                }
-            }
-        }
 
         iteration += 1;
     }
@@ -863,140 +821,6 @@ async fn call_agent_llm_with_tools(
     Ok((turn, reasoning))
 }
 
-/// One-shot LLM call for the harness Refiner (Continual Harness P2). No tools,
-/// no streaming — we only need the rewritten text back. Mirrors the dispatch in
-/// `call_agent_llm_with_tools` (`with_tools = false`, no-op chunk sink). Lives
-/// in runner.rs so it can reuse the private message builders; `harness.rs`
-/// orchestrates the evolution and calls this.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn call_refiner(
-    client: &reqwest::Client,
-    protocol: &str,
-    base_url: &str,
-    model: &str,
-    api_key: &str,
-    chat_template_kwargs: &Option<serde_json::Value>,
-    system: &str,
-    user: &str,
-) -> Result<String, String> {
-    let history = vec![
-        AgentMessage::Text {
-            role: "system".to_string(),
-            content: system.to_string(),
-        },
-        AgentMessage::Text {
-            role: "user".to_string(),
-            content: user.to_string(),
-        },
-    ];
-    let mut sink = |_kind: &str, _chunk: &str| {};
-    let turn = match protocol {
-        "anthropic" => {
-            let messages = build_anthropic_messages(&history);
-            chat::call_anthropic(
-                client, base_url, model, &messages, api_key, false, None, None, &mut sink,
-            )
-            .await?
-        }
-        "openai" | "custom" => {
-            let messages = build_openai_text_projection(&history);
-            chat::call_openai_compat(
-                client,
-                base_url,
-                model,
-                &messages,
-                api_key,
-                protocol,
-                chat_template_kwargs,
-                false,
-                None,
-                None,
-                &mut sink,
-            )
-            .await?
-        }
-        "ollama" => {
-            let messages: Vec<ChatMessage> = history
-                .iter()
-                .filter_map(|m| match m {
-                    AgentMessage::Text { role, content } => Some(ChatMessage {
-                        role: role.clone(),
-                        content: content.clone(),
-                    }),
-                    _ => None,
-                })
-                .collect();
-            chat::call_ollama(client, base_url, model, &messages, None, &mut sink).await?
-        }
-        other => return Err(format!("unsupported refiner protocol: {other}")),
-    };
-    Ok(turn.content)
-}
-
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut t: String = s.chars().take(max).collect();
-        t.push('…');
-        t
-    }
-}
-
-/// Build a SAFE textual digest of the recent trajectory for the Refiner.
-///
-/// SECURITY (prompt-injection): this NEVER includes file CONTENTS returned by
-/// tools — only the tool name, its arguments, and whether the call errored.
-/// That collapses the injection surface from "any file in the workspace" (a
-/// malicious file could try to rewrite the agent's system prompt) to "the
-/// agent's own tool-call arguments". The whole digest is length-capped.
-fn build_trajectory_digest(history: &[AgentMessage]) -> String {
-    const MAX: usize = 6000;
-    let mut out = String::new();
-    for msg in history {
-        match msg {
-            AgentMessage::AssistantWithTools {
-                content,
-                tool_calls,
-            } => {
-                if !content.trim().is_empty() {
-                    out.push_str(&format!("assistant: {}\n", truncate_chars(content, 200)));
-                }
-                for tc in tool_calls {
-                    out.push_str(&format!(
-                        "  call {}({})\n",
-                        tc.name,
-                        truncate_chars(&tc.arguments, 200)
-                    ));
-                }
-            }
-            AgentMessage::ToolResults(results) => {
-                for r in results {
-                    if r.is_error {
-                        out.push_str(&format!(
-                            "  result {} ERROR: {}\n",
-                            r.name,
-                            truncate_chars(&r.content, 160)
-                        ));
-                    } else {
-                        // Success: name only, NEVER the returned content.
-                        out.push_str(&format!("  result {} ok\n", r.name));
-                    }
-                }
-            }
-            // Text turns (system prompt, user task, our own nudges) carry no
-            // tool-trajectory signal and may contain large pasted content — skip.
-            _ => {}
-        }
-        if out.len() > MAX {
-            out.truncate(MAX);
-            out.push_str("\n…(troncature)\n");
-            break;
-        }
-    }
-    out
-}
-
 /// Text-only projection of AgentMessage history for the existing
 /// `call_openai_compat` signature. AssistantWithTools is serialized
 /// inline (tool_calls become a `[tool_call:NAME] {ARGS}` text fragment),
@@ -1054,10 +878,37 @@ fn build_openai_text_projection(history: &[AgentMessage]) -> Vec<ChatMessage> {
 /// strings in `seed_prompt` stay untouched.
 const GENERATION_MODE_PROMPT: &str = "=== GENERATION MODE (a design system is active) ===\nWhen the task asks you to build, generate, create, or design a page, site, landing page, dashboard, component, or any UI, you MUST produce a COMPLETE, SELF-CONTAINED static web project WRITTEN TO DISK using `fs_write_file` — NOT a chat answer and NOT a single fenced code block.\n\nBefore writing files, call `todo_write` with a short checklist (3-6 steps) of your plan, then update the statuses as you complete each step.\n\nRules:\n1. Write the entry point at `.shugu-forge/preview/index.html`.\n2. Put CSS in `.shugu-forge/preview/styles.css` and JS in `.shugu-forge/preview/script.js`, linked from index.html with RELATIVE paths (href=\"styles.css\", src=\"script.js\").\n3. Apply the design context below (a design system and/or a colour direction): declare its color / typography / spacing tokens as CSS custom properties in `:root { ... }`, and follow the visual direction, component patterns, and anti-patterns.\n4. Produce real, polished, responsive markup with enough sections to demonstrate the design (e.g. hero, content sections, footer). No placeholder-only output.\n5. Always (over)write the files under `.shugu-forge/preview/` so the live preview reflects the latest version; read existing files first when iterating.\n6. After writing, reply with ONE short line: what you built, which design skill(s) you applied, + the entry path `.shugu-forge/preview/index.html`.";
 
-/// Seed harness prompt (generation 0) for a role. Continual Harness serves the
-/// ACTIVE generation from the DB via `load_active_harness`; this hard-coded text
-/// is only the fallback the first time a role is seen — it is then persisted as
-/// generation 0, after which a Refiner may evolve it.
+/// System prompt for an Atelier run — the env-grounded learning loop. The agent
+/// builds a small web UI on a throwaway mirror, then PROVES it works by driving a
+/// real browser (Playwright in the Docker sandbox), iterates on real failures,
+/// and only saves a skill once the test exits 0 (the gate enforces this). This is
+/// the Voyager/Hermes loop: act → observe real feedback → adapt → capture.
+pub(super) const ATELIER_PROMPT: &str = r#"You are Shugu's Atelier agent. You build a small WEB UI and then PROVE it works by actually driving a real browser — never by claiming it looks correct.
+
+You work on a DISPOSABLE copy of nothing (a throwaway mirror), never the user's real project. All file paths are workspace-relative POSIX paths (e.g. `index.html`, `app.js`). Your tools: `fs_write_file(path, content)`, `fs_read_file(path)`, `fs_edit(path, old_string, new_string)`, `fs_list_dir(path)`, `run_command(command)`, and `skill_save(name, when_to_use, body)`.
+
+THE LOOP — follow it exactly:
+1. BUILD the app: write a self-contained static web app to disk — `index.html` plus optional `styles.css` / `app.js` linked with relative paths. Vanilla HTML/CSS/JS only: NO build step, NO frameworks, NO npm packages.
+2. WRITE a browser test that DRIVES the UI. Create a CommonJS file `test.cjs` that uses Playwright for real interaction:
+   - `const { chromium } = require('playwright');`
+   - launch with `chromium.launch({ args: ['--no-sandbox'] })` (the `--no-sandbox` flag is REQUIRED inside the container),
+   - `await page.goto('file:///work/index.html');`  (your files are mounted at /work in the sandbox),
+   - interact for real: `await page.click('#add')`, `await page.fill('#name', 'x')`, etc.,
+   - ASSERT the resulting DOM, e.g. `const n = await page.locator('.item').count();` then `if (n !== 1) { console.error('FAIL: expected 1, got ' + n); process.exit(1); }`,
+   - `await browser.close();` and finish with exit 0 on success. Wrap in `.catch(e => { console.error(e); process.exit(1); })`.
+3. RUN it: call `run_command("node test.cjs")`. You get the REAL exit code + stdout + stderr.
+4. If it FAILS (non-zero exit): read the actual error, FIX the app or the test with `fs_edit`, and run it again. Repeat until it passes. NEVER claim success without a passing run.
+5. When the test PASSES (exit 0): call `skill_save` to capture the REUSABLE approach — a concise, generalizable recipe (how to build + test this kind of UI), NOT this one app's full source. The skill loads automatically into future runs so you get faster over time. NOTE: `skill_save` is REFUSED unless your last `run_command` exited 0 — the environment must confirm it works first.
+
+Rules:
+- The container has NO network. Do NOT `npm install` — Playwright is already importable via `require('playwright')`.
+- Inside `test.cjs`, always reference the page as `file:///work/...`.
+- Keep the app small but genuinely INTERACTIVE (the point is to test behavior, not render static text).
+- Finish with ONE short line: what you built and that its browser test passes."#;
+
+/// Seed system prompt for a role (chat path). Served verbatim by
+/// `load_active_harness` — the Refiner that used to evolve it is retired, so this
+/// is the agent's stable prompt; learning now lives in the skill library.
 fn seed_prompt(role: &str) -> String {
     // Why this prompt is so directive: cloud LLMs (DeepSeek, GLM, Kimi, …) tend
     // to default to "respond from training data" when the system prompt is soft
@@ -1093,139 +944,19 @@ pub(super) struct ActiveHarness {
     pub(super) system_prompt: String,
 }
 
-/// Format the long-term memory JSON (array of `{title, content}`) as a compact
-/// bullet overview injected into the assembled prompt. Best-effort: invalid
-/// JSON yields an empty overview rather than an error.
-fn format_memory_overview(memory_json: &str) -> String {
-    let entries: Vec<serde_json::Value> = serde_json::from_str(memory_json).unwrap_or_default();
-    let mut out = String::new();
-    for e in entries.iter().take(50) {
-        let title = e.get("title").and_then(|x| x.as_str()).unwrap_or("");
-        let content = e.get("content").and_then(|x| x.as_str()).unwrap_or("");
-        if content.is_empty() {
-            continue;
-        }
-        if title.is_empty() {
-            out.push_str(&format!("- {content}\n"));
-        } else {
-            out.push_str(&format!("- {title}: {content}\n"));
-        }
-    }
-    out
-}
-
-/// Assemble the prompt served to the agent: the stored system prompt plus a
-/// long-term memory overview (P3) when memory is non-empty.
-fn assemble_prompt(prompt: &str, memory_json: &str) -> String {
-    let overview = format_memory_overview(memory_json);
-    if overview.is_empty() {
-        prompt.to_string()
-    } else {
-        format!("{prompt}\n\n=== LONG-TERM MEMORY (lessons learned across runs) ===\n{overview}")
-    }
-}
-
-/// Load the ACTIVE harness generation for `role` from `harness_generations`.
+/// Load the system prompt for `role`.
 ///
-/// On the first run of a role no row exists yet, so we SEED generation 0 from
-/// `seed_prompt` and persist it (`active = 1`). Behaviour is therefore identical
-/// to the pre-Continual-Harness build until a Refiner writes a newer generation.
-/// Any DB error degrades gracefully to an in-memory seed WITHOUT persisting —
-/// we never block an agent run on harness storage, and not persisting means the
-/// next run retries the seed rather than masking the failure.
-pub(super) fn load_active_harness(app: &AppHandle, role: &str) -> ActiveHarness {
-    if let Ok(conn_mutex) = get_conn(app) {
-        if let Ok(conn) = conn_mutex.lock() {
-            let existing = conn.query_row(
-                "SELECT generation, system_prompt, memory
-                   FROM harness_generations
-                  WHERE role = ?1 AND active = 1
-                  LIMIT 1",
-                params![role],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                    ))
-                },
-            );
-            match existing {
-                Ok((generation, system_prompt, memory)) => {
-                    return ActiveHarness {
-                        generation,
-                        // P3: long-term memory is appended to the stored prompt
-                        // at assembly time. The `system_prompt` COLUMN stays pure
-                        // (no memory) so the Refiner evolves prompt and memory
-                        // independently.
-                        system_prompt: assemble_prompt(&system_prompt, &memory),
-                    };
-                }
-                Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    let seed = seed_prompt(role);
-                    let _ = conn.execute(
-                        "INSERT OR IGNORE INTO harness_generations
-                            (id, role, generation, parent_generation, trigger_reason,
-                             created_by, system_prompt, memory, subagents, skills,
-                             active, created_at)
-                         VALUES (?1, ?2, 0, NULL, 'seed', 'seed', ?3,
-                                 '[]', '[]', '[]', 1, ?4)",
-                        params![format!("{role}-gen0"), role, seed, now_ms()],
-                    );
-                    return ActiveHarness {
-                        generation: 0,
-                        system_prompt: seed,
-                    };
-                }
-                Err(_) => {
-                    return ActiveHarness {
-                        generation: 0,
-                        system_prompt: seed_prompt(role),
-                    };
-                }
-            }
-        }
-    }
+/// Since the lot « agent ancré » retired the prompt-rewriting Refiner and the
+/// `harness_generations` table, this is now a pure, static seed: every run uses
+/// generation 0 (`seed_prompt`). The agent's LEARNING lives in the env-verified
+/// skill library (`agent_skills`), not in prompt rewrites. Kept as a function
+/// (not inlined) so the call site and the `ActiveHarness`/`generation` plumbing
+/// stay unchanged.
+pub(super) fn load_active_harness(_app: &AppHandle, role: &str) -> ActiveHarness {
     ActiveHarness {
         generation: 0,
         system_prompt: seed_prompt(role),
     }
-}
-
-/// Load a SPECIFIC harness generation for `role` (not necessarily the active
-/// one) — used by the measurement bench to replay a fixed task against gen 0,
-/// gen N, … for A/B comparison. Returns `None` when that (role, generation) row
-/// does not exist; the bench caller decides how to handle a missing generation
-/// (skip + report). Memory is assembled into the prompt exactly like
-/// `load_active_harness`, so a pinned run is byte-identical to how that
-/// generation actually ran.
-#[allow(dead_code)] // consumed by the bench runner (agents::bench), landing next.
-pub(super) fn load_harness_generation(
-    app: &AppHandle,
-    role: &str,
-    generation: i64,
-) -> Option<ActiveHarness> {
-    let conn_mutex = get_conn(app).ok()?;
-    let conn = conn_mutex.lock().ok()?;
-    conn.query_row(
-        "SELECT generation, system_prompt, memory
-           FROM harness_generations
-          WHERE role = ?1 AND generation = ?2
-          LIMIT 1",
-        params![role, generation],
-        |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        },
-    )
-    .ok()
-    .map(|(generation, system_prompt, memory)| ActiveHarness {
-        generation,
-        system_prompt: assemble_prompt(&system_prompt, &memory),
-    })
 }
 
 /// Persist the per-run outcome row consumed by per-generation metrics (P1).

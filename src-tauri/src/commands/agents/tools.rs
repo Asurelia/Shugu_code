@@ -26,6 +26,7 @@
 //! workspace root). This file does NOT re-implement path guards.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
@@ -396,8 +397,9 @@ pub(super) fn execute_tool(
     allow_exec: bool,
     app: &AppHandle,
     role: &str,
+    last_exec_exit: &AtomicI64,
 ) -> ToolResult {
-    match dispatch_inner(call, workspace_root, allow_exec, app, role) {
+    match dispatch_inner(call, workspace_root, allow_exec, app, role, last_exec_exit) {
         Ok(content) => ToolResult {
             id: call.id.clone(),
             name: call.name.clone(),
@@ -419,6 +421,7 @@ fn dispatch_inner(
     allow_exec: bool,
     app: &AppHandle,
     role: &str,
+    last_exec_exit: &AtomicI64,
 ) -> Result<String, String> {
     let args: serde_json::Value = serde_json::from_str(&call.arguments)
         .map_err(|e| format!("argument parse error: {e}"))?;
@@ -522,6 +525,13 @@ fn dispatch_inner(
                 .ok_or_else(|| "missing required field: command".to_string())?;
             let timeout_secs = args["timeoutSecs"].as_u64().unwrap_or(60).clamp(1, 300);
             let res = super::sandbox::run_in_sandbox(root, command, timeout_secs);
+            // Record the exit code for the skill gate: `skill_save` only persists
+            // when the LAST run_command exited 0 (env-verified success). Timeout
+            // (sentinel -2) and infra failure (-1) both block saving a skill.
+            last_exec_exit.store(
+                if res.timed_out { -2 } else { res.exit_code as i64 },
+                Ordering::Relaxed,
+            );
             // ALWAYS Ok: a non-zero exit (failing test) is DATA the agent must see
             // and react to, not a tool error — and a docker-unavailable result must
             // NOT count as a tool_error (that would drive evolution on an infra
@@ -538,6 +548,19 @@ fn dispatch_inner(
             ))
         }
         "skill_save" => {
+            // Env-verified gate: a skill is only worth keeping if the real
+            // environment just CONFIRMED the approach works — i.e. the last
+            // `run_command` exited 0. This is Voyager's "critic", replaced by
+            // ground truth. Refuse otherwise (incl. chat, which never execs).
+            let last = last_exec_exit.load(Ordering::Relaxed);
+            if last != 0 {
+                let seen = if last == i64::MIN { "aucun".to_string() } else { last.to_string() };
+                return Err(format!(
+                    "skill non sauvé : un skill ne se garde qu'APRÈS un test vérifié qui passe \
+                     (dernier run_command = {seen}, attendu 0). Écris un test, lance-le avec \
+                     run_command jusqu'à exit 0, PUIS sauve le skill."
+                ));
+            }
             let name = args["name"]
                 .as_str()
                 .ok_or_else(|| "missing required field: name".to_string())?;

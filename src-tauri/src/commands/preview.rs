@@ -162,6 +162,19 @@ fn inject_controller(html: &[u8]) -> Vec<u8> {
 /// 404 response when there is no open workspace, the path escapes the base, or
 /// the file is missing.
 pub fn serve(app: &AppHandle, raw_path: &str) -> Response<Cow<'static, [u8]>> {
+    // Decode %xx, drop the leading slash.
+    let decoded = percent_encoding::percent_decode_str(raw_path).decode_utf8_lossy();
+    let rel = decoded.trim_start_matches('/');
+
+    // Atelier preview: `__atelier__/<agentId>/<path>` serves from that run's
+    // DISPOSABLE mirror under the OS temp dir — the Atelier never writes into the
+    // user's workspace, so this path is workspace-independent. Lets the
+    // TranscriptDrawer render the web app the agent built + tested.
+    if let Some(rest) = rel.strip_prefix("__atelier__/") {
+        return serve_atelier(rest);
+    }
+
+    // Workspace preview (Design Studio): <workspace>/.shugu-forge/preview/<path>.
     // Live workspace root from managed state (seeded on startup from the
     // settings table, updated by fs_open_folder). On Windows this is the
     // canonical `\\?\`-prefixed path — std::fs::read handles it fine.
@@ -182,9 +195,6 @@ pub fn serve(app: &AppHandle, raw_path: &str) -> Response<Cow<'static, [u8]>> {
         base.push(part);
     }
 
-    // Decode %xx, drop the leading slash, default to index.html.
-    let decoded = percent_encoding::percent_decode_str(raw_path).decode_utf8_lossy();
-    let rel = decoded.trim_start_matches('/');
     let rel = if rel.is_empty() { "index.html" } else { rel };
 
     // Build the target path component-by-component, rejecting anything that
@@ -198,11 +208,41 @@ pub fn serve(app: &AppHandle, raw_path: &str) -> Response<Cow<'static, [u8]>> {
         }
     }
 
-    match std::fs::read(&target) {
+    read_and_respond(&target)
+}
+
+/// Serve a file from an Atelier run's disposable mirror: `rest` is
+/// `<agentId>/<path>` (path defaults to index.html). The agent id is validated
+/// (alphanumerics + `-` only, matching a UUID) so it can't escape the temp dir,
+/// and every sub-path component is checked the same way as the workspace branch.
+fn serve_atelier(rest: &str) -> Response<Cow<'static, [u8]>> {
+    let mut it = rest.splitn(2, '/');
+    let agent_id = it.next().unwrap_or("");
+    if agent_id.is_empty() || !agent_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return not_found();
+    }
+    let sub = it.next().unwrap_or("");
+    let sub = if sub.is_empty() { "index.html" } else { sub };
+
+    let mut target = std::env::temp_dir();
+    target.push(format!("shugu-atelier-{agent_id}"));
+    for comp in std::path::Path::new(sub).components() {
+        match comp {
+            Component::Normal(c) => target.push(c),
+            Component::CurDir => {}
+            _ => return not_found(),
+        }
+    }
+
+    read_and_respond(&target)
+}
+
+/// Read `target` and build the HTTP response: HTML gets the Studio controller
+/// injected (inert in the Atelier, but harmless), everything else is served raw.
+fn read_and_respond(target: &std::path::Path) -> Response<Cow<'static, [u8]>> {
+    match std::fs::read(target) {
         Ok(bytes) => {
-            let mime = guess_mime(&target);
-            // Inject the Studio controller into HTML so element selection works
-            // across the cross-origin iframe boundary (postMessage bridge).
+            let mime = guess_mime(target);
             if mime.starts_with("text/html") {
                 respond(200, mime, Cow::Owned(inject_controller(&bytes)))
             } else {

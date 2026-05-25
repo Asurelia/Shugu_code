@@ -68,18 +68,10 @@ mod runner;
 // (the `pub(super)` items) from here.
 mod tools;
 
-/// Continual Harness — harness evolution / Refiner (lot 1 P2) + UI commands.
-pub(crate) mod harness;
-
-/// Measurement bench (banc de mesure) — replays fixed tasks against PINNED
-/// harness generations on COPIED fixtures, judges with non-executing verifiers,
-/// records `bench_runs`, and A/B-compares generations. The legibility spine.
-pub(crate) mod bench;
-
 /// Sandboxed execution — runs agent-written code/tests inside a throwaway,
 /// network-isolated Docker container (the "environment" that gives real
-/// pass/fail feedback). Gated by `allow_exec`: bench copies only, never the
-/// user's real project.
+/// pass/fail feedback). Gated by `allow_exec`: the Atelier's disposable copy
+/// only, never the user's real project.
 pub(crate) mod sandbox;
 
 /// Skill library (Voyager / Hermes) — the agent saves reusable skills it learns
@@ -258,22 +250,14 @@ pub enum AgentEvent {
         agent_id: String,
         error: String,
     },
-    /// Continual Harness (P2) — the harness Refiner is running or has applied a
-    /// new generation for this agent's role. Two-stage so the UI never looks
-    /// hung during the 5-30s Refiner call: `status = "evolving"` when the call
-    /// starts, `status = "applied"` (with generations + summary) on success.
-    HarnessEvolved {
+    /// Skill learned (Voyager/Hermes) — the agent saved a REUSABLE skill that the
+    /// real environment VERIFIED (its last `run_command` test exited 0). Emitted
+    /// by the tool loop so the main chat UI shows an inline "🎓 appris : <name>"
+    /// badge. Replaces the retired `HarnessEvolved` (prompt-rewrite Refiner).
+    SkillLearned {
         agent_id: String,
         role: String,
-        status: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        from_generation: Option<i64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        to_generation: Option<i64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        summary: Option<String>,
+        name: String,
     },
 }
 
@@ -289,7 +273,7 @@ impl AgentEvent {
             AgentEvent::Delta { .. } => "delta",
             AgentEvent::Complete { .. } => "complete",
             AgentEvent::Error { .. } => "error",
-            AgentEvent::HarnessEvolved { .. } => "harnessEvolved",
+            AgentEvent::SkillLearned { .. } => "skillLearned",
         }
     }
 
@@ -304,7 +288,7 @@ impl AgentEvent {
             | AgentEvent::Delta { agent_id, .. }
             | AgentEvent::Complete { agent_id, .. }
             | AgentEvent::Error { agent_id, .. }
-            | AgentEvent::HarnessEvolved { agent_id, .. } => agent_id,
+            | AgentEvent::SkillLearned { agent_id, .. } => agent_id,
         }
     }
 }
@@ -334,6 +318,20 @@ pub struct SpawnArgs {
     /// Only the Studio "Generate" passes it; chat delegation leaves it None
     /// (zero impact on the existing delegate path).
     pub design_context: Option<String>,
+}
+
+/// Arguments for an Atelier run (env-grounded build→test→learn loop). Mirrors the
+/// provider routing of `SpawnArgs`, but role is fixed to "coder" and the run
+/// happens on a disposable mirror with execution enabled.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AtelierArgs {
+    pub task: String,
+    pub model: String,
+    pub protocol: Option<String>,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub chat_template_kwargs: Option<serde_json::Value>,
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -618,8 +616,129 @@ pub async fn agent_spawn(
             chat_template_kwargs_for_task,
             design_context_for_task,
             abort_token,
+            None,  // workspace_override — chat works on the real open workspace
+            false, // allow_exec — chat never executes; only the Atelier does
+            None,  // system_prompt_override — chat uses the role's seed prompt
         )
         .await;
+    });
+
+    Ok(agent_id)
+}
+
+/// Atelier run — the env-grounded learning loop. Spawns a `coder` agent on a
+/// DISPOSABLE mirror dir (under the OS temp dir, which Docker Desktop can mount)
+/// with execution ENABLED, driven by `ATELIER_PROMPT`: it builds a small web UI,
+/// writes a Playwright test, runs it in the sandbox, iterates on real failures,
+/// and saves a skill only once the test passes. Streams into the SAME transcript
+/// UI as any agent — no separate window.
+#[tauri::command]
+pub async fn agent_atelier_run(
+    app: tauri::AppHandle,
+    state: State<'_, AgentManagerState>,
+    args: AtelierArgs,
+) -> Result<String, String> {
+    // Dedicated role so Atelier-learned skills ("build + browser-test a web UI")
+    // load for FUTURE Atelier runs but never pollute plain `coder` chat turns
+    // (where a UI-testing recipe is irrelevant). The system prompt is overridden
+    // (ATELIER_PROMPT) regardless of role, so `seed_prompt` for it is unused.
+    let role = "atelier";
+
+    // Capacity check + handle insertion (same cap as agent_spawn).
+    let agent_id = Uuid::new_v4().to_string();
+    {
+        let mut guard = state.0.lock().map_err(|e| e.to_string())?;
+        if guard.len() >= MAX_CONCURRENT_AGENTS {
+            return Err(format!(
+                "agent capacity reached: {} active",
+                MAX_CONCURRENT_AGENTS
+            ));
+        }
+        guard.insert(
+            agent_id.clone(),
+            AgentHandle {
+                role: role.to_string(),
+                abort: std::sync::Arc::new(tokio::sync::Notify::new()),
+            },
+        );
+    }
+
+    // Disposable mirror dir under the OS temp dir (already inside Docker Desktop's
+    // file-sharing scope). Canonicalize so the workspace path-guard's
+    // pre-canonicalized-root contract holds on Windows (the `\\?\` prefix).
+    let ws_raw = std::env::temp_dir().join(format!("shugu-atelier-{agent_id}"));
+    if let Err(e) = std::fs::create_dir_all(&ws_raw) {
+        if let Ok(mut g) = state.0.lock() {
+            g.remove(&agent_id);
+        }
+        return Err(format!("create atelier dir: {e}"));
+    }
+    let ws = std::fs::canonicalize(&ws_raw).unwrap_or(ws_raw);
+
+    // INSERT the agents row (standalone — no conversation, no parent).
+    let created_at = now_ms();
+    {
+        let conn_mutex = get_conn(&app)?;
+        let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO agents
+                (id, role, status, parent_id, model, task, conversation_id, created_at)
+             VALUES (?1, ?2, 'running', NULL, ?3, ?4, NULL, ?5)",
+            params![agent_id, role, args.model, args.task, created_at],
+        )
+        .map_err(|e| {
+            if let Ok(mut g) = state.0.lock() {
+                g.remove(&agent_id);
+            }
+            format!("insert agents row: {e}")
+        })?;
+    }
+
+    persist_and_emit(
+        &app,
+        &AgentEvent::Spawn {
+            agent_id: agent_id.clone(),
+            parent_id: None,
+            role: role.to_string(),
+            task: args.task.clone(),
+            model: args.model.clone(),
+            conversation_id: None,
+        },
+    )?;
+
+    let abort_token = {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        guard
+            .get(&agent_id)
+            .map(|h| h.abort.clone())
+            .ok_or_else(|| "agent handle vanished between insert and spawn".to_string())?
+    };
+
+    let app_for_task = app.clone();
+    let agent_state = state.0.clone();
+    let agent_id_for_task = agent_id.clone();
+    let ws_for_task = ws.clone();
+    tauri::async_runtime::spawn(async move {
+        runner::run_agent_task(
+            app_for_task,
+            agent_state,
+            agent_id_for_task,
+            role.to_string(),
+            args.task,
+            args.model,
+            args.protocol,
+            args.base_url,
+            args.api_key,
+            args.chat_template_kwargs,
+            None, // design_context
+            abort_token,
+            Some(ws_for_task), // workspace_override — the disposable mirror
+            true,              // allow_exec — the Atelier is the ONLY exec path
+            Some(runner::ATELIER_PROMPT.to_string()),
+        )
+        .await;
+        // The mirror dir is intentionally left on disk so the preview pane can
+        // render the built app; the OS reclaims the temp dir over time.
     });
 
     Ok(agent_id)

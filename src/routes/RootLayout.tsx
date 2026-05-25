@@ -40,7 +40,6 @@ import {
 } from "@/features/tweaks/tweaks-panel";
 import { shiftHsl } from "@/lib/colors";
 
-import { seedAgents } from "@/mocks/seedAgents";
 import { seedGenerations } from "@/mocks/seedGenerations";
 import { seedGalleryFolders } from "@/mocks/seedGalleryFolders";
 import type { DockState, FileNode } from "@/lib/types";
@@ -55,7 +54,7 @@ import { useRefreshOpenFiles } from "@/features/fs/useRefreshOpenFiles";
 import { indexWorkspace } from "@/features/fs/workspaceIndexer";
 import { AgentsPanel } from "@/features/agents/AgentsPanel";
 import { useAgentEvents } from "@/features/agents/useEvents";
-import { setSelectedAgentId } from "@/features/agents/queries";
+import { setSelectedAgentId, useAgentsRailDisplay } from "@/features/agents/queries";
 import { useChatEvents } from "@/features/chat/useEvents";
 import { useChatStreamListener } from "@/features/chat/useChatStream";
 import { useLlamaLifecycle } from "@/features/llama/useLlamaLifecycle";
@@ -76,7 +75,7 @@ import { formatCurrentDocumentCli, formatCodeDirect } from "@/features/code/form
 // ─── Path → view string (derived navigation) ─────────────────
 
 type ViewKey =
-  | "chat" | "code" | "git" | "image" | "studio" | "agents" | "harness"
+  | "chat" | "code" | "git" | "image" | "studio" | "agents"
   | "gallery" | "settings" | "profile" | "connections";
 
 function pathToView(pathname: string): ViewKey {
@@ -86,7 +85,6 @@ function pathToView(pathname: string): ViewKey {
   if (pathname === "/image")        return "image";
   if (pathname.startsWith("/studio")) return "studio";
   if (pathname === "/agents")       return "agents";
-  if (pathname === "/harness")      return "harness";
   if (pathname === "/gallery")      return "gallery";
   if (pathname.startsWith("/settings")) return "settings";
   if (pathname === "/profile")      return "profile";
@@ -97,7 +95,7 @@ function pathToView(pathname: string): ViewKey {
 function railTargetFor(v: string): string {
   const map: Record<string, string> = {
     chat: "/chat", code: "/code", git: "/git", image: "/image",
-    studio: "/studio", agents: "/agents", harness: "/harness", gallery: "/gallery",
+    studio: "/studio", agents: "/agents", gallery: "/gallery",
     settings: "/settings", profile: "/profile", connections: "/connections",
   };
   return map[v] ?? "/chat";
@@ -430,8 +428,10 @@ export function RootLayout() {
   const [galleryFolders] = useState(seedGalleryFolders);
   const [activeFolder, setActiveFolder] = useState("g1");
 
-  // Agents
-  const [agents] = useState(seedAgents);
+  // Agents — REAL active agents (was: useState(seedAgents) mock). Feeds the
+  // left-rail "Workers" list + the header subtitle. The /agents page renders
+  // the full real AgentsPanel directly (see routes/agents.tsx).
+  const agents = useAgentsRailDisplay();
   const [activeAgent, setActiveAgent] = useState("a1");
 
   // LOT 2 — Find-in-files panel open state. Lifted ici car (1) la commande

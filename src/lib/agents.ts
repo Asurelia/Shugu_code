@@ -30,7 +30,7 @@ export type AgentEventKind =
   | "delta"
   | "complete"
   | "error"
-  | "harnessEvolved";
+  | "skillLearned";
 
 // ────────────────────────────────────────────────────────────────────
 // DB row shapes (mirror Rust AgentRow / AgentEventRow)
@@ -118,16 +118,12 @@ export type AgentEvent =
     }
   | { kind: "error"; agentId: string; error: string }
   | {
-      kind: "harnessEvolved";
+      kind: "skillLearned";
       agentId: string;
       role: string;
-      /** "evolving" = Refiner call started (5-30s); "applied" = new generation
-       * active; "failed" = Refiner errored, current harness kept. */
-      status: "evolving" | "applied" | "failed";
-      reason?: string;
-      fromGeneration?: number;
-      toGeneration?: number;
-      summary?: string;
+      /** Name of the reusable skill the agent just saved — VERIFIED by a real
+       * passing test (the env gate). The chat UI shows an inline "🎓 appris" badge. */
+      name: string;
     };
 
 // ────────────────────────────────────────────────────────────────────
@@ -300,179 +296,7 @@ export async function revealAgent(agentId: string): Promise<void> {
   }
 }
 
-// ────────────────────────────────────────────────────────────────────
-// Continual Harness (lot 1) — generation log, metrics, edit/rollback,
-// Refiner config, run feedback. Mirrors commands::agents::harness.
-// ────────────────────────────────────────────────────────────────────
-
-/** One immutable snapshot of a role's harness (mirror HarnessGenerationRow). */
-export interface HarnessGeneration {
-  id: string;
-  role: string;
-  generation: number;
-  parentGeneration: number | null;
-  /** "seed" | "manual" | "stuck:<reason>" — why this generation exists. */
-  triggerReason: string | null;
-  /** "seed" | "user" | "refiner:<model>" | "fallback:<model>". */
-  createdBy: string | null;
-  systemPrompt: string;
-  /** JSON array string of memory entries. */
-  memory: string;
-  /** 1 = the generation currently served to the agent. */
-  active: number;
-  createdAt: number;
-}
-
-/** Per-generation outcome metrics (mirror HarnessMetricRow). */
-export interface HarnessMetric {
-  generation: number | null;
-  runs: number;
-  successes: number;
-  stuckCount: number;
-  avgIterations: number;
-}
-
-/** Every generation of a role's harness, newest first. */
-export async function listHarnessGenerations(role: string): Promise<HarnessGeneration[]> {
-  return invoke<HarnessGeneration[]>("harness_list_generations", { role });
-}
-
-/** Per-generation metrics for a role. */
-export async function harnessMetrics(role: string): Promise<HarnessMetric[]> {
-  return invoke<HarnessMetric[]>("harness_metrics", { role });
-}
-
-/** Make an earlier generation active again (rollback). */
-export async function rollbackHarness(role: string, generation: number): Promise<void> {
-  return invoke<void>("harness_rollback", { role, generation });
-}
-
-/** Persist a user-authored harness as a new active generation. */
-export async function saveManualHarness(
-  role: string,
-  systemPrompt: string,
-  memory: string,
-): Promise<void> {
-  return invoke<void>("harness_save_manual", { role, systemPrompt, memory });
-}
-
-/** Read the configured Refiner provider JSON (null = self-fallback). */
-export async function getHarnessRefiner(): Promise<string | null> {
-  return invoke<string | null>("harness_get_refiner");
-}
-
-/** Set the Refiner provider config JSON `{protocol, baseUrl, model, apiKey?}`. */
-export async function setHarnessRefiner(value: string): Promise<void> {
-  return invoke<void>("harness_set_refiner", { value });
-}
-
-/** Record accept/reject feedback on a run's outcome (null clears it). */
-export async function setOutcomeFeedback(
-  agentId: string,
-  feedback: string | null,
-): Promise<void> {
-  return invoke<void>("outcome_set_feedback", { agentId, feedback });
-}
-
-// ── Measurement bench (banc de mesure) — mirrors commands::agents::bench ──
-
-/** A registered bench task (mirror BenchTaskRow). */
-export interface BenchTaskRow {
-  id: string;
-  role: string;
-  domain: string;
-  title: string;
-  prompt: string;
-  verifierKind: string;
-  enabled: boolean;
-}
-
-/** One task's verdict in a suite run (mirror BenchRunSummary). */
-export interface BenchRunSummary {
-  taskId: string;
-  title: string;
-  passed: boolean;
-  /** Graded score (0-10) from the `claude` verifier; null for the `files` verifier. */
-  score: number | null;
-  detail: string;
-  ms: number;
-}
-
-/** Result of running a whole suite against one generation (mirror BenchSuiteResult). */
-export interface BenchSuiteResult {
-  suiteRunId: string;
-  role: string;
-  generation: number;
-  total: number;
-  passed: number;
-  results: BenchRunSummary[];
-}
-
-/** Per-task A/B between two generations (mirror BenchTaskCompare). */
-export interface BenchTaskCompare {
-  taskId: string;
-  title: string;
-  passedA: boolean | null;
-  passedB: boolean | null;
-  regression: boolean;
-}
-
-/** A/B comparison of two generations on the same suite (mirror BenchComparison). */
-export interface BenchComparison {
-  role: string;
-  generationA: number;
-  generationB: number;
-  aPassed: number;
-  bPassed: number;
-  total: number;
-  regressions: number;
-  tasks: BenchTaskCompare[];
-}
-
-/** List the enabled bench tasks for a role. */
-export async function benchList(role: string): Promise<BenchTaskRow[]> {
-  return invoke<BenchTaskRow[]>("bench_list", { role });
-}
-
-/** Register (or replace) a bench task. */
-export async function benchAddTask(args: {
-  id: string;
-  role: string;
-  domain: string;
-  title: string;
-  prompt: string;
-  fixtureDir: string | null;
-  verifierKind: string;
-  verifierSpec: string;
-}): Promise<void> {
-  return invoke<void>("bench_add_task", args);
-}
-
-/** Run a role's suite against a pinned generation. The API key is resolved
- *  Rust-side from the keychain by `providerId` — never passed in cleartext. */
-export async function benchRunSuite(args: {
-  role: string;
-  generation: number;
-  model: string;
-  providerId: string;
-  protocol?: string;
-  baseUrl?: string;
-}): Promise<BenchSuiteResult> {
-  return invoke<BenchSuiteResult>("bench_run_suite", args);
-}
-
-/** A/B two generations on the same suite (regression = passed in A, fails in B). */
-export async function benchCompareGenerations(
-  role: string,
-  generationA: number,
-  generationB: number,
-): Promise<BenchComparison> {
-  return invoke<BenchComparison>("bench_compare_generations", {
-    role,
-    generationA,
-    generationB,
-  });
-}
+// ── Skill library (Voyager / Hermes) — mirrors commands::agents::skills ──
 
 /** One reusable skill the agent has learned (Voyager/Hermes), mirror of SkillRow. */
 export interface SkillRow {
@@ -490,4 +314,23 @@ export async function skillsList(role: string): Promise<SkillRow[]> {
 /** Wipe a role's learned skills (demo reset / cleanup). */
 export async function skillsClear(role: string): Promise<void> {
   return invoke<void>("skills_clear", { role });
+}
+
+// ── Atelier (env-grounded build → test → learn loop) — mirrors agent_atelier_run ──
+
+/** Launch an Atelier run: a `coder` agent builds a small web UI on a DISPOSABLE
+ *  mirror, drives it with a real browser (Playwright in the Docker sandbox),
+ *  iterates on real failures, and saves a skill once its test passes (exit 0).
+ *  Returns the agent id — stream it in the SAME transcript UI as any agent.
+ *  Provider routing mirrors `spawnAgent`: the key is resolved by the caller from
+ *  the keychain (never cleartext at rest). */
+export async function atelierRun(args: {
+  task: string;
+  model: string;
+  protocol?: string;
+  baseUrl?: string;
+  apiKey?: string;
+  chatTemplateKwargs?: Record<string, unknown>;
+}): Promise<string> {
+  return invoke<string>("agent_atelier_run", { args });
 }

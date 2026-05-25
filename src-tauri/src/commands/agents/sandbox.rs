@@ -7,22 +7,26 @@
 //! container:
 //!
 //! ```text
-//! docker run --rm --network none --cpus 1 --memory 512m --pids-limit 256 \
-//!   -v <ws>:/work -w /work node:22-alpine sh -c "timeout <N> <command>"
+//! docker run --rm --network none --cpus 2 --memory 2g --shm-size 1g \
+//!   --pids-limit 512 -v <ws>:/work -w /work shugu-playwright:1.60 \
+//!   sh -c "timeout <N> <command>"
 //! ```
 //!
 //! Network off (no exfiltration, no install), resource + wall-clock limits,
-//! `--rm` (ephemeral), and ONLY the disposable sandbox copy mounted → the
+//! `--rm` (ephemeral), and ONLY the disposable Atelier copy mounted → the
 //! container cannot touch the host beyond that copy. This is the "execution"
-//! half of safety axis 1 (containment). v1 runs ONLY against the bench's copied
-//! fixtures (`allow_exec` gate), never the user's real project.
+//! half of safety axis 1 (containment). It runs ONLY against the Atelier's
+//! throwaway mirror (`allow_exec` gate), never the user's real project.
 
 use std::path::Path;
 use std::process::Command;
 
-/// Image with a Node runtime (`node --test` is built in) — small (~150 MB).
-/// Must be pulled once (`docker pull node:22-alpine`); runs are `--network none`.
-const SANDBOX_IMAGE: &str = "node:22-alpine";
+/// Custom Atelier image: the official Playwright image (Chromium + browsers + OS
+/// deps baked in, version-pinned) PLUS the Playwright npm library at a fixed
+/// `NODE_PATH`, so an agent-written `node` script can drive a REAL browser with
+/// the container OFFLINE (`--network none`). Built ONCE:
+///   docker build -t shugu-playwright:1.60 -f docker/playwright.Dockerfile docker
+const SANDBOX_IMAGE: &str = "shugu-playwright:1.60";
 
 /// Hard ceiling on captured output per stream, to protect the LLM context budget
 /// (and the event log) from a runaway test that prints megabytes.
@@ -49,8 +53,8 @@ pub(super) fn run_in_sandbox(ws: &Path, command: &str, timeout_secs: u64) -> San
         .unwrap_or(&ws_str)
         .replace('\\', "/");
 
-    // `timeout SECS CMD` (BusyBox coreutils, present in alpine) caps wall-clock
-    // INSIDE the container; it exits 124 when it kills the command.
+    // `timeout SECS CMD` (GNU coreutils, present in the jammy base) caps
+    // wall-clock INSIDE the container; it exits 124 when it kills the command.
     let inner = format!("timeout {timeout_secs} {command}");
 
     let output = Command::new("docker")
@@ -60,11 +64,13 @@ pub(super) fn run_in_sandbox(ws: &Path, command: &str, timeout_secs: u64) -> San
             "--network",
             "none",
             "--cpus",
-            "1",
+            "2",
             "--memory",
-            "512m",
+            "2g",
+            "--shm-size",
+            "1g",
             "--pids-limit",
-            "256",
+            "512",
             "-v",
             &format!("{mount}:/work"),
             "-w",
@@ -90,8 +96,9 @@ pub(super) fn run_in_sandbox(ws: &Path, command: &str, timeout_secs: u64) -> San
             exit_code: -1,
             stdout: String::new(),
             stderr: format!(
-                "exécution sandbox impossible : {e}. Docker Desktop est-il démarré ? \
-                 (image attendue : {SANDBOX_IMAGE})"
+                "exécution sandbox impossible : {e}. Docker Desktop est-il démarré, \
+                 et l'image construite ? (attendue : {SANDBOX_IMAGE} — voir \
+                 docker/playwright.Dockerfile)"
             ),
             timed_out: false,
         },

@@ -24,7 +24,6 @@ const LazyStudioShell      = lazy(() => import("./routes/studio"));        // un
 const LazyStudioCreate     = lazy(() => import("./routes/studio.create")); // /studio index → the assistant
 const LazyStudioProjects   = lazy(() => import("./routes/studio.projects")); // /studio/projects → saved-projects grid
 const LazyAgentsRoute      = lazy(() => import("./routes/agents"));
-const LazyHarnessRoute     = lazy(() => import("./routes/harness"));
 const LazyGalleryRoute     = lazy(() => import("./routes/gallery"));
 const LazySettingsRoute    = lazy(() => import("./routes/settings"));
 const LazySettingsSection  = lazy(() => import("./routes/settings.section"));
@@ -111,13 +110,6 @@ const agentsRoute = createRoute({
   component: () => <LazyAgentsRoute />,
 });
 
-// ─── /harness (Continual Harness — self-evolving agent harness) ─
-const harnessRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/harness",
-  component: () => <LazyHarnessRoute />,
-});
-
 // ─── /gallery ────────────────────────────────────────────────
 const galleryRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -163,7 +155,6 @@ const routeTree = rootRoute.addChildren([
   designRedirectRoute,
   studioRoute.addChildren([studioCreateRoute, studioProjectsRoute, studioInspirationRoute]),
   agentsRoute,
-  harnessRoute,
   galleryRoute,
   settingsIndexRoute,
   settingsSectionRoute,

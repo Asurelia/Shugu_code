@@ -174,7 +174,6 @@ export function Rail({ view, setView }: any) {
     { id: "image",   icon: "image",   label: "Image" },
     { id: "studio",  icon: "palette", label: "Studio" },
     { id: "agents",  icon: "agent",   label: "Agents" },
-    { id: "harness", icon: "sparkle", label: "Harness" },
     { id: "gallery", icon: "gallery", label: "Gallery" },
   ];
   return (
