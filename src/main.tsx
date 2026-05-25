@@ -10,6 +10,10 @@ import "./styles/panels.css";
 import "./styles/chat-sidebar.css";
 import "./styles/settings-extras.css";
 import "./styles/ai-edit.css";
+import "./styles/chat-codex.css";
+import "./styles/forge-integrations.css";
+import "./styles/design.css";
+import "./styles/studio.css";
 
 import { RouterProvider } from "@tanstack/react-router";
 import { ThemeBootstrap } from "./lib/ThemeBootstrap";

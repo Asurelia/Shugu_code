@@ -1,0 +1,1052 @@
+[
+  {
+    "id": "agentic",
+    "name": "Design System Inspired by Agentic",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "airbnb",
+    "name": "Design System Inspired by Airbnb",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "airtable",
+    "name": "Design System Inspired by Airtable",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "ant",
+    "name": "Design System Inspired by Ant",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "apple",
+    "name": "Design System Inspired by Apple",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "application",
+    "name": "Design System Inspired by Application",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "arc",
+    "name": "Design System Inspired by Arc Browser",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "artistic",
+    "name": "Design System Inspired by Artistic",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "atelier-zero",
+    "name": "Atelier Zero",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "bento",
+    "name": "Design System Inspired by Bento",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "binance",
+    "name": "Design System Inspired by Binance.US",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "bmw",
+    "name": "Design System Inspired by BMW",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "bmw-m",
+    "name": "Design System Inspired by BMW M",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "bold",
+    "name": "Design System Inspired by Bold",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "brutalism",
+    "name": "Design System Inspired by Brutalism",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "bugatti",
+    "name": "Design System Inspired by Bugatti",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "cafe",
+    "name": "Design System Inspired by Cafe",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "cal",
+    "name": "Design System Inspired by Cal.com",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "canva",
+    "name": "Design System Inspired by Canva",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "cisco",
+    "name": "Design System Inspired by Cisco",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "claude",
+    "name": "Design System Inspired by Claude (Anthropic)",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "clay",
+    "name": "Design System Inspired by Clay",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "claymorphism",
+    "name": "Design System Inspired by Claymorphism",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "clean",
+    "name": "Design System Inspired by Clean",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "clickhouse",
+    "name": "Design System Inspired by ClickHouse",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "cohere",
+    "name": "Design System Inspired by Cohere",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "coinbase",
+    "name": "Design System Inspired by Coinbase",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "colorful",
+    "name": "Design System Inspired by Colorful",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "composio",
+    "name": "Design System Inspired by Composio",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "contemporary",
+    "name": "Design System Inspired by Contemporary",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "corporate",
+    "name": "Design System Inspired by Corporate",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "cosmic",
+    "name": "Design System Inspired by Cosmic",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "creative",
+    "name": "Design System Inspired by Creative",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "cursor",
+    "name": "Design System Inspired by Cursor",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "dashboard",
+    "name": "Design System Inspired by Dashboard",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "default",
+    "name": "Neutral Modern",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "discord",
+    "name": "Design System Inspired by Discord",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "dithered",
+    "name": "Design System Inspired by Dithered",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "doodle",
+    "name": "Design System Inspired by Doodle",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "dramatic",
+    "name": "Design System Inspired by Dramatic",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "duolingo",
+    "name": "Design System Inspired by Duolingo",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "editorial",
+    "name": "Design System Inspired by Editorial",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "elegant",
+    "name": "Design System Inspired by Elegant",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "elevenlabs",
+    "name": "Design System Inspired by ElevenLabs",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "energetic",
+    "name": "Design System Inspired by Energetic",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "enterprise",
+    "name": "Design System Inspired by Enterprise",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "expo",
+    "name": "Design System Inspired by Expo",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "expressive",
+    "name": "Design System Inspired by Expressive",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "fantasy",
+    "name": "Design System Inspired by Fantasy",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "ferrari",
+    "name": "Design System Inspired by Ferrari",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "figma",
+    "name": "Design System Inspired by Figma",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "flat",
+    "name": "Design System Inspired by Flat",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "framer",
+    "name": "Design System Inspired by Framer",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "friendly",
+    "name": "Design System Inspired by Friendly",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "futuristic",
+    "name": "Design System Inspired by Futuristic",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "github",
+    "name": "Design System Inspired by GitHub",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "glassmorphism",
+    "name": "Design System Inspired by Glassmorphism",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "gradient",
+    "name": "Design System Inspired by Gradient",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "hashicorp",
+    "name": "Design System Inspired by HashiCorp",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "hud",
+    "name": "HUD Design System",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "huggingface",
+    "name": "Design System Inspired by Hugging Face",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "ibm",
+    "name": "Design System Inspired by IBM",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "intercom",
+    "name": "Design System Inspired by Intercom",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "kami",
+    "name": "Design System Inspired by kami (紙 / 纸)",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "kraken",
+    "name": "Design System Inspired by Kraken",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "lamborghini",
+    "name": "Design System Inspired by Lamborghini",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "levels",
+    "name": "Design System Inspired by Levels",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "linear-app",
+    "name": "Design System Inspired by Linear",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "lingo",
+    "name": "Design System Inspired by Lingo",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "loom",
+    "name": "Loom Design System",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "lovable",
+    "name": "Design System Inspired by Lovable",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "luxury",
+    "name": "Design System Inspired by Luxury",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "mastercard",
+    "name": "Design System Inspired by Mastercard",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "material",
+    "name": "Design System Inspired by Material",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "meta",
+    "name": "Design System Inspired by Meta (Store)",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "minimal",
+    "name": "Design System Inspired by Minimal",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "minimax",
+    "name": "Design System Inspired by MiniMax",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "mintlify",
+    "name": "Design System Inspired by Mintlify",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "miro",
+    "name": "Design System Inspired by Miro",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "mission-control",
+    "name": "Mission Control Design System",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "mistral-ai",
+    "name": "Design System Inspired by Mistral AI",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "modern",
+    "name": "Design System Inspired by Modern",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "mongodb",
+    "name": "Design System Inspired by MongoDB",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "mono",
+    "name": "Design System Inspired by Mono",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "neobrutalism",
+    "name": "Design System Inspired by Neobrutalism",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "neon",
+    "name": "Design System Inspired by Neon",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "neumorphism",
+    "name": "Design System Inspired by Neumorphism",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "nike",
+    "name": "Design System Inspired by Nike",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "notion",
+    "name": "Design System Inspired by Notion",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "nvidia",
+    "name": "Design System Inspired by NVIDIA",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "ollama",
+    "name": "Design System Inspired by Ollama",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "openai",
+    "name": "Design System Inspired by OpenAI",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "opencode-ai",
+    "name": "Design System Inspired by OpenCode",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "pacman",
+    "name": "Design System Inspired by Pacman",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "paper",
+    "name": "Design System Inspired by Paper",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "perplexity",
+    "name": "Design System Inspired by Perplexity AI",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "perspective",
+    "name": "Design System Inspired by Perspective",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "pinterest",
+    "name": "Design System Inspired by Pinterest",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "playstation",
+    "name": "Design System Inspired by PlayStation",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "posthog",
+    "name": "Design System Inspired by PostHog",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "premium",
+    "name": "Design System Inspired by Premium",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "professional",
+    "name": "Design System Inspired by Professional",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "publication",
+    "name": "Design System Inspired by Publication",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "raycast",
+    "name": "Design System Inspired by Raycast",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "refined",
+    "name": "Design System Inspired by Refined",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "renault",
+    "name": "Design System Inspired by Renault",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "replicate",
+    "name": "Design System Inspired by Replicate",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "resend",
+    "name": "Design System Inspired by Resend",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "retro",
+    "name": "Design System Inspired by Retro",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "revolut",
+    "name": "Design System Inspired by Revolut",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "runwayml",
+    "name": "Design System Inspired by Runway",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "sanity",
+    "name": "Design System Inspired by Sanity",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "sentry",
+    "name": "Design System Inspired by Sentry",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "shadcn",
+    "name": "Design System Inspired by Shadcn",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "shopify",
+    "name": "Design System Inspired by Shopify",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "simple",
+    "name": "Design System Inspired by Simple",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "skeumorphism",
+    "name": "Design System Inspired by Skeumorphism",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "slack",
+    "name": "Design System Inspired by Slack",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "sleek",
+    "name": "Design System Inspired by Sleek",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "spacex",
+    "name": "Design System Inspired by SpaceX",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "spacious",
+    "name": "Design System Inspired by Spacious",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "spotify",
+    "name": "Design System Inspired by Spotify",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "starbucks",
+    "name": "Design System Inspired by Starbucks",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "storytelling",
+    "name": "Design System Inspired by Storytelling",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "stripe",
+    "name": "Design System Inspired by Stripe",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "supabase",
+    "name": "Design System Inspired by Supabase",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "superhuman",
+    "name": "Design System Inspired by Superhuman",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "tesla",
+    "name": "Design System Inspired by Tesla",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "tetris",
+    "name": "Design System Inspired by Tetris",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "theverge",
+    "name": "Design System Inspired by The Verge",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "together-ai",
+    "name": "Design System Inspired by Together AI",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "totality-festival",
+    "name": "Design System Inspired by Totality Festival",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "trading-terminal",
+    "name": "Trading Terminal Design System",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "uber",
+    "name": "Design System Inspired by Uber",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "urdu",
+    "name": "Urdu Modern (Indus Script System)",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "vercel",
+    "name": "Design System Inspired by Vercel",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "vibrant",
+    "name": "Design System Inspired by Vibrant",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "vintage",
+    "name": "Design System Inspired by Vintage",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "vodafone",
+    "name": "Design System Inspired by Vodafone",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "voltagent",
+    "name": "Design System Inspired by VoltAgent",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "warm-editorial",
+    "name": "Warm Editorial",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "warp",
+    "name": "Design System Inspired by Warp",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "webex",
+    "name": "Design System Inspired by Webex",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "webflow",
+    "name": "Design System Inspired by Webflow",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "wechat",
+    "name": "WeChat Design System",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "wired",
+    "name": "Design System Inspired by WIRED",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "wise",
+    "name": "Design System Inspired by Wise",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "x-ai",
+    "name": "Design System Inspired by xAI",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "xiaohongshu",
+    "name": "Design System Inspired by Xiaohongshu",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  },
+  {
+    "id": "zapier",
+    "name": "Design System Inspired by Zapier",
+    "hasTokens": true,
+    "hasComponents": true,
+    "hasSpec": true
+  }
+]

@@ -267,41 +267,6 @@ export function DiffView({ original, modified }: { original: string; modified: s
   );
 }
 
-// ─── Agents view ────────────────────────────────────────────
-export function AgentsView({ agents }: any) {
-  return (
-    <div className="agent-shell scroll">
-      <div style={{display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:16}}>
-        <div>
-          <div style={{fontFamily:"var(--font-display)", fontSize:14, fontWeight:700, color:"var(--on-surface)"}}>Active workers · {agents.filter((a: any) => a.status === 'running').length} running</div>
-          <div style={{fontSize:12, color:"var(--on-surface-variant)", marginTop:4}}>Long-running tasks delegated to background agents. They keep working even when you switch views.</div>
-        </div>
-        <button className="lgb lgb-primary"><Icon name="plus" size={13}/> New agent</button>
-      </div>
-      <div className="agent-grid">
-        {agents.map((a: any) => (
-          <div key={a.id} className={"agent-card " + a.status}>
-            <div className="head">
-              <div className="who">
-                <span className="ico" style={{background: a.color}}>{a.icon}</span>
-                {a.name}
-              </div>
-              <span className={"chip " + (a.status === 'running' ? 'tertiary' : a.status === 'done' ? 'success' : 'warn')}>{a.status}</span>
-            </div>
-            <div className="desc">{a.desc}</div>
-            <div className="log">{a.log}</div>
-            <div className="foot">
-              <span>{a.elapsed}</span>
-              <div className="progress"><div className="fill" style={{width: a.progress + "%"}}></div></div>
-              <span style={{color: a.status === 'running' ? 'var(--tertiary)' : 'var(--on-surface-muted)'}}>{a.progress}%</span>
-            </div>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
 // ─── Gallery view ───────────────────────────────────────────
 export function GalleryView({ generations }: any) {
   return (

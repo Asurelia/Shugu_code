@@ -15,13 +15,36 @@
 // et l'optimisation des re-renders nativement.
 
 import { useEffect, useState } from "react";
-import { spawnAgent, killAgent, type AgentRow, type AgentEvent } from "@/lib/agents";
+import {
+  killAgent,
+  atelierRun,
+  type AgentRow,
+  type AgentEvent,
+} from "@/lib/agents";
 import {
   useActiveAgents,
   useAgentTranscript,
   useSelectedAgentId,
   setSelectedAgentId,
 } from "./queries";
+import { useSkillsList, invalidateSkills } from "./skillsQueries";
+import { resolveProvider, type Protocol } from "@/lib/providers";
+import { loadProviderConfig, getConfig, getProviderEnabled } from "@/lib/credentials";
+import { useActiveModel } from "@/features/chat/chat-sync";
+
+// wry serves a custom `foo://` scheme as `http://foo.localhost/` on Windows and
+// `foo://localhost/` elsewhere — mirror ProjectPreview's origin so the Atelier
+// preview iframe hits the same `preview://` Rust handler.
+function previewOrigin(): string {
+  const isWin =
+    typeof navigator !== "undefined" && /Windows|Win32|Win64/i.test(navigator.userAgent);
+  return isWin ? "http://preview.localhost" : "preview://localhost";
+}
+
+// Preset for the "Démo : to-do list" button — a small but genuinely interactive
+// app the agent must build AND verify by driving a real browser.
+const ATELIER_TODO_PRESET =
+  "Construis une petite to-do list web : un champ texte + un bouton « Ajouter » qui ajoute la saisie comme nouvel item dans une liste (<ul>) ; chaque item a un bouton « Supprimer » qui le retire ; cliquer sur le texte d'un item le marque comme fait (une classe CSS qui barre le texte). Puis écris un test Playwright en CommonJS (require('playwright'), chromium.launch({ args: ['--no-sandbox'] }), page sur file:///work/index.html) qui : ajoute deux items, en supprime un, marque l'autre comme fait, et vérifie le DOM à chaque étape (process.exit(1) si un check échoue). Lance le test avec run_command et corrige jusqu'à exit 0, puis sauve le skill.";
 
 // Tick utility — force un re-render périodique tant que `active=true`.
 // Cas d'usage : faire que `fmtAge()` (qui lit `Date.now()`) tick en live
@@ -153,6 +176,7 @@ function TranscriptDrawer({
   onClose: () => void;
 }) {
   const { data, isLoading } = useAgentTranscript(agentId);
+  const [previewNonce, setPreviewNonce] = useState(0);
 
   if (isLoading || !data) {
     return (
@@ -181,6 +205,21 @@ function TranscriptDrawer({
   const errorEvent = events.find((e) => e.kind === "error");
   const toolCallCount = events.filter((e) => e.kind === "toolCall").length;
   const isActive = row.status === "running" || row.status === "pending";
+
+  // Atelier-specific views: the real browser-test runs (run_command) + the
+  // skills the env-verified gate accepted. An "atelier" run is detected by the
+  // presence of run_command tool calls (chat agents never execute).
+  const skillEvents = events.filter((e) => e.kind === "skillLearned");
+  const runCalls = events.filter((e) => e.kind === "toolCall" && e.tool === "run_command");
+  const isAtelier = runCalls.length > 0;
+  const resultByCall = new Map<string, string>();
+  for (const e of events) {
+    if (e.kind === "toolResult") {
+      const content =
+        typeof e.result === "string" ? e.result : e.error ?? JSON.stringify(e.result);
+      resultByCall.set(e.toolCallId, content);
+    }
+  }
 
   // Live stream — extract le dernier delta de chaque kind pour afficher
   // ce que l'agent est en train de générer en temps réel. Avec le push
@@ -380,6 +419,123 @@ function TranscriptDrawer({
           </div>
         </div>
       )}
+
+      {/* Atelier — env-verified skills the agent captured this run */}
+      {skillEvents.length > 0 && (
+        <div style={{ marginTop: 10, display: "flex", flexWrap: "wrap", gap: 6 }}>
+          {skillEvents.map((e, i) =>
+            e.kind === "skillLearned" ? (
+              <span
+                key={i}
+                title="Skill vérifié par un vrai test (exit 0) — pas une opinion du LLM"
+                style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  padding: "3px 8px",
+                  borderRadius: 99,
+                  background: "rgba(74, 222, 128, 0.15)",
+                  color: "var(--success, #4ade80)",
+                  border: "1px solid rgba(74, 222, 128, 0.35)",
+                }}
+              >
+                🎓 appris : {e.name}
+              </span>
+            ) : null,
+          )}
+        </div>
+      )}
+
+      {/* Atelier — the real browser-test runs (the build→test→fix loop) */}
+      {isAtelier && (
+        <div style={sectionStyle}>
+          <span style={labelStyle}>Tests exécutés (environnement réel)</span>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {runCalls.map((e, i) => {
+              if (e.kind !== "toolCall") return null;
+              const cmd = (e.args as { command?: string } | null)?.command ?? "(commande)";
+              const out = resultByCall.get(e.toolCallId) ?? "(en cours…)";
+              const passed = out.trim().startsWith("[exit 0]");
+              return (
+                <div
+                  key={e.toolCallId}
+                  style={{
+                    borderRadius: 6,
+                    border: `1px solid ${
+                      passed ? "rgba(74,222,128,0.3)" : "rgba(255,107,107,0.25)"
+                    }`,
+                    overflow: "hidden",
+                  }}
+                >
+                  <div
+                    style={{
+                      fontSize: 10,
+                      fontFamily: "var(--font-mono)",
+                      padding: "3px 6px",
+                      background: passed
+                        ? "rgba(74,222,128,0.12)"
+                        : "rgba(255,107,107,0.10)",
+                      color: passed ? "var(--success, #4ade80)" : "var(--error, #ff6b6b)",
+                    }}
+                  >
+                    {passed ? "✓" : "✗"} essai #{i + 1} — {cmd}
+                  </div>
+                  <pre
+                    style={{
+                      margin: 0,
+                      padding: 6,
+                      fontSize: 10,
+                      lineHeight: 1.4,
+                      maxHeight: 160,
+                      overflow: "auto",
+                      whiteSpace: "pre-wrap",
+                      color: "var(--on-surface-muted)",
+                    }}
+                  >
+                    {out}
+                  </pre>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Atelier — live preview of the built app (served by the preview:// handler) */}
+      {isAtelier && (
+        <div style={sectionStyle}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+            <span style={{ ...labelStyle, marginBottom: 0 }}>Aperçu de l'app</span>
+            <span style={{ flex: 1 }} />
+            <button
+              onClick={() => setPreviewNonce((n) => n + 1)}
+              style={{
+                fontSize: 9,
+                padding: "2px 8px",
+                borderRadius: 4,
+                background: "transparent",
+                color: "var(--on-surface-muted)",
+                border: "1px solid rgba(150,150,150,0.25)",
+                cursor: "pointer",
+              }}
+            >
+              Recharger
+            </button>
+          </div>
+          <iframe
+            key={previewNonce}
+            src={`${previewOrigin()}/__atelier__/${agentId}/index.html?_=${previewNonce}`}
+            style={{
+              width: "100%",
+              height: 260,
+              border: "1px solid rgba(124,58,237,0.18)",
+              borderRadius: 6,
+              background: "#fff",
+            }}
+            sandbox="allow-scripts allow-same-origin"
+            title="Aperçu de l'app construite par l'atelier"
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -404,15 +560,71 @@ export function AgentsPanel() {
   // invalide useActiveAgents.
   useTick(1000, running > 0);
 
-  const handleSpawnTest = async () => {
+  // ── Atelier launcher state + the SkillLearned → refetch-skills listener ──
+  const [modelId] = useActiveModel();
+  const [atelierTask, setAtelierTask] = useState("");
+  const [launching, setLaunching] = useState(false);
+  const [atelierErr, setAtelierErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    void (async () => {
+      try {
+        const mod = await import("@tauri-apps/api/event");
+        unlisten = await mod.listen<AgentEvent>("agent://lifecycle", (e) => {
+          if (e.payload.kind === "skillLearned") invalidateSkills(e.payload.role);
+        });
+      } catch (err) {
+        console.warn("[AgentsPanel] skillLearned listen failed:", err);
+      }
+    })();
+    return () => unlisten?.();
+  }, []);
+
+  const launchAtelier = async (task: string) => {
+    const t = task.trim();
+    if (!t || launching) return;
+    setLaunching(true);
+    setAtelierErr(null);
     try {
-      await spawnAgent({
-        role: "orchestrator",
-        task: "Phase 0 smoke test — verify end-to-end pipeline",
-        model: "phase-0-synthetic",
-      });
+      // Resolve the active model → provider/protocol/baseUrl/key, exactly like
+      // the chat delegate flow (key stays in the keychain, never cleartext).
+      const fullId = modelId?.includes("/")
+        ? modelId
+        : `anthropic/${modelId ?? "claude-haiku-4-5"}`;
+      const {
+        providerId,
+        protocol: defProto,
+        baseUrl: defBase,
+        model: realModel,
+      } = resolveProvider(fullId);
+      const enabled = await getProviderEnabled(providerId);
+      if (enabled !== "true") {
+        setAtelierErr("Aucun provider LLM configuré — Réglages → Connexions.");
+        return;
+      }
+      const cfg = await loadProviderConfig(providerId);
+      let protocol: Protocol = defProto;
+      if (defProto === "custom") {
+        const stored = await getConfig(providerId, "protocol");
+        if (
+          stored === "anthropic" ||
+          stored === "openai" ||
+          stored === "ollama" ||
+          stored === "custom"
+        ) {
+          protocol = stored;
+        }
+      }
+      const baseUrl = cfg.baseUrl && cfg.baseUrl !== "" ? cfg.baseUrl : defBase;
+      const apiKey = cfg.apiKey && cfg.apiKey !== "" ? cfg.apiKey : undefined;
+      const id = await atelierRun({ task: t, model: realModel, protocol, baseUrl, apiKey });
+      setSelectedId(id);
+      setAtelierTask("");
     } catch (err) {
-      console.warn("[AgentsPanel] spawn test failed:", err);
+      setAtelierErr(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLaunching(false);
     }
   };
 
@@ -427,22 +639,99 @@ export function AgentsPanel() {
         <span style={{ fontSize: 11, color: "var(--on-surface-muted)" }}>
           {running} running · {agents.length} total
         </span>
-        <span style={{ flex: 1 }} />
-        <button
-          onClick={() => void handleSpawnTest()}
+      </div>
+
+      {/* Atelier — env-grounded build → test → learn loop */}
+      <div
+        style={{
+          marginBottom: 12,
+          padding: 10,
+          borderRadius: 8,
+          background: "rgba(124, 58, 237, 0.06)",
+          border: "1px solid rgba(124, 58, 237, 0.22)",
+        }}
+      >
+        <div
           style={{
-            fontSize: 10,
-            padding: "3px 10px",
-            borderRadius: 4,
-            background: "rgba(124, 58, 237, 0.18)",
+            fontSize: 11,
+            fontWeight: 700,
             color: "var(--primary, #7c3aed)",
-            border: "1px solid rgba(124, 58, 237, 0.4)",
-            cursor: "pointer",
+            marginBottom: 4,
           }}
-          title="Phase 0 debug — spawns a synthetic agent that emits Spawn → Message → Complete events on its own. Validates the plumbing end-to-end without an LLM."
         >
-          + Spawn test agent
-        </button>
+          🛠️ Atelier — apprentissage par l'environnement
+        </div>
+        <div
+          style={{
+            fontSize: 10.5,
+            color: "var(--on-surface-muted)",
+            lineHeight: 1.5,
+            marginBottom: 8,
+          }}
+        >
+          L'agent construit une UI web sur une copie jetable, la <b>teste pour de vrai</b> dans
+          un navigateur (Playwright en sandbox), corrige sur l'échec réel, et ne garde un{" "}
+          <b>skill vérifié</b> qu'une fois le test au vert. La boucle, l'app et le skill
+          s'affichent dans le transcript.
+        </div>
+        <textarea
+          value={atelierTask}
+          onChange={(e) => setAtelierTask(e.target.value)}
+          placeholder="Décris l'app web à construire + tester…"
+          rows={2}
+          style={{
+            width: "100%",
+            boxSizing: "border-box",
+            resize: "vertical",
+            fontSize: 11,
+            padding: "6px 8px",
+            borderRadius: 6,
+            background: "var(--surface, #14141f)",
+            color: "var(--on-surface, #ddd)",
+            border: "1px solid rgba(124, 58, 237, 0.25)",
+            fontFamily: "inherit",
+          }}
+        />
+        <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap" }}>
+          <button
+            onClick={() => void launchAtelier(atelierTask)}
+            disabled={launching || !atelierTask.trim()}
+            style={{
+              fontSize: 10,
+              padding: "4px 12px",
+              borderRadius: 4,
+              background: "rgba(124, 58, 237, 0.22)",
+              color: "var(--primary, #7c3aed)",
+              border: "1px solid rgba(124, 58, 237, 0.45)",
+              cursor: launching || !atelierTask.trim() ? "default" : "pointer",
+              opacity: launching || !atelierTask.trim() ? 0.6 : 1,
+            }}
+          >
+            {launching ? "Lancement…" : "Lancer l'atelier"}
+          </button>
+          <button
+            onClick={() => void launchAtelier(ATELIER_TODO_PRESET)}
+            disabled={launching}
+            style={{
+              fontSize: 10,
+              padding: "4px 12px",
+              borderRadius: 4,
+              background: "transparent",
+              color: "var(--on-surface-muted)",
+              border: "1px solid rgba(150,150,150,0.3)",
+              cursor: launching ? "default" : "pointer",
+              opacity: launching ? 0.6 : 1,
+            }}
+            title="Démo : une to-do list que l'agent construit puis teste au navigateur"
+          >
+            🧪 Démo : to-do list
+          </button>
+        </div>
+        {atelierErr && (
+          <div style={{ marginTop: 6, fontSize: 10, color: "var(--error, #ff6b6b)" }}>
+            {atelierErr}
+          </div>
+        )}
       </div>
 
       {isLoading ? (
@@ -487,6 +776,72 @@ export function AgentsPanel() {
           agentId={selectedId}
           onClose={() => setSelectedId(null)}
         />
+      )}
+
+      <SkillsSection role="atelier" />
+    </div>
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Skills section — the role's env-verified learned skills (Voyager/Hermes),
+// woven into the main panel (no separate window). Refetched when a
+// `skillLearned` event invalidates the query (see the listener above).
+// ────────────────────────────────────────────────────────────────────
+
+function SkillsSection({ role }: { role: string }) {
+  const { data: skills = [] } = useSkillsList(role);
+  const [open, setOpen] = useState(true);
+  if (skills.length === 0) return null;
+  return (
+    <div
+      style={{
+        marginTop: 14,
+        borderTop: "1px solid rgba(150,150,150,0.12)",
+        paddingTop: 8,
+      }}
+    >
+      <button
+        onClick={() => setOpen((o) => !o)}
+        style={{
+          fontSize: 11,
+          fontWeight: 700,
+          color: "var(--success, #4ade80)",
+          background: "transparent",
+          border: "none",
+          cursor: "pointer",
+          padding: 0,
+        }}
+      >
+        🎓 Compétences apprises ({skills.length}) {open ? "▾" : "▸"}
+      </button>
+      {open && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 8 }}>
+          {skills.map((s) => (
+            <div
+              key={s.name}
+              style={{
+                padding: "6px 8px",
+                borderRadius: 6,
+                background: "rgba(74, 222, 128, 0.06)",
+                border: "1px solid rgba(74, 222, 128, 0.18)",
+              }}
+            >
+              <div
+                style={{ fontSize: 11, fontWeight: 600, color: "var(--on-surface, #ddd)" }}
+              >
+                {s.name}
+              </div>
+              {s.whenToUse && (
+                <div
+                  style={{ fontSize: 10, color: "var(--on-surface-muted)", marginTop: 2 }}
+                >
+                  {s.whenToUse}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );

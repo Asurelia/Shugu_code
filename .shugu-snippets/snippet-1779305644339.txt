@@ -1,0 +1,14 @@
+// path: src/demo.ts
+/**
+ * Fichier de démonstration.
+ * Remplacez ce contenu par le code réel de votre projet.
+ */
+export const DEMO_VERSION = "1.0.0";
+
+export function init(): void {
+  console.log(`[demo] Initialisé (v${DEMO_VERSION})`);
+}
+
+export function runTest(): string {
+  return "Test réussi ✅";
+}

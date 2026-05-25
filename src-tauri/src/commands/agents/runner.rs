@@ -50,6 +50,11 @@ use crate::commands::chat::{self, AssistantTurn, ChatMessage};
 /// signal instead of "agent exceeded MAX_ITERATIONS" with no output.
 const MAX_ITERATIONS: u32 = 8;
 
+/// Iteration budget for the Atelier (exec) path. Higher than chat because each
+/// write→run-test→fix cycle costs one iteration; the agent needs room to see a
+/// real failure, fix it, and re-run before producing its final answer.
+const MAX_ITERATIONS_EXEC: u32 = 16;
+
 // ────────────────────────────────────────────────────────────────────
 // Internal conversation history shape
 // ────────────────────────────────────────────────────────────────────
@@ -67,7 +72,7 @@ const MAX_ITERATIONS: u32 = 8;
 ///     `role: "tool"` per result; Anthropic packs all results into a
 ///     single `role: "user"` message with `content: [tool_result, ...]`.
 #[allow(dead_code)] // variants used in match arms but rustc sees only construction
-enum AgentMessage {
+pub(super) enum AgentMessage {
     Text { role: String, content: String },
     AssistantWithTools { content: String, tool_calls: Vec<ToolCall> },
     ToolResults(Vec<ToolResult>),
@@ -231,7 +236,7 @@ fn build_anthropic_native(history: &[AgentMessage]) -> (Vec<serde_json::Value>, 
 /// is open — the dispatcher then returns an "is_error: true" ToolResult
 /// for every call this iteration so the model sees the situation and
 /// can ask the user to open a workspace.
-fn get_workspace_root(app: &AppHandle) -> Option<PathBuf> {
+pub(super) fn get_workspace_root(app: &AppHandle) -> Option<PathBuf> {
     let state = app.state::<Mutex<Option<PathBuf>>>();
     let guard = state.lock().ok()?;
     guard.clone()
@@ -257,13 +262,41 @@ pub(super) async fn run_agent_task(
     base_url: Option<String>,
     api_key_opt: Option<String>,
     chat_template_kwargs: Option<serde_json::Value>,
+    design_context: Option<String>,
     abort: Arc<tokio::sync::Notify>,
+    // Atelier additions: when set, the agent works on a disposable mirror with
+    // execution enabled and a task-specific prompt. Chat passes (None, false, None).
+    workspace_override: Option<PathBuf>,
+    allow_exec: bool,
+    system_prompt_override: Option<String>,
 ) {
     let start = std::time::Instant::now();
     let protocol = protocol.unwrap_or_else(|| "openai".to_string());
     let base_url = base_url.unwrap_or_default();
 
-    let system_prompt = build_system_prompt(&role);
+    // System prompt: the Atelier passes a task-specific override; chat loads the
+    // role's static seed via `load_active_harness`. `active_generation` (always 0
+    // now that the Refiner is retired) is still recorded against the run outcome
+    // for telemetry.
+    let (active_generation, mut system_prompt) = match system_prompt_override {
+        Some(p) => (0, p),
+        None => {
+            let harness = load_active_harness(&app, &role);
+            (harness.generation, harness.system_prompt)
+        }
+    };
+    // Phase A (Design Studio) — when the Studio passes a design-system context,
+    // append GENERATION MODE so the agent writes a complete styled project to
+    // `.shugu-forge/preview/` (served live by the preview:// protocol). Chat
+    // delegation never sets `design_context`, so the normal path is unchanged.
+    if let Some(ctx) = design_context.as_deref() {
+        if !ctx.trim().is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(GENERATION_MODE_PROMPT);
+            system_prompt.push_str("\n\nGENERATION CONTEXT (apply the design system and/or colour direction below, honour the user preferences, and select the most relevant design skill):\n");
+            system_prompt.push_str(ctx);
+        }
+    }
 
     // Emit the initial Message events for the audit trail.
     let _ = persist_and_emit(
@@ -311,6 +344,7 @@ pub(super) async fn run_agent_task(
     // body (`tool_use_loop`) calls the LLM, executes tools, appends to
     // history, repeats. The abort branch wins if the user kills the
     // agent mid-flight.
+    let mut loop_metrics = LoopMetrics::default();
     let loop_result = tokio::select! {
         r = tool_use_loop(
             &app,
@@ -321,7 +355,11 @@ pub(super) async fn run_agent_task(
             &api_key,
             &chat_template_kwargs,
             &agent_id,
+            &role,
             &mut history,
+            &mut loop_metrics,
+            workspace_override,
+            allow_exec,
         ) => r,
         _ = abort.notified() => {
             mark_killed(&app, &agent_id);
@@ -331,8 +369,20 @@ pub(super) async fn run_agent_task(
 
     let ms = start.elapsed().as_millis() as u64;
 
+    // Record the run outcome for per-generation metrics (Continual Harness P1).
+    // Written for both success and failure; abort (killed) returns earlier and
+    // is intentionally not scored.
+    record_outcome(
+        &app,
+        &agent_id,
+        &role,
+        active_generation,
+        loop_result.is_ok(),
+        &loop_metrics,
+    );
+
     match loop_result {
-        Ok(output) => {
+        Ok((output, reasoning)) => {
             if let Ok(conn_mutex) = get_conn(&app) {
                 if let Ok(conn) = conn_mutex.lock() {
                     let _ = conn.execute(
@@ -351,6 +401,7 @@ pub(super) async fn run_agent_task(
                     agent_id: agent_id.clone(),
                     output,
                     tokens_used: None,
+                    reasoning: if reasoning.trim().is_empty() { None } else { Some(reasoning) },
                     ms,
                 },
             );
@@ -368,11 +419,22 @@ pub(super) async fn run_agent_task(
 // Tool-use loop (the heart of Phase 2)
 // ────────────────────────────────────────────────────────────────────
 
+/// Per-run loop metrics, filled in-place by `tool_use_loop` and recorded
+/// against the run's `agent_outcomes` row (Continual Harness P1). `stuck_reason`
+/// keeps the FIRST stall signature detected; in lot 1 it is purely
+/// observational, in P2 it becomes the trigger for harness evolution.
+#[derive(Default)]
+pub(super) struct LoopMetrics {
+    pub(super) iterations: u32,
+    pub(super) tool_errors: u32,
+    pub(super) stuck_reason: Option<String>,
+}
+
 /// Multi-turn loop body. Returns the final answer text when the LLM
 /// produces a turn without tool_calls. Returns Err when the iteration
 /// budget is exhausted or any underlying call fails.
 #[allow(clippy::too_many_arguments)]
-async fn tool_use_loop(
+pub(super) async fn tool_use_loop(
     app: &AppHandle,
     client: &reqwest::Client,
     protocol: &str,
@@ -381,21 +443,67 @@ async fn tool_use_loop(
     api_key: &str,
     chat_template_kwargs: &Option<serde_json::Value>,
     agent_id: &str,
+    role: &str,
     history: &mut Vec<AgentMessage>,
-) -> Result<String, String> {
-    for iteration in 0..MAX_ITERATIONS {
+    metrics: &mut LoopMetrics,
+    // When `Some`, tool calls resolve against THIS root instead of the global
+    // open workspace — the measurement bench points it at a copied fixture so a
+    // run never touches the user's real project. `None` = current behaviour.
+    workspace_override: Option<PathBuf>,
+    // When `false`, the `run_command` tool is REFUSED. Executing code runs
+    // arbitrary commands a path-guard can't contain, so only the bench (which
+    // works on a disposable copy) passes `true`; real chat agents pass `false`.
+    allow_exec: bool,
+) -> Result<(String, String), String> {
+    // Stall-detection state: repeated identical tool-call signatures and
+    // consecutive tool-error rounds are the two cheap "stuck" signals, recorded
+    // as telemetry on `metrics.stuck_reason`; budget exhaustion is handled in the
+    // `last_iteration` branch.
+    let mut last_sig: Option<String> = None;
+    let mut repeat_count: u32 = 0;
+    let mut err_streak: u32 = 0;
+    // Iteration budget. The Atelier (exec) path gets more room because each
+    // write→run-test→fix cycle costs one iteration; chat stays tight.
+    let budget = if allow_exec { MAX_ITERATIONS_EXEC } else { MAX_ITERATIONS };
+    let mut iteration: u32 = 0;
+
+    // Load this role's learned skills (Voyager/Hermes) into context, right after
+    // the system prompt — so the agent applies what it has already figured out
+    // instead of re-deriving it. No-op when the role has no skills yet. This is
+    // the reuse half of skill-learning; `skill_save` is the capture half.
+    let skills_block = super::skills::skills_prompt_block(app, role);
+    if !skills_block.is_empty() {
+        let pos = history.len().min(1);
+        history.insert(
+            pos,
+            AgentMessage::Text {
+                role: "system".to_string(),
+                content: skills_block,
+            },
+        );
+    }
+
+    // Env-verified skill gate: `run_command` writes its exit code here; the
+    // `skill_save` tool refuses unless the LAST run was exit 0. A skill is thus
+    // only ever born from a test the REAL environment confirmed — never an LLM
+    // opinion. Sentinel i64::MIN = "no command run yet" (so chat, which can't
+    // exec, never saves a skill). Shared (Arc) into each parallel tool task.
+    let last_exec_exit = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN));
+
+    while iteration < budget {
+        metrics.iterations = iteration + 1;
         // ── 0. Inject "approaching budget" nudge messages — aide les
         //       modèles moins capables (DeepSeek V4 Flash, Mistral 7B…)
         //       à converger vers une réponse au lieu de tool-call à
         //       l'infini. Le pénultième round avertit, le dernier round
         //       FORCE la réponse en texte.
-        let last_iteration = iteration == MAX_ITERATIONS - 1;
-        if iteration == MAX_ITERATIONS - 2 {
+        let last_iteration = iteration == budget - 1;
+        if iteration + 2 == budget {
             history.push(AgentMessage::Text {
                 role: "user".to_string(),
                 content: format!(
                     "[Shugu system] You've used {} of {} tool-use iterations. Plan to produce the final answer in 1-2 more rounds — don't keep exploring indefinitely.",
-                    iteration, MAX_ITERATIONS,
+                    iteration, budget,
                 ),
             });
         } else if last_iteration {
@@ -406,7 +514,7 @@ async fn tool_use_loop(
         }
 
         // ── 1. Call the LLM with the current history + tools manifest ──
-        let turn =
+        let (turn, reasoning) =
             call_agent_llm_with_tools(app, client, protocol, base_url, model, history, api_key, chat_template_kwargs, agent_id).await?;
 
         // ── 2. Persist Message event for this assistant turn ───────────
@@ -424,9 +532,13 @@ async fn tool_use_loop(
         //    modèle produit, même s'il a tenté plus de tool calls. Mieux
         //    vaut un answer partiel qu'une erreur "exceeded iterations".
         if turn.tool_calls.is_empty() {
-            return Ok(turn.content);
+            return Ok((turn.content, reasoning));
         }
         if last_iteration {
+            // Budget exhausted with the model still wanting tools = stuck.
+            metrics
+                .stuck_reason
+                .get_or_insert_with(|| "max_iterations".to_string());
             let content = if turn.content.trim().is_empty() {
                 format!(
                     "⚠ L'orchestrateur a épuisé son budget ({MAX_ITERATIONS} itérations) en tool-calls sans produire de réponse. \
@@ -436,7 +548,26 @@ async fn tool_use_loop(
             } else {
                 turn.content
             };
-            return Ok(content);
+            return Ok((content, reasoning));
+        }
+
+        // Stall signal #1 — same tool-call signature repeated across rounds.
+        let sig = turn
+            .tool_calls
+            .iter()
+            .map(|tc| format!("{}:{}", tc.name, tc.arguments))
+            .collect::<Vec<_>>()
+            .join("|");
+        if last_sig.as_deref() == Some(sig.as_str()) {
+            repeat_count += 1;
+        } else {
+            repeat_count = 0;
+            last_sig = Some(sig);
+        }
+        if repeat_count >= 2 {
+            metrics
+                .stuck_reason
+                .get_or_insert_with(|| "repeat".to_string());
         }
 
         // ── 4. Emit ToolCall events BEFORE executing — gives the UI a
@@ -458,7 +589,10 @@ async fn tool_use_loop(
         }
 
         // ── 5. Resolve workspace + execute tools in parallel ───────────
-        let workspace_root = get_workspace_root(app);
+        let workspace_root = workspace_override
+            .as_ref()
+            .cloned()
+            .or_else(|| get_workspace_root(app));
         let results: Vec<ToolResult> = if let Some(root) = workspace_root {
             let root_arc = Arc::new(root);
             let futures = turn.tool_calls.iter().map(|tc| {
@@ -472,13 +606,18 @@ async fn tool_use_loop(
                 let fallback_id = tc_clone.id.clone();
                 let fallback_name = tc_clone.name.clone();
                 let root_clone = root_arc.clone();
+                let app_clone = app.clone();
+                let role_clone = role.to_string();
+                let last_exec_clone = last_exec_exit.clone();
                 async move {
                     // `spawn_blocking` because the fs ops are synchronous —
                     // running them on the async runtime thread would starve
                     // other tokio tasks. `unwrap_or_else` defends against
                     // a JoinError (panic in the closure); `execute_tool`
                     // itself never panics for normal fs failures.
-                    tokio::task::spawn_blocking(move || execute_tool(&tc_clone, &root_clone))
+                    tokio::task::spawn_blocking(move || {
+                        execute_tool(&tc_clone, &root_clone, allow_exec, &app_clone, &role_clone, &last_exec_clone)
+                    })
                         .await
                         .unwrap_or_else(|join_err| ToolResult {
                             id: fallback_id,
@@ -522,6 +661,52 @@ async fn tool_use_loop(
             );
         }
 
+        // Stall signal #2 — consecutive rounds where at least one tool errored.
+        let round_errors = results.iter().filter(|r| r.is_error).count() as u32;
+        metrics.tool_errors += round_errors;
+        if round_errors > 0 {
+            err_streak += 1;
+        } else {
+            err_streak = 0;
+        }
+        if err_streak >= 2 {
+            metrics
+                .stuck_reason
+                .get_or_insert_with(|| "tool_errors".to_string());
+        }
+
+        // Skill captured — emit SkillLearned for each `skill_save` the gate
+        // ACCEPTED (env-verified: the last run_command exited 0), so the chat UI
+        // shows the inline "🎓 appris" badge. A surfaced skill was confirmed by a
+        // real passing test, not an LLM opinion. Done here (loop has agent_id +
+        // role) while `turn.tool_calls` is still in scope, before it moves below.
+        for tc in &turn.tool_calls {
+            if tc.name != "skill_save" {
+                continue;
+            }
+            let accepted = results.iter().any(|r| r.id == tc.id && !r.is_error);
+            if !accepted {
+                continue;
+            }
+            if let Some(name) = serde_json::from_str::<serde_json::Value>(&tc.arguments)
+                .ok()
+                .and_then(|v| {
+                    v.get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string())
+                })
+            {
+                let _ = persist_and_emit(
+                    app,
+                    &AgentEvent::SkillLearned {
+                        agent_id: agent_id.to_string(),
+                        role: role.to_string(),
+                        name,
+                    },
+                );
+            }
+        }
+
         // ── 7. Append to history for the next iteration ────────────────
         history.push(AgentMessage::AssistantWithTools {
             content: turn.content,
@@ -529,11 +714,7 @@ async fn tool_use_loop(
         });
         history.push(AgentMessage::ToolResults(results));
 
-        // Loop continues. La dernière itération `return Ok(...)` plus
-        // haut (force-accept), donc on n'atteint pas le Err en bas en
-        // pratique — c'est juste un filet pour le cas théorique où le
-        // loop sortirait sans avoir return (e.g. MAX_ITERATIONS = 0).
-        let _ = iteration;
+        iteration += 1;
     }
 
     Err(format!(
@@ -564,7 +745,7 @@ async fn call_agent_llm_with_tools(
     api_key: &str,
     chat_template_kwargs: &Option<serde_json::Value>,
     agent_id: &str,
-) -> Result<AssistantTurn, String> {
+) -> Result<(AssistantTurn, String), String> {
     // Live streaming restauré post-migration TanStack (2026-05-17).
     //
     // L'ancien bug (cascade de re-renders → freeze WebView2) venait du
@@ -580,6 +761,12 @@ async fn call_agent_llm_with_tools(
     // sont émis comme Delta events.
     let app_for_chunks = app.clone();
     let aid = agent_id.to_string();
+    // Accumulate reasoning chunks (hot-path-safe: one push_str per chunk) so the
+    // final turn's thinking can ride on the durable Complete event. Arc<Mutex>
+    // (not &mut) because the closure lives across the streaming .await and must
+    // be Send. The live Delta emit below is unchanged.
+    let reasoning_acc = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let reasoning_for_chunks = reasoning_acc.clone();
     let mut on_chunk = move |kind: &str, chunk: &str| {
         match kind {
             "tool_call_delta" | "tool_use_block" => {
@@ -589,6 +776,9 @@ async fn call_agent_llm_with_tools(
             }
             _ => {
                 let delta_kind = if kind == "reasoning" {
+                    if let Ok(mut g) = reasoning_for_chunks.lock() {
+                        g.push_str(chunk);
+                    }
                     "reasoning".to_string()
                 } else {
                     "content".to_string()
@@ -605,7 +795,7 @@ async fn call_agent_llm_with_tools(
         }
     };
 
-    match protocol {
+    let turn = match protocol {
         "anthropic" => {
             // Lot 3 — native Anthropic multi-turn: tool_use / tool_result
             // content blocks (was: tool_calls serialized into assistant text).
@@ -655,14 +845,54 @@ async fn call_agent_llm_with_tools(
             chat::call_ollama(client, base_url, model, &messages, None, &mut on_chunk).await
         }
         other => Err(format!("unsupported protocol for agent: {other}")),
-    }
+    }?;
+    let reasoning = reasoning_acc.lock().map(|g| g.clone()).unwrap_or_default();
+    Ok((turn, reasoning))
 }
 
 // ────────────────────────────────────────────────────────────────────
 // System prompt + error helpers (unchanged from Phase 1)
 // ────────────────────────────────────────────────────────────────────
 
-fn build_system_prompt(role: &str) -> String {
+/// Appended to the agent's system prompt when a design system is active
+/// (Studio "Generate"). Turns the agent into a UI generator that writes a
+/// complete static project to `.shugu-forge/preview/` so the live preview
+/// (`preview://` protocol) can render it. Kept as a const so the large role
+/// strings in `seed_prompt` stay untouched.
+const GENERATION_MODE_PROMPT: &str = "=== GENERATION MODE (a design system is active) ===\nWhen the task asks you to build, generate, create, or design a page, site, landing page, dashboard, component, or any UI, you MUST produce a COMPLETE, SELF-CONTAINED static web project WRITTEN TO DISK using `fs_write_file` — NOT a chat answer and NOT a single fenced code block.\n\nBefore writing files, call `todo_write` with a short checklist (3-6 steps) of your plan, then update the statuses as you complete each step.\n\nRules:\n1. Write the entry point at `.shugu-forge/preview/index.html`.\n2. Put CSS in `.shugu-forge/preview/styles.css` and JS in `.shugu-forge/preview/script.js`, linked from index.html with RELATIVE paths (href=\"styles.css\", src=\"script.js\").\n3. Apply the design context below (a design system and/or a colour direction): declare its color / typography / spacing tokens as CSS custom properties in `:root { ... }`, and follow the visual direction, component patterns, and anti-patterns.\n4. Produce real, polished, responsive markup with enough sections to demonstrate the design (e.g. hero, content sections, footer). No placeholder-only output.\n5. Always (over)write the files under `.shugu-forge/preview/` so the live preview reflects the latest version; read existing files first when iterating.\n6. After writing, reply with ONE short line: what you built, which design skill(s) you applied, + the entry path `.shugu-forge/preview/index.html`.";
+
+/// System prompt for an Atelier run — the env-grounded learning loop. The agent
+/// builds a small web UI on a throwaway mirror, then PROVES it works by driving a
+/// real browser (Playwright in the Docker sandbox), iterates on real failures,
+/// and only saves a skill once the test exits 0 (the gate enforces this). This is
+/// the Voyager/Hermes loop: act → observe real feedback → adapt → capture.
+pub(super) const ATELIER_PROMPT: &str = r#"You are Shugu's Atelier agent. You build a small WEB UI and then PROVE it works by actually driving a real browser — never by claiming it looks correct.
+
+You work on a DISPOSABLE copy of nothing (a throwaway mirror), never the user's real project. All file paths are workspace-relative POSIX paths (e.g. `index.html`, `app.js`). Your tools: `fs_write_file(path, content)`, `fs_read_file(path)`, `fs_edit(path, old_string, new_string)`, `fs_list_dir(path)`, `run_command(command)`, and `skill_save(name, when_to_use, body)`.
+
+THE LOOP — follow it exactly:
+1. BUILD the app: write a self-contained static web app to disk — `index.html` plus optional `styles.css` / `app.js` linked with relative paths. Vanilla HTML/CSS/JS only: NO build step, NO frameworks, NO npm packages.
+2. WRITE a browser test that DRIVES the UI. Create a CommonJS file `test.cjs` that uses Playwright for real interaction:
+   - `const { chromium } = require('playwright');`
+   - launch with `chromium.launch({ args: ['--no-sandbox'] })` (the `--no-sandbox` flag is REQUIRED inside the container),
+   - `await page.goto('file:///work/index.html');`  (your files are mounted at /work in the sandbox),
+   - interact for real: `await page.click('#add')`, `await page.fill('#name', 'x')`, etc.,
+   - ASSERT the resulting DOM, e.g. `const n = await page.locator('.item').count();` then `if (n !== 1) { console.error('FAIL: expected 1, got ' + n); process.exit(1); }`,
+   - `await browser.close();` and finish with exit 0 on success. Wrap in `.catch(e => { console.error(e); process.exit(1); })`.
+3. RUN it: call `run_command("node test.cjs")`. You get the REAL exit code + stdout + stderr.
+4. If it FAILS (non-zero exit): read the actual error, FIX the app or the test with `fs_edit`, and run it again. Repeat until it passes. NEVER claim success without a passing run.
+5. When the test PASSES (exit 0): call `skill_save` to capture the REUSABLE approach — a concise, generalizable recipe (how to build + test this kind of UI), NOT this one app's full source. The skill loads automatically into future runs so you get faster over time. NOTE: `skill_save` is REFUSED unless your last `run_command` exited 0 — the environment must confirm it works first.
+
+Rules:
+- The container has NO network. Do NOT `npm install` — Playwright is already importable via `require('playwright')`.
+- Inside `test.cjs`, always reference the page as `file:///work/...`.
+- Keep the app small but genuinely INTERACTIVE (the point is to test behavior, not render static text).
+- Finish with ONE short line: what you built and that its browser test passes."#;
+
+/// Seed system prompt for a role (chat path). Served verbatim by
+/// `load_active_harness` — the Refiner that used to evolve it is retired, so this
+/// is the agent's stable prompt; learning now lives in the skill library.
+fn seed_prompt(role: &str) -> String {
     // Why this prompt is so directive: cloud LLMs (DeepSeek, GLM, Kimi, …) tend
     // to default to "respond from training data" when the system prompt is soft
     // ("you have access to tools, use them when needed"). The user repeatedly
@@ -685,6 +915,63 @@ fn build_system_prompt(role: &str) -> String {
         other => format!(
             "You are a Shugu sub-agent with role '{other}', running on the user's machine. You have three filesystem tools: `fs_read_file(path)`, `fs_write_file(path, content)`, `fs_list_dir(path)`. All paths are workspace-relative.\n\nRULE: never answer from training data about the user's project. Always use the tools to gather evidence first. If the task is about a file or directory, your first action is `fs_list_dir` or `fs_read_file`. Output only the final result."
         ),
+    }
+}
+
+/// One active harness generation, as served to a running agent.
+pub(super) struct ActiveHarness {
+    /// Generation number — recorded against the run's outcome (P1) so
+    /// per-generation metrics can be computed.
+    pub(super) generation: i64,
+    /// Assembled system prompt `p` for this generation.
+    pub(super) system_prompt: String,
+}
+
+/// Load the system prompt for `role`.
+///
+/// Since the lot « agent ancré » retired the prompt-rewriting Refiner and the
+/// `harness_generations` table, this is now a pure, static seed: every run uses
+/// generation 0 (`seed_prompt`). The agent's LEARNING lives in the env-verified
+/// skill library (`agent_skills`), not in prompt rewrites. Kept as a function
+/// (not inlined) so the call site and the `ActiveHarness`/`generation` plumbing
+/// stay unchanged.
+pub(super) fn load_active_harness(_app: &AppHandle, role: &str) -> ActiveHarness {
+    ActiveHarness {
+        generation: 0,
+        system_prompt: seed_prompt(role),
+    }
+}
+
+/// Persist the per-run outcome row consumed by per-generation metrics (P1).
+/// `user_feedback` is left untouched here — it is set later from the UI; a run
+/// records its outcome exactly once at completion, so INSERT OR REPLACE is safe.
+fn record_outcome(
+    app: &AppHandle,
+    agent_id: &str,
+    role: &str,
+    generation: i64,
+    success: bool,
+    metrics: &LoopMetrics,
+) {
+    if let Ok(conn_mutex) = get_conn(app) {
+        if let Ok(conn) = conn_mutex.lock() {
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO agent_outcomes
+                    (agent_id, role, generation, success, stuck_reason,
+                     iterations, tool_errors, ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    agent_id,
+                    role,
+                    generation,
+                    success as i64,
+                    metrics.stuck_reason.as_deref(),
+                    metrics.iterations as i64,
+                    metrics.tool_errors as i64,
+                    now_ms(),
+                ],
+            );
+        }
     }
 }
 

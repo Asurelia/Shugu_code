@@ -1,7 +1,18 @@
-// Shugu Forge — Chat + Image views (ported from views-chat.jsx)
-// highlightRust returns JSX tokens (no innerHTML injection — XSS-safe by construction).
+// Shugu Forge — Chat (Codex/Claude-Code agent layout) + Image views.
+//
+// Phase 1 of the design-delta lot: the chat surface is redesigned to the
+// agent-style "cx" layout (no avatars, mono meta lines, inline code chips,
+// "files modified" action card, context chips under the composer) recreated
+// from the design handoff (chat5). All data stays wired to the existing
+// LOCAL-FIRST layer: useMessages (SQLite), useChatStream (live deltas),
+// sendChatMessage / useActiveModel (chat-sync). No mock replies.
+//
+// highlightRust returns JSX tokens (no innerHTML injection — XSS-safe).
 
 import React, { useState, useEffect, useRef, useCallback } from "react";
+import { createPortal } from "react-dom";
+import { useNavigate } from "@tanstack/react-router";
+import { useQuery } from "@tanstack/react-query";
 import { Icon } from "@/components/components";
 import { invoke } from "@/lib/tauri";
 import { useChatStream } from "./useChatStream";
@@ -10,7 +21,15 @@ import { ModelPicker } from "@/features/panels/panels";
 import { resolveImageProvider } from "@/lib/imageProviders";
 import { revealAgent } from "@/lib/agents";
 import { useMessageDisplay } from "./useMessageDisplay";
-import { detectBlockPath } from "@/lib/markdown";
+import { useShell } from "@/routes/shell-context";
+import { CodeMirrorEditor } from "@/features/code/CodeMirrorEditor";
+import { GitDiffView } from "@/features/code/DiffView";
+import { ContextBubble } from "@/features/context-cards/ContextBubble";
+import { useGitBranches } from "@/features/git/queries";
+import { useWorkspaceChanges } from "@/features/git/useWorkspaceChanges";
+import { fsGetWorkspaceRoot } from "@/lib/fs";
+import { fsKeys } from "@/features/fs/keys";
+import type { Message, MessageAction } from "@/lib/types";
 
 type ImageResult = {
   id: number | string;
@@ -27,63 +46,70 @@ type ImageResult = {
   resultUrl?: string | null;
 };
 
-// ─── Chat ───────────────────────────────────────────────────
+// Strip Windows extended-length prefix + trailing slashes, return last segment.
+function basename(p: string | null | undefined): string {
+  if (!p) return "votre espace de travail";
+  const clean = p.replace(/^\\\\\?\\/, "").replace(/[\\/]+$/, "");
+  const seg = clean.split(/[\\/]/).filter(Boolean).pop();
+  return seg || "votre espace de travail";
+}
+
+// ─── Chat (agent-style "cx" layout) ─────────────────────────
 //
-// ChatView reads its message list from the shared chat-sync layer, which
-// is backed by SQLite. Cross-window sync with the mascot's FloatChat rides
-// on the chat://messages-changed Tauri event — both windows render the
-// same SQLite truth.
+// Reads its message list from chat-sync (SQLite-backed). Cross-window sync
+// with the mascot's FloatChat rides on chat://messages-changed.
 export function ChatView({
   activeConv,
   model: modelProp,
   onOpenSnippet,
-  onApplyToFile,
 }: {
   activeConv: string;
-  // Legacy prop — accepted as the FIRST-EVER default if nothing has been
-  // persisted yet, but never authoritative. The real source of truth is
-  // useActiveModel() which mirrors localStorage and syncs cross-window.
-  // Routes are encouraged to omit this and let the hook decide.
   model?: string;
   onOpenSnippet?: (code: string, lang: string) => void;
-  onApplyToFile?: (code: string, lang: string, path: string) => void;
 }) {
   const [input, setInput] = useState("");
   const [typing, setTyping] = useState(false);
-  const [mode, setMode] = useState("chat");
-  // ─────────────────────────────────────────────────────────────────
-  // NOT TanStack because:
-  //   1. pendingImage is transient UI state for a single composer — it
-  //      exists only between "user picks/pastes an image" and "user clicks
-  //      Send". No other component needs to observe it.
-  //   2. Sharing via QueryClient would require a per-conversation key and
-  //      cleanup on send — net complexity for zero benefit.
-  // SI un jour on voulait "draft persisté entre sessions", on basculerait
-  // vers setQueryData(chatKeys.pendingAttachment(convId)).
-  // ─────────────────────────────────────────────────────────────────
+  const [mode, setMode] = useState<"chat" | "image">("chat");
   const [pendingImage, setPendingImage] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const feedRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+
   const chatStream = useChatStream(activeConv);
   const { data: messages } = useMessages(activeConv);
-  // The model the user has actually picked. Defaults to llamacpp/local on
-  // a brand-new install, or to `modelProp` if a legacy route still passes
-  // one with a "/" in it. Switching from the composer's ModelPicker writes
-  // here and broadcasts to the mascot window so both stay in sync.
   const [model, setModel] = useActiveModel(modelProp);
 
-  // Auto-scroll the feed to the bottom on any content change so the live
-  // streaming preview stays in view. The previous deps list missed
-  // `partialReasoning` and `streaming` — meaning that when Qwen 3.5 is in
-  // its thinking phase (reasoning streaming, content still empty), the
-  // typing block was growing downward OFF-SCREEN with no auto-scroll.
-  // From the user's point of view: nothing visible during reasoning, then
-  // the message appears via the SQLite refetch once `stop()` fires — i.e.
-  // "no streaming, no thinking" even though both ARE rendered (just below
-  // the viewport). The mascot's ChatPanel doesn't hit this because its
-  // history container is compact and the streaming row stays naturally in
-  // view.
+  const navigate = useNavigate();
+  const { openFile, fileContents, setFileContents, editorPrefs, compareFile, setCompareFile } = useShell();
+
+  // Phase 2 — Chat→Editor handoff. When a file is opened from an action card,
+  // we reveal an in-chat split (chat left, CodeMirror right) instead of
+  // leaving the chat view. `splitFile` null = no split.
+  const [splitFile, setSplitFile] = useState<string | null>(null);
+
+  // Real context chips: current git branch + workspace folder name.
+  const { data: branches } = useGitBranches();
+  const branch = branches?.current ?? null;
+  const { data: wsRoot } = useQuery({
+    queryKey: fsKeys.workspaceRoot(),
+    queryFn: fsGetWorkspaceRoot,
+    staleTime: Infinity,
+    retry: false,
+  });
+  const cwd = basename(wsRoot);
+
+  const isEmpty = !messages || messages.length === 0;
+
+  // Most-recent agent-relay message id — the live workspace-diff action card
+  // is attached only to it (avoids implying stale per-message attribution on
+  // historical turns).
+  const latestAgentId = (() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].viaAgent) return messages[i].id;
+    }
+    return null;
+  })();
+
   useEffect(() => {
     if (feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
   }, [messages, typing, chatStream.streaming, chatStream.partial, chatStream.partialReasoning]);
@@ -112,6 +138,31 @@ export function ChatView({
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); }
   };
 
+  // Open a workspace file from an action card → reveal the in-chat split
+  // (chat left, editor right), staying in the chat view. `openFile` loads the
+  // content into the shared fileContents store first.
+  const handleOpenFile = useCallback((path: string) => {
+    setCompareFile(null); // opening a file for editing supersedes any open diff
+    void (async () => {
+      await openFile(path);
+      setSplitFile(path);
+    })();
+  }, [openFile, setCompareFile]);
+
+  const closeSplit = useCallback(() => setSplitFile(null), []);
+  const openFullEditor = useCallback(() => {
+    setSplitFile(null);
+    void navigate({ to: "/code" });
+  }, [navigate]);
+
+  // Split editor edits write through to the SAME fileContents store /code
+  // uses, marking the file dirty. Saving happens via "Plein écran" → /code
+  // (Ctrl+S); the split is a handoff/preview surface, not a second save path.
+  const onSplitChange = useCallback((v: string) => {
+    if (!splitFile) return;
+    setFileContents((c: any) => ({ ...c, [splitFile]: { ...c[splitFile], text: v, dirty: true } }));
+  }, [splitFile, setFileContents]);
+
   const readFileAsDataUrl = (file: File): Promise<string> =>
     new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -128,378 +179,464 @@ export function ChatView({
     const file = imageItem.getAsFile();
     if (!file) return;
     try {
-      const dataUrl = await readFileAsDataUrl(file);
-      setPendingImage(dataUrl);
+      setPendingImage(await readFileAsDataUrl(file));
     } catch (err) {
       console.warn("[ChatView] paste image read failed:", err);
     }
   }, []);
 
-  return (
-    <div className="chat-shell">
-      <div className="chat-feed scroll" ref={feedRef}>
-        <div className="chat-feed-inner">
-          {messages.map((m: any) => <ChatMessage key={m.id} m={m} onOpenSnippet={onOpenSnippet} onApplyToFile={onApplyToFile}/>)}
-          {typing && (
-            <div className="msg ai">
-              <div className="avatar">S</div>
-              <div className="body">
-                <div className="who">Shugu <span className="ts">— {model}</span></div>
-                {/* Reasoning trace from thinking-enabled models (Qwen 3.5, DeepSeek-R1, …).
-                    Rendered above the visible answer so the user can watch the model's
-                    internal monologue stream in live, then see the actual reply form
-                    below it. Italic + dimmed so it's clearly distinct from the answer.
-                    Hidden once a reply is persisted to SQLite (typing flips off). */}
-                {chatStream.streaming && chatStream.partialReasoning && (
-                  <details
-                    open
-                    style={{
-                      margin: "4px 0 8px",
-                      padding: "6px 10px",
-                      borderLeft: "2px solid rgba(124, 58, 237, 0.35)",
-                      background: "rgba(124, 58, 237, 0.04)",
-                      borderRadius: 4,
-                      fontSize: 12,
-                    }}
-                  >
-                    <summary style={{ cursor: "pointer", color: "var(--on-surface-muted)", fontFamily: "var(--font-mono)", fontSize: 10, letterSpacing: 0.5, textTransform: "uppercase" }}>
-                      Thinking…
-                    </summary>
-                    <p style={{ margin: "6px 0 0", fontStyle: "italic", color: "var(--on-surface-muted)", whiteSpace: "pre-wrap" }}>
-                      {chatStream.partialReasoning}
-                    </p>
-                  </details>
-                )}
-                {chatStream.streaming && chatStream.partial
-                  ? <div className="text"><p style={{ whiteSpace: "pre-wrap" }}>{chatStream.partial}</p></div>
-                  : !chatStream.partialReasoning
-                    ? <div className="typing"><span className="d"></span><span className="d"></span><span className="d"></span></div>
-                    : null
-                }
-              </div>
-            </div>
+  const composer = (
+    <>
+      <div className="cx-composer">
+        {pendingImage && (
+          <div className="cx-pending">
+            <img src={pendingImage} alt="pending attachment" />
+            <button onClick={() => setPendingImage(null)} title="Retirer l'image">×</button>
+          </div>
+        )}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          style={{ display: "none" }}
+          onChange={async (e) => {
+            const file = e.target.files?.[0];
+            if (!file) return;
+            try { setPendingImage(await readFileAsDataUrl(file)); }
+            catch (err) { console.warn("[ChatView] file attach read failed:", err); }
+            e.target.value = "";
+          }}
+        />
+        <textarea
+          ref={inputRef}
+          className="cx-composer-input"
+          placeholder={
+            mode === "image"
+              ? "Décris l'image que tu veux générer…"
+              : isEmpty ? "Pose une question ou décris une tâche…" : "Demander des modifications de suivi…"
+          }
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={onKey}
+          onPaste={handlePaste}
+          rows={1}
+        />
+        <div className="cx-composer-bar">
+          <button className="cx-tool" title="Joindre une image" onClick={() => fileInputRef.current?.click()}>
+            <Icon name="attach" size={15} />
+          </button>
+          <button
+            className={"cx-tool" + (mode === "image" ? " on" : "")}
+            onClick={() => setMode((m) => (m === "image" ? "chat" : "image"))}
+            title="Mode image"
+          >
+            <Icon name="image" size={15} />
+          </button>
+          <button className="cx-tool" title="Voix"><Icon name="mic" size={15} /></button>
+          <div className="cx-spacer" />
+          <ModelPicker model={model} onChange={setModel} className="composer-model" />
+          {typing ? (
+            <button
+              className="cx-send stop"
+              title="Arrêter la génération"
+              onClick={() => { chatStream.abort(); setTyping(false); }}
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2" /></svg>
+            </button>
+          ) : (
+            <button className="cx-send" onClick={() => void send()} disabled={!input.trim() && !pendingImage} title="Envoyer (↵)">
+              <Icon name="send" size={14} />
+            </button>
           )}
         </div>
       </div>
-      <div className="composer-wrap">
-        <div className="composer">
-          {/* Hidden file input for attach button */}
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*"
-            style={{ display: "none" }}
-            onChange={async (e) => {
-              const file = e.target.files?.[0];
-              if (!file) return;
-              try {
-                const dataUrl = await readFileAsDataUrl(file);
-                setPendingImage(dataUrl);
-              } catch (err) {
-                console.warn("[ChatView] file attach read failed:", err);
-              }
-              // Reset so the same file can be re-attached if cleared.
-              e.target.value = "";
-            }}
-          />
-          {/* Pending image thumbnail preview */}
-          {pendingImage && (
-            <div style={{ padding: "4px 8px 0", display: "flex", alignItems: "center", gap: 6 }}>
-              <img
-                src={pendingImage}
-                alt="pending attachment"
-                style={{ height: 40, borderRadius: 4, objectFit: "cover", border: "1px solid rgba(255,255,255,0.1)" }}
-              />
-              <button
-                onClick={() => setPendingImage(null)}
-                title="Remove image"
-                style={{ background: "none", border: "none", cursor: "pointer", color: "var(--on-surface-muted)", fontSize: 14 }}
-              >
-                ×
-              </button>
-            </div>
-          )}
-          <textarea
-            ref={inputRef}
-            className="composer-input"
-            placeholder={mode === "image" ? "Décris l'image que tu veux générer…" : "Demande à Shugu (Tab pour passer en /image, Cmd+K pour les commandes)"}
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={onKey}
-            onPaste={handlePaste}
-            rows={1}
-          />
-          <div className="composer-bar">
-            <div className="composer-tools">
-              <button
-                className="composer-tool"
-                title="Attach image"
-                onClick={() => fileInputRef.current?.click()}
-              >
-                <Icon name="attach" size={15}/>
-              </button>
-              <button className={"composer-tool" + (mode === "image" ? " on" : "")} onClick={() => setMode(m => m === "image" ? "chat" : "image")} title="Image mode"><Icon name="image" size={15}/></button>
-              <button
-                className="composer-tool"
-                title="Code block"
-                onClick={() => {
-                  const el = inputRef.current;
-                  if (!el) return;
-                  const start = el.selectionStart ?? el.value.length;
-                  const end = el.selectionEnd ?? el.value.length;
-                  const before = el.value.slice(0, start);
-                  const after = el.value.slice(end);
-                  const insertion = "```\n\n```";
-                  el.value = before + insertion + after;
-                  // Place caret inside the code block (after the first ``\n).
-                  const cursorPos = start + 4;
-                  el.setSelectionRange(cursorPos, cursorPos);
-                  // Sync React controlled state.
-                  setInput(el.value);
-                  el.focus();
-                }}
-              >
-                <Icon name="code" size={15}/>
-              </button>
-              <button className="composer-tool" title="Voice"><Icon name="mic" size={15}/></button>
-            </div>
-            <div className="composer-spacer"></div>
-            <ModelPicker model={model} onChange={setModel} className="composer-model"/>
-            {typing ? (
-              <button
-                className="composer-send"
-                title="Stop generation"
-                onClick={() => {
-                  chatStream.abort();
-                  setTyping(false);
-                }}
-                style={{ color: "var(--accent-red, #e05252)" }}
-              >
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
-                  <rect x="4" y="4" width="16" height="16" rx="2"/>
-                </svg>
-              </button>
-            ) : (
-              <button className="composer-send" onClick={send} disabled={!input.trim()} title="Send">
-                <Icon name="send" size={15}/>
-              </button>
-            )}
-          </div>
+      <div className="cx-ctx-row">
+        <button className="cx-chip status" title="Accès au système de fichiers (Tauri)">
+          <span className="dot" />
+          Accès complet
+        </button>
+        <button className="cx-chip" title="Espace de travail">
+          <Icon name="folder" size={11} />
+          {cwd}
+        </button>
+        {branch && (
+          <button className="cx-chip branch" title="Branche git courante">
+            <span className="dot" />
+            {branch}
+          </button>
+        )}
+        <div className="cx-chip-spacer" />
+        <button className="cx-chip" title="Exécution locale (local-first)">
+          <Icon name="shield" size={11} />
+          local
+        </button>
+      </div>
+    </>
+  );
+
+  const chatMain = (
+    <div className="cx">
+      {!isEmpty && (
+        <div className="cx-head">
+          <span className="dot" />
+          <span className="title">{cwd}</span>
+          <span style={{ opacity: 0.4 }}>·</span>
+          <span>{messages.length} message{messages.length > 1 ? "s" : ""}</span>
         </div>
+      )}
+
+      {isEmpty ? (
+        <div className="cx-empty">
+          <div className="cx-empty-spark"><Icon name="sparkle" size={26} /></div>
+          <h1 className="cx-empty-title">
+            Que devrions-nous construire dans <span className="acc">{cwd}</span> ?
+          </h1>
+          <div className="cx-empty-composer">{composer}</div>
+        </div>
+      ) : (
+        <>
+          <div className="cx-feed scroll" ref={feedRef}>
+            <div className="cx-feed-inner">
+              {messages.map((m) => (
+                <CxMessage
+                  key={String(m.id)}
+                  m={m}
+                  model={model}
+                  isLatestAgent={m.id === latestAgentId}
+                  onOpenFile={handleOpenFile}
+                  onOpenSnippet={onOpenSnippet}
+                />
+              ))}
+              {typing && (
+                <div className="cx-msg ai">
+                  <div className="cx-meta">
+                    <span className="mark ai"><Icon name="sparkle" size={11} /></span>
+                    <span className="who">Shugu</span>
+                    <span className="sep">·</span>
+                    <span className="ts">en train de travailler…</span>
+                  </div>
+                  {chatStream.streaming && (chatStream.partial || chatStream.partialReasoning) ? (
+                    <div className="cx-body">
+                      {chatStream.partialReasoning && (
+                        <ThinkBlock open text={chatStream.partialReasoning} />
+                      )}
+                      {chatStream.partial && <p>{chatStream.partial}</p>}
+                    </div>
+                  ) : (
+                    <div className="cx-working">
+                      <span className="ring" />
+                      analyse du contexte · {model}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+          <div className="cx-composer-wrap">{composer}</div>
+        </>
+      )}
+      {/* Contextual cards — the trigger is portaled into the titlebar (sits with
+          History/Bell/Settings); the panel floats here when opened. Mounted for
+          the whole chat view incl. the empty state; chatMain isn't rendered
+          during the handoff split, so that case is already excluded. */}
+      <ContextBubble convId={activeConv} onOpenFile={handleOpenFile} />
+    </div>
+  );
+
+  if (!splitFile && !compareFile) return chatMain;
+
+  // Phase 2 — handoff split: chat on the left, the opened file on the right.
+  // The right pane shows a read-only git diff (working tree vs HEAD) when a
+  // change is selected in the Git context card (compareFile), otherwise the
+  // CodeMirror editor for the opened file (splitFile). Separate editor instance
+  // from /code; light edits flow through the shared fileContents store and
+  // "Plein écran" promotes to /code for saving.
+  const splitContent = splitFile ? fileContents[splitFile] : undefined;
+  return (
+    <div className="chat-split">
+      <div className="chat-split-left">{chatMain}</div>
+      <div className="chat-split-right">
+        {compareFile ? (
+          <GitDiffView path={compareFile.right} onClose={() => setCompareFile(null)} />
+        ) : splitFile ? (
+          <>
+            <div className="chat-split-head">
+              <span className="dot ide" />
+              <span className="label">Éditeur</span>
+              <span className="sep">·</span>
+              <span className="path">{splitFile}</span>
+              <span style={{ flex: 1 }} />
+              <button className="lgb lgb-sm" onClick={openFullEditor} title="Ouvrir en plein écran">
+                <Icon name="code" size={11} /> Plein écran
+              </button>
+              <button className="split-close" onClick={closeSplit} title="Fermer le split">
+                <Icon name="x" size={12} />
+              </button>
+            </div>
+            <div className="chat-split-editor">
+              <CodeMirrorEditor
+                value={splitContent?.text ?? ""}
+                onChange={onSplitChange}
+                path={splitFile}
+                wordWrap={editorPrefs.wordWrap}
+                stickyScroll={editorPrefs.stickyScroll}
+                minimap={editorPrefs.minimap}
+              />
+            </div>
+          </>
+        ) : null}
       </div>
     </div>
   );
 }
 
-export function ChatMessage({
+// ─── Per-message renderer ───────────────────────────────────
+function CxMessage({
   m,
+  model,
+  isLatestAgent,
+  onOpenFile,
   onOpenSnippet,
-  onApplyToFile,
 }: {
-  m: any;
+  m: Message;
+  model: string;
+  isLatestAgent: boolean;
+  onOpenFile: (path: string) => void;
   onOpenSnippet?: (code: string, lang: string) => void;
-  onApplyToFile?: (code: string, lang: string, path: string) => void;
 }) {
-  // Hook partagé avec le ChatPanel mascotte — détecte les placeholders
-  // agent encore "au travail" et y branche le streaming live (depuis
-  // useAgentTranscript, cache prouvé fonctionnel via le drawer agent).
-  // Pour les messages normaux, no-op.
   const { displayBody, liveReasoning, isStreamingAgent, imageDataUrl } = useMessageDisplay(m);
 
   if (m.role === "user") {
     return (
-      <div className="msg user">
-        <div className="avatar">VU</div>
-        <div className="body">
-          <div className="who">You <span className="ts">— {m.ts}</span></div>
-          {imageDataUrl ? (
-            <img
-              src={imageDataUrl}
-              alt="attached"
-              style={{ maxWidth: "100%", maxHeight: 300, borderRadius: 6, display: "block", marginTop: 4 }}
-            />
-          ) : (
-            <div className="text">{m.text}</div>
-          )}
+      <div className="cx-msg user">
+        <div className="cx-meta">
+          <span className="mark user">›</span>
+          <span className="who">Toi</span>
+          <span className="sep">·</span>
+          <span className="ts">{m.ts}</span>
+        </div>
+        <div className="cx-body">
+          {imageDataUrl ? <img src={imageDataUrl} alt="pièce jointe" /> : renderInlineCode(m.text ?? "")}
         </div>
       </div>
     );
   }
+
   return (
-    <div className="msg ai">
-      <div className="avatar">S</div>
-      <div className="body">
-        <div className="who">
-          Shugu <span className="ts">— {m.ts}</span>
-          <span className="chip primary" style={{marginLeft:4}}>shugu-haiku</span>
-          {/* Verbatim relay badge — surfaces when the message body is the
-              direct output of an orchestrator agent (not the chat model).
-              Click → opens the Agents panel + selects the agent's
-              transcript drawer. Pure presentation toggle via the Tauri
-              event bus; no shared React context required. */}
-          {m.viaAgent && m.agentId && (
-            <button
-              type="button"
-              onClick={() => void revealAgent(m.agentId!)}
-              title="Voir la trace de l'orchestrator"
-              style={{
-                marginLeft: 6,
-                padding: "2px 8px",
-                borderRadius: 99,
-                fontSize: 9,
-                fontWeight: 600,
-                letterSpacing: 0.5,
-                textTransform: "uppercase",
-                background: "rgba(124, 58, 237, 0.16)",
-                color: "var(--primary, #7c3aed)",
-                border: "1px solid rgba(124, 58, 237, 0.35)",
-                cursor: "pointer",
-              }}
-            >
-              via orchestrator
-            </button>
-          )}
-        </div>
-        {/* Live reasoning pendant l'agent run (deltas coalesced du
-            transcript). Affiché au-dessus du body pour matcher le
-            pattern des autres messages thinking-enabled. */}
-        {isStreamingAgent && liveReasoning && !m.reasoning && (
-          <details
-            open
-            style={{
-              margin: "4px 0 8px",
-              padding: "6px 10px",
-              borderLeft: "2px solid rgba(124, 58, 237, 0.35)",
-              background: "rgba(124, 58, 237, 0.04)",
-              borderRadius: 4,
-              fontSize: 12,
-            }}
-          >
-            <summary style={{ cursor: "pointer", color: "var(--on-surface-muted)", fontFamily: "var(--font-mono)", fontSize: 10, letterSpacing: 0.5, textTransform: "uppercase" }}>
-              Thinking…
-            </summary>
-            <p style={{ margin: "6px 0 0", fontStyle: "italic", color: "var(--on-surface-muted)", whiteSpace: "pre-wrap" }}>
-              {liveReasoning}
-            </p>
-          </details>
+    <div className="cx-msg ai">
+      <div className="cx-meta">
+        <span className="mark ai"><Icon name="sparkle" size={11} /></span>
+        <span className="who">Shugu</span>
+        <span className="sep">·</span>
+        <span className="ts">{m.ts}</span>
+        <span className="sep">·</span>
+        <span className="pill">{model}</span>
+        {m.viaAgent && m.agentId && (
+          <span className="via-agent" onClick={() => void revealAgent(m.agentId!)} title="Voir la trace de l'orchestrateur">
+            via orchestrator
+          </span>
         )}
-        {/* Persisted reasoning trace — collapsed by default for historical
-            messages so the conversation stays scan-friendly, but one click
-            reveals the full thinking process. Only thinking-enabled models
-            (Qwen 3.5, DeepSeek-R1, Llama-3.3-R) populate this; for everyone
-            else m.reasoning is undefined and nothing renders. */}
-        {m.reasoning && (
-          <details
-            style={{
-              margin: "4px 0 8px",
-              padding: "6px 10px",
-              borderLeft: "2px solid rgba(124, 58, 237, 0.35)",
-              background: "rgba(124, 58, 237, 0.04)",
-              borderRadius: 4,
-              fontSize: 12,
-            }}
-          >
-            <summary style={{ cursor: "pointer", color: "var(--on-surface-muted)", fontFamily: "var(--font-mono)", fontSize: 10, letterSpacing: 0.5, textTransform: "uppercase" }}>
-              Thinking ({m.reasoning.length} chars)
-            </summary>
-            <p style={{ margin: "6px 0 0", fontStyle: "italic", color: "var(--on-surface-muted)", whiteSpace: "pre-wrap" }}>
-              {m.reasoning}
-            </p>
-          </details>
+      </div>
+
+      {isStreamingAgent && liveReasoning && !m.reasoning && <ThinkBlock open text={liveReasoning} />}
+      {m.reasoning && <ThinkBlock text={m.reasoning} label={`Thinking (${m.reasoning.length} chars)`} />}
+
+      <div className="cx-body">
+        {imageDataUrl ? (
+          <img src={imageDataUrl} alt="image générée" />
+        ) : (
+          <>
+            {displayBody && renderProse(displayBody)}
+            {m.code && (
+              <CodeBlock
+                lang={m.code.lang}
+                text={m.code.text}
+                onOpen={onOpenSnippet ? () => onOpenSnippet(m.code!.text, m.code!.lang) : undefined}
+              />
+            )}
+            {m.action && <ActionCard action={m.action} onOpenFile={onOpenFile} />}
+            {isLatestAgent && !m.action && <WorkspaceDiffCard onOpenFile={onOpenFile} />}
+          </>
         )}
-        <div className="text">
-          {imageDataUrl ? (
-            <img
-              src={imageDataUrl}
-              alt="generated"
-              style={{ maxWidth: "100%", maxHeight: 300, borderRadius: 6, display: "block", marginTop: 4 }}
-            />
-          ) : (
-            <>
-              {displayBody && <p style={{whiteSpace: "pre-wrap"}}>{displayBody}</p>}
-              {m.code && <CodeBlock lang={m.code.lang} text={m.code.text} onOpenInEditor={onOpenSnippet} onApplyToFile={onApplyToFile}/>}
-            </>
-          )}
+        <div className="cx-react">
+          <button title="Copier" onClick={() => copyText(displayBody || m.body || m.text || "")}>
+            <Icon name="copy" size={12} />
+          </button>
         </div>
       </div>
     </div>
   );
 }
 
+function copyText(text: string) {
+  if (text && typeof navigator !== "undefined" && navigator.clipboard) {
+    void navigator.clipboard.writeText(text).catch(() => {});
+  }
+}
+
+// Collapsible reasoning / thinking trace.
+function ThinkBlock({ text, open = false, label = "Thinking…" }: { text: string; open?: boolean; label?: string }) {
+  return (
+    <details className="cx-think" open={open}>
+      <summary>{label}</summary>
+      <div className="body">{text}</div>
+    </details>
+  );
+}
+
+// Render markdown prose: split on blank lines into paragraphs, render inline
+// `code` spans as Celestial-Veil code chips. No innerHTML.
+function renderProse(text: string): React.ReactNode {
+  const paras = text.split(/\n{2,}/);
+  return paras.map((para, i) => <p key={i}>{renderInlineCode(para)}</p>);
+}
+
+function renderInlineCode(text: string): React.ReactNode[] {
+  // Split on `inline code` spans, keeping the delimited groups.
+  const parts = text.split(/(`[^`]+`)/g);
+  return parts.map((part, i) => {
+    if (part.startsWith("`") && part.endsWith("`") && part.length > 1) {
+      return <code key={i} className="cx-code-inline">{part.slice(1, -1)}</code>;
+    }
+    return <React.Fragment key={i}>{part}</React.Fragment>;
+  });
+}
+
+// "N files modified" card from a message's structured `action` field.
+function ActionCard({ action, onOpenFile }: { action: MessageAction; onOpenFile: (path: string) => void }) {
+  const [open, setOpen] = useState(true);
+  return (
+    <div className="cx-action">
+      <div className="cx-action-head">
+        <div className="cx-action-ico"><Icon name="diff" size={15} /></div>
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div className="cx-action-title">{action.title}</div>
+          <div className="cx-action-sub">
+            <span className="plus">+{action.add}</span>
+            <span className="minus">−{action.rem}</span>
+            <span style={{ opacity: 0.6 }}>· {action.files.length} fichier{action.files.length > 1 ? "s" : ""}</span>
+          </div>
+        </div>
+        <div className="cx-action-actions">
+          <button className="cx-action-btn" onClick={() => setOpen((o) => !o)}>{open ? "Masquer" : "Détails"}</button>
+        </div>
+      </div>
+      {open && (
+        <div className="cx-action-files">
+          {action.files.map((f) => (
+            <div key={f.name} className="cx-action-file" onClick={() => onOpenFile(f.name)} title="Ouvrir dans l'éditeur">
+              <span className={"dot " + f.st} />
+              <span className="name">{f.name}</span>
+              <span className="stats">
+                <span className="add">+{f.add}</span>
+                <span className="rem">−{f.rem}</span>
+              </span>
+              <span className="open-hint">Ouvrir ›</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Live workspace-diff card: real working-tree changes from git, attached to
+// the latest agent-relay message. Files are clickable → editor. Renders
+// nothing outside a repo or with a clean tree.
+function WorkspaceDiffCard({ onOpenFile }: { onOpenFile: (path: string) => void }) {
+  const { files, isRepo } = useWorkspaceChanges();
+  const [open, setOpen] = useState(true);
+  if (!isRepo || files.length === 0) return null;
+  return (
+    <div className="cx-action">
+      <div className="cx-action-head">
+        <div className="cx-action-ico"><Icon name="diff" size={15} /></div>
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div className="cx-action-title">{files.length} fichier{files.length > 1 ? "s" : ""} modifié{files.length > 1 ? "s" : ""}</div>
+          <div className="cx-action-sub"><span style={{ opacity: 0.6 }}>espace de travail · git</span></div>
+        </div>
+        <div className="cx-action-actions">
+          <button className="cx-action-btn" onClick={() => setOpen((o) => !o)}>{open ? "Masquer" : "Détails"}</button>
+        </div>
+      </div>
+      {open && (
+        <div className="cx-action-files">
+          {files.map((f) => (
+            <div key={f.name} className="cx-action-file" onClick={() => onOpenFile(f.name)} title="Ouvrir dans l'éditeur">
+              <span className={"dot " + f.st} />
+              <span className="name">{f.name}</span>
+              <span className="open-hint">Ouvrir ›</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Code block inside an AI message body (Codex-styled).
 export function CodeBlock({
   lang,
   text,
-  onOpenInEditor,
-  onApplyToFile,
+  onOpen,
 }: {
   lang: string;
   text: string;
-  onOpenInEditor?: (code: string, lang: string) => void;
-  onApplyToFile?: (code: string, lang: string, path: string) => void;
+  onOpen?: () => void;
 }) {
-  // Lot 2 — a block that declares a target path (info-string or `// path:`
-  // comment) gets an "Apply" affordance. Detection runs on `text` so it works
-  // both live and after the message round-trips through SQLite.
-  const detectedPath = detectBlockPath(text);
-  const fileName = detectedPath ? detectedPath.split("/").pop() : null;
-  const copyToClipboard = () => {
-    if (typeof navigator !== "undefined" && navigator.clipboard) {
-      void navigator.clipboard.writeText(text).catch(() => {});
-    }
-  };
+  const [preview, setPreview] = useState(false);
+  // HTML blocks get a live "Aperçu" — the payoff of activating a design
+  // system (Design view → "Utiliser dans le chat") is SEEING the generated
+  // UI. Rendered via srcdoc in a sandboxed iframe (no network, no
+  // same-origin) inside a portal overlay so it escapes the chat feed's
+  // overflow clipping. NOT the chat-split-right editor pane — that's for
+  // files on disk; this is an ephemeral render of inline output.
+  const isHtml = lang === "html" || lang === "htm";
+
   return (
-    <div className="code-block">
-      <div className="code-block-head">
-        <span className="lang">
-          <span className="dot"></span> {lang}
-          {detectedPath && (
-            <span className="code-block-path" title={detectedPath}> · {fileName}</span>
-          )}
-        </span>
-        <span style={{display:"flex", gap:6}}>
-          {detectedPath && onApplyToFile && (
-            <button
-              className="composer-tool code-apply-btn"
-              title={`Apply to ${detectedPath}`}
-              onClick={() => onApplyToFile(text, lang, detectedPath)}
-            >
-              <Icon name="sparkle" size={12}/> Apply
+    <div className="cx-code-block">
+      <div className="cx-code-block-head">
+        <span className="lang"><span className="dot" /> {lang}</span>
+        <span style={{ display: "flex", gap: 6 }}>
+          {isHtml && (
+            <button className="cx-tool" title="Aperçu HTML" onClick={() => setPreview(true)} style={{ color: "var(--tertiary)" }}>
+              <Icon name="image" size={12} />
             </button>
           )}
-          <button className="composer-tool" title="Copy" onClick={copyToClipboard}><Icon name="copy" size={12}/></button>
+          <button className="cx-tool" title="Copier" onClick={() => copyText(text)}><Icon name="copy" size={12} /></button>
           <button
-            className="composer-tool"
-            title="Open in editor"
-            onClick={() => onOpenInEditor?.(text, lang)}
-            disabled={!onOpenInEditor}
+            className="cx-tool"
+            title="Ouvrir dans l'éditeur"
+            onClick={onOpen}
+            disabled={!onOpen}
+            style={onOpen ? { color: "var(--primary)" } : undefined}
           >
-            <Icon name="code" size={12}/>
+            <Icon name="code" size={12} />
           </button>
         </span>
       </div>
       <pre><code>{highlightRust(text)}</code></pre>
+      {preview && isHtml && createPortal(
+        <div
+          className="cx-preview-scrim"
+          onClick={(e) => { if (e.target === e.currentTarget) setPreview(false); }}
+        >
+          <div className="cx-preview-modal">
+            <div className="cx-preview-head">
+              <span className="cx-preview-title"><Icon name="image" size={13} /> Aperçu</span>
+              <span style={{ flex: 1 }} />
+              <button className="cx-tool" title="Fermer" onClick={() => setPreview(false)}><Icon name="x" size={13} /></button>
+            </div>
+            <iframe className="cx-preview-frame" title="Aperçu HTML" srcDoc={text} sandbox="allow-scripts" />
+          </div>
+        </div>,
+        document.body,
+      )}
     </div>
   );
 }
 
-export function InlineImage({ prompt: _prompt }: { prompt?: string }) {
-  return (
-    <div className="inline-image" style={{flexDirection:"column"}}>
-      <div style={{position:"relative", aspectRatio: "16 / 9", background: "radial-gradient(circle at 30% 30%, #ff9ec7 0%, transparent 50%), radial-gradient(circle at 70% 70%, #81ecff 0%, transparent 50%), radial-gradient(circle at 60% 30%, #e08efe 0%, transparent 55%), linear-gradient(135deg, #2a1437 0%, #0d0d18 100%)"}}>
-        <div style={{position:"absolute", inset:0, backgroundImage: "radial-gradient(1px 1px at 13% 22%, rgba(255,255,255,0.4), transparent), radial-gradient(1px 1px at 47% 61%, rgba(255,255,255,0.3), transparent), radial-gradient(1px 1px at 72% 33%, rgba(255,255,255,0.4), transparent)", mixBlendMode:"overlay"}}/>
-      </div>
-      <div className="inline-image-meta">
-        <span className="chip secondary">flux.1-veil</span>
-        <span>16:9 · 1024×576 · seed 8204</span>
-        <span style={{flex:1}}></span>
-        <button className="lgb lgb-sm"><Icon name="download" size={12}/> Save</button>
-        <button className="lgb lgb-sm"><Icon name="sparkle" size={12}/> Variations</button>
-      </div>
-    </div>
-  );
-}
-
-// ─── Image view (dedicated) ─────────────────────────────────
+// ─── Image view (dedicated) — unchanged data wiring ─────────
 export function ImageView({ generations, setGenerations }: any) {
   const [prompt, setPrompt] = useState("celestial veil over a quiet ocean at dusk, soft purples and cyan, painterly");
   const [negative, setNegative] = useState("");
@@ -524,7 +661,6 @@ export function ImageView({ generations, setGenerations }: any) {
         prompt, negative, ratio, model: realModel, protocol, baseUrl,
         seed, steps, guidance, style: styleKey,
       });
-      // Normalize: mock returns rich object; Rust returns sparse {id, status, resultUrl}.
       const derivedHue = [...prompt].reduce((a, c) => a + c.charCodeAt(0), 0) % 360;
       const normalized: ImageResult = {
         id:        raw.id       ?? Date.now(),
@@ -646,7 +782,7 @@ export function nowTime() {
   return `${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
 }
 
-// Lightweight Rust tokenizer that emits JSX (no innerHTML). XSS-safe by construction.
+// Lightweight Rust tokenizer that emits JSX (no innerHTML). XSS-safe.
 const RUST_KEYWORDS = new Set(["fn","let","mut","use","pub","struct","impl","return","if","else","match","Err","Ok","Some","None","Result","String","i32","u32","f32","bool"]);
 
 type Token = { cls: string | null; text: string };
@@ -658,12 +794,10 @@ function tokenizeRust(src: string): Token[] {
   const push = (cls: string | null, text: string) => { if (text) tokens.push({ cls, text }); };
   while (i < n) {
     const c = src[i];
-    // line comment
     if (c === "/" && src[i + 1] === "/") {
       let j = i; while (j < n && src[j] !== "\n") j++;
       push("c", src.slice(i, j)); i = j; continue;
     }
-    // string
     if (c === '"') {
       let j = i + 1;
       while (j < n) {
@@ -673,7 +807,6 @@ function tokenizeRust(src: string): Token[] {
       }
       push("s", src.slice(i, j)); i = j; continue;
     }
-    // attribute #[...]
     if (c === "#" && src[i + 1] === "[") {
       let j = i + 2, depth = 1;
       while (j < n && depth > 0) {
@@ -683,12 +816,10 @@ function tokenizeRust(src: string): Token[] {
       }
       push("p", src.slice(i, j)); i = j; continue;
     }
-    // number
     if (/[0-9]/.test(c)) {
       let j = i; while (j < n && /[0-9.]/.test(src[j])) j++;
       push("n", src.slice(i, j)); i = j; continue;
     }
-    // identifier
     if (/[A-Za-z_]/.test(c)) {
       let j = i; while (j < n && /[A-Za-z0-9_]/.test(src[j])) j++;
       const word = src.slice(i, j);
@@ -697,7 +828,6 @@ function tokenizeRust(src: string): Token[] {
       else push(null, word);
       i = j; continue;
     }
-    // anything else
     let j = i;
     while (j < n && !/[\/"#0-9A-Za-z_]/.test(src[j])) j++;
     push(null, src.slice(i, j || i + 1));

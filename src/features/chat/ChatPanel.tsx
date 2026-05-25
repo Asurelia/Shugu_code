@@ -13,8 +13,10 @@
 //     setChatUnread(false) on mode === "full" or user typing
 //     → ChibiWithMood reads this to choose peek_open vs peek_closed
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { Icon } from "@/components/components";
+import { ContextCard, CTX_TABS, useCtxCounts, type CtxTabId } from "@/features/context-cards/cards";
+import { ShellContext, createDetachedShell } from "@/routes/shell-context";
 import {
   useMessages,
   useActiveConv,
@@ -338,7 +340,38 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
   // We only READ from the store here; the wiring is done upstream.
   const { data: agentsData } = useActiveAgents();
   const agentsCount = agentsData?.length ?? 0;
-  const [tab, setTab] = useState<"feed" | "history" | "agents">("feed");
+  // Tab can be one of the chat tabs OR a contextual card id (Phase 4). The
+  // ctx tabs swap the mascot panel content to the matching card (local to the
+  // mascot — they do NOT drive the main chat's ContextBubble).
+  const [tab, setTab] = useState<"feed" | "history" | "agents" | CtxTabId>("feed");
+  const ctxCounts = useCtxCounts(activeConv);
+  const isCtxTab = CTX_TABS.some((t) => t.id === tab);
+
+  // Opening a file from a mascot ctx card crosses windows: emit app://open-file
+  // (RootLayout opens it in the editor) and focus the main IDE window.
+  const mascotOpenFile = useCallback((path: string) => {
+    void (async () => {
+      try {
+        const eventMod = await import("@tauri-apps/api/event");
+        await eventMod.emit("app://open-file", { path });
+      } catch (err) {
+        console.warn("[ChatPanel] open-file emit failed", err);
+      }
+      try {
+        const winMod = await import("@tauri-apps/api/webviewWindow");
+        const main = await winMod.WebviewWindow.getByLabel("main");
+        if (main) { await main.show(); await main.unminimize(); await main.setFocus(); }
+      } catch (err) {
+        console.warn("[ChatPanel] focus main window failed", err);
+      }
+    })();
+  }, []);
+
+  // The mascot has no RootLayout → no ShellContext. SideGit (Git card) and
+  // ConflictResolver read useShell() and would crash the mascot. Provide a
+  // detached shell whose file-opens cross to the main window via mascotOpenFile.
+  const detachedShell = useMemo(() => createDetachedShell(mascotOpenFile), [mascotOpenFile]);
+
   const [historyConvs, setHistoryConvs] = useState<{ id: string; title: string; ts: number }[]>([]);
   const [histRefresh, setHistRefresh] = useState(0);
   const historyRef = useRef<HTMLDivElement | null>(null);
@@ -483,7 +516,13 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
     <>
       {mode === "full" && (
         <div className="float-history-shell">
-          {tab === "feed" ? (
+          {isCtxTab ? (
+            <ShellContext.Provider value={detachedShell}>
+              <div className="float-history-list ctx-in-float" style={{ padding: 0 }}>
+                <ContextCard tab={tab as CtxTabId} convId={activeConv} onOpenFile={mascotOpenFile} />
+              </div>
+            </ShellContext.Provider>
+          ) : tab === "feed" ? (
             <div className="float-history" ref={historyRef}>
               {msgs.length === 0 && (
                 <div style={{color:"var(--on-surface-muted)", fontSize:12, padding:"24px 8px", textAlign:"center", fontFamily:"var(--font-mono)"}}>
@@ -601,6 +640,21 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
             <span>Agents</span>
             {agentsCount > 0 && <span className="float-tab-count">{agentsCount}</span>}
           </button>
+          {/* Phase 4 — contextual card shortcuts (Plan / Tâches / Git / Prévisu
+              / Sources / Env). Icon-only to fit the narrow panel; the strip
+              scrolls horizontally if needed (scrollbar hidden via CSS). */}
+          <span className="float-ctx-sep" />
+          {CTX_TABS.map((t) => (
+            <button
+              key={t.id}
+              className={"float-tab float-ctx-btn" + (tab === t.id ? " on" : "")}
+              onClick={() => setTab(t.id)}
+              title={t.label}
+            >
+              <Icon name={t.icon} size={12} />
+              {ctxCounts[t.id] > 0 && <span className="float-tab-count">{ctxCounts[t.id]}</span>}
+            </button>
+          ))}
         </div>
       )}
 

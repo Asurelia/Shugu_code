@@ -181,6 +181,147 @@ CREATE INDEX IF NOT EXISTS idx_agent_events_agent_ts ON agent_events(agent_id, t
 CREATE INDEX IF NOT EXISTS idx_agent_events_ts      ON agent_events(ts);
 ";
 
+// V7 — auto-evolving harness (Continual Harness, lot 1 P0).
+//
+// `harness_generations` stores one IMMUTABLE snapshot per (role, generation)
+// of the agent harness: the system prompt `p`, plus memory `M`, subagents `G`
+// and skills `K` as JSON. In lot 1 only `system_prompt` (P2) and `memory`
+// (P3) are written; `subagents`/`skills` stay '[]' (wired for lot 2). Exactly
+// one row per role has `active = 1` — the snapshot `load_active_harness`
+// serves. Generation 0 is SEEDED from the hard-coded role prompts on first
+// use, so behaviour is byte-identical to today until a Refiner writes a new
+// generation. Rollback = flip `active` to an earlier generation; nothing is
+// mutated in place, so the audit trail is the table itself.
+//
+// `agent_outcomes` is one row per agent run: success / stuck_reason + the
+// iteration & tool-error counters, tied to the `generation` that produced
+// the run. Per-generation metrics are therefore a GROUP BY (no
+// denormalization), and a later anti-regression audit can compare a new
+// generation's outcomes against its parent's.
+const MIGRATION_V7: &str = "
+CREATE TABLE IF NOT EXISTS harness_generations (
+    id                TEXT    PRIMARY KEY,
+    role              TEXT    NOT NULL,
+    generation        INTEGER NOT NULL,
+    parent_generation INTEGER,
+    trigger_reason    TEXT,
+    created_by        TEXT,
+    system_prompt     TEXT    NOT NULL,
+    memory            TEXT    NOT NULL DEFAULT '[]',
+    subagents         TEXT    NOT NULL DEFAULT '[]',
+    skills            TEXT    NOT NULL DEFAULT '[]',
+    active            INTEGER NOT NULL DEFAULT 0,
+    created_at        INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_harness_role_gen ON harness_generations(role, generation);
+CREATE INDEX        IF NOT EXISTS idx_harness_active   ON harness_generations(role, active);
+CREATE TABLE IF NOT EXISTS agent_outcomes (
+    agent_id      TEXT    PRIMARY KEY,
+    role          TEXT    NOT NULL,
+    generation    INTEGER,
+    success       INTEGER,
+    stuck_reason  TEXT,
+    iterations    INTEGER NOT NULL DEFAULT 0,
+    tool_errors   INTEGER NOT NULL DEFAULT 0,
+    user_feedback TEXT,
+    ts            INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_outcomes_role_gen ON agent_outcomes(role, generation);
+";
+
+// V8 — Studio projects (Projets tab). One row per saved/auto design snapshot;
+// the files live under `<workspace>/.shugu-forge/projects/<id>/`. `conversation_id`
+// links to the chat that produced it — the turn log is rebuilt from
+// agents/agent_events (no turns table, DRY). `workspace_root` scopes rows to the
+// workspace they belong to. `deleted_at` = soft-delete (never a hard removal).
+const MIGRATION_V8: &str = "
+CREATE TABLE IF NOT EXISTS studio_projects (
+    id              TEXT    PRIMARY KEY,
+    name            TEXT    NOT NULL,
+    conversation_id TEXT,
+    workspace_root  TEXT    NOT NULL,
+    dir             TEXT    NOT NULL,
+    kind            TEXT    NOT NULL DEFAULT 'auto',
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    deleted_at      INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_studio_projects_ws ON studio_projects(workspace_root, updated_at);
+";
+
+// V9 — measurement bench (banc de mesure) for the self-evolving harness.
+//
+// `bench_tasks` is the registry of FIXED tasks — the "milestones" of Forge — one
+// row per task. The task's fixture workspace (a small reproducible project the
+// agent acts on) lives under `<workspace>/.shugu-forge/bench/<id>/`. `verifier_kind`
+// selects how success is judged WITHOUT executing agent-generated code in v1
+// (files | text | ast | cargo_check | claude_judge); `verifier_spec` is its JSON
+// config.
+//
+// `bench_runs` is one row per (task × generation) execution. `suite_run_id` groups
+// a whole suite pass so a later generation can be A/B-compared against gen 0 on the
+// SAME task set (apples-to-apples — the gap `agent_outcomes` could not fill, since
+// it has no task identity). `passed` is the boolean verdict; `score` is reserved
+// for graded verifiers (Claude-judge, /N) and stays NULL for boolean checks.
+// `agent_id` links back to the underlying agent run in `agents`/`agent_outcomes`.
+const MIGRATION_V9: &str = "
+CREATE TABLE IF NOT EXISTS bench_tasks (
+    id            TEXT    PRIMARY KEY,
+    role          TEXT    NOT NULL,
+    domain        TEXT    NOT NULL DEFAULT 'code',
+    title         TEXT    NOT NULL DEFAULT '',
+    prompt        TEXT    NOT NULL,
+    fixture_dir   TEXT,
+    verifier_kind TEXT    NOT NULL DEFAULT 'files',
+    verifier_spec TEXT    NOT NULL DEFAULT '{}',
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    created_at    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bench_tasks_role ON bench_tasks(role, enabled);
+CREATE TABLE IF NOT EXISTS bench_runs (
+    run_id        TEXT    PRIMARY KEY,
+    suite_run_id  TEXT    NOT NULL,
+    task_id       TEXT    NOT NULL,
+    role          TEXT    NOT NULL,
+    generation    INTEGER NOT NULL,
+    agent_id      TEXT,
+    passed        INTEGER NOT NULL DEFAULT 0,
+    score         REAL,
+    detail        TEXT,
+    ms            INTEGER NOT NULL DEFAULT 0,
+    ts            INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bench_runs_task_gen ON bench_runs(task_id, generation);
+CREATE INDEX IF NOT EXISTS idx_bench_runs_suite    ON bench_runs(suite_run_id);
+";
+
+// Skill library (Voyager / Hermes style): the agent SAVES reusable skills it
+// learns, scoped per role; future runs LOAD them into context → measurable,
+// persistent learning without needing to trick the model into stalling.
+// `id = '<role>:<name>'` so re-saving a skill REFINES it (INSERT OR REPLACE).
+const MIGRATION_V10: &str = "
+CREATE TABLE IF NOT EXISTS agent_skills (
+    id          TEXT    PRIMARY KEY,
+    role        TEXT    NOT NULL,
+    name        TEXT    NOT NULL,
+    when_to_use TEXT    NOT NULL DEFAULT '',
+    body        TEXT    NOT NULL,
+    created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_skills_role ON agent_skills(role);
+";
+
+// Lot « agent ancré » (2026-05-25): retire l'auto-évolution par réécriture de
+// prompt (le Refiner) ET le banc de mesure. La table `agent_skills` est conservée :
+// les skills deviennent le SEUL mécanisme d'apprentissage, et un skill n'est gardé
+// que si le vrai test l'a validé (gate exit 0). On dépose les tables devenues
+// mortes (générations + banc). `agent_outcomes` reste (télémétrie par run).
+const MIGRATION_V11: &str = "
+DROP TABLE IF EXISTS harness_generations;
+DROP TABLE IF EXISTS bench_runs;
+DROP TABLE IF EXISTS bench_tasks;
+";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = vec![
@@ -220,6 +361,36 @@ pub fn run() {
             sql: MIGRATION_V6,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 7,
+            description: "harness_generations_outcomes",
+            sql: MIGRATION_V7,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 8,
+            description: "studio_projects",
+            sql: MIGRATION_V8,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 9,
+            description: "bench_tasks_runs",
+            sql: MIGRATION_V9,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 10,
+            description: "agent_skills_library",
+            sql: MIGRATION_V10,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 11,
+            description: "drop_harness_bench_keep_skills",
+            sql: MIGRATION_V11,
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
@@ -231,6 +402,13 @@ pub fn run() {
                 .add_migrations("sqlite:shugu.db", migrations)
                 .build(),
         )
+        // `preview://` — Design Studio live preview (Phase B). Serves
+        // <workspace>/.shugu-forge/preview/ so the iframe renders a real
+        // multi-file project (relative imports resolve under one origin).
+        // No HTTP server, no new dependency. See commands/preview.rs.
+        .register_uri_scheme_protocol("preview", |ctx, request| {
+            commands::preview::serve(ctx.app_handle(), request.uri().path())
+        })
         // Workspace root — set by fs_open_folder, read by all other fs commands.
         .manage(Mutex::new(None::<std::path::PathBuf>))
         .manage(commands::terminal::PtyRegistry::default())
@@ -425,6 +603,17 @@ pub fn run() {
             commands::agents::agent_list_active,
             commands::agents::agent_get_transcript,
             commands::agents::agent_list_by_conversation,
+            commands::agents::agent_atelier_run,
+            // Skill library (Voyager / Hermes) — learned reusable skills.
+            commands::agents::skills::skills_list,
+            commands::agents::skills::skills_clear,
+            // Design Studio — project snapshots (Projets tab).
+            commands::studio::studio_project_upsert_auto,
+            commands::studio::studio_project_save_as,
+            commands::studio::studio_project_list,
+            commands::studio::studio_project_load,
+            commands::studio::studio_project_rename,
+            commands::studio::studio_project_delete,
             commands::diag::js_diag,
             // LOT 2b — format document via CLI formatter (rustfmt/black/prettier/gofmt).
             commands::format::format_code,

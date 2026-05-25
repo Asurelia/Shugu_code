@@ -67,3 +67,7 @@ src-tauri/.fastembed_cache/
 
 # Snippets créés au runtime par "Open in editor" (openSnippetInEditor)
 .shugu-snippets/
+
+# Design Studio — agent-generated preview project (when shugu_code itself is
+# the open workspace, e.g. dogfooding). Disposable output served by preview://.
+.shugu-forge/

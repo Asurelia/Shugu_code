@@ -1,0 +1,369 @@
+/* ============================================================
+   Shugu Forge — Contextual cards (Plan / Tâches / Git / Prévisu
+   / Sources / Env). Retractable floating bubble in the chat view
+   + the shared card bodies (also reused by the mascot FloatChat).
+   Celestial Veil tokens only — no new color/font tokens.
+   ============================================================ */
+
+/* ── Titlebar context trigger ─────────────────────────────────
+   The collapsed trigger is portaled into #tb-ctx-slot and styled as a
+   tb-action so it groups with History/Bell/Settings. display:contents makes
+   the slot wrapper vanish so the button is a direct flex child of .titlebar. */
+.tb-ctx-slot { display: contents; }
+.ctx-tb-btn { position: relative; }  /* anchors the corner count badge */
+/* Count rides the top-right corner as a small notification badge so the button
+   stays a compact square. Scoped to the trigger — the open header/menu keep
+   the inline badge below. */
+.ctx-tb-btn > .ctx-pill-count {
+  position: absolute; top: -4px; right: -4px;
+  min-width: 14px; height: 14px; padding: 0 3px; font-size: 8.5px;
+}
+
+/* Count badge (shared) */
+.ctx-pill-count {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 16px; height: 16px; padding: 0 4px;
+  border-radius: 999px;
+  font-family: var(--font-mono); font-size: 9.5px; font-weight: 600;
+  background: rgba(224,142,254,0.16);
+  color: var(--primary);
+  border: 1px solid rgba(224,142,254,0.3);
+}
+
+/* ── Open bubble ──────────────────────────────────────────── */
+.ctx-bubble {
+  position: absolute; top: 14px; right: 18px; z-index: 20;
+  width: 360px; max-width: calc(100% - 36px);
+  max-height: calc(100% - 28px);
+  display: flex; flex-direction: column;
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(20,18,32,0.86), rgba(13,12,22,0.86));
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturation));
+  -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturation));
+  border: 1px solid rgba(255,255,255,0.09);
+  box-shadow: 0 24px 60px -24px rgba(0,0,0,0.8);
+  animation: ctx-pop 180ms ease-out both;
+  /* visible (not hidden) so the absolutely-positioned .ctx-menu dropdown can
+     extend past a short bubble without being clipped. The body clips its own
+     content to the rounded bottom corners (see .ctx-bubble-body). */
+  overflow: visible;
+}
+@keyframes ctx-pop {
+  from { opacity: 0; transform: translateY(-6px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.ctx-bubble-head {
+  position: relative;
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 8px 8px 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  flex-shrink: 0;
+}
+.ctx-trigger {
+  flex: 1; min-width: 0;
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 6px 10px; border-radius: 10px;
+  font-family: var(--font-display); font-weight: 600; font-size: 12.5px;
+  color: var(--on-surface);
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.06);
+  cursor: pointer; transition: all 140ms ease;
+}
+.ctx-trigger:hover { background: rgba(255,255,255,0.07); border-color: rgba(224,142,254,0.28); }
+.ctx-trigger-label { flex: 1; text-align: left; }
+.ctx-trigger svg:first-child { color: var(--primary); }
+.ctx-bubble-close {
+  width: 28px; height: 28px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 8px; border: 0; cursor: pointer;
+  background: transparent; color: var(--on-surface-muted);
+}
+.ctx-bubble-close:hover { background: rgba(255,255,255,0.06); color: var(--on-surface); }
+
+/* Dropdown menu (closed via click-outside hook in ContextBubble, not a scrim:
+   .ctx-bubble's backdrop-filter would trap a fixed scrim inside the bubble) */
+.ctx-menu {
+  position: absolute; top: calc(100% + 4px); left: 8px; right: 8px; z-index: 31;
+  padding: 6px;
+  border-radius: 12px;
+  background: rgba(16,14,28,0.97);
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturation));
+  border: 1px solid rgba(255,255,255,0.1);
+  box-shadow: 0 18px 44px -18px rgba(0,0,0,0.85);
+  display: flex; flex-direction: column; gap: 2px;
+}
+.ctx-menu-item {
+  display: flex; align-items: center; gap: 9px;
+  padding: 8px 10px; border-radius: 8px;
+  font-family: var(--font-display); font-size: 12px; font-weight: 500;
+  color: var(--on-surface-variant);
+  background: transparent; border: 0; cursor: pointer; text-align: left;
+  transition: all 130ms ease;
+}
+.ctx-menu-item:hover { background: rgba(255,255,255,0.05); color: var(--on-surface); }
+.ctx-menu-item.on { color: var(--primary); }
+.ctx-menu-item .label { flex: 1; }
+.ctx-menu-item .check { color: var(--primary); font-size: 11px; }
+.ctx-menu-item svg:first-child { opacity: 0.85; }
+
+/* overflow-y:auto (with default overflow-x) clips both axes, so the rounded
+   bottom corners are honored even though the parent .ctx-bubble is now
+   overflow:visible — keeps embedded panels (.ctx-embed) from squaring off. */
+.ctx-bubble-body {
+  flex: 1; min-height: 0; overflow-y: auto; padding: 12px;
+  border-bottom-left-radius: 16px; border-bottom-right-radius: 16px;
+}
+
+/* Embedded existing panels (SideGit, AgentsPanel) */
+.ctx-embed { margin: -12px; min-height: 260px; }
+
+/* Shared card empty state */
+.ctx-empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px; padding: 32px 18px; text-align: center;
+  color: var(--on-surface-muted);
+}
+.ctx-empty svg { color: var(--on-surface-muted); opacity: 0.7; }
+.ctx-empty p { margin: 0; font-size: 12px; line-height: 1.5; max-width: 240px; }
+
+/* Generic status dot */
+.ctx-env-file .dot, .ctx-step-dot { background: var(--tertiary); }
+.ctx-env-file .dot.add { background: var(--success); }
+.ctx-env-file .dot.mod { background: var(--warn); }
+.ctx-env-file .dot.del { background: var(--danger); }
+
+/* Tag pill */
+.ctx-tag {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 8px; border-radius: 999px;
+  font-family: var(--font-mono); font-size: 10.5px;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.07);
+  color: var(--on-surface-variant);
+}
+.ctx-tag.branch { color: var(--tertiary); border-color: rgba(129,236,255,0.22); background: rgba(129,236,255,0.05); }
+
+/* ── Card header (Plan / Tâches) ──────────────────────────── */
+.ctx-card-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  margin-bottom: 12px;
+}
+.ctx-card-title {
+  font-family: var(--font-display); font-weight: 600; font-size: 13px;
+  color: var(--on-surface);
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ctx-card-sub { font-family: var(--font-mono); font-size: 10px; color: var(--on-surface-muted); flex-shrink: 0; }
+
+/* ── Plan card (orchestrator steps, checkbox style) ───────── */
+.ctx-plan { display: flex; flex-direction: column; }
+.plan-step { display: flex; gap: 10px; padding: 6px 0; }
+.plan-step .box {
+  width: 18px; height: 18px; flex-shrink: 0; margin-top: 1px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 6px;
+  border: 2px solid var(--on-surface-muted); background: transparent;
+  color: #1a0a24;
+}
+.plan-step.done .box {
+  background: linear-gradient(135deg, var(--primary), var(--secondary));
+  border-color: transparent;
+}
+.plan-step.run .box {
+  border-color: var(--primary); border-right-color: transparent;
+  animation: spin 0.9s linear infinite;
+}
+.plan-step.error .box { border-color: var(--danger); color: var(--danger); }
+.plan-step.error .box .x { font-size: 11px; line-height: 1; }
+.plan-step .content { flex: 1; min-width: 0; }
+.plan-step .label { font-size: 12.5px; color: var(--on-surface); line-height: 1.4; }
+.plan-step.done .label { color: var(--on-surface-variant); }
+.plan-step .meta { display: flex; align-items: center; gap: 8px; margin-top: 3px; font-family: var(--font-mono); font-size: 10px; }
+.plan-step .meta .file { color: var(--tertiary); }
+.plan-step .meta .timer { color: var(--on-surface-muted); }
+.plan-step.run .meta .timer { color: var(--primary); }
+
+/* ── Tâches card (active agents as background tasks) ──────── */
+.ctx-tasks { display: flex; flex-direction: column; }
+.task-card {
+  border: 1px solid rgba(255,255,255,0.07); border-radius: 12px;
+  padding: 11px 12px; margin-bottom: 10px;
+  background: rgba(255,255,255,0.02);
+}
+.task-card.run { border-color: rgba(224,142,254,0.2); }
+.task-row1 { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.task-name {
+  font-family: var(--font-display); font-weight: 600; font-size: 12.5px; color: var(--on-surface);
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.task-badge {
+  flex-shrink: 0;
+  font-family: var(--font-mono); font-size: 8.5px; text-transform: uppercase; letter-spacing: 0.1em;
+  padding: 2px 8px; border-radius: 999px;
+}
+.task-badge.running { color: var(--primary); background: rgba(224,142,254,0.12); border: 1px solid rgba(224,142,254,0.3); }
+.task-badge.queued { color: var(--warn); background: rgba(255,196,0,0.1); border: 1px solid rgba(255,196,0,0.25); }
+.task-stream {
+  margin-top: 8px;
+  font-family: var(--font-mono); font-size: 10.5px; color: var(--on-surface-muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.task-foot { display: flex; align-items: center; gap: 8px; margin-top: 9px; }
+/* Indeterminate sweep — deliberately NOT a fixed-width fill: agents carry no
+   real % so a static bar would be a false numeric claim. A narrow band sweeps
+   to signal "working" without asserting a value. */
+.task-bar { flex: 1; height: 3px; border-radius: 999px; background: rgba(255,255,255,0.06); overflow: hidden; position: relative; }
+.task-bar span {
+  position: absolute; top: 0; left: 0; height: 100%; width: 30%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, transparent, var(--primary), transparent);
+  opacity: 0.55;
+  animation: task-sweep 1.4s ease-in-out infinite;
+}
+@keyframes task-sweep {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(380%); }
+}
+.task-time { flex-shrink: 0; font-family: var(--font-mono); font-size: 10px; color: var(--on-surface-muted); }
+
+/* ── Env card ─────────────────────────────────────────────── */
+.ctx-env { display: flex; flex-direction: column; gap: 16px; }
+.ctx-env-section { display: flex; flex-direction: column; gap: 6px; }
+.ctx-env-label { font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.12em; color: var(--on-surface-muted); }
+.ctx-env-row { display: flex; align-items: center; gap: 8px; }
+.ctx-env-aheadbehind { font-family: var(--font-mono); font-size: 11px; color: var(--tertiary); }
+.ctx-env-sub { font-family: var(--font-mono); font-size: 11px; color: var(--on-surface-muted); }
+.ctx-env-files { display: flex; flex-direction: column; gap: 1px; }
+.ctx-env-file {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 6px; border-radius: 7px;
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--on-surface-variant);
+  cursor: pointer; transition: background 130ms ease;
+}
+.ctx-env-file:hover { background: rgba(255,255,255,0.04); color: var(--on-surface); }
+.ctx-env-file .dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.ctx-env-file .name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ctx-env-remote { display: flex; flex-direction: column; gap: 3px; margin-top: 6px; }
+.ctx-env-url { font-family: var(--font-mono); font-size: 10px; color: var(--on-surface-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ── Sources card ─────────────────────────────────────────── */
+.ctx-sources { display: flex; flex-direction: column; gap: 10px; }
+.ctx-sources-meta { display: flex; align-items: center; gap: 8px; }
+.ctx-sources-hint { font-family: var(--font-mono); font-size: 10.5px; color: var(--on-surface-muted); }
+.ctx-sources-list { display: flex; flex-direction: column; gap: 2px; }
+.ctx-source {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 8px; border-radius: 8px;
+  cursor: pointer; transition: background 130ms ease;
+  color: var(--on-surface-variant);
+}
+.ctx-source:hover { background: rgba(255,255,255,0.04); color: var(--on-surface); }
+.ctx-source svg { color: var(--tertiary); flex-shrink: 0; }
+.ctx-source-name { font-family: var(--font-mono); font-size: 12px; color: var(--on-surface); flex-shrink: 0; }
+.ctx-source-dir { font-family: var(--font-mono); font-size: 10px; color: var(--on-surface-muted); flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ctx-source-sim { font-family: var(--font-mono); font-size: 10px; color: var(--tertiary); }
+
+/* ── Prévisu card ─────────────────────────────────────────── */
+.ctx-preview { display: flex; flex-direction: column; gap: 8px; height: 420px; }
+.ctx-preview-bar { display: flex; align-items: center; gap: 6px; }
+.ctx-preview-url {
+  flex: 1; min-width: 0;
+  background: rgba(7,7,16,0.6);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px; padding: 6px 10px;
+  font-family: var(--font-mono); font-size: 11px;
+  color: var(--on-surface); outline: none;
+}
+.ctx-preview-url:focus { border-color: rgba(224,142,254,0.35); }
+.ctx-preview-go {
+  width: 30px; height: 30px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 8px; cursor: pointer;
+  background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08);
+  color: var(--on-surface-variant);
+}
+.ctx-preview-go:hover { color: var(--on-surface); background: rgba(255,255,255,0.08); }
+.ctx-preview-frame { flex: 1; min-height: 0; border-radius: 10px; overflow: hidden; border: 1px solid rgba(255,255,255,0.08); background: #fff; }
+.ctx-preview-frame iframe { width: 100%; height: 100%; border: 0; display: block; }
+
+@media (max-width: 900px) {
+  .ctx-bubble { width: calc(100% - 36px); }
+}
+
+/* ── Mascot FloatChat ctx strip (Phase 4) ─────────────────── */
+/* Let the tab bar scroll horizontally instead of wrapping/overflowing once
+   the 6 ctx shortcuts are appended after the chat tabs. */
+.float-tabs { max-width: 100%; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+.float-tabs::-webkit-scrollbar { display: none; }
+.float-ctx-sep { width: 1px; align-self: stretch; margin: 3px 3px; background: rgba(255,255,255,0.12); flex-shrink: 0; }
+.float-ctx-btn { flex-shrink: 0; padding-left: 6px; padding-right: 6px; }
+
+/* Contextual card rendered inside the (narrow) mascot panel — tighten it. */
+.ctx-in-float { padding: 10px !important; }
+.ctx-in-float .ctx-embed { margin: -10px; min-height: 220px; }
+.ctx-in-float .ctx-preview { height: 260px; }
+.ctx-in-float .ctx-step-title { font-size: 11.5px; }
+
+/* ── Conversations sidebar — vector search bar (VEC2) ──────────
+   Toggled by the loupe button in the sidebar header. Celestial Veil glass
+   row: sparkle (AI signal) + input + clear ×, with a mono meta-row carrying
+   the real engine info (vector · model · top-k / result count). Design ref:
+   the design's forge-integrations.css .side-search; markup in chat-sidebar.tsx. */
+.side-search {
+  padding: 8px 12px 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+  background: rgba(10,8,22,0.35);
+}
+.side-search-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 10px;
+  background: rgba(20,18,32,0.66);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 10px;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+.side-search-row:focus-within {
+  border-color: rgba(224,142,254,0.40);
+  box-shadow: 0 0 0 3px rgba(224,142,254,0.08);
+}
+.side-search-row .ico {
+  width: 20px; height: 20px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 6px;
+  background: linear-gradient(135deg, rgba(224,142,254,0.25), rgba(129,236,255,0.15));
+  color: var(--primary);
+}
+.side-search-input {
+  flex: 1; min-width: 0;
+  background: transparent; border: 0; outline: 0;
+  color: var(--on-surface);
+  font-family: var(--font-body); font-size: 12.5px; line-height: 1.4;
+}
+.side-search-input::placeholder { color: var(--on-surface-muted); }
+.side-search-clear {
+  width: 18px; height: 18px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; border: 0; border-radius: 50%;
+  color: var(--on-surface-muted); cursor: pointer;
+}
+.side-search-clear:hover { background: rgba(255,255,255,0.06); color: var(--on-surface); }
+.side-search-meta {
+  display: flex; align-items: center; gap: 6px;
+  margin-top: 8px;
+  font-family: var(--font-mono); font-size: 9.5px;
+  letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--on-surface-muted);
+}
+.side-search-meta .chip-mode {
+  padding: 1px 7px; border-radius: 999px;
+  background: rgba(224,142,254,0.12);
+  border: 1px solid rgba(224,142,254,0.28);
+  color: var(--primary);
+  font-size: 8.5px; letter-spacing: 0.16em;
+}
+.side-search-meta .chip-mode.subtle {
+  background: rgba(255,255,255,0.04);
+  border-color: rgba(255,255,255,0.08);
+  color: var(--on-surface-variant);
+}
+.side-search-meta .hint { font-size: 9px; color: var(--on-surface-muted); text-transform: none; letter-spacing: 0.04em; }

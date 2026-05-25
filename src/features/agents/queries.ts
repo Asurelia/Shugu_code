@@ -16,6 +16,7 @@
 //     UI — chaque invalidation refetch depuis SQLite via les commandes
 //     Tauri existantes (`agent_list_active`, `agent_get_transcript`, …).
 
+import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   listActiveAgents,
@@ -26,6 +27,7 @@ import {
 } from "@/lib/agents";
 import { queryClient } from "@/lib/queryClient";
 import { agentKeys } from "./keys";
+import type { Agent } from "@/lib/types";
 
 /** Forme parsée du transcript — events typés en AgentEvent (le row SQLite
  *  garde le payload comme string brute, on parse à la lecture). */
@@ -49,6 +51,56 @@ export function useActiveAgents() {
     queryFn: () => listActiveAgents(),
     staleTime: 0,
   });
+}
+
+// ── Real active agents → lightweight display shape for the left rail + header ──
+// Maps the SQLite-backed `AgentRow[]` (from useActiveAgents) onto the small
+// `Agent` shape that `SideAgents` (left "Workers" list) and the RootLayout
+// header subtitle consume. This REPLACES the `seedAgents` mock that used to feed
+// those views with hardcoded fakes (Refactor Pass, Veil Curator, …).
+//
+// Honesty contract: `status` is the agent's REAL status; `icon`/`color` are
+// role-based presentation (not fabricated data); and the metric fields the rail
+// never reads (`log`/`elapsed`/`progress`) are left empty — we do NOT invent a
+// progress %. `listActiveAgents` returns only pending|running rows, so every
+// agent here is genuinely an active worker.
+const ROLE_ICON: Record<string, string> = {
+  atelier: "🛠️",
+  coder: "🔧",
+  orchestrator: "🧭",
+  researcher: "🔎",
+  tester: "🧪",
+  mascot: "🐾",
+};
+const ROLE_COLOR: Record<string, string> = {
+  atelier: "linear-gradient(135deg, #e08efe, #7c3aed)",
+  coder: "linear-gradient(135deg, #81ecff, #5fd4f0)",
+  orchestrator: "linear-gradient(135deg, #ffcf6b, #ff9756)",
+  researcher: "linear-gradient(135deg, #8aefc7, #5dd4a8)",
+  tester: "linear-gradient(135deg, #fd6c9c, #e04c87)",
+  mascot: "linear-gradient(135deg, #e08efe, #fd6c9c)",
+};
+
+export function useAgentsRailDisplay(): Agent[] {
+  const { data } = useActiveAgents();
+  return useMemo(
+    () =>
+      (data ?? []).map(
+        (r): Agent => ({
+          id: r.id,
+          name:
+            r.task && r.task.length > 28 ? r.task.slice(0, 28) + "…" : r.task || r.role,
+          icon: ROLE_ICON[r.role] ?? "🤖",
+          color: ROLE_COLOR[r.role] ?? "linear-gradient(135deg, #e08efe, #7c3aed)",
+          status: "running",
+          desc: r.task,
+          log: "",
+          elapsed: "",
+          progress: 0,
+        }),
+      ),
+    [data],
+  );
 }
 
 /**

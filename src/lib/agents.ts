@@ -29,7 +29,8 @@ export type AgentEventKind =
   | "toolResult"
   | "delta"
   | "complete"
-  | "error";
+  | "error"
+  | "skillLearned";
 
 // ────────────────────────────────────────────────────────────────────
 // DB row shapes (mirror Rust AgentRow / AgentEventRow)
@@ -112,9 +113,18 @@ export type AgentEvent =
       agentId: string;
       output: string;
       tokensUsed?: number;
+      reasoning?: string;
       ms: number;
     }
-  | { kind: "error"; agentId: string; error: string };
+  | { kind: "error"; agentId: string; error: string }
+  | {
+      kind: "skillLearned";
+      agentId: string;
+      role: string;
+      /** Name of the reusable skill the agent just saved — VERIFIED by a real
+       * passing test (the env gate). The chat UI shows an inline "🎓 appris" badge. */
+      name: string;
+    };
 
 // ────────────────────────────────────────────────────────────────────
 // Command wrappers
@@ -138,6 +148,11 @@ export interface SpawnArgs {
    * mainly used to toggle `{enable_thinking: false}` per request on
    * Qwen 3.5 / DeepSeek-R1 templates. */
   chatTemplateKwargs?: Record<string, unknown>;
+  /** Phase A (Design Studio) — design-system context prepended to the agent's
+   * system prompt so it generates a styled project on disk. Only the Studio
+   * "Generate" sets this; chat delegation leaves it undefined (no impact on
+   * the normal delegate path). Serializes to the Rust `design_context` field. */
+  designContext?: string;
 }
 
 /** Spawn an agent. Returns the freshly minted agent id (UUID v4 string).
@@ -279,4 +294,43 @@ export async function revealAgent(agentId: string): Promise<void> {
   } catch (err) {
     console.warn("[agents] revealAgent emit failed:", err);
   }
+}
+
+// ── Skill library (Voyager / Hermes) — mirrors commands::agents::skills ──
+
+/** One reusable skill the agent has learned (Voyager/Hermes), mirror of SkillRow. */
+export interface SkillRow {
+  name: string;
+  whenToUse: string;
+  body: string;
+  createdAt: number;
+}
+
+/** List the skills a role has learned + saved (loaded into its context each run). */
+export async function skillsList(role: string): Promise<SkillRow[]> {
+  return invoke<SkillRow[]>("skills_list", { role });
+}
+
+/** Wipe a role's learned skills (demo reset / cleanup). */
+export async function skillsClear(role: string): Promise<void> {
+  return invoke<void>("skills_clear", { role });
+}
+
+// ── Atelier (env-grounded build → test → learn loop) — mirrors agent_atelier_run ──
+
+/** Launch an Atelier run: a `coder` agent builds a small web UI on a DISPOSABLE
+ *  mirror, drives it with a real browser (Playwright in the Docker sandbox),
+ *  iterates on real failures, and saves a skill once its test passes (exit 0).
+ *  Returns the agent id — stream it in the SAME transcript UI as any agent.
+ *  Provider routing mirrors `spawnAgent`: the key is resolved by the caller from
+ *  the keychain (never cleartext at rest). */
+export async function atelierRun(args: {
+  task: string;
+  model: string;
+  protocol?: string;
+  baseUrl?: string;
+  apiKey?: string;
+  chatTemplateKwargs?: Record<string, unknown>;
+}): Promise<string> {
+  return invoke<string>("agent_atelier_run", { args });
 }

@@ -42,7 +42,7 @@
 //!   - Max résultats cappé à `max_results` (défaut 1000) pour éviter les UI
 //!     explosions sur les patterns trop génériques (e.g. "function").
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -95,12 +95,10 @@ pub async fn fs_grep_workspace(
     query: String,
     opts: GrepOpts,
 ) -> Result<Vec<GrepMatch>, String> {
-    if query.trim().is_empty() {
-        return Ok(vec![]);
-    }
-
-    // Snapshot du workspace root — on clone hors du Mutex pour ne pas tenir
-    // le lock pendant la recherche (qui peut prendre 100+ ms).
+    // Snapshot du workspace root — clone hors du Mutex (pas de lock pendant la
+    // recherche). Le cœur est factorisé dans `grep_inner` pour être réutilisé
+    // tel quel par l'outil agent `fs_search` (qui passe un root sandbox, pas le
+    // state).
     let workspace_root: Option<PathBuf> = {
         let state = app.state::<Mutex<Option<PathBuf>>>();
         let guard = state.lock().map_err(|e| format!("workspace lock: {e}"))?;
@@ -108,87 +106,92 @@ pub async fn fs_grep_workspace(
     };
     let root = workspace_root.ok_or_else(|| "no workspace open".to_string())?;
 
-    // Mode littéral (défaut) : échappe les métacaractères regex.
-    // Mode regex : laisse le pattern tel quel (l'utilisateur sait ce qu'il fait).
-    let pattern = if opts.regex {
-        query.clone()
-    } else {
-        regex::escape(&query)
-    };
+    // ripgrep est SYNC — blocking pool pour ne pas bloquer le runtime Tauri.
+    tokio::task::spawn_blocking(move || grep_inner(&root, &query, &opts))
+        .await
+        .map_err(|e| format!("blocking task join: {e}"))?
+}
 
+/// Cœur SYNC de la recherche workspace, factorisé hors de `fs_grep_workspace`
+/// pour que la commande Tauri (root depuis le state) ET l'outil agent
+/// `fs_search` (root = la COPIE sandbox du banc) partagent exactement le même
+/// moteur. Bloque pendant que le walker parallèle tourne — à appeler dans un
+/// `spawn_blocking` (la commande) ou un contexte déjà bloquant (le dispatcher
+/// d'outils agent tourne sous `spawn_blocking`).
+pub(crate) fn grep_inner(
+    root: &Path,
+    query: &str,
+    opts: &GrepOpts,
+) -> Result<Vec<GrepMatch>, String> {
+    if query.trim().is_empty() {
+        return Ok(vec![]);
+    }
+    // Mode littéral (défaut) : échappe les métacaractères regex.
+    // Mode regex : laisse le pattern tel quel.
+    let pattern = if opts.regex {
+        query.to_string()
+    } else {
+        regex::escape(query)
+    };
     let max_results = if opts.max_results == 0 { 1000 } else { opts.max_results };
 
-    // ripgrep est SYNC — on déplace dans un blocking pool pour ne pas bloquer
-    // le runtime tokio principal (qui sert les autres commandes Tauri).
-    let result = tokio::task::spawn_blocking(move || -> Result<Vec<GrepMatch>, String> {
-        let matcher = RegexMatcherBuilder::new()
-            .case_insensitive(!opts.case_sensitive)
-            .build(&pattern)
-            .map_err(|e| format!("invalid regex: {e}"))?;
+    let matcher = RegexMatcherBuilder::new()
+        .case_insensitive(!opts.case_sensitive)
+        .build(&pattern)
+        .map_err(|e| format!("invalid regex: {e}"))?;
 
-        let results = Arc::new(Mutex::new(Vec::<GrepMatch>::with_capacity(max_results.min(256))));
-        let stop = Arc::new(AtomicBool::new(false));
-        let root_arc = Arc::new(root.clone());
+    let results = Arc::new(Mutex::new(Vec::<GrepMatch>::with_capacity(max_results.min(256))));
+    let stop = Arc::new(AtomicBool::new(false));
+    let root_arc = Arc::new(root.to_path_buf());
 
-        // Walker parallèle — utilise rayon en interne, threads auto-détectés.
-        let walker = WalkBuilder::new(&root).build_parallel();
-        walker.run(|| {
-            let matcher = matcher.clone();
-            let results = Arc::clone(&results);
-            let stop = Arc::clone(&stop);
-            let root_arc = Arc::clone(&root_arc);
-            Box::new(move |entry| {
-                if stop.load(Ordering::Relaxed) {
-                    return WalkState::Quit;
-                }
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(_) => return WalkState::Continue,
-                };
-                // Skip directories — Searcher veut un fichier.
-                if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                    return WalkState::Continue;
-                }
-                let path = entry.path();
-                // Workspace-relative path en forward-slash (contrat IPC fs).
-                let rel_path = path
-                    .strip_prefix(root_arc.as_ref())
-                    .map(|p| p.to_string_lossy().replace('\\', "/"))
-                    .unwrap_or_else(|_| path.to_string_lossy().to_string());
-
-                let sink = GrepSink {
-                    rel_path,
-                    matches: Arc::clone(&results),
-                    max_results,
-                    stop: Arc::clone(&stop),
-                };
-                let mut searcher = SearcherBuilder::new()
-                    .line_number(true)
-                    .build();
-                // Erreurs de search (binary file, encoding non-UTF8) ignorées —
-                // on continue avec les autres fichiers. Cohérent avec ripgrep CLI.
-                let _ = searcher.search_path(&matcher, path, sink);
-                WalkState::Continue
-            })
-        });
-
-        // Récupère le Vec final. Arc::try_unwrap peut échouer si une closure
-        // a survécu — théoriquement impossible après walker.run(), mais on
-        // gère défensivement.
-        let final_results = match Arc::try_unwrap(results) {
-            Ok(mutex) => mutex.into_inner().map_err(|e| format!("results poison: {e}"))?,
-            Err(arc) => {
-                // Fallback : clone le contenu via le lock.
-                let guard = arc.lock().map_err(|e| format!("results lock: {e}"))?;
-                guard.clone()
+    // Walker parallèle — utilise rayon en interne, threads auto-détectés.
+    let walker = WalkBuilder::new(root).build_parallel();
+    walker.run(|| {
+        let matcher = matcher.clone();
+        let results = Arc::clone(&results);
+        let stop = Arc::clone(&stop);
+        let root_arc = Arc::clone(&root_arc);
+        Box::new(move |entry| {
+            if stop.load(Ordering::Relaxed) {
+                return WalkState::Quit;
             }
-        };
-        Ok(final_results)
-    })
-    .await
-    .map_err(|e| format!("blocking task join: {e}"))?;
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => return WalkState::Continue,
+            };
+            // Skip directories — Searcher veut un fichier.
+            if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                return WalkState::Continue;
+            }
+            let path = entry.path();
+            // Workspace-relative path en forward-slash (contrat IPC fs).
+            let rel_path = path
+                .strip_prefix(root_arc.as_ref())
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| path.to_string_lossy().to_string());
 
-    result
+            let sink = GrepSink {
+                rel_path,
+                matches: Arc::clone(&results),
+                max_results,
+                stop: Arc::clone(&stop),
+            };
+            let mut searcher = SearcherBuilder::new().line_number(true).build();
+            // Erreurs de search (binary, non-UTF8) ignorées — on continue.
+            let _ = searcher.search_path(&matcher, path, sink);
+            WalkState::Continue
+        })
+    });
+
+    // Récupère le Vec final. Arc::try_unwrap peut échouer si une closure a
+    // survécu — théoriquement impossible après walker.run(), géré défensivement.
+    match Arc::try_unwrap(results) {
+        Ok(mutex) => mutex.into_inner().map_err(|e| format!("results poison: {e}")),
+        Err(arc) => {
+            let guard = arc.lock().map_err(|e| format!("results lock: {e}"))?;
+            Ok(guard.clone())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
