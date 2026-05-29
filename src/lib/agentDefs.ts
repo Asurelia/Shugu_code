@@ -66,3 +66,17 @@ export async function writeAgentDef(def: AgentDef): Promise<string> {
 export async function deleteAgentDef(path: string): Promise<void> {
   return invoke<void>("agent_def_delete", { path });
 }
+
+/** Lit le contenu BRUT (frontmatter YAML + body markdown) d'un `.md` agent.
+ *  Utilisé par l'onglet "Source `.md`" du drawer pour exposer l'édition raw
+ *  aux devs. Garde-fou côté Rust : parent = `agents/` + extension `.md`. */
+export async function readAgentDefRaw(path: string): Promise<string> {
+  return invoke<string>("agent_def_read_raw", { path });
+}
+
+/** Écrit le contenu BRUT d'un `.md` agent (édition raw). Atomique côté Rust
+ *  (tmp + rename). Si le frontmatter YAML est cassé après l'édition, la liste
+ *  skippera ce fichier au prochain refetch — best-effort. */
+export async function writeAgentDefRaw(path: string, content: string): Promise<void> {
+  return invoke<void>("agent_def_write_raw", { path, content });
+}

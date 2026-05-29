@@ -653,6 +653,9 @@ pub fn run() {
             commands::agent_defs::agent_def_read,
             commands::agent_defs::agent_def_write,
             commands::agent_defs::agent_def_delete,
+            // Raw `.md` read/write — pour l'onglet "Source `.md`" du drawer.
+            commands::agent_defs::agent_def_read_raw,
+            commands::agent_defs::agent_def_write_raw,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -8,7 +8,7 @@
 // Composition : un seul fichier, sous-composants internes (AgentCard,
 // EmptyState, AgentFormDrawer) pour rester sous le plafond CLAUDE.md.
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { ModelPicker } from "@/features/panels/panels";
 import {
   useAgentDefs,
@@ -20,6 +20,10 @@ import type {
   AgentDefScope,
   AgentDefOrigin,
 } from "@/lib/agentDefs";
+import { readAgentDefRaw, writeAgentDefRaw } from "@/lib/agentDefs";
+import { CodeMirrorEditor } from "@/features/code/CodeMirrorEditor";
+import { useActiveAgents } from "./queries";
+import { TranscriptDrawer } from "./AgentsPanel";
 
 // ─────────────────────────────────────────────────────────────────────
 // Constantes d'affichage
@@ -231,6 +235,13 @@ function AgentFormDrawer({
     setDef((d) => ({ ...d, [k]: v }));
   const canSave = def.name.trim().length > 0 && def.body.trim().length > 0;
 
+  // Onglet courant. Pour un nouvel agent, le `.md` n'existe pas encore →
+  // Source + Activité n'auraient rien à montrer, donc on cache les onglets
+  // et on n'expose que les Réglages tant que l'agent n'est pas sauvegardé.
+  type Tab = "reglages" | "source" | "activite";
+  const [tab, setTab] = useState<Tab>("reglages");
+  const showAllTabs = !initial.isNew;
+
   return (
     <>
       <div style={styles.scrim} onClick={onClose} />
@@ -243,103 +254,141 @@ function AgentFormDrawer({
             ✕
           </button>
         </div>
-        <div style={styles.drawerBody}>
-          <Field label="Nom (alphanumérique, '-' ou '_')">
-            <input
-              style={styles.input}
-              value={def.name}
-              onChange={(e) => set("name", e.target.value)}
-              placeholder="code-reviewer"
-            />
-          </Field>
-          <Field label="Quand m'utiliser (sert au routing auto plus tard)">
-            <input
-              style={styles.input}
-              value={def.description}
-              onChange={(e) => set("description", e.target.value)}
-              placeholder="Quand je dois faire relire mon code Rust"
-            />
-          </Field>
-          <Field label="Instructions (system prompt)">
-            <textarea
-              style={{ ...styles.input, height: 180, fontFamily: "var(--font-mono)" }}
-              value={def.body}
-              onChange={(e) => set("body", e.target.value)}
-              placeholder="Tu es un reviewer Rust expert. Analyse le code…"
-            />
-          </Field>
-          <Field label="Modèle (vide = hérite du modèle actif du chat)">
-            <ModelPicker
-              model={def.model ?? ""}
-              onChange={(m) => set("model", m || undefined)}
-              className=""
-            />
-          </Field>
-          <Field label="Rôle moteur (skills + outils internes hérités)">
-            <select
-              style={styles.input}
-              value={def.baseRole}
-              onChange={(e) => set("baseRole", e.target.value)}
+
+        {showAllTabs && (
+          <div style={styles.drawerTabs}>
+            <button
+              type="button"
+              style={tab === "reglages" ? styles.drawerTabActive : styles.drawerTab}
+              onClick={() => setTab("reglages")}
             >
-              {BASE_ROLES.map((r) => (
-                <option key={r} value={r}>
-                  {r}
-                </option>
-              ))}
-            </select>
-          </Field>
-          {initial.isNew && (
-            <Field label="Emplacement">
-              <div style={{ display: "flex", gap: 8 }}>
-                <ScopeRadio
-                  selected={def.scope}
-                  value="workspace"
-                  label="📁 Ce projet (.claude/agents/)"
-                  onChange={(v) => set("scope", v)}
-                />
-                <ScopeRadio
-                  selected={def.scope}
-                  value="global"
-                  label="🌐 Global (~/.claude/agents/)"
-                  onChange={(v) => set("scope", v)}
-                />
-              </div>
-            </Field>
-          )}
-          <Field label="État">
-            <label style={{ display: "inline-flex", alignItems: "center" }}>
-              <input
-                type="checkbox"
-                checked={def.enabled}
-                onChange={(e) => set("enabled", e.target.checked)}
-                style={{ marginRight: 6 }}
-              />
-              {def.enabled ? "Actif" : "Brouillon"}
-            </label>
-          </Field>
-        </div>
-        <div style={styles.drawerFooter}>
-          {onDelete && (
-            <button style={styles.btnDanger} onClick={() => void onDelete()}>
-              Supprimer
+              🪄 Réglages
             </button>
-          )}
-          <div style={{ flex: 1 }} />
-          <button style={styles.btnGhost} onClick={onClose}>
-            Annuler
-          </button>
-          <button
-            style={{
-              ...styles.btnPrimary,
-              opacity: canSave && !saving ? 1 : 0.5,
-              cursor: canSave && !saving ? "pointer" : "not-allowed",
-            }}
-            disabled={!canSave || saving}
-            onClick={() => void onSave(def)}
-          >
-            {saving ? "Enregistrement…" : "Enregistrer"}
-          </button>
-        </div>
+            <button
+              type="button"
+              style={tab === "source" ? styles.drawerTabActive : styles.drawerTab}
+              onClick={() => setTab("source")}
+              title="Édition brute du fichier .md (frontmatter YAML + body markdown)"
+            >
+              📝 Source .md
+            </button>
+            <button
+              type="button"
+              style={tab === "activite" ? styles.drawerTabActive : styles.drawerTab}
+              onClick={() => setTab("activite")}
+              title="Runs actifs de cet agent (transcript live)"
+            >
+              📊 Activité
+            </button>
+          </div>
+        )}
+
+        {tab === "reglages" && (
+          <>
+            <div style={styles.drawerBody}>
+              <Field label="Nom (lettres, chiffres, '-' ou '_')">
+                <input
+                  style={styles.input}
+                  value={def.name}
+                  onChange={(e) => set("name", e.target.value)}
+                  placeholder="code-reviewer"
+                />
+              </Field>
+              <Field label="Quand m'utiliser (une phrase courte)">
+                <input
+                  style={styles.input}
+                  value={def.description}
+                  onChange={(e) => set("description", e.target.value)}
+                  placeholder="Quand je dois faire relire mon code Rust"
+                />
+              </Field>
+              <Field label="Instructions données à l'assistant">
+                <textarea
+                  style={{ ...styles.input, height: 180, fontFamily: "var(--font-mono)" }}
+                  value={def.body}
+                  onChange={(e) => set("body", e.target.value)}
+                  placeholder="Tu es un reviewer Rust expert. Analyse le code…"
+                />
+              </Field>
+              <Field label="Modèle (vide = hérite du modèle actif du chat)">
+                <ModelPicker
+                  model={def.model ?? ""}
+                  onChange={(m) => set("model", m || undefined)}
+                  className=""
+                />
+              </Field>
+              <Field label="Spécialité (skills hérités)">
+                <select
+                  style={styles.input}
+                  value={def.baseRole}
+                  onChange={(e) => set("baseRole", e.target.value)}
+                >
+                  {BASE_ROLES.map((r) => (
+                    <option key={r} value={r}>
+                      {r}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <ToolsField tools={def.tools} onChange={(t) => set("tools", t)} />
+              {initial.isNew && (
+                <Field label="Emplacement">
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <ScopeRadio
+                      selected={def.scope}
+                      value="workspace"
+                      label="📁 Ce projet (.claude/agents/)"
+                      onChange={(v) => set("scope", v)}
+                    />
+                    <ScopeRadio
+                      selected={def.scope}
+                      value="global"
+                      label="🌐 Global (~/.claude/agents/)"
+                      onChange={(v) => set("scope", v)}
+                    />
+                  </div>
+                </Field>
+              )}
+              <Field label="État">
+                <label style={{ display: "inline-flex", alignItems: "center" }}>
+                  <input
+                    type="checkbox"
+                    checked={def.enabled}
+                    onChange={(e) => set("enabled", e.target.checked)}
+                    style={{ marginRight: 6 }}
+                  />
+                  {def.enabled ? "Actif" : "Brouillon"}
+                </label>
+              </Field>
+            </div>
+            <div style={styles.drawerFooter}>
+              {onDelete && (
+                <button style={styles.btnDanger} onClick={() => void onDelete()}>
+                  Supprimer
+                </button>
+              )}
+              <div style={{ flex: 1 }} />
+              <button style={styles.btnGhost} onClick={onClose}>
+                Annuler
+              </button>
+              <button
+                style={{
+                  ...styles.btnPrimary,
+                  opacity: canSave && !saving ? 1 : 0.5,
+                  cursor: canSave && !saving ? "pointer" : "not-allowed",
+                }}
+                disabled={!canSave || saving}
+                onClick={() => void onSave(def)}
+              >
+                {saving ? "Enregistrement…" : "Enregistrer"}
+              </button>
+            </div>
+          </>
+        )}
+
+        {tab === "source" && showAllTabs && <SourceTab path={initial.path} />}
+
+        {tab === "activite" && showAllTabs && <ActiviteTab def={initial} />}
       </div>
     </>
   );
@@ -374,6 +423,335 @@ function ScopeRadio({
     >
       {label}
     </button>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Sélecteur d'outils — toggles visuels en langage humain
+// ─────────────────────────────────────────────────────────────────────
+
+// Tools "connus" gérés par les toggles ci-dessous. Tout autre tool (MCP, custom)
+// passe par le champ "Outils avancés" et est préservé tel quel.
+const KNOWN_TOOLS = new Set(["read", "write", "edit", "bash"]);
+
+function ToolsField({
+  tools,
+  onChange,
+}: {
+  tools: string[];
+  onChange: (t: string[]) => void;
+}) {
+  const has = (t: string) => tools.includes(t);
+  const setTool = (t: string, on: boolean) => {
+    if (on && !has(t)) onChange([...tools, t]);
+    if (!on && has(t)) onChange(tools.filter((x) => x !== t));
+  };
+  // "Modifier mes fichiers" couvre `write` ET `edit` ensemble (les deux outils
+  // remplissent le même rôle côté UX : altérer un fichier existant).
+  const hasWriteEdit = has("write") || has("edit");
+  const setWriteEdit = (on: boolean) => {
+    const rest = tools.filter((x) => x !== "write" && x !== "edit");
+    onChange(on ? [...rest, "write", "edit"] : rest);
+  };
+  const customTools = tools.filter((t) => !KNOWN_TOOLS.has(t));
+
+  return (
+    <Field label="Capacités">
+      <div style={styles.toolToggles}>
+        <ToolToggle
+          icon="🔧"
+          label="Peut lire mes fichiers"
+          desc="Tools : read"
+          on={has("read")}
+          onChange={(on) => setTool("read", on)}
+        />
+        <ToolToggle
+          icon="✏️"
+          label="Peut modifier mes fichiers"
+          desc="Tools : write, edit"
+          on={hasWriteEdit}
+          onChange={setWriteEdit}
+        />
+        <ToolToggle
+          icon="💻"
+          label="Peut lancer des commandes système"
+          desc="Tools : bash — ⚠️ exécution de code arbitraire (sandbox Docker)"
+          danger
+          on={has("bash")}
+          onChange={(on) => setTool("bash", on)}
+        />
+        <ToolToggle
+          icon="🌐"
+          label="Peut chercher sur le web"
+          desc="(à venir — via serveurs MCP)"
+          disabled
+          on={false}
+          onChange={() => {}}
+        />
+      </div>
+      <details style={styles.advancedTools}>
+        <summary style={styles.advancedToolsSummary}>
+          Outils avancés (MCP, tools custom)
+        </summary>
+        <input
+          style={{ ...styles.input, marginTop: 8 }}
+          value={customTools.join(", ")}
+          onChange={(e) => {
+            const customs = e.target.value
+              .split(",")
+              .map((x) => x.trim())
+              .filter(Boolean);
+            const knowns = tools.filter((t) => KNOWN_TOOLS.has(t));
+            onChange([...knowns, ...customs]);
+          }}
+          placeholder="ex : mcp__notion__search, mcp__figma__get_design"
+        />
+      </details>
+    </Field>
+  );
+}
+
+function ToolToggle({
+  icon,
+  label,
+  desc,
+  on,
+  onChange,
+  danger,
+  disabled,
+}: {
+  icon: string;
+  label: string;
+  desc: string;
+  on: boolean;
+  onChange: (on: boolean) => void;
+  danger?: boolean;
+  disabled?: boolean;
+}) {
+  return (
+    <label
+      style={{
+        display: "flex",
+        alignItems: "flex-start",
+        gap: 10,
+        padding: "8px 10px",
+        borderRadius: 8,
+        background: on
+          ? danger
+            ? "rgba(255,107,107,0.10)"
+            : "rgba(138,239,199,0.08)"
+          : "rgba(255,255,255,0.02)",
+        border: `1px solid ${
+          on
+            ? danger
+              ? "rgba(255,107,107,0.30)"
+              : "rgba(138,239,199,0.25)"
+            : "rgba(255,255,255,0.06)"
+        }`,
+        cursor: disabled ? "not-allowed" : "pointer",
+        opacity: disabled ? 0.4 : 1,
+      }}
+    >
+      <input
+        type="checkbox"
+        checked={on}
+        onChange={(e) => onChange(e.target.checked)}
+        disabled={disabled}
+        style={{ marginTop: 2 }}
+      />
+      <span style={{ fontSize: 18, lineHeight: 1 }}>{icon}</span>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div
+          style={{
+            fontSize: 12.5,
+            fontWeight: 600,
+            color: "var(--on-surface)",
+          }}
+        >
+          {label}
+        </div>
+        <div
+          style={{
+            fontSize: 11,
+            color: danger ? "var(--error, #ff6b6b)" : "var(--on-surface-muted)",
+            marginTop: 2,
+            fontFamily: desc.startsWith("Tools") ? "var(--font-mono)" : "inherit",
+          }}
+        >
+          {desc}
+        </div>
+      </div>
+    </label>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Onglet "Source `.md`" — édition raw du fichier via CodeMirror
+// ─────────────────────────────────────────────────────────────────────
+
+function SourceTab({ path }: { path: string }) {
+  const [content, setContent] = useState<string | null>(null);
+  const [lastSaved, setLastSaved] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  // Lecture initiale (une fois par path). On garde `lastSaved` pour distinguer
+  // l'état "modifié non sauvé" vs "à jour" sans déclencher de save inutile.
+  useEffect(() => {
+    let cancelled = false;
+    setContent(null);
+    setLastSaved(null);
+    setError(null);
+    readAgentDefRaw(path)
+      .then((c) => {
+        if (cancelled) return;
+        setContent(c);
+        setLastSaved(c);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setError(String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [path]);
+
+  // Sauvegarde debounced — 600 ms après la dernière frappe. Pas de save
+  // pendant le chargement initial (content === null) ni si rien n'a changé.
+  useEffect(() => {
+    if (content === null || lastSaved === null || content === lastSaved) return;
+    setSaving(true);
+    const t = setTimeout(() => {
+      writeAgentDefRaw(path, content)
+        .then(() => {
+          setLastSaved(content);
+          setError(null);
+        })
+        .catch((e) => setError(String(e)))
+        .finally(() => setSaving(false));
+    }, 600);
+    return () => clearTimeout(t);
+  }, [content, lastSaved, path]);
+
+  if (error) {
+    return (
+      <div style={{ padding: 16, color: "var(--error, #ff6b6b)", fontSize: 12.5 }}>
+        Erreur : {error}
+      </div>
+    );
+  }
+  if (content === null) {
+    return (
+      <div style={{ padding: 16, color: "var(--on-surface-muted)" }}>Chargement…</div>
+    );
+  }
+
+  const status =
+    saving
+      ? "Enregistrement…"
+      : content === lastSaved
+        ? "✓ Enregistré"
+        : "Modifié (sauvegarde dans une seconde…)";
+
+  return (
+    <div style={styles.sourceTab}>
+      <div style={styles.sourceMeta}>
+        <span style={styles.sourcePath}>{path}</span>
+        <span style={{ flex: 1 }} />
+        <span style={styles.sourceStatus}>{status}</span>
+      </div>
+      <div style={styles.sourceEditor}>
+        <CodeMirrorEditor
+          path={path}
+          value={content}
+          onChange={setContent}
+          gitDecorations={false}
+          gitBlameEnabled={false}
+          blame={null}
+          tabAutocomplete={false}
+        />
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Onglet "Activité" — runs actifs de cet agent + clic → transcript
+// ─────────────────────────────────────────────────────────────────────
+
+function ActiviteTab({ def }: { def: AgentDef }) {
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const { data: agents = [] } = useActiveAgents();
+
+  // Filtre client-side : un AgentRow matche cette définition si son `role` est
+  // soit le nom de la def (cas slash-command `/code-reviewer …`) soit la
+  // spécialité moteur (`baseRole`). v1 = active only ; recent/historical
+  // demanderait une commande Tauri dédiée (follow-up).
+  const matching = agents.filter(
+    (a) => a.role === def.name || a.role === def.baseRole,
+  );
+
+  if (selectedAgentId) {
+    return (
+      <TranscriptDrawer
+        agentId={selectedAgentId}
+        onClose={() => setSelectedAgentId(null)}
+      />
+    );
+  }
+
+  if (matching.length === 0) {
+    return (
+      <div style={styles.activityEmpty}>
+        <div style={{ fontSize: 32, marginBottom: 12 }}>💤</div>
+        <div style={{ fontSize: 13, color: "var(--on-surface)" }}>
+          Aucun run actif de cet agent en ce moment.
+        </div>
+        <div
+          style={{
+            fontSize: 11,
+            marginTop: 10,
+            color: "var(--on-surface-muted)",
+          }}
+        >
+          Lance-le via{" "}
+          <code style={styles.code}>/{def.name}</code> dans le chat — il
+          apparaîtra ici en direct.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.activityList}>
+      <div style={styles.activityCount}>
+        {matching.length} run{matching.length > 1 ? "s" : ""} actif
+        {matching.length > 1 ? "s" : ""} :
+      </div>
+      {matching.map((a) => (
+        <button
+          key={a.id}
+          type="button"
+          onClick={() => setSelectedAgentId(a.id)}
+          style={styles.activityRow}
+        >
+          <span
+            style={{
+              fontSize: 16,
+              color:
+                a.status === "running" ? "var(--primary)" : "var(--on-surface-muted)",
+            }}
+          >
+            {a.status === "running" ? "●" : "○"}
+          </span>
+          <span style={styles.activityTask}>
+            {a.task || "(tâche sans description)"}
+          </span>
+          <span style={styles.activityStatus}>{a.status}</span>
+        </button>
+      ))}
+    </div>
   );
 }
 
@@ -688,5 +1066,132 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 12.5,
     fontFamily: "inherit",
     fontWeight: 600,
+  },
+
+  // ── Drawer tabs (Réglages / Source / Activité) ──
+  drawerTabs: {
+    display: "flex",
+    gap: 4,
+    padding: "8px 12px 0",
+    borderBottom: "1px solid rgba(255,255,255,0.06)",
+  },
+  drawerTab: {
+    background: "transparent",
+    border: 0,
+    padding: "8px 12px",
+    borderBottom: "2px solid transparent",
+    color: "var(--on-surface-muted)",
+    cursor: "pointer",
+    fontSize: 12,
+    fontFamily: "inherit",
+    marginBottom: -1,
+  },
+  drawerTabActive: {
+    background: "transparent",
+    border: 0,
+    padding: "8px 12px",
+    borderBottom: "2px solid var(--primary, #e08efe)",
+    color: "var(--primary, #e08efe)",
+    cursor: "pointer",
+    fontSize: 12,
+    fontFamily: "inherit",
+    fontWeight: 600,
+    marginBottom: -1,
+  },
+
+  // ── ToolsField : toggles visuels + tools custom dans <details> ──
+  toolToggles: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+  },
+  advancedTools: {
+    marginTop: 4,
+  },
+  advancedToolsSummary: {
+    fontSize: 11,
+    color: "var(--on-surface-muted)",
+    cursor: "pointer",
+    padding: "4px 2px",
+  },
+
+  // ── Onglet Source `.md` : meta + éditeur CodeMirror ──
+  sourceTab: {
+    display: "flex",
+    flexDirection: "column",
+    flex: 1,
+    minHeight: 0,
+    padding: 0,
+  },
+  sourceMeta: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    padding: "8px 16px",
+    fontSize: 11,
+    color: "var(--on-surface-muted)",
+    borderBottom: "1px solid rgba(255,255,255,0.04)",
+  },
+  sourcePath: {
+    fontFamily: "var(--font-mono)",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+    flexShrink: 1,
+    minWidth: 0,
+  },
+  sourceStatus: {
+    flexShrink: 0,
+  },
+  sourceEditor: {
+    flex: 1,
+    minHeight: 0,
+    overflow: "hidden",
+    position: "relative",
+  },
+
+  // ── Onglet Activité : liste des runs actifs ──
+  activityEmpty: {
+    padding: "48px 24px",
+    textAlign: "center",
+  },
+  activityList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+    padding: "12px 16px",
+    overflowY: "auto",
+  },
+  activityCount: {
+    fontSize: 11,
+    color: "var(--on-surface-muted)",
+    marginBottom: 4,
+  },
+  activityRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    padding: "10px 12px",
+    borderRadius: 8,
+    background: "rgba(124,58,237,0.06)",
+    border: "1px solid rgba(124,58,237,0.20)",
+    color: "var(--on-surface)",
+    cursor: "pointer",
+    textAlign: "left",
+    fontFamily: "inherit",
+    fontSize: 12,
+  },
+  activityTask: {
+    flex: 1,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+    minWidth: 0,
+  },
+  activityStatus: {
+    fontSize: 10,
+    color: "var(--on-surface-muted)",
+    fontFamily: "var(--font-mono)",
+    flexShrink: 0,
   },
 };

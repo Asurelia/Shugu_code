@@ -502,6 +502,51 @@ pub async fn agent_def_delete(path: String) -> Result<(), String> {
     std::fs::remove_file(&p).map_err(|e| format!("remove {}: {e}", p.display()))
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Raw `.md` read / write — utilisés par l'onglet "Source `.md`" du drawer
+// AgentDefsManager (pont IDE pour les devs : édition raw du frontmatter YAML
+// + body markdown via CodeMirror, sans passer par le formulaire structuré).
+// Même garde-chemin que delete (parent dir `agents/`) + check extension `.md`.
+// ─────────────────────────────────────────────────────────────────────────
+
+fn guard_md_in_agents_dir(p: &Path) -> Result<(), String> {
+    let parent_name = p
+        .parent()
+        .and_then(|x| x.file_name())
+        .and_then(|x| x.to_str())
+        .unwrap_or_default();
+    if parent_name != "agents" {
+        return Err("refus : le path n'est pas dans un dossier `agents/`".into());
+    }
+    if p.extension().and_then(|x| x.to_str()) != Some("md") {
+        return Err("refus : extension `.md` requise".into());
+    }
+    Ok(())
+}
+
+/// Lit le contenu BRUT d'un `.md` agent (frontmatter YAML + body markdown) —
+/// pour l'onglet "Source `.md`" qui expose l'édition raw aux devs.
+#[tauri::command]
+pub async fn agent_def_read_raw(path: String) -> Result<String, String> {
+    let p = PathBuf::from(&path);
+    guard_md_in_agents_dir(&p)?;
+    std::fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display()))
+}
+
+/// Écrit le contenu BRUT d'un `.md` agent (édition raw). Atomique (tmp+rename)
+/// pour qu'un crash ne laisse pas un fichier tronqué. Si le frontmatter YAML
+/// devient invalide après l'édition, `agent_def_list` skippera ce fichier au
+/// prochain refetch (best-effort) jusqu'à ce que le dev corrige.
+#[tauri::command]
+pub async fn agent_def_write_raw(path: String, content: String) -> Result<(), String> {
+    let p = PathBuf::from(&path);
+    guard_md_in_agents_dir(&p)?;
+    let tmp = p.with_extension("md.tmp");
+    std::fs::write(&tmp, &content).map_err(|e| format!("write tmp: {e}"))?;
+    std::fs::rename(&tmp, &p).map_err(|e| format!("rename {}: {e}", p.display()))?;
+    Ok(())
+}
+
 /// Charge une définition d'agent depuis un path absolu — helper sync utilisé
 /// par `agent_spawn` quand `agent_def_path` est fourni. Pas `#[tauri::command]`
 /// (pas exposé directement à JS — `agent_def_read` joue ce rôle côté UI).

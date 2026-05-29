@@ -40,9 +40,8 @@ import {
 } from "@/features/tweaks/tweaks-panel";
 import { shiftHsl } from "@/lib/colors";
 
-import { seedGenerations } from "@/mocks/seedGenerations";
 import { seedGalleryFolders } from "@/mocks/seedGalleryFolders";
-import type { DockState, FileNode } from "@/lib/types";
+import type { DockState, FileNode, Generation } from "@/lib/types";
 import { db, seedIfEmpty, toGenerationRow } from "@/lib/db";
 import { useActiveConv, createConversation, sendChatMessage } from "@/features/chat/chat-sync";
 import { loadOpenFiles, saveOpenFiles } from "@/lib/ide-state";
@@ -411,8 +410,10 @@ export function RootLayout() {
   const [fileContents, setFileContents] = useState<Record<string, any>>({});
   const [filesPanelActive, setFilesPanelActive] = useState("");
 
-  // Image / gallery state
-  const [generations, setGenerations] = useState(seedGenerations);
+  // Image / gallery state — vrai état (vide tant qu'aucune génération n'a été
+  // produite via `image_generate`). Le mock `seedGenerations` (18 fausses cartes)
+  // a été retiré ; la galerie sera honnêtement vide jusqu'à un vrai usage.
+  const [generations, setGenerations] = useState<Generation[]>([]);
 
   /**
    * Write-through wrapper: whenever a generation is ADDED (new id appears),

@@ -668,10 +668,7 @@ export async function seedIfEmpty(): Promise<void> {
 
   if (!conversationsAlreadySeeded) {
     // Lazy-import seed data to avoid circular dependency at module level
-    const [{ SEED_CONVOS }, { seedGenerations }] = await Promise.all([
-      import("@/features/chat/chat-sidebar"),
-      import("@/mocks/seedGenerations"),
-    ]);
+    const { SEED_CONVOS } = await import("@/features/chat/chat-sidebar");
 
     // Flatten conversations (including children with parent_id)
     const allConvos: ConvoUI[] = [];
@@ -685,25 +682,8 @@ export async function seedIfEmpty(): Promise<void> {
     }
 
     await conversations.upsertMany(allConvos.map(convoToRow));
-
-    // Seed generations — coerce types to match DDL (id: TEXT, ts: INTEGER)
-    const genRows: GenerationRow[] = seedGenerations.map((g, i) => ({
-      id: String(g.id),
-      prompt: g.prompt,
-      negative: null,
-      ratio: g.ratio ?? null,
-      model: g.model ?? null,
-      seed: g.seed ?? null,
-      steps: g.steps ?? null,
-      guidance: g.guidance ?? null,
-      style: g.style ?? null,
-      hue: g.hue ?? null,
-      status: null,
-      result_url: null,
-      ts: Date.now() - (18 - i) * 60_000,
-    }));
-
-    await generations.upsertMany(genRows);
+    // (Le seed des 18 fausses générations dans `generations` a été retiré —
+    //  la galerie part désormais honnêtement vide.)
   }
 
   // ─── Seed messages for the c1 conversation if it has none yet ──────────

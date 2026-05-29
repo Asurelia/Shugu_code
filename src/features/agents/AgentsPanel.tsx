@@ -41,6 +41,14 @@ function previewOrigin(): string {
   return isWin ? "http://preview.localhost" : "preview://localhost";
 }
 
+// Flag de parking de l'UI Atelier (2026-05-29). L'Atelier (build → test
+// Playwright Docker → learn) reste câblé côté backend (commande
+// `agent_atelier_run`, `ATELIER_PROMPT`, sandbox Docker, image
+// `shugu-playwright:1.60`), mais son UI est masquée tant qu'elle n'a pas été
+// validée end-to-end et que son utilité produit n'est pas tranchée. Repasser
+// à `true` pour réactiver la carte launcher + bouton Démo.
+const ATELIER_UI_ENABLED = false;
+
 // Preset for the "Démo : to-do list" button — a small but genuinely interactive
 // app the agent must build AND verify by driving a real browser.
 const ATELIER_TODO_PRESET =
@@ -168,7 +176,7 @@ function AgentRowItem({
 //   messages intermédiaires) pour éviter le coût DOM qui causait le freeze.
 // ────────────────────────────────────────────────────────────────────
 
-function TranscriptDrawer({
+export function TranscriptDrawer({
   agentId,
   onClose,
 }: {
@@ -641,7 +649,11 @@ export function AgentsPanel() {
         </span>
       </div>
 
-      {/* Atelier — env-grounded build → test → learn loop */}
+      {/* Atelier — env-grounded build → test → learn loop. PARQUÉ 2026-05-29
+          derrière `ATELIER_UI_ENABLED` : code backend intact (`agent_atelier_run`,
+          sandbox Docker, image Playwright), UI masquée le temps qu'on tranche
+          son utilité produit. La carte revient en flippant le flag. */}
+      {ATELIER_UI_ENABLED && (
       <div
         style={{
           marginBottom: 12,
@@ -733,6 +745,7 @@ export function AgentsPanel() {
           </div>
         )}
       </div>
+      )}
 
       {isLoading ? (
         <div
