@@ -33,3 +33,19 @@ export const agentKeys = {
    *  AgentsPanel (qui consomme pour afficher le drawer). */
   selected: () => [...agentKeys.all, "selected"] as const,
 };
+
+// ─────────────────────────────────────────────────────────────────────
+// Définitions d'agents portables (.md format Claude Code).
+//
+// Disjoint d'`agentKeys` qui traque les RUNS. Ces clés ciblent les
+// fichiers sur disque (~/.claude/agents/*.md, <ws>/.claude/agents/*.md).
+// Le scope est typé `string` localement pour éviter un import croisé
+// avec `@/lib/agentDefs` ; les consommateurs passent leur AgentDefScope
+// (sous-type de string) sans cast.
+// ─────────────────────────────────────────────────────────────────────
+
+export const agentDefKeys = {
+  all: ["agent-defs"] as const,
+  lists: () => [...agentDefKeys.all, "list"] as const,
+  list: (scope: string) => [...agentDefKeys.lists(), scope] as const,
+};

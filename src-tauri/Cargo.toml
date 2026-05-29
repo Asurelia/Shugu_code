@@ -41,6 +41,13 @@ notify = "6"
 portable-pty = "0.8"
 which = "6"
 
+# Frontmatter parser pour les définitions d'agents/skills au format
+# Claude Code (.md avec en-tête YAML). gray_matter sépare frontmatter et
+# body ; serde_yaml fait la (dé)sérialisation typée du frontmatter via les
+# structs du module commands::agent_defs.
+gray_matter = "0.2"
+serde_yaml = "0.9"
+
 # Git read-side ops (status, log, blame, diff) via libgit2 bindings.
 # `vendored-libgit2` bundle libgit2 — pas de dep système. NE PAS activer
 # `vendored-openssl` : sur Windows libgit2 utilise Schannel par défaut, et
@@ -75,6 +82,10 @@ percent-encoding = "2"
 # resolves to the right native backend on each platform.
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
+# Junction NTFS pour lier `.shugu/agents` → `.claude/agents` sans demander
+# de privilèges (contrairement aux symlinks Windows qui exigent le mode
+# développeur ou UAC). Côté Unix on utilise `std::os::unix::fs::symlink`.
+junction = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }

@@ -9,7 +9,7 @@
 //
 // highlightRust returns JSX tokens (no innerHTML injection — XSS-safe).
 
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { useNavigate } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
@@ -20,6 +20,7 @@ import { useMessages, sendChatMessage, useActiveModel } from "./chat-sync";
 import { ModelPicker } from "@/features/panels/panels";
 import { resolveImageProvider } from "@/lib/imageProviders";
 import { revealAgent } from "@/lib/agents";
+import { useAgentDefs } from "@/features/agents/agentDefsQueries";
 import { useMessageDisplay } from "./useMessageDisplay";
 import { useShell } from "@/routes/shell-context";
 import { CodeMirrorEditor } from "@/features/code/CodeMirrorEditor";
@@ -118,24 +119,117 @@ export function ChatView({
     inputRef.current?.focus();
   }, []);
 
+  // Agents disponibles via slash commands (`/code-reviewer ...`). Source =
+  // `.md` sur disque (`~/.claude/agents/*.md` + workspace), refetch on focus.
+  const { data: agentDefs } = useAgentDefs("all");
+  const enabledAgents = useMemo(
+    () => (agentDefs ?? []).filter((d) => d.enabled),
+    [agentDefs],
+  );
+
+  // Palette de slash commands : ouverte dès que l'input commence par `/`. On
+  // peut soit continuer à taper pour filtrer + Tab/↵ pour compléter, soit
+  // taper directement `/<nom> texte` et le parser au send. Esc vide l'input.
+  const [slashIndex, setSlashIndex] = useState(0);
+  const slashFilter = useMemo(() => {
+    const trimmed = input.trimStart();
+    if (!trimmed.startsWith("/")) return null;
+    return trimmed.slice(1).split(/\s/)[0] ?? "";
+  }, [input]);
+  const slashMatches = useMemo(() => {
+    if (slashFilter === null) return [];
+    const f = slashFilter.toLowerCase();
+    return enabledAgents.filter((d) => d.name.toLowerCase().startsWith(f));
+  }, [enabledAgents, slashFilter]);
+  const slashOpen = slashFilter !== null && slashMatches.length > 0;
+  useEffect(() => {
+    if (slashIndex >= slashMatches.length) setSlashIndex(0);
+  }, [slashMatches.length, slashIndex]);
+
+  /** Remplace le préfixe `/<filter>` par `/<name> ` et refocus le textarea. */
+  const applySlash = useCallback(
+    (name: string) => {
+      const trimmed = input.trimStart();
+      const rest = trimmed.startsWith("/")
+        ? trimmed.slice(1).split(/\s/).slice(1).join(" ")
+        : "";
+      setInput(rest ? `/${name} ${rest}` : `/${name} `);
+      setSlashIndex(0);
+      setTimeout(() => inputRef.current?.focus(), 0);
+    },
+    [input],
+  );
+
   const send = useCallback(async () => {
-    const text = input.trim();
-    if (!text && !pendingImage) return;
+    const raw = input.trim();
+    if (!raw && !pendingImage) return;
+    // Parse une éventuelle slash command : `/<nom> reste du message`. Si le
+    // nom matche un agent enabled, on consomme le `/<nom>` et on passe son
+    // path à sendChatMessage (qui forcera la délégation côté chat-sync).
+    let text = raw;
+    let agentDefPath: string | undefined;
+    if (raw.startsWith("/")) {
+      const match = raw.match(/^\/(\S+)\s*([\s\S]*)$/);
+      if (match) {
+        const [, name, rest] = match;
+        const hit = enabledAgents.find((d) => d.name === name);
+        if (hit) {
+          agentDefPath = hit.path;
+          text = rest.trim();
+        }
+      }
+    }
+    if (!text && !pendingImage) return; // slash sans contenu : no-op
     setInput("");
     const imageToSend = pendingImage;
     setPendingImage(null);
     setTyping(true);
     chatStream.start();
     try {
-      await sendChatMessage(activeConv, text, model, imageToSend ?? undefined);
+      await sendChatMessage(
+        activeConv,
+        text,
+        model,
+        imageToSend ?? undefined,
+        agentDefPath,
+      );
     } finally {
       setTyping(false);
       chatStream.stop();
     }
-  }, [input, pendingImage, model, activeConv, chatStream]);
+  }, [input, pendingImage, model, activeConv, chatStream, enabledAgents]);
 
   const onKey = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); }
+    if (slashOpen) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setSlashIndex((i) => Math.min(i + 1, slashMatches.length - 1));
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setSlashIndex((i) => Math.max(i - 1, 0));
+        return;
+      }
+      if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+        const hit = slashMatches[slashIndex];
+        if (hit) {
+          e.preventDefault();
+          applySlash(hit.name);
+          return;
+        }
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        // Vide l'input pour fermer la palette (le `/` qui restait la rouvrirait).
+        setInput("");
+        return;
+      }
+    }
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      void send();
+    }
   };
 
   // Open a workspace file from an action card → reveal the in-chat split
@@ -187,7 +281,79 @@ export function ChatView({
 
   const composer = (
     <>
-      <div className="cx-composer">
+      <div className="cx-composer" style={{ position: "relative" }}>
+        {slashOpen && (
+          <div
+            style={{
+              position: "absolute",
+              bottom: "calc(100% + 6px)",
+              left: 0,
+              right: 0,
+              maxHeight: 260,
+              overflowY: "auto",
+              background: "rgba(20,16,38,0.96)",
+              backdropFilter: "blur(20px) saturate(180%)",
+              border: "1px solid rgba(255,255,255,0.08)",
+              borderRadius: 10,
+              boxShadow: "0 18px 44px -18px rgba(0,0,0,0.7)",
+              padding: 6,
+              zIndex: 50,
+            }}
+          >
+            <div
+              style={{
+                padding: "4px 10px 6px",
+                fontSize: 10,
+                textTransform: "uppercase",
+                letterSpacing: 0.5,
+                color: "var(--on-surface-muted)",
+                fontFamily: "var(--font-mono)",
+              }}
+            >
+              Agents · ↑↓ naviguer · Tab/↵ insérer · Esc annuler
+            </div>
+            {slashMatches.map((d, i) => (
+              <button
+                key={d.path}
+                type="button"
+                onClick={() => applySlash(d.name)}
+                onMouseEnter={() => setSlashIndex(i)}
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  width: "100%",
+                  textAlign: "left",
+                  padding: "6px 10px",
+                  borderRadius: 6,
+                  background:
+                    i === slashIndex
+                      ? "rgba(224,142,254,0.14)"
+                      : "transparent",
+                  border: 0,
+                  color: "var(--on-surface)",
+                  cursor: "pointer",
+                  fontFamily: "inherit",
+                }}
+              >
+                <span style={{ fontWeight: 600, fontSize: 13 }}>
+                  /{d.name}
+                </span>
+                <span
+                  style={{
+                    fontSize: 11,
+                    color: "var(--on-surface-muted)",
+                    marginTop: 2,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {d.description || "—"}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
         {pendingImage && (
           <div className="cx-pending">
             <img src={pendingImage} alt="pending attachment" />

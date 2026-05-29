@@ -892,7 +892,7 @@ Rules:
 /// Seed system prompt for a role (chat path). Served verbatim by
 /// `load_active_harness` — the Refiner that used to evolve it is retired, so this
 /// is the agent's stable prompt; learning now lives in the skill library.
-fn seed_prompt(role: &str) -> String {
+pub(crate) fn seed_prompt(role: &str) -> String {
     // Why this prompt is so directive: cloud LLMs (DeepSeek, GLM, Kimi, …) tend
     // to default to "respond from training data" when the system prompt is soft
     // ("you have access to tools, use them when needed"). The user repeatedly

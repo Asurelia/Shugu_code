@@ -1,3 +1,4 @@
+pub mod agent_defs;
 pub mod agents;
 pub mod chat;
 pub mod credentials;

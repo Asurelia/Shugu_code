@@ -58,7 +58,7 @@ use uuid::Uuid;
 // Phase 1 runner submodule. Owns the real LLM call loop (synthetic emitter
 // of Phase 0 lives no more — `run_agent_task` in runner.rs replaces it).
 // Split out so this file stays under the CLAUDE.md 500-line ceiling.
-mod runner;
+pub(crate) mod runner;
 
 // Phase 2 tools submodule. Defines the closed set of file-system tools the
 // orchestrator can call (`fs_read_file`, `fs_write_file`, `fs_list_dir`),
@@ -98,7 +98,7 @@ const MAX_CONCURRENT_AGENTS: usize = 4;
 /// Roles we accept on the spawn path. Stored as TEXT in the DB so the set
 /// stays soft-extensible (a Phase 2 contributor can add "reviewer" by
 /// editing this slice without a migration).
-const ALLOWED_ROLES: &[&str] = &[
+pub(crate) const ALLOWED_ROLES: &[&str] = &[
     "mascot",
     "orchestrator",
     "coder",
@@ -318,6 +318,10 @@ pub struct SpawnArgs {
     /// Only the Studio "Generate" passes it; chat delegation leaves it None
     /// (zero impact on the existing delegate path).
     pub design_context: Option<String>,
+    /// Path absolu d'un fichier `.md` (format Claude Code) définissant un
+    /// agent custom. Si fourni, son frontmatter remplace `role`/`model` et
+    /// son body devient le `system_prompt_override` envoyé au runner.
+    pub agent_def_path: Option<String>,
 }
 
 /// Arguments for an Atelier run (env-grounded build→test→learn loop). Mirrors the
@@ -505,8 +509,24 @@ pub(super) fn persist_and_emit(app: &tauri::AppHandle, event: &AgentEvent) -> Re
 pub async fn agent_spawn(
     app: tauri::AppHandle,
     state: State<'_, AgentManagerState>,
-    args: SpawnArgs,
+    mut args: SpawnArgs,
 ) -> Result<String, String> {
+    // Agent custom (`.md` format Claude Code) ? Charge la définition et écrase
+    // role/model par ses valeurs. Le body devient le `system_prompt_override`
+    // — le runner accepte déjà ce levier ([runner.rs] system_prompt_override).
+    // Sinon : comportement historique (role brut, seed_prompt par défaut).
+    let system_prompt_override: Option<String> = match args.agent_def_path.as_deref() {
+        Some(p) if !p.is_empty() => {
+            let def = crate::commands::agent_defs::load_def(p)?;
+            args.role = def.base_role;
+            if let Some(m) = def.model {
+                args.model = m;
+            }
+            Some(def.body)
+        }
+        _ => None,
+    };
+
     if !is_role_allowed(&args.role) {
         return Err(format!("invalid role: {}", args.role));
     }
@@ -602,6 +622,7 @@ pub async fn agent_spawn(
     let api_key_for_task = args.api_key.clone();
     let chat_template_kwargs_for_task = args.chat_template_kwargs.clone();
     let design_context_for_task = args.design_context.clone();
+    let system_prompt_override_for_task = system_prompt_override;
     tauri::async_runtime::spawn(async move {
         runner::run_agent_task(
             app_for_task,
@@ -618,7 +639,7 @@ pub async fn agent_spawn(
             abort_token,
             None,  // workspace_override — chat works on the real open workspace
             false, // allow_exec — chat never executes; only the Atelier does
-            None,  // system_prompt_override — chat uses the role's seed prompt
+            system_prompt_override_for_task, // None ⇒ seed_prompt ; Some ⇒ .md custom
         )
         .await;
     });

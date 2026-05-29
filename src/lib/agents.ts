@@ -153,6 +153,10 @@ export interface SpawnArgs {
    * "Generate" sets this; chat delegation leaves it undefined (no impact on
    * the normal delegate path). Serializes to the Rust `design_context` field. */
   designContext?: string;
+  /** Path absolu d'un fichier `.md` (format Claude Code) définissant un
+   *  agent personnalisé. Si fourni, son frontmatter remplace `role`/`model`
+   *  et son body devient le system prompt. Voir [src/lib/agentDefs.ts]. */
+  agentDefPath?: string;
 }
 
 /** Spawn an agent. Returns the freshly minted agent id (UUID v4 string).

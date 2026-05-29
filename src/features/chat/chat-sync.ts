@@ -270,6 +270,7 @@ export async function sendChatMessage(
   text: string,
   modelId: string,
   imageDataUrl?: string,
+  agentDefPath?: string,
 ): Promise<void> {
   const trimmed = text.trim();
   // Allow empty text when an image is provided (image-only messages are valid).
@@ -299,10 +300,14 @@ export async function sendChatMessage(
   // `routing.delegateOverride` ("always-delegate" / "never-delegate").
   const overrideRaw = await db.settings.get("routing.delegateOverride");
   const delegateOverride = parseDelegateOverride(overrideRaw);
-  const route = resolveRoute(trimmed, delegateOverride);
+  // Si un agent custom est sélectionné, on force la délégation et on bypasse
+  // l'heuristique resolveRoute (l'utilisateur a explicitement choisi son agent).
+  const route = agentDefPath
+    ? ("delegate" as const)
+    : resolveRoute(trimmed, delegateOverride);
 
   if (route === "delegate") {
-    await handleDelegate(convId, trimmed);
+    await handleDelegate(convId, trimmed, agentDefPath);
     return;
   }
   // Below: chat-direct + chat-think continue the existing chat flow.
@@ -570,7 +575,11 @@ export async function resolveOrchestrator(): Promise<OrchestratorResolution> {
   return { kind: "ok", model: realModel, protocol, baseUrl, apiKey };
 }
 
-async function handleDelegate(convId: string, task: string): Promise<void> {
+async function handleDelegate(
+  convId: string,
+  task: string,
+  agentDefPath?: string,
+): Promise<void> {
   const orch = await resolveOrchestrator();
   if (orch.kind !== "ok") {
     if (orch.kind === "no-orchestrator") {
@@ -616,6 +625,10 @@ async function handleDelegate(convId: string, task: string): Promise<void> {
       protocol,
       baseUrl,
       apiKey,
+      // Si l'utilisateur a choisi un agent custom dans le sélecteur du chat,
+      // le backend charge ce `.md` et remplace role/model/system_prompt par
+      // ses valeurs (cf. agent_spawn + agent_defs::load_def).
+      agentDefPath,
     });
   } catch (err) {
     await appendMessage(convId, {

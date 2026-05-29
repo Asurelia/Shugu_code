@@ -81,8 +81,14 @@
 .ctx-bubble-close:hover { background: rgba(255,255,255,0.06); color: var(--on-surface); }
 
 /* Dropdown menu (closed via click-outside hook in ContextBubble, not a scrim:
-   .ctx-bubble's backdrop-filter would trap a fixed scrim inside the bubble) */
-.ctx-menu {
+   .ctx-bubble's backdrop-filter would trap a fixed scrim inside the bubble).
+   SCOPED to .ctx-bubble: the bare `.ctx-menu` class also belongs to the global
+   right-click menu (panels.css, z-index:9999). Unscoped, this rule won the
+   cascade (imported later) and dropped that menu to z-index:31 — under its own
+   close-overlay (9998) — so every click hit the overlay and the menu was
+   unclickable. The descendant selector keeps this style on the bubble dropdown
+   (higher specificity) while leaving the global menu on panels.css. */
+.ctx-bubble .ctx-menu {
   position: absolute; top: calc(100% + 4px); left: 8px; right: 8px; z-index: 31;
   padding: 6px;
   border-radius: 12px;

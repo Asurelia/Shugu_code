@@ -1,16 +1,16 @@
-// Lazy route module for /agents — the full, REAL agents workspace.
+// Lazy route module for /agents — gestionnaire visuel d'agents personnalisés.
 //
-// Renders the live `AgentsPanel`: real active agents from SQLite (no mock),
-// the Atelier launcher (build → test-for-real → learn), and click-to-transcript
-// with the environment-test runs, the live preview, and the verified-skill
-// badge. Previously this route showed a hardcoded `seedAgents` mock via
-// `AgentsView` — that fake panel is gone.
-import { AgentsPanel } from "@/features/agents/AgentsPanel";
+// Refonte 2026-05-26 : la page n'est plus un panneau d'observabilité de runs
+// (l'ancien `AgentsPanel`) mais un GESTIONNAIRE de définitions d'agents
+// portables au format Claude Code (.md + frontmatter). L'observabilité brute
+// (transcripts live) reste accessible en secondaire au clic sur une carte
+// — voir le plan `harmonic-tinkering-hearth.md`.
+import { AgentDefsManager } from "@/features/agents/AgentDefsManager";
 
 export default function AgentsRouteComponent() {
   return (
     <div className="agent-shell scroll">
-      <AgentsPanel />
+      <AgentDefsManager />
     </div>
   );
 }

@@ -465,6 +465,12 @@ pub fn run() {
                 Ok(())
             })();
 
+            // Lien `.shugu/agents` (junction NTFS / symlink) + seed des 5
+            // `.md` builtin dans `~/.claude/agents/` si absents. Source de
+            // vérité au format Claude Code, pour que les agents définis ici
+            // marchent aussi dans Claude Code / Codex / Pi sans conversion.
+            commands::agent_defs::setup_links_and_seed(app.handle());
+
             // ──────────────────────────────────────────────────────────────
             // System tray icon — Discord/Steam-style "minimize to tray".
             //
@@ -642,6 +648,11 @@ pub fn run() {
             commands::git::git_remotes,
             commands::git::git_remote_add,
             commands::git::git_remote_remove,
+            // Définitions d'agents portables (format Claude Code .md).
+            commands::agent_defs::agent_def_list,
+            commands::agent_defs::agent_def_read,
+            commands::agent_defs::agent_def_write,
+            commands::agent_defs::agent_def_delete,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
