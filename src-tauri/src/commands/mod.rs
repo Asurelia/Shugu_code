@@ -1,6 +1,8 @@
 pub mod agent_defs;
 pub mod agents;
 pub mod chat;
+pub mod codex;
+pub mod codex_app_server;
 pub mod credentials;
 pub mod diag;
 pub mod format;

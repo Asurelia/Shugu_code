@@ -48,6 +48,26 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// Serialize a chat `messages` array into a single prompt for `codex exec`
+/// (which takes one prompt, not a messages array). Prior turns become labelled
+/// context; the trailing user turn is the task. We drop our `system` message —
+/// Codex injects its own system prompt, and forwarding ours risks conflicting
+/// instructions.
+fn build_codex_prompt(messages: &[ChatMessage]) -> String {
+    let mut out = String::new();
+    for m in messages {
+        if m.role == "system" {
+            continue;
+        }
+        let who = if m.role == "assistant" { "Assistant" } else { "User" };
+        out.push_str(who);
+        out.push_str(": ");
+        out.push_str(&m.content);
+        out.push_str("\n\n");
+    }
+    out.trim_end().to_string()
+}
+
 /// Parse a data URL like `data:image/png;base64,iVBORw0KG...` into
 /// `(media_type, base64_payload)`. Returns `None` for malformed input or
 /// non-base64 encodings (we only support base64 for image attachments —
@@ -693,6 +713,9 @@ pub async fn chat_send(
     api_key: Option<String>,
     conversation_id: Option<String>,
     chat_template_kwargs: Option<serde_json::Value>,
+    // Codex-only: reasoning effort (none|minimal|low|medium|high|xhigh) passed
+    // natively to the app-server `turn/start`. Ignored by the API protocols.
+    reasoning_effort: Option<String>,
     // Optional `data:image/...;base64,...` URL for vision-enabled models.
     // When provided, it's injected into the LAST user message as a
     // multimodal content block (Anthropic `type:image` / OpenAI `image_url`).
@@ -764,6 +787,18 @@ pub async fn chat_send(
             // of base64 strings, not multimodal content blocks). Out of MVP
             // scope — image is silently ignored for the ollama path.
             call_ollama(&client, &base_url, &model, &messages, abort_flag.clone(), &mut on_chunk).await
+        }
+        "codex" => {
+            // Codex (ChatGPT subscription, no API key) over the native app-server.
+            // It takes a SINGLE prompt, so we serialize the non-system turns into a
+            // transcript. ALWAYS read-only here — a chat answer must never mutate
+            // files. `model` + `reasoning_effort` come from the picker and are
+            // passed natively to `turn/start`. Image attachments out of MVP scope.
+            let prompt = build_codex_prompt(&messages);
+            let effort = reasoning_effort.as_deref();
+            crate::commands::codex::codex_chat_turn(&app, &prompt, Some(model.as_str()), effort, &mut on_chunk)
+                .await
+                .map(|content| AssistantTurn { content, tool_calls: Vec::new() })
         }
         other => Err(format!("unsupported protocol: {}", other)),
     };

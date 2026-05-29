@@ -16,8 +16,17 @@ import {
   getConfig,
   clearProviderConfig,
   setProviderEnabled,
+  getProviderEnabled,
 } from "@/lib/credentials";
 import { invalidateDiscovery, useDiscoveredModels } from "@/lib/modelDiscovery";
+import { useCodexAuth, invalidateCodex } from "./codexQueries";
+import { CodexUsage } from "./CodexUsage";
+import {
+  codexLogin,
+  codexLogout,
+  codexGetDedicated,
+  codexSetDedicated,
+} from "@/lib/codex";
 import { db } from "@/lib/db";
 import { getInstalledIds, getModelPath } from "@/lib/modelBundle";
 import { parseThinkingMode, serializeThinkingMode, type ThinkingMode } from "@/lib/thinkingHeuristic";
@@ -95,6 +104,10 @@ export function ConnectionsView() {
       { id: "groq", name: "Groq", meta: "Fast LPU inference", logo: "G", color: "#f55036", fields: [
         { label: "API key", key: "apiKey", placeholder: "gsk_…", secret: true },
       ]},
+      // Codex = the user's ChatGPT subscription via the local `codex` CLI
+      // (shell-out, no API key). Rendered by a dedicated <CodexCard/> (status +
+      // usage panel) instead of the generic key-field ConnCard.
+      { id: "codex", name: "OpenAI Codex", meta: "Abonnement ChatGPT (CLI)", logo: "C", color: "#10a37f", fields: [] },
     ],
     tools: [
       { id: "github", name: "GitHub", meta: "Repos, PRs, issues", logo: "G", color: "#24292f", fields: [
@@ -148,7 +161,9 @@ export function ConnectionsView() {
             ))}
           </div>
           <div className="connections-grid">
-            {(cards[tab] || []).map((c: any) => <ConnCard key={c.id} c={c}/>)}
+            {(cards[tab] || []).map((c: any) =>
+              c.id === "codex" ? <CodexCard key={c.id} c={c}/> : <ConnCard key={c.id} c={c}/>,
+            )}
             {tab === "models" && customModels.map((c: any) => <ConnCard key={c.id} c={c}/>)}
             {tab === "models" && (
               <div className="conn-add-card" onClick={() => setAdding(true)}>
@@ -287,6 +302,324 @@ export interface ConnCardData {
 }
 
 type ConnStatus = "loading" | "connected" | "disconnected";
+
+/** Dedicated card for the Codex CLI provider: no API key (subscription auth via
+ *  `codex login`), so we show connection status + an enable toggle + the usage
+ *  panel instead of the generic key fields. */
+export function CodexCard({ c }: { c: ConnCardData }) {
+  const { data: auth, refetch, isFetching } = useCodexAuth();
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [dedicated, setDedicated] = useState<boolean | null>(null);
+  const [loggingIn, setLoggingIn] = useState(false);
+  // Structured login prompt from the app-server (browser authUrl, or device
+  // userCode + verificationUrl), plus a status/error line.
+  const [loginPrompt, setLoginPrompt] = useState<{
+    kind: "browser" | "device";
+    authUrl?: string;
+    userCode?: string;
+    verificationUrl?: string;
+  } | null>(null);
+  const [loginMsg, setLoginMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const [en, ded] = await Promise.all([getProviderEnabled("codex"), codexGetDedicated()]);
+      if (cancelled) return;
+      setEnabled(en === "true");
+      setDedicated(ded);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Live login progress from the app-server `codex://login` events. The Rust
+  // `codex_login` emits a `{phase:"prompt", kind, authUrl|userCode|verificationUrl}`
+  // when the user must act, then a `{phase:"completed", success, error}` at the end.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    void (async () => {
+      try {
+        const mod = await import("@tauri-apps/api/event");
+        unlisten = await mod.listen<{
+          phase?: string;
+          kind?: "browser" | "device";
+          authUrl?: string | null;
+          userCode?: string | null;
+          verificationUrl?: string | null;
+          success?: boolean;
+          error?: string | null;
+        }>("codex://login", (e) => {
+          const p = e.payload;
+          if (p?.phase === "prompt") {
+            setLoginPrompt({
+              kind: p.kind ?? "browser",
+              authUrl: p.authUrl ?? undefined,
+              userCode: p.userCode ?? undefined,
+              verificationUrl: p.verificationUrl ?? undefined,
+            });
+          } else if (p?.phase === "completed") {
+            setLoginPrompt(null);
+            setLoginMsg(p.success ? "✓ Connecté." : "✗ " + (p.error ?? "échec de connexion"));
+          }
+        });
+      } catch {
+        /* not in Tauri (web dev) — login button is a no-op there anyway */
+      }
+    })();
+    return () => unlisten?.();
+  }, []);
+
+  const ready = !!auth?.loggedIn && !!auth?.binaryFound;
+
+  const onLogin = async () => {
+    setLoggingIn(true);
+    setLoginPrompt(null);
+    setLoginMsg(null);
+    try {
+      // Browser OAuth (smoothest). The app-server returns an authUrl (emitted as
+      // a prompt the card shows); codex_login resolves when login completes.
+      await codexLogin(false);
+      setLoginMsg("✓ Connecté.");
+      invalidateCodex();
+      await refetch();
+      void invalidateDiscovery();
+    } catch (err) {
+      setLoginMsg("✗ " + String(err));
+    } finally {
+      setLoggingIn(false);
+      setLoginPrompt(null);
+    }
+  };
+
+  const onLogout = async () => {
+    try {
+      await codexLogout();
+      setLoginMsg(null);
+      invalidateCodex();
+      await refetch();
+      void invalidateDiscovery();
+    } catch (err) {
+      setLoginMsg("✗ " + String(err));
+    }
+  };
+
+  const toggleDedicated = async (on: boolean) => {
+    setDedicated(on);
+    await codexSetDedicated(on);
+    // Switching home changes which auth.json counts — re-check status + picker.
+    invalidateCodex();
+    await refetch();
+    void invalidateDiscovery();
+  };
+  const statusLabel = !auth
+    ? "loading…"
+    : ready
+      ? "connecté"
+      : !auth.binaryFound
+        ? "binaire manquant"
+        : "login requis";
+  const statusClass = ready ? "connected" : "disconnected";
+
+  const toggleEnabled = async (on: boolean) => {
+    setEnabled(on);
+    await setProviderEnabled("codex", on);
+    void invalidateDiscovery();
+  };
+
+  const recheck = async () => {
+    invalidateCodex();
+    await refetch();
+    void invalidateDiscovery();
+  };
+
+  return (
+    <div className={"conn-card " + (ready ? "connected" : "")}>
+      <div className="conn-head">
+        <div className="conn-logo" style={{ background: c.color, color: "rgba(0,0,0,0.7)" }}>
+          {c.logo}
+        </div>
+        <div className="conn-info">
+          <div className="conn-name">{c.name}</div>
+          <div className="conn-meta">{c.meta}</div>
+        </div>
+        <span className={"conn-status " + statusClass}>{statusLabel}</span>
+      </div>
+
+      {/* Status detail + remediation */}
+      <div style={{ fontSize: 11, color: "var(--on-surface-muted)", lineHeight: 1.5, margin: "6px 0" }}>
+        {!auth ? (
+          "Vérification…"
+        ) : ready ? (
+          <>
+            ✓ Connecté via ton abonnement ChatGPT (aucune clé API, aucun token facturé en plus).
+            <br />
+            <span style={{ opacity: 0.7 }}>Binaire : <code>{auth.binary}</code></span>
+          </>
+        ) : !auth.binaryFound ? (
+          <>
+            ✗ Binaire <code>codex</code> introuvable. Installe-le dans un terminal :
+            <br />
+            <code style={{ background: "rgba(0,0,0,0.3)", padding: "1px 5px", borderRadius: 3 }}>
+              npm i -g @openai/codex
+            </code>
+          </>
+        ) : (
+          <>
+            ✗ Pas connecté à ton compte ChatGPT. Clique « Se connecter » ci-dessous — Codex
+            ouvre la page de connexion OpenAI dans ton navigateur.
+          </>
+        )}
+      </div>
+
+      {/* Dedicated-vs-shared account toggle (always available; it changes WHERE
+          the login is stored). Shared = the terminal-global ~/.codex login.
+          Dedicated = a Shugu-only account isolated via CODEX_HOME. */}
+      <label
+        style={{
+          display: "flex",
+          alignItems: "flex-start",
+          gap: 8,
+          fontSize: 11,
+          color: "var(--on-surface)",
+          margin: "6px 0",
+          cursor: "pointer",
+        }}
+      >
+        <input
+          type="checkbox"
+          checked={dedicated ?? false}
+          onChange={(e) => void toggleDedicated(e.target.checked)}
+          style={{ marginTop: 2 }}
+        />
+        <span>
+          Compte Codex dédié à Shugu
+          <span style={{ display: "block", color: "var(--on-surface-muted)", fontSize: 10 }}>
+            {dedicated
+              ? "Connexion isolée du terminal (CODEX_HOME propre à Shugu)."
+              : "Partagé avec ton terminal (login ~/.codex global)."}
+          </span>
+        </span>
+      </label>
+
+      {/* Enable-in-picker toggle (only meaningful once ready) */}
+      {ready && (
+        <label
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            fontSize: 11,
+            color: "var(--on-surface)",
+            margin: "4px 0",
+            cursor: "pointer",
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={enabled ?? true}
+            onChange={(e) => void toggleEnabled(e.target.checked)}
+          />
+          Proposer Codex dans le sélecteur de modèles du chat
+        </label>
+      )}
+
+      {/* Login prompt (browser link or device code) + status, during/after login */}
+      {(loggingIn || loginPrompt || loginMsg) && (
+        <div
+          style={{
+            margin: "6px 0",
+            padding: "8px 10px",
+            borderRadius: 6,
+            background: "rgba(0,0,0,0.25)",
+            border: "1px solid rgba(255,255,255,0.06)",
+            fontSize: 11,
+            color: "var(--on-surface-muted)",
+            lineHeight: 1.5,
+          }}
+        >
+          {loggingIn && !loginPrompt && !loginMsg && "Démarrage de la connexion…"}
+
+          {loginPrompt?.kind === "browser" && loginPrompt.authUrl && (
+            <div>
+              Ouvre cette page pour te connecter à ChatGPT :
+              <br />
+              <a
+                href={loginPrompt.authUrl}
+                target="_blank"
+                rel="noreferrer"
+                style={{ color: "var(--primary, #7c3aed)", wordBreak: "break-all" }}
+              >
+                {loginPrompt.authUrl}
+              </a>
+              <div style={{ marginTop: 4, opacity: 0.7 }}>
+                Puis approuve — cette fenêtre se mettra à jour automatiquement.
+              </div>
+            </div>
+          )}
+
+          {loginPrompt?.kind === "device" && (
+            <div>
+              Va sur{" "}
+              <a
+                href={loginPrompt.verificationUrl}
+                target="_blank"
+                rel="noreferrer"
+                style={{ color: "var(--primary, #7c3aed)" }}
+              >
+                {loginPrompt.verificationUrl}
+              </a>{" "}
+              et saisis le code :
+              <div
+                style={{
+                  marginTop: 4,
+                  fontFamily: "var(--font-mono)",
+                  fontSize: 16,
+                  fontWeight: 700,
+                  letterSpacing: 2,
+                  color: "var(--on-surface)",
+                }}
+              >
+                {loginPrompt.userCode}
+              </div>
+            </div>
+          )}
+
+          {loginMsg && (
+            <div style={{ color: loginMsg.startsWith("✗") ? "var(--error, #ff6b6b)" : "#10a37f" }}>
+              {loginMsg}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Usage panel (real per-run tokens + local rolling-window estimate) */}
+      {ready && <CodexUsage />}
+
+      <div className="conn-actions">
+        {auth?.binaryFound && (
+          ready ? (
+            <button className="lgb lgb-sm" onClick={() => void onLogout()}>
+              <Icon name="x" size={11} /> Se déconnecter
+            </button>
+          ) : (
+            <button
+              className="lgb lgb-sm lgb-primary"
+              onClick={() => void onLogin()}
+              disabled={loggingIn}
+            >
+              <Icon name="sparkle" size={11} /> {loggingIn ? "Connexion…" : "Se connecter à Codex"}
+            </button>
+          )
+        )}
+        <button className="lgb lgb-sm" onClick={() => void recheck()} disabled={isFetching}>
+          <Icon name="check" size={11} /> {isFetching ? "Vérification…" : "Vérifier"}
+        </button>
+      </div>
+    </div>
+  );
+}
 
 export function ConnCard({ c }: { c: ConnCardData }) {
   // `vals` is the live edited state. `saved` mirrors what's actually persisted

@@ -29,9 +29,10 @@
 import { useCallback, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { PROVIDER_REGISTRY, type Protocol } from "@/lib/providers";
-import { loadProviderConfig, getConfig, getProviderEnabled } from "@/lib/credentials";
+import { loadProviderConfig, getConfig, getProviderEnabled, setProviderEnabled } from "@/lib/credentials";
 import { db } from "@/lib/db";
 import { getInstalledIds as getBundleInstalledIds } from "@/lib/modelBundle";
+import { codexReady, codexModels } from "@/lib/codex";
 import { invoke } from "@/lib/tauri";
 import { queryClient } from "@/lib/queryClient";
 
@@ -205,6 +206,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   llamacpp:  "llama.cpp",
   mistral:   "Mistral",
   groq:      "Groq",
+  codex:     "OpenAI Codex",
 };
 
 // ─── Per-protocol probe (delegated to Rust) ───────────────────────────
@@ -344,6 +346,59 @@ export async function discoverAllModels(): Promise<DiscoveryResult> {
     const enabled = await getProviderEnabled(id);
     if (enabled === "false") {
       // Explicitly disabled — hide entirely.
+      return;
+    }
+
+    // Codex is a CLI shell-out with NO /v1/models endpoint and NO API key —
+    // it can't be HTTP-probed. Surface a single static model, zero-config:
+    // visible as soon as the user is logged in (`~/.codex/auth.json` + binary),
+    // unless they explicitly disabled it above. Mirrors the llamacpp
+    // auto-enable affordance, but the "is it ready" check is the auth/binary
+    // probe instead of a bundle-on-disk check.
+    if (id === "codex") {
+      const ready = await codexReady();
+      if (!ready) {
+        // Not logged in / no binary — surface as a "to configure" hint.
+        result.unconfigured.push(id);
+        return;
+      }
+      // Zero-config: logged in ⇒ usable. The chat SEND path (chat-sync
+      // resolveChatTarget) strictly requires `enabled === "true"`, so we
+      // persist that once here when the user has never touched the toggle —
+      // otherwise Codex would appear in the picker but every send would fail
+      // "unconfigured". Idempotent; explicit "false" was already filtered above.
+      if (enabled !== "true") {
+        await setProviderEnabled("codex", true);
+      }
+      // Real models from the account via the app-server (`model/list`): GPT-5.5,
+      // GPT-5.4, GPT-5.4-Mini, GPT-5.3-Codex, … Each row is `codex/<model>`; the
+      // picker reads supported reasoning efforts from the same source for its
+      // effort selector. Falls back to a single generic row if the call fails
+      // (e.g. app-server briefly unreachable) so Codex never vanishes silently.
+      try {
+        const models = await codexModels();
+        if (models.length > 0) {
+          for (const m of models) {
+            result.models.push({
+              id: `codex/${m.model}`,
+              providerId: "codex",
+              providerLabel: "OpenAI Codex",
+              modelId: m.model,
+              label: m.displayName || m.model,
+            });
+          }
+          return;
+        }
+      } catch (err) {
+        result.errors.codex = "Modèles Codex indisponibles : " + String(err);
+      }
+      result.models.push({
+        id: "codex/gpt-5.5",
+        providerId: "codex",
+        providerLabel: "OpenAI Codex",
+        modelId: "gpt-5.5",
+        label: "Codex (abonnement)",
+      });
       return;
     }
     // Auto-enable llamacpp when the bundle is on disk, EVEN if the user

@@ -9,6 +9,8 @@
 import { useState, useEffect, useRef } from "react";
 import { Icon } from "@/components/components";
 import { useDiscoveredModels } from "@/lib/modelDiscovery";
+import { useActiveCodexEffort } from "@/features/chat/chat-sync";
+import { codexModels, type CodexModel } from "@/lib/codex";
 
 // Mirrors the labels used in ConnectionsView's card catalog. Local copy here
 // so ModelPicker can label provider groups even when discovery reports only
@@ -36,6 +38,25 @@ export function ModelPicker({ model, onChange, className = "float-foot-model" }:
   // their list-models endpoint. Errors per provider surface as a small line
   // under the group header so the user can debug (wrong key, server down, etc.).
   const { data: discovered, errors, unconfigured, isLoading, refresh } = useDiscoveredModels();
+
+  // Codex reasoning-effort selector — only shown when a `codex/*` model is the
+  // active one. The supported efforts come from the same `model/list` the picker
+  // already surfaces (loaded lazily when the popover opens on a codex model).
+  const isCodex = model.startsWith("codex/");
+  const [effort, setEffort] = useActiveCodexEffort();
+  const [codexList, setCodexList] = useState<CodexModel[]>([]);
+  useEffect(() => {
+    if (!open || !isCodex) return;
+    let cancelled = false;
+    void codexModels()
+      .then((ms) => { if (!cancelled) setCodexList(ms); })
+      .catch(() => { /* app-server briefly unreachable — keep the fallback efforts */ });
+    return () => { cancelled = true; };
+  }, [open, isCodex]);
+  const activeCodexModel = isCodex ? model.slice("codex/".length) : "";
+  const supportedEfforts =
+    codexList.find((m) => m.model === activeCodexModel)?.supportedEfforts ??
+    ["low", "medium", "high", "xhigh"];
 
   // Re-discovery is handled by the shared store: the 60s TTL kicks in on
   // next consume, and ConnCard / AddProviderModal explicitly invalidate
@@ -117,6 +138,23 @@ export function ModelPicker({ model, onChange, className = "float-foot-model" }:
           {!isLoading && unconfigured.length > 0 && (
             <div style={{ padding: "6px 14px 8px", fontSize: 10, color: "var(--on-surface-muted)" }}>
               Non configurés : {unconfigured.map(id => PROVIDER_LABELS_DISPLAY[id] ?? id).join(", ")}
+            </div>
+          )}
+          {isCodex && (
+            <div>
+              <div className="model-pop-group">Raisonnement (Codex)</div>
+              <div style={{ display: "flex", gap: 4, flexWrap: "wrap", padding: "2px 14px 8px" }}>
+                {supportedEfforts.map((e) => (
+                  <button
+                    key={e}
+                    className={"lgb lgb-sm" + (e === effort ? " lgb-primary" : "")}
+                    onClick={() => setEffort(e)}
+                    title={`Niveau de raisonnement : ${e}`}
+                  >
+                    {e}
+                  </button>
+                ))}
+              </div>
             </div>
           )}
           <div className="model-pop-foot">

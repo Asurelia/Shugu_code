@@ -352,7 +352,7 @@ static AGENTS_CONN: OnceLock<Mutex<Connection>> = OnceLock::new();
 /// `running`/`pending` rows left behind by a previous crash. This MUST
 /// run before any consumer reads `agent_list_active`, otherwise the UI
 /// shows phantom agents from the previous process.
-pub(super) fn get_conn(app: &tauri::AppHandle) -> Result<&'static Mutex<Connection>, String> {
+pub(crate) fn get_conn(app: &tauri::AppHandle) -> Result<&'static Mutex<Connection>, String> {
     if let Some(c) = AGENTS_CONN.get() {
         return Ok(c);
     }
@@ -418,7 +418,7 @@ pub(super) fn get_conn(app: &tauri::AppHandle) -> Result<&'static Mutex<Connecti
 // Small helpers
 // ────────────────────────────────────────────────────────────────────────
 
-pub(super) fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

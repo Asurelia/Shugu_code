@@ -54,6 +54,7 @@ const EVT_ACTIVE       = "chat://active-changed";
 const EVT_ACTIVE_MODEL = "chat://active-model-changed";
 const KEY_ACTIVE       = "shugu.chat.activeConv.v1";
 const KEY_ACTIVE_MODEL = "shugu.chat.activeModel.v1";
+const KEY_CODEX_EFFORT = "shugu.chat.codexEffort.v1";
 
 // Fallback when no model has ever been chosen. We default to llama.cpp local
 // because (a) it doesn't need an API key, (b) it's the smoke-test target, and
@@ -483,6 +484,9 @@ export async function sendChatMessage(
       apiKey,
       conversationId: convId,
       chatTemplateKwargs,
+      // Codex-only: native reasoning effort for the app-server turn. Undefined
+      // for the API protocols (Rust treats it as None / ignores it).
+      reasoningEffort: protocol === "codex" ? getActiveCodexEffort() : undefined,
       attachedImage: imageDataUrl,
     });
     // Parse fenced ```code blocks``` out of the reply so the UI gets the
@@ -961,6 +965,40 @@ export function useActiveModel(initial?: string): [string, (m: string) => void] 
   }, []);
 
   return [active, setActive];
+}
+
+// ─── Active Codex reasoning effort (none|minimal|low|medium|high|xhigh) ──
+// Only meaningful when a `codex/*` model is active. Persisted like the active
+// model; read by sendChatMessage to pass `reasoningEffort` to chat_send.
+const DEFAULT_CODEX_EFFORT = "medium";
+
+/** Plain getter for the send path (localStorage-only, no React). */
+export function getActiveCodexEffort(): string {
+  try {
+    return localStorage.getItem(KEY_CODEX_EFFORT) || DEFAULT_CODEX_EFFORT;
+  } catch {
+    return DEFAULT_CODEX_EFFORT;
+  }
+}
+
+/** Picker hook: the active reasoning effort + a setter (TanStack-backed so the
+ *  popover re-renders on change, mirroring useActiveModel). */
+export function useActiveCodexEffort(): [string, (e: string) => void] {
+  const { data: effort = getActiveCodexEffort() } = useQuery<string>({
+    queryKey: chatKeys.codexEffort(),
+    queryFn: () => getActiveCodexEffort(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  const setEffort = useCallback((e: string) => {
+    queryClient.setQueryData<string>(chatKeys.codexEffort(), e);
+    try {
+      localStorage.setItem(KEY_CODEX_EFFORT, e);
+    } catch {
+      /* quota */
+    }
+  }, []);
+  return [effort, setEffort];
 }
 
 // ─── createConversation — insert a fresh conv row + return its id ──────

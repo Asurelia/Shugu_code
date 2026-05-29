@@ -322,6 +322,35 @@ DROP TABLE IF EXISTS bench_runs;
 DROP TABLE IF EXISTS bench_tasks;
 ";
 
+// Lot « pont Codex CLI » (2026-05-29): suivi d'usage de l'agent Codex (abonnement
+// ChatGPT, shell-out). `codex_usage` = une ligne par run avec les tokens RÉELS
+// (event `turn.completed.usage`) — input/cached/output/reasoning + la surface
+// (chat | worker). `codex_limit_events` horodate les « limite atteinte » détectées
+// (pour la bannière UI). NB : le quota réel OpenAI (5h/hebdo) n'est PAS exposé en
+// headless — l'UI dérive une ESTIMATION locale par fenêtre glissante depuis ces
+// tokens réels.
+const MIGRATION_V12: &str = "
+CREATE TABLE IF NOT EXISTS codex_usage (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id              TEXT    NOT NULL,
+    ts                  INTEGER NOT NULL,
+    model               TEXT    NOT NULL DEFAULT '',
+    surface             TEXT    NOT NULL DEFAULT 'chat',
+    input_tokens        INTEGER NOT NULL DEFAULT 0,
+    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens       INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_codex_usage_ts ON codex_usage(ts);
+CREATE TABLE IF NOT EXISTS codex_limit_events (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      INTEGER NOT NULL,
+    kind    TEXT    NOT NULL DEFAULT 'rate_limit',
+    message TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_codex_limit_ts ON codex_limit_events(ts);
+";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = vec![
@@ -389,6 +418,12 @@ pub fn run() {
             version: 11,
             description: "drop_harness_bench_keep_skills",
             sql: MIGRATION_V11,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 12,
+            description: "codex_usage_tracking",
+            sql: MIGRATION_V12,
             kind: MigrationKind::Up,
         },
     ];
@@ -613,6 +648,15 @@ pub fn run() {
             // Skill library (Voyager / Hermes) — learned reusable skills.
             commands::agents::skills::skills_list,
             commands::agents::skills::skills_clear,
+            // Codex CLI bridge — auth status + real usage tracking (ChatGPT subscription).
+            commands::codex::codex_auth_status,
+            commands::codex::codex_login,
+            commands::codex::codex_logout,
+            commands::codex::codex_models,
+            commands::codex::codex_rate_limits,
+            commands::codex::codex_usage_window,
+            commands::codex::codex_usage_recent,
+            commands::codex::codex_limit_recent,
             // Design Studio — project snapshots (Projets tab).
             commands::studio::studio_project_upsert_auto,
             commands::studio::studio_project_save_as,

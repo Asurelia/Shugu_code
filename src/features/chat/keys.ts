@@ -15,4 +15,6 @@ export const chatKeys = {
   activeConv: () => [...chatKeys.all, "active-conv"] as const,
   /** Active model id (synthetic global state). */
   activeModel: () => [...chatKeys.all, "active-model"] as const,
+  /** Active Codex reasoning effort (synthetic global state). */
+  codexEffort: () => [...chatKeys.all, "codex-effort"] as const,
 };

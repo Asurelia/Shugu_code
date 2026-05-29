@@ -9,7 +9,10 @@
 // values stored under `provider.<id>.protocol` / `.baseUrl` in the
 // SQLite settings table.
 
-export type Protocol = "anthropic" | "openai" | "ollama" | "custom";
+// `codex` = the OpenAI Codex CLI shelled out by the Rust `chat_send` codex arm
+// (ChatGPT subscription, no API key). It is NOT an HTTP endpoint, so its
+// `baseUrl` is empty and never used — routing is by protocol only.
+export type Protocol = "anthropic" | "openai" | "ollama" | "custom" | "codex";
 
 export interface ProviderDescriptor {
   protocol: Protocol;
@@ -30,6 +33,9 @@ export const PROVIDER_REGISTRY: Record<string, ProviderDescriptor> = {
   llamacpp:  { protocol: "openai",    baseUrl: "http://localhost:8090" },
   mistral:   { protocol: "openai",    baseUrl: "https://api.mistral.ai" },
   groq:      { protocol: "openai",    baseUrl: "https://api.groq.com/openai" },
+  // Codex CLI (shell-out, subscription auth). No HTTP baseUrl — the Rust codex
+  // arm spawns the local `codex` binary and ignores baseUrl/apiKey entirely.
+  codex:     { protocol: "codex",     baseUrl: "" },
 };
 
 const _warnedPrefixes = new Set<string>();
@@ -112,6 +118,9 @@ export const MODEL_CATALOG: ModelDescriptor[] = [
   { id: "anthropic/claude-sonnet-5",  label: "claude-sonnet-5",  group: "Anthropic", meta: "balanced · 200k" },
   // OpenAI
   { id: "openai/gpt-4o-mini",         label: "gpt-4o-mini",      group: "OpenAI",    meta: "cheap" },
+  // Codex CLI via the user's ChatGPT subscription (shell-out, no API key). The
+  // model part is cosmetic — the actual model is governed by ~/.codex/config.toml.
+  { id: "codex/gpt-5-codex",          label: "Codex (abonnement)", group: "OpenAI",  meta: "ChatGPT · CLI" },
   // Local (Ollama; llamacpp models discovered dynamically via the running server)
   { id: "ollama/qwen2.5:32b",         label: "qwen2.5:32b",      group: "Local",     meta: "local · 32B" },
 ];
