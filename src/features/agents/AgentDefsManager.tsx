@@ -242,10 +242,62 @@ function AgentFormDrawer({
   const [tab, setTab] = useState<Tab>("reglages");
   const showAllTabs = !initial.isNew;
 
+  // Drawer resisable (drag depuis le bord gauche). La `borderLeft` existante
+  // du drawer fait office d'indicateur visuel ; la hit-zone (6 px) est
+  // légèrement plus large pour rester facile à attraper. Persistance via
+  // localStorage à la FIN du drag (mouseup) — pas pendant, sinon ~60 writes/s.
+  const DRAWER_WIDTH_KEY = "shugu:agentDrawerWidth";
+  const DRAWER_MIN = 360;
+  const [drawerWidth, setDrawerWidth] = useState<number>(() => {
+    if (typeof window === "undefined") return 480;
+    const saved = localStorage.getItem(DRAWER_WIDTH_KEY);
+    const n = saved ? parseInt(saved, 10) : NaN;
+    if (!Number.isFinite(n)) return 480;
+    return Math.min(Math.max(DRAWER_MIN, n), window.innerWidth);
+  });
+  const onResizeStart = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = drawerWidth;
+    // Bloque la sélection de texte + force le curseur col-resize globalement
+    // tant qu'on drague (sinon survol d'un autre élément reset le curseur).
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "col-resize";
+    const onMove = (ev: MouseEvent) => {
+      // Drawer ancré à droite → drag vers la gauche augmente la largeur.
+      const next = Math.min(
+        Math.max(DRAWER_MIN, startW + (startX - ev.clientX)),
+        window.innerWidth,
+      );
+      setDrawerWidth(next);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+      setDrawerWidth((w) => {
+        try {
+          localStorage.setItem(DRAWER_WIDTH_KEY, String(w));
+        } catch {
+          /* quota dépassé / mode privé : on ignore, la session courante reste OK */
+        }
+        return w;
+      });
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
   return (
     <>
       <div style={styles.scrim} onClick={onClose} />
-      <div style={styles.drawer}>
+      <div style={{ ...styles.drawer, width: drawerWidth }}>
+        <div
+          style={styles.resizeHandle}
+          onMouseDown={onResizeStart}
+          title="Glisser pour redimensionner"
+        />
         <div style={styles.drawerHead}>
           <h3 style={styles.drawerTitle}>
             {initial.isNew ? "Nouvel agent" : `Éditer · ${initial.name}`}
@@ -1066,6 +1118,20 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 12.5,
     fontFamily: "inherit",
     fontWeight: 600,
+  },
+
+  // ── Drawer resize handle : hit-zone 6 px chevauchant le bord gauche.
+  //    La `borderLeft` du drawer (1 px subtil) sert d'indicateur visuel ;
+  //    le changement de cursor au survol confirme l'affordance.
+  resizeHandle: {
+    position: "absolute",
+    top: 0,
+    left: -3,
+    width: 6,
+    height: "100%",
+    cursor: "col-resize",
+    zIndex: 202,
+    background: "transparent",
   },
 
   // ── Drawer tabs (Réglages / Source / Activité) ──
