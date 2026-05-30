@@ -558,6 +558,8 @@ export function ChatView({
                   isLatestAgent={m.id === latestAgentId}
                   onOpenFile={handleOpenFile}
                   onOpenSnippet={onOpenSnippet}
+                  activeFile={activeFile}
+                  onApply={(code, lang, target) => void applyCodeToFile(code, lang, target)}
                 />
               ))}
               {typing && (
