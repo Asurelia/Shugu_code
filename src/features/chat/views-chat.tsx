@@ -17,6 +17,8 @@ import { Icon } from "@/components/components";
 import { invoke } from "@/lib/tauri";
 import { useChatStream } from "./useChatStream";
 import { useMessages, sendChatMessage, useActiveModel } from "./chat-sync";
+import { useEditorSelection } from "./editorSelectionStore";
+import { db } from "@/lib/db";
 import { ModelPicker } from "@/features/panels/panels";
 import { resolveImageProvider } from "@/lib/imageProviders";
 import { revealAgent } from "@/lib/agents";
@@ -81,12 +83,29 @@ export function ChatView({
   const [model, setModel] = useActiveModel(modelProp);
 
   const navigate = useNavigate();
-  const { openFile, fileContents, setFileContents, editorPrefs, compareFile, setCompareFile } = useShell();
+  const { activeFile, openFile, fileContents, setFileContents, editorPrefs, compareFile, setCompareFile } = useShell();
 
   // Phase 2 — Chat→Editor handoff. When a file is opened from an action card,
   // we reveal an in-chat split (chat left, CodeMirror right) instead of
   // leaving the chat view. `splitFile` null = no split.
   const [splitFile, setSplitFile] = useState<string | null>(null);
+
+  // Lot A — contexte éditeur auto. Le composer du MAIN IDE a accès à l'éditeur
+  // (activeFile + fileContents via useShell) ; il joint donc automatiquement le
+  // fichier actif (+ la sélection courante) au message envoyé. La mascotte
+  // (FloatChat) n'a pas de ShellContext réel → elle ne passe jamais editorCtx.
+  //
+  // `selection` est publiée par CodeMirrorEditor (editorSelectionStore). Le chip
+  // ci-dessous montre ce qui sera envoyé et permet de le retirer pour un tour.
+  // `ctxDropped` est remis à false après chaque envoi (le contexte se réactive
+  // au tour suivant). Le toggle `chat.autoEditorContext` (défaut ON) le coupe.
+  const selection = useEditorSelection();
+  const [ctxDropped, setCtxDropped] = useState(false);
+  const { data: autoCtxOn = true } = useQuery({
+    queryKey: ["settings", "chat.autoEditorContext"],
+    queryFn: async () => (await db.settings.get("chat.autoEditorContext")) !== "false",
+    staleTime: 30_000,
+  });
 
   // Real context chips: current git branch + workspace folder name.
   const { data: branches } = useGitBranches();
@@ -180,6 +199,20 @@ export function ChatView({
       }
     }
     if (!text && !pendingImage) return; // slash sans contenu : no-op
+
+    // Lot A — contexte éditeur auto (main IDE uniquement). On joint le fichier
+    // actif (+ sélection courante si elle le concerne) sauf si le toggle est
+    // OFF ou que l'utilisateur a retiré le chip pour ce tour. La déduplication
+    // avec les @-mentions est gérée côté sendChatMessage (chat-sync.ts).
+    let editorCtx: Parameters<typeof sendChatMessage>[5] | undefined;
+    if (autoCtxOn && !ctxDropped && activeFile && fileContents[activeFile]) {
+      const sel =
+        selection && selection.path === activeFile && selection.text.trim()
+          ? { text: selection.text, startLine: selection.startLine, endLine: selection.endLine }
+          : undefined;
+      editorCtx = { path: activeFile, content: fileContents[activeFile].text, selection: sel };
+    }
+
     setInput("");
     const imageToSend = pendingImage;
     setPendingImage(null);
@@ -192,12 +225,26 @@ export function ChatView({
         model,
         imageToSend ?? undefined,
         agentDefPath,
+        editorCtx,
       );
     } finally {
       setTyping(false);
       chatStream.stop();
+      setCtxDropped(false); // le contexte se réactive au tour suivant
     }
-  }, [input, pendingImage, model, activeConv, chatStream, enabledAgents]);
+  }, [
+    input,
+    pendingImage,
+    model,
+    activeConv,
+    chatStream,
+    enabledAgents,
+    autoCtxOn,
+    ctxDropped,
+    activeFile,
+    fileContents,
+    selection,
+  ]);
 
   const onKey = (e: React.KeyboardEvent) => {
     if (slashOpen) {
@@ -417,6 +464,39 @@ export function ChatView({
         </div>
       </div>
       <div className="cx-ctx-row">
+        {/* Lot A — chip contexte éditeur retirable. Montre le fichier actif (+
+            sélection) qui sera joint au prochain message. Le × le retire pour
+            ce tour (réactivé après envoi). Réutilise .cx-chip (charte glass). */}
+        {autoCtxOn && !ctxDropped && activeFile && (
+          <span className="cx-chip ctx-editor" title="Contexte envoyé au modèle — cliquez × pour ne pas l'envoyer">
+            <span aria-hidden>📄</span>
+            <span className="name">{basename(activeFile)}</span>
+            {selection?.path === activeFile && selection.text.trim() && (
+              <span className="sel" title="Sélection courante incluse">
+                ⊿ sélection ({selection.endLine - selection.startLine + 1} l.)
+              </span>
+            )}
+            <button
+              type="button"
+              className="ctx-x"
+              title="Ne pas envoyer ce contexte"
+              onClick={() => setCtxDropped(true)}
+              style={{
+                background: "none",
+                border: "none",
+                cursor: "pointer",
+                color: "inherit",
+                opacity: 0.6,
+                padding: 0,
+                marginLeft: 2,
+                lineHeight: 1,
+                font: "inherit",
+              }}
+            >
+              ×
+            </button>
+          </span>
+        )}
         <button className="cx-chip status" title="Accès au système de fichiers (Tauri)">
           <span className="dot" />
           Accès complet
