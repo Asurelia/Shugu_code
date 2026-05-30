@@ -14,13 +14,19 @@
 //! qui réutilisent les MÊMES helpers d'exécution (`fs::*_inner`, `grep::grep_inner`)
 //! que les agents — donc le même path-guard, sans duplication de la logique d'I/O.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
 
 /// Une écriture du tour, pour l'annulation. `before = None` = fichier créé
 /// (l'annulation devra donc le supprimer ; cf. Task 13 `chat_revert_writes`).
-#[derive(Clone, Debug, Serialize)]
+///
+/// `Deserialize` AUSSI : la commande `chat_revert_writes` reçoit ce même type
+/// depuis le front (qui l'a obtenu via l'event `chat://writes`), donc Tauri doit
+/// pouvoir le désérialiser depuis l'invoke. Sans `Deserialize`,
+/// `Vec<ChatWriteRecord>` n'implémente pas `CommandArg` → erreur de compilation
+/// du `generate_handler!`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatWriteRecord {
     pub path: String,
@@ -201,6 +207,47 @@ fn record_before(root: &Path, path: &str, journal: &mut Vec<ChatWriteRecord>) {
         path: path.to_string(),
         before,
     });
+}
+
+// ---------------------------------------------------------------------------
+// Annulation d'un tour (Task 13)
+// ---------------------------------------------------------------------------
+
+/// Annule les écritures d'un tour de chat.
+///
+/// Restaure chaque fichier à son contenu d'AVANT le tour, en parcourant le
+/// journal en ordre INVERSE. Pour chaque enregistrement :
+///   * `before = Some(content)` → le fichier existait avant le tour : on
+///     réécrit son contenu d'origine via `write_file_inner` (path-guard
+///     `safe_resolve_for_write`).
+///   * `before = None` → le fichier a été CRÉÉ pendant le tour : on le supprime
+///     via `delete_file_inner` (best-effort — `let _ =`), qui réutilise EXACTEMENT
+///     le même path-guard que l'écriture qu'on annule. Best-effort car le
+///     fichier peut déjà avoir été retiré (l'utilisateur, un autre outil…) ;
+///     l'annulation ne doit pas échouer pour autant.
+///
+/// L'ordre inverse est cohérent même si un path apparaît plusieurs fois (ce qui
+/// ne devrait pas arriver — `record_before` déduplique par path), car le tout
+/// premier `before` capturé est l'état d'avant le tour.
+#[tauri::command]
+pub async fn chat_revert_writes(
+    app: tauri::AppHandle,
+    records: Vec<ChatWriteRecord>,
+) -> Result<(), String> {
+    let root = crate::commands::fs::restore_workspace_root(&app)
+        .ok_or_else(|| "aucun projet ouvert".to_string())?;
+    for r in records.iter().rev() {
+        match &r.before {
+            Some(content) => {
+                crate::commands::fs::write_file_inner(&root, &r.path, content)?;
+            }
+            None => {
+                // Fichier créé pendant le tour → suppression best-effort.
+                let _ = crate::commands::fs::delete_file_inner(&root, &r.path);
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
