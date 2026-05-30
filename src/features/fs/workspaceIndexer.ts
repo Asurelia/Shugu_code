@@ -14,11 +14,11 @@
 //   - SKIP LIST: binary extensions, node_modules, target, .git are skipped.
 //   - SIZE LIMIT: files > 200 KB are skipped (fastembed would time out).
 
-import { fsReadDir, fsReadFile } from "@/lib/fs";
+import { fsListFiles, fsReadFile } from "@/lib/fs";
 import { vecIndex, vecClear } from "@/lib/vector";
 import { chunkSource, chunkId } from "./chunker";
 import { db } from "@/lib/db";
-import type { FileNode } from "@/lib/types";
+import { pushToast } from "@/components/toast";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -27,52 +27,37 @@ import type { FileNode } from "@/lib/types";
 const MAX_FILE_BYTES = 200_000;
 const INDEX_TTL_MS   = 24 * 60 * 60 * 1000; // 24 h
 
-const SKIP_DIRS = new Set([
-  "node_modules", "target", ".git", ".svn", ".hg",
-  "dist", "build", ".next", "out", "coverage",
-  ".claude", ".pcc", ".playwright-mcp", ".remember", ".cache",
-  "_design_extracted", ".turbo", ".vite", ".vercel",
-]);
+// Generous budget for the number of code files to index in one pass. Big ML
+// repos (Comfyui ≈ 98k entries) blow past the file-tree's 5000 cap, but the
+// indexer walks WITHOUT that cap (it's background work) — this budget instead
+// bounds the embedding cost. When exceeded, the user is told (toast) rather
+// than the index silently truncating or, as before, failing entirely (0 files).
+const MAX_INDEX_FILES = 20_000;
 
-const BINARY_EXTS = new Set([
-  "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp",
-  "pdf", "zip", "tar", "gz", "br", "7z", "rar",
-  "wasm", "bin", "dll", "so", "dylib", "exe",
-  "mp3", "mp4", "wav", "ogg", "flac", "webm",
-  "ttf", "otf", "woff", "woff2",
-  "lock",  // package-lock.json / pnpm-lock.yaml are huge and not useful
-]);
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-function isBinaryPath(path: string): boolean {
-  const ext = path.split(".").pop()?.toLowerCase() ?? "";
-  return BINARY_EXTS.has(ext);
-}
-
-/** Flatten a FileNode tree into a list of leaf file paths, skipping known junk dirs. */
-function collectLeafPaths(nodes: FileNode[]): string[] {
-  const paths: string[] = [];
-
-  function walk(node: FileNode) {
-    if (node.children !== undefined) {
-      // It's a directory node.
-      const dirName = node.name;
-      if (SKIP_DIRS.has(dirName)) return;
-      for (const child of node.children) walk(child);
-    } else {
-      // It's a file node.
-      if (!isBinaryPath(node.path)) {
-        paths.push(node.path);
-      }
-    }
-  }
-
-  for (const n of nodes) walk(n);
-  return paths;
-}
+// Extensions excluded from indexing — binaries, media, models/datasets, and
+// huge lockfiles. Filtered RUST-SIDE (fs_list_files) BEFORE the budget so a
+// project full of .safetensors/.png never starves the code budget. The dir
+// pruning (node_modules, target, .git…) is the Rust `is_ignored` list, shared
+// with the file watcher — no need to re-list dirs here.
+const EXCLUDE_EXTS = [
+  // images / media
+  "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp", "tiff", "avif",
+  "mp3", "mp4", "wav", "ogg", "flac", "webm", "mov", "avi", "mkv",
+  // archives
+  "pdf", "zip", "tar", "gz", "br", "7z", "rar", "xz", "zst",
+  // compiled / native
+  "wasm", "bin", "dll", "so", "dylib", "exe", "o", "a", "lib", "pdb",
+  // fonts
+  "ttf", "otf", "woff", "woff2", "eot",
+  // ML models / weights / datasets (the Comfyui reality)
+  "safetensors", "ckpt", "pt", "pth", "onnx", "gguf", "ggml", "bin",
+  "npy", "npz", "h5", "hdf5", "pkl", "pickle", "parquet", "arrow",
+  // huge / non-useful text. NB: the Rust side extracts the LAST dot-segment as
+  // the extension (`foo.min.js` → "js"), so multi-part suffixes like "min.js"
+  // would never match — don't list them here. Minified bundles are valid text
+  // and get indexed; that's acceptable (rare in source trees we care about).
+  "lock", "map",
+];
 
 /** Simple stable hash of a list of strings — used to detect workspace changes. */
 function simpleHash(paths: string[]): string {
@@ -149,18 +134,18 @@ export async function reindexWorkspace(): Promise<number> {
 async function runIndex(force = false): Promise<number> {
   let count = 0;
   try {
-    // 1. Read the file tree.
-    const tree = await fsReadDir();
-    if (tree.length === 0) return 0; // no workspace open
-
-    // 2. Collect leaf paths and compute a lightweight hash.
-    const paths = collectLeafPaths(tree);
-    if (paths.length === 0) return 0;
+    // 1. Flat list of code-eligible files (Rust walks WITHOUT the tree cap,
+    //    filters binaries/models by extension, and bounds by MAX_INDEX_FILES).
+    //    This replaces the old fsReadDir() whole-tree walk, which threw on
+    //    >5000 entries → the catch below swallowed it → big projects got a
+    //    ZERO-file index. Now they degrade to a (large) partial index instead.
+    const { paths, truncated, totalSeen } = await fsListFiles(EXCLUDE_EXTS, MAX_INDEX_FILES);
+    if (paths.length === 0) return 0; // no workspace open / nothing to index
 
     const rootHash = simpleHash(paths);
     const settingKey = `vec.workspace.indexed.${rootHash}`;
 
-    // 3. Check the TTL gate (skipped on a forced rebuild).
+    // 2. Check the TTL gate (skipped on a forced rebuild).
     if (!force) {
       const lastIndexed = await db.settings.get(settingKey);
       if (lastIndexed) {
@@ -169,6 +154,19 @@ async function runIndex(force = false): Promise<number> {
           return 0; // already indexed within the TTL window
         }
       }
+    }
+
+    // 3. Tell the user what's happening — big projects take a while, and a
+    //    truncated index must be visible (no silent cap). Forced rebuilds
+    //    always announce; the gated boot path only announces on big projects.
+    if (truncated) {
+      pushToast(
+        `Indexation du code : ${paths.length} fichiers (sur ${totalSeen} — au-delà de la limite de ${MAX_INDEX_FILES}, le reste est ignoré).`,
+        "info",
+        7000,
+      );
+    } else if (force || paths.length > 2000) {
+      pushToast(`Indexation du code : ${paths.length} fichiers…`, "info", 4000);
     }
 
     // 4. Index each file (best-effort).

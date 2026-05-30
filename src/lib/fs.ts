@@ -151,15 +151,6 @@ export async function fsGetWorkspaceRoot(): Promise<string | null> {
   return invoke<string | null>("fs_get_workspace_root");
 }
 
-/** Read the recursive directory tree rooted at the current workspace.
- *  Used by the bulk vector indexer (workspaceIndexer) and the Studio file
- *  panels, which need the whole tree at once. The interactive explorer uses
- *  the lazy `fsReadDirShallow` instead (no 5000-entry cap). */
-export async function fsReadDir(): Promise<FileNode[]> {
-  const entries = await invoke<FsEntry[]>("fs_read_dir");
-  return entries.map(fsEntryToFileNode);
-}
-
 /** List ONE directory level (lazy tree). `path` is a workspace-relative dir
  *  (forward-slash), or undefined/"" for the workspace root. Each returned dir
  *  node carries an empty `children` (fetched on its own expand); files carry
@@ -171,6 +162,38 @@ export async function fsReadDirShallow(path?: string): Promise<FileNode[]> {
     rel: path && path !== "" ? path : null,
   });
   return entries.map(fsEntryToFileNode);
+}
+
+/** Recursive tree of a SUBPATH only (e.g. Studio's `.shugu-forge/preview/`).
+ *  No 5000-entry cap (the subtree is small), full workspace-relative paths.
+ *  Returns [] if the subpath doesn't exist yet. */
+export async function fsReadDirScoped(path: string): Promise<FileNode[]> {
+  const entries = await invoke<FsEntry[]>("fs_read_dir_scoped", {
+    rel: path && path !== "" ? path : null,
+  });
+  return entries.map(fsEntryToFileNode);
+}
+
+/** Result of {@link fsListFiles} — a flat path list plus truncation info. */
+export interface FileListResult {
+  /** Workspace-relative file paths (forward-slash), code-eligible only. */
+  paths: string[];
+  /** True when more code files existed than `maxFiles` allowed. */
+  truncated: boolean;
+  /** Total code-eligible files seen before the budget (>= paths.length). */
+  totalSeen: number;
+}
+
+/** Flat list of workspace-relative FILE paths for the vector indexer. Walks
+ *  WITHOUT the tree cap (background work, not a DOM render). `excludeExts` are
+ *  filtered BEFORE the `maxFiles` budget so binaries/models (.safetensors,
+ *  .png…) never consume it; `truncated`/`totalSeen` let the caller report what
+ *  was dropped instead of capping silently. */
+export async function fsListFiles(
+  excludeExts: string[],
+  maxFiles: number,
+): Promise<FileListResult> {
+  return invoke<FileListResult>("fs_list_files", { excludeExts, maxFiles });
 }
 
 /** Read a workspace-relative file and return its content wrapped in FileContent. */

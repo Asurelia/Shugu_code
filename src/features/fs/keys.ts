@@ -14,6 +14,10 @@ export const fsKeys = {
    *  `""` = racine du workspace. L'explorateur fetch un niveau à l'expansion. */
   dir: (path: string) => [...fsKeys.all, "dir", path] as const,
 
+  /** Sous-arbre récursif d'UN sous-chemin (cf. `fs_read_dir_scoped`).
+   *  Utilisé par Studio pour ne lire que `.shugu-forge/preview/`, sans le cap. */
+  scoped: (path: string) => [...fsKeys.all, "scoped", path] as const,
+
   /** Contenu d'un fichier (workspace-relative path). */
   file: (path: string) => [...fsKeys.all, "file", path] as const,
 };

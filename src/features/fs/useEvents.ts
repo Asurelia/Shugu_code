@@ -8,16 +8,13 @@
 // besoin du file tree.
 
 import { useEffect } from "react";
-import { useQueryClient } from "@tanstack/react-query";
 import { listen } from "@/lib/tauri";
 import { diag } from "@/lib/diag";
-import { fsKeys } from "./keys";
 import { invalidateDirChildren } from "./queries";
 import { invalidateGrep } from "@/features/code/grep/queries";
 import { invalidateAllGit } from "@/features/git/queries";
 
 export function useFsEvents(): void {
-  const qc = useQueryClient();
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | null = null;
@@ -28,11 +25,11 @@ export function useFsEvents(): void {
       try {
         unlisten = await listen<void>("fs://changed", () => {
           if (cancelled) return;
-          diag("fs-events", "fs://changed → invalidate tree + dir + grep + git");
-          // Arbre complet (indexer / Studio) ...
-          void qc.invalidateQueries({ queryKey: fsKeys.tree() });
-          // ... ET les niveaux lazy de l'explorateur (refetch des dossiers
-          // ouverts seulement ; l'état d'expansion vit dans SideFiles).
+          diag("fs-events", "fs://changed → invalidate dir + scoped + grep + git");
+          // Niveaux lazy de l'explorateur (`fsKeys.dir`) + sous-arbres scoped
+          // Studio (`fsKeys.scoped`) — refetch des dossiers/preview ouverts
+          // seulement ; l'état d'expansion vit dans SideFiles. (L'ancien
+          // `fsKeys.tree()` complet a disparu avec le lazy-load.)
           invalidateDirChildren();
           // LOT 2 — les résultats grep sont caches par (query, opts) avec
           // staleTime 30s ; un changement fs les rend obsolètes (path
@@ -57,5 +54,5 @@ export function useFsEvents(): void {
       cancelled = true;
       unlisten?.();
     };
-  }, [qc]);
+  }, []);
 }

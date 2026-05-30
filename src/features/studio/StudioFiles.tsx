@@ -1,32 +1,22 @@
 // Shugu Forge — Design Studio · Files pane (Phase I + H).
 //
 // The "Design Files" tab of the right pane: the generated project's file tree
-// (.shugu-forge/preview/), sourced from useFileTree() — disk-backed and live
+// (.shugu-forge/preview/), sourced from useScopedTree(PREVIEW_DIR) — reads ONLY
+// that subtree (fs_read_dir_scoped, no 5000-entry cap), disk-backed and live
 // (the Rust watcher invalidates it via fs://changed), so it stays correct even
-// after an app reload. Clicking a file opens it in Shugu's CodeMirror editor
-// (parent wires onOpen → openFile + /code).
+// after an app reload AND on huge workspaces. Clicking a file opens it in
+// Shugu's CodeMirror editor (parent wires onOpen → openFile + /code).
 //
 // Phase H — an export footer copies the disposable preview into a real, named,
 // git-trackable folder in the workspace (studioExport.exportToWorkspace).
 
 import { useMemo, useState } from "react";
 import { Icon } from "@/components/components";
-import { useFileTree } from "@/features/fs/queries";
+import { useScopedTree } from "@/features/fs/queries";
 import type { FileNode } from "@/lib/types";
 import { exportToWorkspace, flattenLeaves, slugifyName } from "./studioExport";
 
 const PREVIEW_DIR = ".shugu-forge/preview";
-
-function findByPath(nodes: FileNode[], target: string): FileNode | null {
-  for (const n of nodes) {
-    if (n.path === target) return n;
-    if (n.children) {
-      const found = findByPath(n.children, target);
-      if (found) return found;
-    }
-  }
-  return null;
-}
 
 function FileRows({
   nodes,
@@ -81,8 +71,10 @@ export function StudioFiles({
   onOpen: (path: string) => void;
   defaultName?: string;
 }) {
-  const { data: tree = [] } = useFileTree();
-  const files = useMemo(() => findByPath(tree, PREVIEW_DIR)?.children ?? [], [tree]);
+  // Read ONLY the preview subtree (recursive, no cap) — `useScopedTree`
+  // returns the children of `.shugu-forge/preview/` directly, so no whole-tree
+  // walk and no findByPath. flattenLeaves still recurses for the export.
+  const { data: files = [] } = useScopedTree(PREVIEW_DIR);
   const leaves = useMemo(() => flattenLeaves(files), [files]);
 
   const [name, setName] = useState(defaultName);
