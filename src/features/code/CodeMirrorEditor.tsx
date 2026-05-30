@@ -46,6 +46,7 @@ import { blameCompartment, buildBlameGutter } from "./blame-decorations";
 import { aiEditCompartment, aiEditStreamAnnotation } from "./ai-edit/unifiedDiffExtension";
 import { ghostTextExtension } from "./autocomplete/ghostText";
 import { fimCompartment, buildFimTrigger } from "./autocomplete/fimTrigger";
+import { setEditorSelection } from "@/features/chat/editorSelectionStore";
 import type { GitBlameLine } from "@/lib/types";
 
 /**
@@ -173,6 +174,13 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
   const viewRef = useRef<EditorView | null>(null);
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
+  // LOT A (ressenti curseur) — ref qui suit toujours la prop `path` courante.
+  // Même mécanique que onChangeRef : l'updateListener est créé une seule fois au
+  // mount (deps [langExt]) et NE re-monte PAS quand on passe de `a.ts` à `b.ts`
+  // (même langage → même langExt). Capturer `path` directement dans la closure
+  // donnerait une valeur PÉRIMÉE ; on lit donc pathRef.current au moment du publish.
+  const pathRef = useRef(path);
+  pathRef.current = path;
   // LOT 2 — Doc version counter, incrémenté à chaque docChanged via le
   // updateListener. Lu par OutlinePanel/Breadcrumbs via getDocVersion().
   const docVersionRef = useRef(0);
@@ -233,6 +241,27 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
         const isAiStream = u.transactions.some((tr) => tr.annotation(aiEditStreamAnnotation));
         if (!isAiStream && onChangeRef.current) {
           onChangeRef.current(u.state.doc.toString());
+        }
+      }
+
+      // LOT A (ressenti curseur) — publie la sélection courante vers
+      // editorSelectionStore (lu par le chip du composer, même hors /code).
+      // On publie quand la sélection bouge (selectionSet) OU quand le doc change
+      // sous une sélection (docChanged → les offsets/texte ont pu bouger).
+      // pathRef.current (pas `path`) car la closure de l'updateListener est
+      // figée au mount et `path` y serait périmé sur changement de fichier
+      // même-langage.
+      if (u.selectionSet || u.docChanged) {
+        const sel = u.state.selection.main;
+        if (sel.empty) {
+          setEditorSelection(null);
+        } else {
+          setEditorSelection({
+            path: pathRef.current ?? "",
+            text: u.state.sliceDoc(sel.from, sel.to),
+            startLine: u.state.doc.lineAt(sel.from).number,
+            endLine: u.state.doc.lineAt(sel.to).number,
+          });
         }
       }
     });
