@@ -18,8 +18,10 @@
 //! half of safety axis 1 (containment). It runs ONLY against the Atelier's
 //! throwaway mirror (`allow_exec` gate), never the user's real project.
 
+use serde::Serialize;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// Custom Atelier image: the official Playwright image (Chromium + browsers + OS
 /// deps baked in, version-pinned) PLUS the Playwright npm library at a fixed
@@ -114,4 +116,135 @@ fn truncate(s: &str) -> String {
         end -= 1;
     }
     format!("{}\n[... tronqué à {OUTPUT_CAP} octets ...]", &s[..end])
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Preflight — is the exec sandbox usable RIGHT NOW? The frontend calls this
+// to enable/disable the "Grounded Run" button and show an ACTIONABLE reason
+// when it can't. Three distinct failure states, each with its own remedy:
+//   1. docker binary missing  → spawn fails (NotFound)
+//   2. daemon down            → spawns, `docker info` exits non-zero
+//   3. image absent           → daemon up, `docker image inspect` exits non-zero
+// Web mode (no Tauri) never reaches here — the command simply isn't invokable.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Capability report for the exec sandbox. Serialized camelCase to the
+/// frontend (`{ dockerAvailable, imagePresent, reason }`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecCapability {
+    pub docker_available: bool,
+    pub image_present: bool,
+    /// Actionable, human-readable reason when exec is unusable; `None` when
+    /// everything is ready. Shown verbatim in the disabled-button tooltip.
+    pub reason: Option<String>,
+}
+
+/// Outcome of one bounded docker subprocess probe. We only ever surface canned,
+/// actionable messages to the user, so the variants carry no captured output.
+enum Probe {
+    /// Process exited 0.
+    Ok,
+    /// Process exited non-zero (daemon down / image absent).
+    NonZero,
+    /// `docker` binary not found / not spawnable.
+    NotSpawnable,
+    /// Process didn't finish within the deadline (hung daemon).
+    TimedOut,
+}
+
+/// Run `docker <args>` with a hard wall-clock deadline. BLOCKS — call under
+/// `spawn_blocking`. Never hangs the UI: a stuck daemon is killed and reported
+/// as `TimedOut` rather than blocking forever. Output is discarded — we only
+/// read the exit status.
+fn probe_docker(args: &[&str], timeout: Duration) -> Probe {
+    let mut child = match Command::new("docker")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return Probe::NotSpawnable,
+    };
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    Probe::Ok
+                } else {
+                    Probe::NonZero
+                };
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Probe::TimedOut;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return Probe::NotSpawnable,
+        }
+    }
+}
+
+/// Probe Docker availability + the sandbox image presence. BLOCKS — call under
+/// `spawn_blocking`. ~8 s worst-case (two 4 s-capped probes).
+pub(super) fn check_docker() -> ExecCapability {
+    const BUILD_HINT: &str =
+        "docker build -t shugu-playwright:1.60 -f docker/playwright.Dockerfile docker";
+
+    // 1. Daemon reachable? `docker info --format {{.ServerVersion}}` is light:
+    //    prints the version when the daemon is up, errors when it's down.
+    match probe_docker(&["info", "--format", "{{.ServerVersion}}"], Duration::from_secs(4)) {
+        Probe::NotSpawnable => {
+            return ExecCapability {
+                docker_available: false,
+                image_present: false,
+                reason: Some(format!(
+                    "Docker introuvable. Installe Docker Desktop, puis construis l'image sandbox :\n{BUILD_HINT}"
+                )),
+            };
+        }
+        Probe::TimedOut => {
+            return ExecCapability {
+                docker_available: false,
+                image_present: false,
+                reason: Some(
+                    "Docker ne répond pas (daemon en cours de démarrage ?). Réessaie dans un instant."
+                        .to_string(),
+                ),
+            };
+        }
+        Probe::NonZero => {
+            return ExecCapability {
+                docker_available: false,
+                image_present: false,
+                reason: Some(
+                    "Docker Desktop n'est pas démarré. Lance-le, puis réessaie.".to_string(),
+                ),
+            };
+        }
+        Probe::Ok => {}
+    }
+
+    // 2. Daemon is up — is the sandbox image built?
+    match probe_docker(&["image", "inspect", SANDBOX_IMAGE], Duration::from_secs(4)) {
+        Probe::Ok => ExecCapability {
+            docker_available: true,
+            image_present: true,
+            reason: None,
+        },
+        _ => ExecCapability {
+            docker_available: true,
+            image_present: false,
+            reason: Some(format!(
+                "Image sandbox « {SANDBOX_IMAGE} » absente. Construis-la une fois :\n{BUILD_HINT}"
+            )),
+        },
+    }
 }
