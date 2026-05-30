@@ -608,6 +608,7 @@ pub fn run() {
             commands::llama::llama_backend_info,
             commands::fs::fs_open_folder,
             commands::fs::fs_read_dir,
+            commands::fs::fs_read_dir_shallow,
             commands::fs::fs_read_file,
             commands::fs::fs_write_file,
             commands::fs::fs_create_file,
@@ -645,6 +646,9 @@ pub fn run() {
             commands::agents::agent_get_transcript,
             commands::agents::agent_list_by_conversation,
             commands::agents::agent_atelier_run,
+            commands::agents::agent_exec_preflight,
+            commands::agents::agent_grounded_run,
+            commands::agents::agent_reverse_patch,
             // Skill library (Voyager / Hermes) — learned reusable skills.
             commands::agents::skills::skills_list,
             commands::agents::skills::skills_clear,

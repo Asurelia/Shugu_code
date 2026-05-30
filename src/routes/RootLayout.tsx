@@ -46,7 +46,7 @@ import { db, seedIfEmpty, toGenerationRow } from "@/lib/db";
 import { useActiveConv, createConversation, sendChatMessage } from "@/features/chat/chat-sync";
 import { loadOpenFiles, saveOpenFiles } from "@/lib/ide-state";
 import { fsReadFile, fsWriteFile, fsCreateDir, fsCreateFile, langToExt } from "@/lib/fs";
-import { useFileTree, invalidateFileTree } from "@/features/fs/queries";
+import { invalidateFileTree } from "@/features/fs/queries";
 import { useFsEvents } from "@/features/fs/useEvents";
 import { useGitEvents } from "@/features/git/useEvents";
 import { useRefreshOpenFiles } from "@/features/fs/useRefreshOpenFiles";
@@ -399,12 +399,11 @@ export function RootLayout() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // File state — fileTree migré vers useFileTree (TanStack Query).
-  // Le useState local + useEffect+useState async ont disparu dans la
-  // Phase G de la migration TanStack (mai 2026). `invalidateFileTree()`
-  // est exposé via shellContext pour les mutations externes (command
-  // palette open-folder).
-  const { data: fileTree = [] } = useFileTree();
+  // File state — l'explorateur charge l'arbre en LAZY (SideFiles →
+  // useDirChildren, un niveau à l'expansion), donc RootLayout ne pré-charge
+  // plus l'arbre complet ici (l'ancien `useFileTree()` heurtait le cap 5000
+  // sur les gros projets). `invalidateFileTree()` reste exposé via
+  // shellContext pour open-folder (il invalide tree + niveaux lazy).
   const [openFiles, setOpenFiles] = useState<string[]>([]);
   const [activeFile, setActiveFile] = useState<string | null>(null);
   const [fileContents, setFileContents] = useState<Record<string, any>>({});
@@ -902,16 +901,14 @@ export function RootLayout() {
     // Files (alphabetical)
     activeFile,
     fileContents,
-    fileTree,
     openFiles,
     saveAll,
     saveFile,
     setActiveFile,
     setFileContents,
-    /** Refetch le file tree (utilisé par command palette open-folder).
-     *  Remplace l'ancien `setFileTree` (qui était un useState setter)
-     *  par un trigger d'invalidation TanStack — le useFileTree hook
-     *  refetch automatiquement et propage à tous les consumers. */
+    /** Rafraîchit l'arbre après un changement de workspace (open-folder).
+     *  Invalide le tree complet (indexer/Studio) ET les niveaux lazy de
+     *  l'explorateur (SideFiles → useDirChildren). */
     invalidateFileTree,
     setOpenFiles,
     // Gallery / Agents
@@ -935,7 +932,7 @@ export function RootLayout() {
     tweaks, setTweak,
     newChat,
     // Files (alphabetical)
-    activeFile, fileContents, fileTree, openFiles,
+    activeFile, fileContents, openFiles,
     saveAll, saveFile,
     setActiveFile, setFileContents, setOpenFiles,
     // Gallery / Agents
@@ -987,7 +984,6 @@ export function RootLayout() {
     if (view === "code") {
       return (
         <SideFiles
-          tree={fileTree}
           active={filesPanelActive}
           onPick={openFile}
         />

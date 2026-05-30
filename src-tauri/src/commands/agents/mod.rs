@@ -74,6 +74,11 @@ mod tools;
 /// only, never the user's real project.
 pub(crate) mod sandbox;
 
+/// Disposable project mirror — clones the user's real project into a throwaway
+/// temp dir so Grounded Run executes on a COPY, never the live tree. The patch
+/// it produces is auto-applied to the real project and is reversible.
+mod mirror;
+
 /// Skill library (Voyager / Hermes) — the agent saves reusable skills it learns
 /// (`skill_save` tool) and loads them into context on future runs. Persistent,
 /// per-role, compounding learning.
@@ -259,6 +264,17 @@ pub enum AgentEvent {
         role: String,
         name: String,
     },
+    /// Grounded Run produced a unified diff (mirror vs baseline) and tried to
+    /// auto-apply it to the live project. `applied` reports whether the write
+    /// succeeded; `apply_error` carries the reason when it didn't. The patch is
+    /// shown read-only in the panel and reversed via `agent_reverse_patch`.
+    Diff {
+        agent_id: String,
+        patch: String,
+        applied: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        apply_error: Option<String>,
+    },
 }
 
 impl AgentEvent {
@@ -274,6 +290,7 @@ impl AgentEvent {
             AgentEvent::Complete { .. } => "complete",
             AgentEvent::Error { .. } => "error",
             AgentEvent::SkillLearned { .. } => "skillLearned",
+            AgentEvent::Diff { .. } => "diff",
         }
     }
 
@@ -288,7 +305,8 @@ impl AgentEvent {
             | AgentEvent::Delta { agent_id, .. }
             | AgentEvent::Complete { agent_id, .. }
             | AgentEvent::Error { agent_id, .. }
-            | AgentEvent::SkillLearned { agent_id, .. } => agent_id,
+            | AgentEvent::SkillLearned { agent_id, .. }
+            | AgentEvent::Diff { agent_id, .. } => agent_id,
         }
     }
 }
@@ -336,6 +354,23 @@ pub struct AtelierArgs {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub chat_template_kwargs: Option<serde_json::Value>,
+}
+
+/// Arguments for a Grounded Run — exec on a disposable mirror of the user's
+/// REAL project. Mirrors `AtelierArgs` provider routing, plus an optional
+/// verification command the agent must run after each change.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroundedArgs {
+    pub task: String,
+    pub model: String,
+    pub protocol: Option<String>,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub chat_template_kwargs: Option<serde_json::Value>,
+    /// The project's verification command (e.g. "pnpm typecheck"). When set it
+    /// is injected into the system prompt so the agent runs EXACTLY that.
+    pub test_command: Option<String>,
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -640,6 +675,7 @@ pub async fn agent_spawn(
             None,  // workspace_override — chat works on the real open workspace
             false, // allow_exec — chat never executes; only the Atelier does
             system_prompt_override_for_task, // None ⇒ seed_prompt ; Some ⇒ .md custom
+            Vec::new(), // exec_ro_mounts — chat never execs
         )
         .await;
     });
@@ -756,6 +792,7 @@ pub async fn agent_atelier_run(
             Some(ws_for_task), // workspace_override — the disposable mirror
             true,              // allow_exec — the Atelier is the ONLY exec path
             Some(runner::ATELIER_PROMPT.to_string()),
+            Vec::new(), // exec_ro_mounts — Atelier builds from scratch, no deps mount
         )
         .await;
         // The mirror dir is intentionally left on disk so the preview pane can
@@ -763,6 +800,219 @@ pub async fn agent_atelier_run(
     });
 
     Ok(agent_id)
+}
+
+/// Preflight the exec sandbox so the UI can enable/disable "Grounded Run" with
+/// an ACTIONABLE reason. Runs the (blocking) docker probes off the async runtime
+/// so a hung daemon never blocks the UI thread. Safe to call from desktop only —
+/// in web mode the `invoke` simply isn't available and the UI hides the button.
+#[tauri::command]
+pub async fn agent_exec_preflight() -> Result<sandbox::ExecCapability, String> {
+    tokio::task::spawn_blocking(sandbox::check_docker)
+        .await
+        .map_err(|e| format!("preflight join error: {e}"))
+}
+
+/// Grounded Run — the env-grounded loop on a COPY of the user's REAL project.
+/// Spawns a `grounded` agent on a disposable mirror with execution ENABLED,
+/// driven by `GROUNDED_PROMPT`: it reads, edits, runs the project's checks, and
+/// iterates on real failures. When the run ends, the mirror diff is computed,
+/// AUTO-APPLIED to the live project (reversible via `agent_reverse_patch`), and
+/// emitted as a `Diff` event for the panel. The live project is touched ONLY by
+/// that single auto-apply — never by the agent's exec, which stays on the copy.
+#[tauri::command]
+pub async fn agent_grounded_run(
+    app: tauri::AppHandle,
+    state: State<'_, AgentManagerState>,
+    args: GroundedArgs,
+) -> Result<String, String> {
+    let role = "grounded";
+
+    // The live project root must be open — that's what we mirror.
+    let real_root = crate::commands::fs::restore_workspace_root(&app)
+        .ok_or_else(|| "aucun projet ouvert : ouvre un dossier avant un Grounded Run".to_string())?;
+
+    // Capacity check + handle insertion (same cap as agent_spawn / Atelier).
+    let agent_id = Uuid::new_v4().to_string();
+    {
+        let mut guard = state.0.lock().map_err(|e| e.to_string())?;
+        if guard.len() >= MAX_CONCURRENT_AGENTS {
+            return Err(format!(
+                "agent capacity reached: {} active",
+                MAX_CONCURRENT_AGENTS
+            ));
+        }
+        guard.insert(
+            agent_id.clone(),
+            AgentHandle {
+                role: role.to_string(),
+                abort: std::sync::Arc::new(tokio::sync::Notify::new()),
+            },
+        );
+    }
+
+    // Build the disposable mirror from the live project (blocking git/fs work).
+    let real_root_for_mirror = real_root.clone();
+    let agent_id_for_mirror = agent_id.clone();
+    let mirror = match tokio::task::spawn_blocking(move || {
+        mirror::prepare_project_mirror(&real_root_for_mirror, &agent_id_for_mirror)
+    })
+    .await
+    {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => {
+            if let Ok(mut g) = state.0.lock() {
+                g.remove(&agent_id);
+            }
+            return Err(format!("préparation du miroir : {e}"));
+        }
+        Err(e) => {
+            if let Ok(mut g) = state.0.lock() {
+                g.remove(&agent_id);
+            }
+            return Err(format!("mirror task join error: {e}"));
+        }
+    };
+
+    // INSERT the agents row (standalone — no conversation, no parent).
+    let created_at = now_ms();
+    {
+        let conn_mutex = get_conn(&app)?;
+        let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO agents
+                (id, role, status, parent_id, model, task, conversation_id, created_at)
+             VALUES (?1, ?2, 'running', NULL, ?3, ?4, NULL, ?5)",
+            params![agent_id, role, args.model, args.task, created_at],
+        )
+        .map_err(|e| {
+            if let Ok(mut g) = state.0.lock() {
+                g.remove(&agent_id);
+            }
+            format!("insert agents row: {e}")
+        })?;
+    }
+
+    persist_and_emit(
+        &app,
+        &AgentEvent::Spawn {
+            agent_id: agent_id.clone(),
+            parent_id: None,
+            role: role.to_string(),
+            task: args.task.clone(),
+            model: args.model.clone(),
+            conversation_id: None,
+        },
+    )?;
+
+    // System prompt = GROUNDED_PROMPT + the project's verification command (if
+    // provided) so the agent runs EXACTLY that after each change.
+    let mut system_prompt = runner::GROUNDED_PROMPT.to_string();
+    if let Some(cmd) = args.test_command.as_deref() {
+        let cmd = cmd.trim();
+        if !cmd.is_empty() {
+            system_prompt.push_str(&format!(
+                "\n\nVERIFICATION COMMAND (run EXACTLY this with run_command after each change, iterate until it exits 0):\n{cmd}\n"
+            ));
+        }
+    }
+
+    let abort_token = {
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        guard
+            .get(&agent_id)
+            .map(|h| h.abort.clone())
+            .ok_or_else(|| "agent handle vanished between insert and spawn".to_string())?
+    };
+
+    // Gate JS — mount the LIVE project's `node_modules` read-only at
+    // `/work/node_modules` so `pnpm`/`tsc`/etc. resolve OFFLINE inside the
+    // network-isolated sandbox (the mirror excludes node_modules; Docker creates
+    // the mount point). Verified: pnpm's relative symlinks stay valid when the
+    // whole dir is mounted as a unit. Read-only ⇒ the agent's exec can never
+    // mutate the real deps. Absent ⇒ no mount (a depless project still works).
+    let mut exec_ro_mounts: Vec<(String, String)> = Vec::new();
+    let real_node_modules = real_root.join("node_modules");
+    if real_node_modules.is_dir() {
+        match std::fs::canonicalize(&real_node_modules) {
+            Ok(nm) => exec_ro_mounts.push((
+                nm.to_string_lossy().to_string(),
+                "/work/node_modules".to_string(),
+            )),
+            Err(e) => eprintln!("[grounded] node_modules canonicalize failed, skipping mount: {e}"),
+        }
+    }
+
+    let app_for_task = app.clone();
+    let agent_state = state.0.clone();
+    let agent_id_for_task = agent_id.clone();
+    let mirror_for_task = mirror.clone();
+    tauri::async_runtime::spawn(async move {
+        runner::run_agent_task(
+            app_for_task.clone(),
+            agent_state,
+            agent_id_for_task.clone(),
+            role.to_string(),
+            args.task,
+            args.model,
+            args.protocol,
+            args.base_url,
+            args.api_key,
+            args.chat_template_kwargs,
+            None, // design_context
+            abort_token,
+            Some(mirror_for_task.clone()), // workspace_override — the disposable mirror
+            true,                          // allow_exec — grounded execs on the copy
+            Some(system_prompt),
+            exec_ro_mounts, // node_modules:ro so pnpm/tsc resolve offline (gate JS)
+        )
+        .await;
+
+        // POST-RUN (best-effort even if the run was killed): compute the diff of
+        // the agent's changes vs baseline, AUTO-APPLY it to the live project
+        // (reversible), emit it for the panel, then delete the mirror.
+        let diff_event = tokio::task::spawn_blocking(move || {
+            let patch = mirror::compute_mirror_patch(&mirror_for_task).unwrap_or_default();
+            if patch.trim().is_empty() {
+                mirror::cleanup_mirror(&mirror_for_task);
+                return None;
+            }
+            let (applied, apply_error) = match mirror::apply_patch(&real_root, &patch) {
+                Ok(()) => (true, None),
+                Err(e) => (false, Some(e)),
+            };
+            mirror::cleanup_mirror(&mirror_for_task);
+            Some((patch, applied, apply_error))
+        })
+        .await
+        .ok()
+        .flatten();
+
+        if let Some((patch, applied, apply_error)) = diff_event {
+            let _ = persist_and_emit(
+                &app_for_task,
+                &AgentEvent::Diff {
+                    agent_id: agent_id_for_task,
+                    patch,
+                    applied,
+                    apply_error,
+                },
+            );
+        }
+    });
+
+    Ok(agent_id)
+}
+
+/// Reverse a Grounded Run's auto-applied patch (the "Annuler ce run" button).
+/// Writes ONLY to the live workspace, behind the user's explicit click.
+#[tauri::command]
+pub async fn agent_reverse_patch(app: tauri::AppHandle, patch: String) -> Result<(), String> {
+    let real_root = crate::commands::fs::restore_workspace_root(&app)
+        .ok_or_else(|| "aucun projet ouvert".to_string())?;
+    tokio::task::spawn_blocking(move || mirror::reverse_patch(&real_root, &patch))
+        .await
+        .map_err(|e| format!("reverse task join error: {e}"))?
 }
 
 /// Kill a running agent. Cooperative cancellation: the runner task selects

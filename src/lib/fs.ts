@@ -122,8 +122,12 @@ function fsEntryToFileNode(entry: FsEntry): FileNode {
   const node: FileNode = {
     name: entry.name,
     path: entry.path,
+    isDir: entry.is_dir,
   };
   if (entry.is_dir) {
+    // Recursive walk (fs_read_dir): children are pre-populated. Shallow walk
+    // (fs_read_dir_shallow): the backend returns `[]`, so a directory still
+    // satisfies `Array.isArray(children)` but starts empty (filled on expand).
     node.children = entry.children.map(fsEntryToFileNode);
   }
   return node;
@@ -147,9 +151,25 @@ export async function fsGetWorkspaceRoot(): Promise<string | null> {
   return invoke<string | null>("fs_get_workspace_root");
 }
 
-/** Read the recursive directory tree rooted at the current workspace. */
+/** Read the recursive directory tree rooted at the current workspace.
+ *  Used by the bulk vector indexer (workspaceIndexer) and the Studio file
+ *  panels, which need the whole tree at once. The interactive explorer uses
+ *  the lazy `fsReadDirShallow` instead (no 5000-entry cap). */
 export async function fsReadDir(): Promise<FileNode[]> {
   const entries = await invoke<FsEntry[]>("fs_read_dir");
+  return entries.map(fsEntryToFileNode);
+}
+
+/** List ONE directory level (lazy tree). `path` is a workspace-relative dir
+ *  (forward-slash), or undefined/"" for the workspace root. Each returned dir
+ *  node carries an empty `children` (fetched on its own expand); files carry
+ *  none. No entry cap — only one level is read, so even a 50k-child dir is a
+ *  single flat list. This is what makes huge projects (Comfyui ≈ 98k total
+ *  entries) open instantly where the recursive walk would hit its cap. */
+export async function fsReadDirShallow(path?: string): Promise<FileNode[]> {
+  const entries = await invoke<FsEntry[]>("fs_read_dir_shallow", {
+    rel: path && path !== "" ? path : null,
+  });
   return entries.map(fsEntryToFileNode);
 }
 

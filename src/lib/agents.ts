@@ -30,7 +30,8 @@ export type AgentEventKind =
   | "delta"
   | "complete"
   | "error"
-  | "skillLearned";
+  | "skillLearned"
+  | "diff";
 
 // ────────────────────────────────────────────────────────────────────
 // DB row shapes (mirror Rust AgentRow / AgentEventRow)
@@ -124,6 +125,16 @@ export type AgentEvent =
       /** Name of the reusable skill the agent just saved — VERIFIED by a real
        * passing test (the env gate). The chat UI shows an inline "🎓 appris" badge. */
       name: string;
+    }
+  | {
+      kind: "diff";
+      agentId: string;
+      /** Unified diff (mirror vs baseline) of everything the Grounded Run changed. */
+      patch: string;
+      /** Whether the patch was auto-applied to the live project. */
+      applied: boolean;
+      /** Reason the auto-apply failed (only set when `applied` is false). */
+      applyError?: string;
     };
 
 // ────────────────────────────────────────────────────────────────────
@@ -337,4 +348,46 @@ export async function atelierRun(args: {
   chatTemplateKwargs?: Record<string, unknown>;
 }): Promise<string> {
   return invoke<string>("agent_atelier_run", { args });
+}
+
+// ── Grounded Run (exec on a disposable mirror of the REAL project) ──
+
+/** Exec-sandbox capability report (mirror of Rust `ExecCapability`). Drives the
+ *  enabled/disabled state of the "Grounded Run" button + its reason tooltip. */
+export interface ExecCapability {
+  dockerAvailable: boolean;
+  imagePresent: boolean;
+  /** Actionable reason when exec is unusable; absent when everything is ready. */
+  reason?: string;
+}
+
+/** Probe whether the exec sandbox is usable right now (Docker daemon + image).
+ *  Rejects if the IPC itself is unreachable; the caller treats that as
+ *  "sandbox unavailable" and disables the button. */
+export async function execPreflight(): Promise<ExecCapability> {
+  return invoke<ExecCapability>("agent_exec_preflight");
+}
+
+/** Launch a Grounded Run: a `grounded` agent works on a DISPOSABLE mirror of the
+ *  user's REAL project with execution enabled, runs the project's checks, and
+ *  iterates on real failures. When it ends, the diff is auto-applied to the live
+ *  project (reversible via [`reversePatch`]) and emitted as a `diff` event.
+ *  Provider routing mirrors `spawnAgent` (key resolved from the keychain). */
+export async function groundedRun(args: {
+  task: string;
+  model: string;
+  protocol?: string;
+  baseUrl?: string;
+  apiKey?: string;
+  chatTemplateKwargs?: Record<string, unknown>;
+  /** The project's verification command, e.g. "pnpm typecheck". */
+  testCommand?: string;
+}): Promise<string> {
+  return invoke<string>("agent_grounded_run", { args });
+}
+
+/** Reverse a Grounded Run's auto-applied patch ("Annuler ce run"). Writes ONLY
+ *  to the live workspace, behind the user's explicit click. */
+export async function reversePatch(patch: string): Promise<void> {
+  return invoke<void>("agent_reverse_patch", { patch });
 }

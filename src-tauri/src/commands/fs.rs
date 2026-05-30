@@ -351,6 +351,88 @@ pub fn fs_open_folder(
     Ok(Some(display))
 }
 
+/// List the IMMEDIATE children of one directory (lazy tree loading).
+///
+/// `rel` is a workspace-relative dir path (forward-slash), or `None`/empty for
+/// the workspace root. Returns ONE level: each child carries `is_dir` and an
+/// empty `children` vec (the UI fetches a folder's children on first expand).
+///
+/// This is what the file-explorer UI uses, so a huge project (Comfyui = 98k
+/// entries, node-heavy ML trees) opens instantly instead of failing the 5000-
+/// entry cap of the recursive `fs_read_dir` (which stays for the bulk indexer).
+///
+/// Containment: the root is canonicalized; `rel` is resolved with `safe_resolve`
+/// (rejects traversal / symlink escape). Returns `Err("no workspace open")` when
+/// no folder is open, or `Err` if `rel` is not a directory inside the root.
+#[tauri::command]
+pub fn fs_read_dir_shallow(
+    rel: Option<String>,
+    root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
+) -> Result<Vec<FsEntry>, String> {
+    let root = {
+        let guard = root_state
+            .lock()
+            .map_err(|e| format!("workspace state lock: {e}"))?;
+        guard.clone().ok_or_else(|| "no workspace open".to_string())?
+    };
+
+    // Resolve the directory to list: the root itself, or a relative subdir.
+    let dir = match rel.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => root.clone(),
+        Some(r) => {
+            let resolved = safe_resolve(&root, r)?;
+            if !resolved.is_dir() {
+                return Err(format!("not a directory: {r}"));
+            }
+            resolved
+        }
+    };
+
+    let read = std::fs::read_dir(&dir).map_err(|e| format!("read_dir: {e}"))?;
+    let mut children: Vec<FsEntry> = Vec::new();
+    for entry in read {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("[fs_read_dir_shallow] skipping entry: {e}");
+                continue;
+            }
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if is_ignored(&name) {
+            continue;
+        }
+        // file_type() avoids a full stat where possible; fall back to is_dir().
+        let is_dir = entry
+            .file_type()
+            .map(|t| t.is_dir())
+            .unwrap_or(false);
+        // Workspace-relative, forward-slash path. Derive from the listed dir's
+        // path relative to root, then append the child name — robust to the
+        // `\\?\` prefix because we strip the canonicalized root prefix.
+        let child_abs = entry.path();
+        let rel_path = child_abs
+            .strip_prefix(&root)
+            .unwrap_or(&child_abs)
+            .to_string_lossy()
+            .replace('\\', "/");
+        children.push(FsEntry {
+            name,
+            path: rel_path,
+            is_dir,
+            children: Vec::new(), // lazy — fetched on expand
+        });
+    }
+
+    // Sort: directories first, then files, both case-insensitive alphabetical.
+    children.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(children)
+}
+
 /// Walk the workspace root and return a recursive directory tree.
 ///
 /// Returns `Err("no workspace open")` if no folder has been opened yet.

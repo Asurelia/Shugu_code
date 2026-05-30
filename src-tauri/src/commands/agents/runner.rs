@@ -53,7 +53,7 @@ const MAX_ITERATIONS: u32 = 8;
 /// Iteration budget for the Atelier (exec) path. Higher than chat because each
 /// write→run-test→fix cycle costs one iteration; the agent needs room to see a
 /// real failure, fix it, and re-run before producing its final answer.
-const MAX_ITERATIONS_EXEC: u32 = 16;
+const MAX_ITERATIONS_EXEC: u32 = 24;
 
 // ────────────────────────────────────────────────────────────────────
 // Internal conversation history shape
@@ -269,6 +269,10 @@ pub(super) async fn run_agent_task(
     workspace_override: Option<PathBuf>,
     allow_exec: bool,
     system_prompt_override: Option<String>,
+    // Read-only `(host, container)` mounts added to the exec sandbox. Grounded
+    // Run passes the live project's `node_modules` so `pnpm`/`tsc` resolve
+    // OFFLINE; chat/atelier pass an empty vec (no extra mounts).
+    exec_ro_mounts: Vec<(String, String)>,
 ) {
     let start = std::time::Instant::now();
     let protocol = protocol.unwrap_or_else(|| "openai".to_string());
@@ -360,6 +364,7 @@ pub(super) async fn run_agent_task(
             &mut loop_metrics,
             workspace_override,
             allow_exec,
+            exec_ro_mounts,
         ) => r,
         _ = abort.notified() => {
             mark_killed(&app, &agent_id);
@@ -454,6 +459,9 @@ pub(super) async fn tool_use_loop(
     // arbitrary commands a path-guard can't contain, so only the bench (which
     // works on a disposable copy) passes `true`; real chat agents pass `false`.
     allow_exec: bool,
+    // Read-only mounts threaded to `run_command`'s sandbox (Grounded Run's
+    // `node_modules`); empty for chat/atelier.
+    exec_ro_mounts: Vec<(String, String)>,
 ) -> Result<(String, String), String> {
     // Stall-detection state: repeated identical tool-call signatures and
     // consecutive tool-error rounds are the two cheap "stuck" signals, recorded
@@ -609,6 +617,7 @@ pub(super) async fn tool_use_loop(
                 let app_clone = app.clone();
                 let role_clone = role.to_string();
                 let last_exec_clone = last_exec_exit.clone();
+                let mounts_clone = exec_ro_mounts.clone();
                 async move {
                     // `spawn_blocking` because the fs ops are synchronous —
                     // running them on the async runtime thread would starve
@@ -616,7 +625,7 @@ pub(super) async fn tool_use_loop(
                     // a JoinError (panic in the closure); `execute_tool`
                     // itself never panics for normal fs failures.
                     tokio::task::spawn_blocking(move || {
-                        execute_tool(&tc_clone, &root_clone, allow_exec, &app_clone, &role_clone, &last_exec_clone)
+                        execute_tool(&tc_clone, &root_clone, allow_exec, &app_clone, &role_clone, &last_exec_clone, &mounts_clone)
                     })
                         .await
                         .unwrap_or_else(|join_err| ToolResult {
@@ -866,6 +875,30 @@ const GENERATION_MODE_PROMPT: &str = "=== GENERATION MODE (a design system is ac
 /// real browser (Playwright in the Docker sandbox), iterates on real failures,
 /// and only saves a skill once the test exits 0 (the gate enforces this). This is
 /// the Voyager/Hermes loop: act → observe real feedback → adapt → capture.
+pub(super) const GROUNDED_PROMPT: &str = r#"You are Shugu's Grounded agent. You work on a DISPOSABLE COPY of the user's real project — never the live tree — with execution ENABLED inside a network-isolated sandbox. Your job: make the requested change AND prove it works by running the project's own checks.
+
+LOOP (DeepSWE-shaped):
+1. UNDERSTAND before editing. Use fs_search and fs_read_file to locate the relevant code and read it FULLY. Never edit a file you have not read.
+2. EDIT surgically: fs_edit for changes to existing files, fs_write_file for new ones.
+3. VERIFY after every change with run_command. If a verification command was provided below, run it — but adapt it to the sandbox toolchain below if needed.
+4. READ the failure. A non-zero exit is INFORMATION, not defeat: read stderr, find the root cause, fix it, then run the check AGAIN.
+5. Declare done ONLY when the check passes (exit 0). End with a short plain-text summary of what you changed and why.
+
+SANDBOX TOOLCHAIN (what actually exists in this container):
+- Available: `node`, `npm`, `npx` (with `--no-install`), and any local binary under `node_modules/.bin/`. The project's installed `node_modules` IS mounted, so local tools resolve.
+- NOT usable: `pnpm` and `yarn` are absent, and the network is OFF — `corepack` exists but cannot fetch them offline, so you CANNOT install anything. Translate any `pnpm`/`yarn` command to its offline equivalent:
+    `pnpm typecheck` / `pnpm run typecheck`  →  read the script in `package.json` and run it directly, e.g. `node_modules/.bin/tsc -b --noEmit`
+    `pnpm test`                               →  `node_modules/.bin/<runner> ...` or `npx --no-install <runner>`
+    `pnpm exec X` / `pnpm dlx X`              →  `npx --no-install X`
+- For TypeScript projects, `node_modules/.bin/tsc --noEmit` (or `-b --noEmit` for project references) is the reliable type check.
+- For Rust/Python projects in the sandbox, prefer `cargo check` / `pytest` only if that toolchain is present; otherwise verify what you can.
+
+RULES:
+- The copy is throwaway; the user reviews your diff and can revert it with one click. Be bold but correct.
+- run_command runs OFFLINE (no network). Do not try to install packages or fetch anything — work with what is already present (see toolchain above).
+- Keep going until the check is green or you exhaust your iteration budget. Honest partial progress beats a confident wrong answer.
+"#;
+
 pub(super) const ATELIER_PROMPT: &str = r#"You are Shugu's Atelier agent. You build a small WEB UI and then PROVE it works by actually driving a real browser — never by claiming it looks correct.
 
 You work on a DISPOSABLE copy of nothing (a throwaway mirror), never the user's real project. All file paths are workspace-relative POSIX paths (e.g. `index.html`, `app.js`). Your tools: `fs_write_file(path, content)`, `fs_read_file(path)`, `fs_edit(path, old_string, new_string)`, `fs_list_dir(path)`, `run_command(command)`, and `skill_save(name, when_to_use, body)`.

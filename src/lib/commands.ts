@@ -57,7 +57,6 @@ export interface CommandContext {
   // Files
   activeFile: string | null;
   fileContents: Record<string, any>;
-  fileTree: any[];
   openFiles: string[];
   saveAll: () => Promise<void>;
   saveFile: (path: string) => Promise<void>;

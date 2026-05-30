@@ -6,6 +6,9 @@ import { createPortal } from "react-dom";
 import { fsCreateFile, fsCreateDir, fsRename, fsDelete } from "@/lib/fs";
 // LOT 3 git-ui — annotate the file tree with git status.
 import { useGitStatusMap, type GitStatusChar } from "@/features/git/useGitStatusMap";
+// Lazy tree — each folder fetches its direct children on first expand
+// (fs_read_dir_shallow), so huge projects open instantly (no 5000-entry cap).
+import { useDirChildren } from "@/features/fs/queries";
 
 // ── Icons (24x24 stroke) ────────────────────────────────────
 export function Icon({ name, size = 18, className = "" }: { name: string; size?: number; className?: string }) {
@@ -255,10 +258,16 @@ export function SideHistory({ items, active, onPick, onNew }: any) {
 
 type FileCtxAction = "newFile" | "newFolder" | "rename" | "delete";
 
-export function SideFiles({ tree, active, onPick }: any) {
+export function SideFiles({ active, onPick }: any) {
   // LOT 3 git-ui — per-path git status char (no-op outside a git repo).
   const gitStatusMap = useGitStatusMap();
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  // Lazy tree — root level only; each folder fetches its children on expand.
+  // No 5000-entry cap (the recursive fs_read_dir hit it on big ML projects).
+  const { data: rootChildren = [] } = useDirChildren("");
+  // Expansion is OPT-IN now (default closed → only root level visible).
+  // Was `collapsed` (default open) when the whole tree loaded eagerly; the
+  // lazy loader can't pre-open everything, so we track which folders ARE open.
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [renaming, setRenaming] = useState<string | null>(null); // path of node being renamed
   const [ctxMenu, setCtxMenu] = useState<{ node: any; x: number; y: number } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<any | null>(null);
@@ -268,15 +277,15 @@ export function SideFiles({ tree, active, onPick }: any) {
   const [createPopover, setCreatePopover] = useState<{ parent: string; x: number; y: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const toggleCollapsed = (path: string) => {
-    setCollapsed(s => {
+  const toggleExpanded = (path: string) => {
+    setExpanded(s => {
       const n = new Set(s);
       if (n.has(path)) n.delete(path); else n.add(path);
       return n;
     });
   };
   const forceExpand = (path: string) => {
-    setCollapsed(s => { const n = new Set(s); n.delete(path); return n; });
+    setExpanded(s => { const n = new Set(s); n.add(path); return n; });
   };
 
   const openCtxMenu = (node: any, e: React.MouseEvent) => {
@@ -294,7 +303,7 @@ export function SideFiles({ tree, active, onPick }: any) {
     } else if (action === "delete") {
       setConfirmDelete(node);
     } else if (action === "newFile" || action === "newFolder") {
-      const isDir = Array.isArray(node.children);
+      const isDir = node.isDir ?? Array.isArray(node.children);
       // New file in a folder = child; new file on a file = sibling.
       const parent = isDir ? node.path : node.path.split("/").slice(0, -1).join("/");
       if (isDir) forceExpand(node.path);
@@ -364,15 +373,15 @@ export function SideFiles({ tree, active, onPick }: any) {
             onCancel={() => setCreating(null)}
           />
         )}
-        {tree.map((node: any) => (
+        {rootChildren.map((node: any) => (
           <FileNode
             key={node.path}
             node={node}
             depth={0}
             active={active}
             onPick={onPick}
-            collapsed={collapsed}
-            onToggleCollapsed={toggleCollapsed}
+            expanded={expanded}
+            onToggleExpanded={toggleExpanded}
             renaming={renaming}
             onCommitRename={doRename}
             onCancelRename={() => setRenaming(null)}
@@ -431,19 +440,29 @@ export function SideFiles({ tree, active, onPick }: any) {
 
 export function FileNode({
   node, depth, active, onPick,
-  collapsed, onToggleCollapsed,
+  expanded, onToggleExpanded,
   renaming, onCommitRename, onCancelRename,
   onContextMenu,
   creating, onCommitCreate, onCancelCreate,
   onOpenCreatePopover,
   gitStatusMap,
 }: any) {
-  const isDir = Array.isArray(node.children);
+  // A directory node carries `children: []` from the shallow loader (files
+  // carry `undefined`), so `isDir` is the explicit flag with array fallback
+  // for any eagerly-loaded node (Studio passes recursive trees elsewhere).
+  const isDir = node.isDir ?? Array.isArray(node.children);
   // creating.parent === node.path keeps a folder force-open while the user
   // is typing the new child's name (the create row lives inside its children).
-  const isOpen = !collapsed.has(node.path) || creating?.parent === node.path;
+  const isOpen = (isDir && expanded.has(node.path)) || creating?.parent === node.path;
   const isRenaming = renaming === node.path;
   const pad = 10 + depth * 14;
+  // Lazy children — fetched only while this folder is open. `node.children`
+  // (pre-loaded) wins if present and non-empty; otherwise use the fetched set.
+  const { data: fetchedChildren = [] } = useDirChildren(node.path, isDir && isOpen);
+  const children: any[] =
+    Array.isArray(node.children) && node.children.length > 0
+      ? node.children
+      : fetchedChildren;
   // LOT 3 git-ui — stamp the node with its current git char if any.
   // The legacy renderer below uses `node.git` so we expose it via a local
   // variable instead of mutating the upstream node (mutations would
@@ -458,7 +477,7 @@ export function FileNode({
         style={{ paddingLeft: pad }}
         onClick={() => {
           if (isRenaming) return;
-          if (isDir) onToggleCollapsed(node.path);
+          if (isDir) onToggleExpanded(node.path);
           else onPick(node.path);
         }}
         onContextMenu={(e) => onContextMenu(node, e)}
@@ -466,7 +485,7 @@ export function FileNode({
         {isDir
           ? <span
               className="file-chevron"
-              onClick={(e) => { e.stopPropagation(); onToggleCollapsed(node.path); }}
+              onClick={(e) => { e.stopPropagation(); onToggleExpanded(node.path); }}
             >{isOpen ? "▾" : "▸"}</span>
           : <span className="file-chevron-spacer" />}
         {isDir
@@ -519,15 +538,15 @@ export function FileNode({
               onCancel={onCancelCreate}
             />
           )}
-          {node.children.map((c: any) => (
+          {children.map((c: any) => (
             <FileNode
               key={c.path}
               node={c}
               depth={depth + 1}
               active={active}
               onPick={onPick}
-              collapsed={collapsed}
-              onToggleCollapsed={onToggleCollapsed}
+              expanded={expanded}
+              onToggleExpanded={onToggleExpanded}
               renaming={renaming}
               onCommitRename={onCommitRename}
               onCancelRename={onCancelRename}
@@ -683,7 +702,7 @@ function FileCtxMenu({ node, x, y, onClose, onAction }: { node: any; x: number; 
     };
   }, [onClose]);
 
-  const isDir = Array.isArray(node.children);
+  const isDir = node.isDir ?? Array.isArray(node.children);
   return (
     <div ref={ref} className="file-ctx-menu" style={{ left: x, top: y }}>
       {/* "New" items live at the top — VS Code convention. For a file we
@@ -708,7 +727,7 @@ function FileDeleteConfirm({ node, onCancel, onConfirm }: { node: any; onCancel:
     return () => document.removeEventListener("keydown", onEsc);
   }, [onCancel]);
 
-  const isDir = Array.isArray(node.children);
+  const isDir = node.isDir ?? Array.isArray(node.children);
   return (
     <div className="file-delete-overlay" onClick={onCancel}>
       <div className="file-delete-modal" onClick={(e) => e.stopPropagation()}>

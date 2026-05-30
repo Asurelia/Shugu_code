@@ -18,8 +18,12 @@ import { useEffect, useState } from "react";
 import {
   killAgent,
   atelierRun,
+  groundedRun,
+  execPreflight,
+  reversePatch,
   type AgentRow,
   type AgentEvent,
+  type ExecCapability,
 } from "@/lib/agents";
 import {
   useActiveAgents,
@@ -31,6 +35,48 @@ import { useSkillsList, invalidateSkills } from "./skillsQueries";
 import { resolveProvider, type Protocol } from "@/lib/providers";
 import { loadProviderConfig, getConfig, getProviderEnabled } from "@/lib/credentials";
 import { useActiveModel } from "@/features/chat/chat-sync";
+
+// Resolve the active model → provider routing (protocol / baseUrl / key), exactly
+// like the chat delegate flow: the key stays in the keychain, never cleartext.
+// Shared by the Atelier and Grounded launchers so the resolution logic lives in
+// ONE place (a divergence here would be a silent auth bug in one launcher only).
+interface ResolvedProvider {
+  protocol: Protocol;
+  baseUrl: string;
+  apiKey: string | undefined;
+  model: string;
+}
+
+// Throws Error("Aucun provider…") when no provider is enabled — both launchers
+// already have a try/catch that surfaces err.message, so the error path stays
+// uniform without a discriminated-union return (which `strict:false` narrows
+// unreliably here).
+async function resolveActiveProviderConfig(
+  modelId: string | undefined,
+): Promise<ResolvedProvider> {
+  const fullId = modelId?.includes("/") ? modelId : `anthropic/${modelId ?? "claude-haiku-4-5"}`;
+  const {
+    providerId,
+    protocol: defProto,
+    baseUrl: defBase,
+    model: realModel,
+  } = resolveProvider(fullId);
+  const enabled = await getProviderEnabled(providerId);
+  if (enabled !== "true") {
+    throw new Error("Aucun provider LLM configuré — Réglages → Connexions.");
+  }
+  const cfg = await loadProviderConfig(providerId);
+  let protocol: Protocol = defProto;
+  if (defProto === "custom") {
+    const stored = await getConfig(providerId, "protocol");
+    if (stored === "anthropic" || stored === "openai" || stored === "ollama" || stored === "custom") {
+      protocol = stored;
+    }
+  }
+  const baseUrl = cfg.baseUrl && cfg.baseUrl !== "" ? cfg.baseUrl : defBase;
+  const apiKey = cfg.apiKey && cfg.apiKey !== "" ? cfg.apiKey : undefined;
+  return { protocol, baseUrl, apiKey, model: realModel };
+}
 
 // wry serves a custom `foo://` scheme as `http://foo.localhost/` on Windows and
 // `foo://localhost/` elsewhere — mirror ProjectPreview's origin so the Atelier
@@ -185,6 +231,8 @@ export function TranscriptDrawer({
 }) {
   const { data, isLoading } = useAgentTranscript(agentId);
   const [previewNonce, setPreviewNonce] = useState(0);
+  const [reverseState, setReverseState] = useState<"idle" | "reversing" | "done">("idle");
+  const [reverseErr, setReverseErr] = useState<string | null>(null);
 
   if (isLoading || !data) {
     return (
@@ -219,7 +267,12 @@ export function TranscriptDrawer({
   // presence of run_command tool calls (chat agents never execute).
   const skillEvents = events.filter((e) => e.kind === "skillLearned");
   const runCalls = events.filter((e) => e.kind === "toolCall" && e.tool === "run_command");
-  const isAtelier = runCalls.length > 0;
+  // Both Atelier and Grounded execute via run_command, so the "real-env tests"
+  // view applies to either. The browser-preview iframe is Atelier-ONLY; the
+  // diff + "Annuler ce run" are Grounded-ONLY — keyed on the agent's role.
+  const hasExecRuns = runCalls.length > 0;
+  const isAtelierRun = row.role === "atelier";
+  const diffEvent = events.find((e) => e.kind === "diff");
   const resultByCall = new Map<string, string>();
   for (const e of events) {
     if (e.kind === "toolResult") {
@@ -453,8 +506,8 @@ export function TranscriptDrawer({
         </div>
       )}
 
-      {/* Atelier — the real browser-test runs (the build→test→fix loop) */}
-      {isAtelier && (
+      {/* Real-env command runs (the test→fix loop) — Atelier or Grounded */}
+      {hasExecRuns && (
         <div style={sectionStyle}>
           <span style={labelStyle}>Tests exécutés (environnement réel)</span>
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -509,7 +562,7 @@ export function TranscriptDrawer({
       )}
 
       {/* Atelier — live preview of the built app (served by the preview:// handler) */}
-      {isAtelier && (
+      {isAtelierRun && (
         <div style={sectionStyle}>
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
             <span style={{ ...labelStyle, marginBottom: 0 }}>Aperçu de l'app</span>
@@ -544,6 +597,123 @@ export function TranscriptDrawer({
           />
         </div>
       )}
+
+      {/* Grounded — the diff auto-applied to the live project, reversible. */}
+      {diffEvent && diffEvent.kind === "diff" && (
+        <div style={sectionStyle}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+            <span style={{ ...labelStyle, marginBottom: 0 }}>Modifications du projet</span>
+            <span style={{ flex: 1 }} />
+            {reverseState === "done" ? (
+              <span
+                style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  padding: "2px 8px",
+                  borderRadius: 99,
+                  background: "rgba(150,150,150,0.18)",
+                  color: "var(--on-surface-muted)",
+                }}
+              >
+                ⊘ run annulé
+              </span>
+            ) : diffEvent.applied ? (
+              <>
+                <span
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    padding: "2px 8px",
+                    borderRadius: 99,
+                    background: "rgba(74, 222, 128, 0.15)",
+                    color: "var(--success, #4ade80)",
+                    border: "1px solid rgba(74, 222, 128, 0.35)",
+                  }}
+                >
+                  ✓ appliqué au projet
+                </span>
+                <button
+                  onClick={() => {
+                    if (reverseState === "reversing") return;
+                    setReverseState("reversing");
+                    setReverseErr(null);
+                    void reversePatch(diffEvent.patch)
+                      .then(() => setReverseState("done"))
+                      .catch((err) => {
+                        setReverseErr(err instanceof Error ? err.message : String(err));
+                        setReverseState("idle");
+                      });
+                  }}
+                  disabled={reverseState === "reversing"}
+                  title="Défaire tous les changements de ce run sur le vrai projet"
+                  style={{
+                    fontSize: 10,
+                    padding: "2px 8px",
+                    borderRadius: 4,
+                    background: "rgba(255, 107, 107, 0.12)",
+                    color: "var(--error, #ff6b6b)",
+                    border: "1px solid rgba(255, 107, 107, 0.3)",
+                    cursor: reverseState === "reversing" ? "default" : "pointer",
+                    opacity: reverseState === "reversing" ? 0.6 : 1,
+                  }}
+                >
+                  {reverseState === "reversing" ? "Annulation…" : "Annuler ce run"}
+                </button>
+              </>
+            ) : (
+              <span
+                title={diffEvent.applyError ?? undefined}
+                style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  padding: "2px 8px",
+                  borderRadius: 99,
+                  background: "rgba(255, 107, 107, 0.12)",
+                  color: "var(--error, #ff6b6b)",
+                  border: "1px solid rgba(255, 107, 107, 0.3)",
+                }}
+              >
+                ✗ non appliqué
+              </span>
+            )}
+          </div>
+          {!diffEvent.applied && diffEvent.applyError && (
+            <div
+              style={{
+                fontSize: 10,
+                color: "var(--error, #ff6b6b)",
+                marginBottom: 6,
+                whiteSpace: "pre-wrap",
+              }}
+            >
+              {diffEvent.applyError}
+            </div>
+          )}
+          {reverseErr && (
+            <div style={{ fontSize: 10, color: "var(--error, #ff6b6b)", marginBottom: 6 }}>
+              {reverseErr}
+            </div>
+          )}
+          <pre
+            style={{
+              margin: 0,
+              padding: 8,
+              fontSize: 10,
+              lineHeight: 1.4,
+              maxHeight: 320,
+              overflow: "auto",
+              whiteSpace: "pre",
+              fontFamily: "var(--font-mono)",
+              color: "var(--on-surface-muted)",
+              background: "var(--surface, #14141f)",
+              borderRadius: 6,
+              border: "1px solid rgba(124,58,237,0.12)",
+            }}
+          >
+            {diffEvent.patch}
+          </pre>
+        </div>
+      )}
     </div>
   );
 }
@@ -574,6 +744,31 @@ export function AgentsPanel() {
   const [launching, setLaunching] = useState(false);
   const [atelierErr, setAtelierErr] = useState<string | null>(null);
 
+  // ── Grounded Run launcher state + Docker preflight ──
+  const [groundedTask, setGroundedTask] = useState("");
+  const [groundedTestCmd, setGroundedTestCmd] = useState("");
+  const [groundedLaunching, setGroundedLaunching] = useState(false);
+  const [groundedErr, setGroundedErr] = useState<string | null>(null);
+  const [execCap, setExecCap] = useState<ExecCapability | null>(null);
+
+  // Probe Docker once on mount so the button reflects real capability. Re-probed
+  // when the user clicks "Revérifier" after starting Docker / building the image.
+  // A rejected IPC (not running under Tauri) is treated as "sandbox unavailable".
+  const refreshPreflight = async () => {
+    try {
+      setExecCap(await execPreflight());
+    } catch {
+      setExecCap({
+        dockerAvailable: false,
+        imagePresent: false,
+        reason: "Préflight Docker impossible (sandbox indisponible).",
+      });
+    }
+  };
+  useEffect(() => {
+    void refreshPreflight();
+  }, []);
+
   useEffect(() => {
     let unlisten: (() => void) | null = null;
     void (async () => {
@@ -595,44 +790,45 @@ export function AgentsPanel() {
     setLaunching(true);
     setAtelierErr(null);
     try {
-      // Resolve the active model → provider/protocol/baseUrl/key, exactly like
-      // the chat delegate flow (key stays in the keychain, never cleartext).
-      const fullId = modelId?.includes("/")
-        ? modelId
-        : `anthropic/${modelId ?? "claude-haiku-4-5"}`;
-      const {
-        providerId,
-        protocol: defProto,
-        baseUrl: defBase,
-        model: realModel,
-      } = resolveProvider(fullId);
-      const enabled = await getProviderEnabled(providerId);
-      if (enabled !== "true") {
-        setAtelierErr("Aucun provider LLM configuré — Réglages → Connexions.");
-        return;
-      }
-      const cfg = await loadProviderConfig(providerId);
-      let protocol: Protocol = defProto;
-      if (defProto === "custom") {
-        const stored = await getConfig(providerId, "protocol");
-        if (
-          stored === "anthropic" ||
-          stored === "openai" ||
-          stored === "ollama" ||
-          stored === "custom"
-        ) {
-          protocol = stored;
-        }
-      }
-      const baseUrl = cfg.baseUrl && cfg.baseUrl !== "" ? cfg.baseUrl : defBase;
-      const apiKey = cfg.apiKey && cfg.apiKey !== "" ? cfg.apiKey : undefined;
-      const id = await atelierRun({ task: t, model: realModel, protocol, baseUrl, apiKey });
+      const resolved = await resolveActiveProviderConfig(modelId);
+      const id = await atelierRun({
+        task: t,
+        model: resolved.model,
+        protocol: resolved.protocol,
+        baseUrl: resolved.baseUrl,
+        apiKey: resolved.apiKey,
+      });
       setSelectedId(id);
       setAtelierTask("");
     } catch (err) {
       setAtelierErr(err instanceof Error ? err.message : String(err));
     } finally {
       setLaunching(false);
+    }
+  };
+
+  const execReady = execCap?.dockerAvailable === true && execCap?.imagePresent === true;
+  const launchGrounded = async () => {
+    const t = groundedTask.trim();
+    if (!t || groundedLaunching || !execReady) return;
+    setGroundedLaunching(true);
+    setGroundedErr(null);
+    try {
+      const resolved = await resolveActiveProviderConfig(modelId);
+      const id = await groundedRun({
+        task: t,
+        model: resolved.model,
+        protocol: resolved.protocol,
+        baseUrl: resolved.baseUrl,
+        apiKey: resolved.apiKey,
+        testCommand: groundedTestCmd.trim() || undefined,
+      });
+      setSelectedId(id);
+      setGroundedTask("");
+    } catch (err) {
+      setGroundedErr(err instanceof Error ? err.message : String(err));
+    } finally {
+      setGroundedLaunching(false);
     }
   };
 
@@ -746,6 +942,142 @@ export function AgentsPanel() {
         )}
       </div>
       )}
+
+      {/* Grounded Run — exec ancré sur une COPIE jetable du vrai projet. L'agent
+          lit → écrit → lance les tests → corrige → relance, le tout dans une
+          sandbox Docker (réseau coupé). À la fin le diff est auto-appliqué au
+          vrai projet et réversible d'un clic. */}
+      <div
+        style={{
+          marginBottom: 12,
+          padding: 10,
+          borderRadius: 8,
+          background: "rgba(74, 222, 128, 0.06)",
+          border: "1px solid rgba(74, 222, 128, 0.22)",
+        }}
+      >
+        <div
+          style={{
+            fontSize: 11,
+            fontWeight: 700,
+            color: "var(--success, #4ade80)",
+            marginBottom: 4,
+          }}
+        >
+          🌱 Grounded Run — l'agent code ET teste sur le vrai projet
+        </div>
+        <div
+          style={{
+            fontSize: 10.5,
+            color: "var(--on-surface-muted)",
+            lineHeight: 1.5,
+            marginBottom: 8,
+          }}
+        >
+          L'agent travaille sur une <b>copie jetable</b> de ton projet, lance ses tests dans une
+          sandbox isolée, corrige sur les <b>échecs réels</b> et relance jusqu'au vert. À la fin, ses
+          changements sont <b>appliqués au vrai projet</b> — tu vois le diff et tu peux{" "}
+          <b>tout annuler d'un clic</b>. Ton projet n'est jamais modifié pendant que l'agent travaille.
+        </div>
+
+        {/* Preflight status — Docker readiness with an actionable reason. */}
+        {execCap && !execReady ? (
+          <div
+            style={{
+              fontSize: 10,
+              color: "var(--error, #ff6b6b)",
+              marginBottom: 8,
+              display: "flex",
+              alignItems: "flex-start",
+              gap: 6,
+            }}
+          >
+            <span style={{ whiteSpace: "pre-wrap", flex: 1 }}>
+              ⚠ {execCap.reason ?? "Sandbox d'exécution indisponible."}
+            </span>
+            <button
+              onClick={() => void refreshPreflight()}
+              style={{
+                fontSize: 9,
+                padding: "2px 8px",
+                borderRadius: 4,
+                background: "transparent",
+                color: "var(--on-surface-muted)",
+                border: "1px solid rgba(150,150,150,0.3)",
+                cursor: "pointer",
+                flexShrink: 0,
+              }}
+            >
+              Revérifier
+            </button>
+          </div>
+        ) : null}
+
+        <textarea
+          value={groundedTask}
+          onChange={(e) => setGroundedTask(e.target.value)}
+          placeholder="Décris la tâche de code à réaliser sur le projet ouvert…"
+          rows={2}
+          style={{
+            width: "100%",
+            boxSizing: "border-box",
+            resize: "vertical",
+            fontSize: 11,
+            padding: "6px 8px",
+            borderRadius: 6,
+            background: "var(--surface, #14141f)",
+            color: "var(--on-surface, #ddd)",
+            border: "1px solid rgba(74, 222, 128, 0.25)",
+            fontFamily: "inherit",
+          }}
+        />
+        <input
+          value={groundedTestCmd}
+          onChange={(e) => setGroundedTestCmd(e.target.value)}
+          placeholder="Commande de vérif (optionnel) — ex. pnpm typecheck"
+          style={{
+            width: "100%",
+            boxSizing: "border-box",
+            fontSize: 11,
+            padding: "6px 8px",
+            marginTop: 6,
+            borderRadius: 6,
+            background: "var(--surface, #14141f)",
+            color: "var(--on-surface, #ddd)",
+            border: "1px solid rgba(74, 222, 128, 0.18)",
+            fontFamily: "var(--font-mono)",
+          }}
+        />
+        <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap" }}>
+          <button
+            onClick={() => void launchGrounded()}
+            disabled={groundedLaunching || !groundedTask.trim() || !execReady}
+            title={
+              !execReady
+                ? execCap?.reason ?? "Sandbox indisponible"
+                : "Lancer un Grounded Run sur le projet ouvert"
+            }
+            style={{
+              fontSize: 10,
+              padding: "4px 12px",
+              borderRadius: 4,
+              background: "rgba(74, 222, 128, 0.18)",
+              color: "var(--success, #4ade80)",
+              border: "1px solid rgba(74, 222, 128, 0.45)",
+              cursor:
+                groundedLaunching || !groundedTask.trim() || !execReady ? "default" : "pointer",
+              opacity: groundedLaunching || !groundedTask.trim() || !execReady ? 0.5 : 1,
+            }}
+          >
+            {groundedLaunching ? "Lancement…" : "🌱 Grounded Run"}
+          </button>
+        </div>
+        {groundedErr && (
+          <div style={{ marginTop: 6, fontSize: 10, color: "var(--error, #ff6b6b)" }}>
+            {groundedErr}
+          </div>
+        )}
+      </div>
 
       {isLoading ? (
         <div
