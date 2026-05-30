@@ -288,7 +288,8 @@ pub(crate) async fn call_anthropic(
         Some(system_parts.join("\n\n"))
     };
     call_anthropic_structured(
-        client, base_url, model, convo, system, api_key, with_tools, abort, on_chunk,
+        client, base_url, model, convo, system, api_key, with_tools, /* tools */ None, abort,
+        on_chunk,
     )
     .await
 }
@@ -299,6 +300,13 @@ pub(crate) async fn call_anthropic(
 /// flat `call_anthropic` wrapper above (which builds `messages` from
 /// `&[ChatMessage]`). Lot 3 — replaces the agent runner's degraded text
 /// projection with native multi-turn tool messages.
+///
+/// `tools`: optional custom tool schema (Anthropic shape: array of
+/// `{name, description, input_schema}`). When `Some`, it OVERRIDES the default
+/// agent tool set — this is how the chat tool loop (Lot A — Task 11) injects its
+/// read/write subset (`chat_tools::chat_tools_json_anthropic`). When `None` and
+/// `with_tools` is true, the default `tools_json_anthropic()` (full agent set)
+/// is used, so the agent runner's behavior is byte-identical to before.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_anthropic_structured(
     client: &reqwest::Client,
@@ -308,6 +316,7 @@ pub(crate) async fn call_anthropic_structured(
     system: Option<String>,
     api_key: &str,
     with_tools: bool,
+    tools: Option<serde_json::Value>,
     abort: Option<Arc<AtomicBool>>,
     on_chunk: &mut (dyn FnMut(&str, &str) + Send),
 ) -> Result<AssistantTurn, String> {
@@ -328,7 +337,9 @@ pub(crate) async fn call_anthropic_structured(
         }
     }
     if with_tools {
-        body["tools"] = tools_json_anthropic();
+        // Custom tools (the chat read/write subset) override the default agent
+        // tool set when provided; otherwise fall back to the full agent tools.
+        body["tools"] = tools.unwrap_or_else(tools_json_anthropic);
         // Anthropic auto-selects when tools are present — no tool_choice
         // field needed (default behavior is "auto").
     }
@@ -491,7 +502,7 @@ pub(crate) async fn call_openai_compat(
         .collect();
     call_openai_compat_structured(
         client, base_url, model, messages_json, api_key, protocol, chat_template_kwargs,
-        with_tools, abort, on_chunk,
+        with_tools, /* tools */ None, abort, on_chunk,
     )
     .await
 }
@@ -501,6 +512,13 @@ pub(crate) async fn call_openai_compat(
 /// agent loop). Shares the body assembly + SSE parser with the flat
 /// `call_openai_compat` wrapper above. Lot 3 — replaces the agent runner's
 /// degraded text projection with native multi-turn tool messages.
+///
+/// `tools`: optional custom tool schema (OpenAI shape: array of
+/// `{type:"function", function:{name, description, parameters}}`). When `Some`,
+/// it OVERRIDES the default agent tool set — the chat tool loop (Lot A — Task
+/// 11) injects its read/write subset (`chat_tools::chat_tools_json_openai`).
+/// When `None` and `with_tools` is true, the default `tools_json_openai()`
+/// (full agent set) is used, so the agent runner's behavior is unchanged.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_openai_compat_structured(
     client: &reqwest::Client,
@@ -511,6 +529,7 @@ pub(crate) async fn call_openai_compat_structured(
     protocol: &str,
     chat_template_kwargs: &Option<serde_json::Value>,
     with_tools: bool,
+    tools: Option<serde_json::Value>,
     abort: Option<Arc<AtomicBool>>,
     on_chunk: &mut (dyn FnMut(&str, &str) + Send),
 ) -> Result<AssistantTurn, String> {
@@ -536,7 +555,9 @@ pub(crate) async fn call_openai_compat_structured(
         // alternatives are "none" (text-only) or `{type:"function",
         // function:{name:"X"}}` (force a specific tool). Auto matches
         // the agent runtime contract where the orchestrator decides.
-        body["tools"] = tools_json_openai();
+        // Custom tools (the chat read/write subset) override the default agent
+        // tool set when provided; otherwise fall back to the full agent tools.
+        body["tools"] = tools.unwrap_or_else(tools_json_openai);
         body["tool_choice"] = serde_json::json!("auto");
     }
 
@@ -678,6 +699,232 @@ pub(crate) async fn call_ollama(
 }
 
 // ---------------------------------------------------------------------------
+// Chat tool loop (Lot A — Task 11)
+//
+// When the read/write toggles are ON and the protocol natively supports
+// tool-use (anthropic / openai / custom), `chat_send` drives a BOUNDED loop
+// here instead of a single LLM call. The chat can then READ the workspace
+// (fs_read_file / fs_list_dir / fs_search) and — when write tools are enabled —
+// WRITE it (fs_write_file / fs_edit). Visibility flows through `chat://delta`
+// with `kind:"tool"`; reversibility through a journal emitted on `chat://writes`
+// at the end (the front offers "undo this message's changes" — Task 12/13).
+//
+// Shape mirrors `agents::runner::tool_use_loop` BUT, deliberately:
+//   * emits on `chat://delta` / `chat://writes` (NOT `agent://lifecycle`)
+//   * persists nothing (no agent_events rows)
+//   * injects the CHAT tool subset (chat_tools::chat_tools_json_*) via the new
+//     `tools: Option<Value>` param of the structured helpers
+//   * resolves the REAL open workspace (runner::get_workspace_root)
+// ---------------------------------------------------------------------------
+
+/// Maximum LLM round-trips in one chat tool turn. The last iteration runs WITH
+/// tools disabled so the turn always terminates with a plain-text answer.
+const CHAT_TOOL_MAX_ITERS: u32 = 8;
+
+/// Short, human-readable activity label for one tool call, shown inline in the
+/// chat via a `chat://delta` of `kind:"tool"`. Pure (no I/O). Derived from the
+/// tool name + its args so the user SEES what the assistant is doing.
+fn chat_tool_label(name: &str, args: &serde_json::Value) -> String {
+    let p = args["path"].as_str().unwrap_or("");
+    match name {
+        "fs_read_file" => format!("🔍 a lu `{p}`"),
+        "fs_list_dir" => format!("📁 a listé `{}`", if p.is_empty() { "." } else { p }),
+        "fs_search" => {
+            let q = args["query"].as_str().unwrap_or("");
+            format!("🔎 grep `{q}`")
+        }
+        "fs_write_file" => format!("✏️ a écrit `{p}`"),
+        "fs_edit" => format!("✏️ a modifié `{p}`"),
+        other => format!("⚙️ {other}"),
+    }
+}
+
+/// Build the per-protocol request body shape from an `AgentMessage` history,
+/// reusing the agent runner's builders so the wire format is identical.
+/// Returns `(system, messages)`: Anthropic hoists `system` to a top-level field;
+/// the OpenAI path keeps `system` as a `role:"system"` message inside `messages`
+/// (so it returns `None` for the separate system here).
+fn chat_build_request(
+    history: &[crate::commands::agents::runner::AgentMessage],
+    protocol: &str,
+) -> (Option<String>, Vec<serde_json::Value>) {
+    use crate::commands::agents::runner::{build_anthropic_native, build_openai_messages};
+    match protocol {
+        "anthropic" => {
+            // build_anthropic_native returns (messages, system) — swap to the
+            // (system, messages) order this helper promises.
+            let (messages, system) = build_anthropic_native(history);
+            (system, messages)
+        }
+        // openai / custom: system stays inline as a role:"system" message.
+        _ => (None, build_openai_messages(history)),
+    }
+}
+
+/// Drive the bounded chat tool loop. Returns the final assistant text.
+///
+/// `journal` accumulates every write performed during the turn (for the
+/// `chat://writes` reversibility event the caller emits). When a tool is invoked
+/// but no workspace is open, the loop feeds a clear error back to the model
+/// instead of touching the filesystem.
+#[allow(clippy::too_many_arguments)]
+async fn run_chat_tool_loop(
+    app: &tauri::AppHandle,
+    client: &reqwest::Client,
+    protocol: &str,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+    chat_template_kwargs: &Option<serde_json::Value>,
+    messages: &[ChatMessage],
+    write_enabled: bool,
+    conversation_id: &Option<String>,
+    abort: Option<Arc<AtomicBool>>,
+    journal: &mut Vec<crate::commands::chat_tools::ChatWriteRecord>,
+) -> Result<String, String> {
+    use crate::commands::agents::runner::{get_workspace_root, AgentMessage};
+    use crate::commands::agents::ToolResult;
+    use crate::commands::chat_tools::{
+        chat_tools_json_anthropic, chat_tools_json_openai, execute_chat_tool,
+    };
+
+    // The workspace root is required to execute ANY tool. We still answer
+    // (text-only) when none is open, but a tool call reports the missing
+    // workspace to the model rather than touching the filesystem.
+    let root = get_workspace_root(app);
+
+    // Project the flat chat history into the richer AgentMessage form so we can
+    // append assistant-tool-call + tool-result turns as the loop progresses.
+    let mut history: Vec<AgentMessage> = messages
+        .iter()
+        .map(|m| AgentMessage::Text {
+            role: m.role.clone(),
+            content: m.content.clone(),
+        })
+        .collect();
+
+    for iter in 0..CHAT_TOOL_MAX_ITERS {
+        // The last allowed iteration forces a final text answer (no tools), the
+        // same termination guarantee as `runner::tool_use_loop`'s last round.
+        let last_iteration = iter == CHAT_TOOL_MAX_ITERS - 1;
+        let with_tools = !last_iteration;
+
+        let (system, msgs) = chat_build_request(&history, protocol);
+
+        // The chat tool schema for this protocol (only when tools are allowed).
+        let tools_json: Option<serde_json::Value> = if with_tools {
+            Some(match protocol {
+                "anthropic" => chat_tools_json_anthropic(write_enabled),
+                _ => chat_tools_json_openai(write_enabled),
+            })
+        } else {
+            None
+        };
+
+        // Live-streaming sink — forwards `content`/`reasoning` chunks to
+        // `chat://delta` token-by-token, EXACTLY like the legacy chat path's
+        // `on_chunk` (same kind mapping). This preserves the live "typing" feel
+        // for every iteration. Tool-call activity is emitted SEPARATELY below as
+        // `kind:"tool"`.
+        //
+        // We clone `app` + `conversation_id` INTO the closure (owned) so it
+        // doesn't borrow the outer `app`/`conversation_id` — otherwise the
+        // `&mut sink` passed to `call_*_structured` would conflict with the
+        // tool-delta `app.emit` calls below (same pattern the agent runner uses:
+        // `app_for_chunks = app.clone()`). `AppHandle` clone is an Arc bump.
+        let sink_app = app.clone();
+        let sink_conv = conversation_id.clone();
+        let mut sink = move |kind: &str, chunk: &str| {
+            let delta_kind: &'static str =
+                if kind == "reasoning" { "reasoning" } else { "content" };
+            let _ = sink_app.emit(
+                "chat://delta",
+                ChatDelta {
+                    conversation_id: sink_conv.clone(),
+                    chunk: chunk.to_string(),
+                    kind: delta_kind,
+                    done: false,
+                },
+            );
+        };
+
+        let turn: AssistantTurn = match protocol {
+            "anthropic" => {
+                call_anthropic_structured(
+                    client, base_url, model, msgs, system, api_key, with_tools, tools_json,
+                    abort.clone(), &mut sink,
+                )
+                .await?
+            }
+            "openai" | "custom" => {
+                call_openai_compat_structured(
+                    client, base_url, model, msgs, api_key, protocol, chat_template_kwargs,
+                    with_tools, tools_json, abort.clone(), &mut sink,
+                )
+                .await?
+            }
+            other => return Err(format!("chat tool loop: unsupported protocol {other}")),
+        };
+
+        // No tool calls → final answer. The content was ALREADY streamed live by
+        // `sink` above, so we DON'T re-emit it (that would double it in the
+        // chat-sync buffer). Just return the accumulated text.
+        if turn.tool_calls.is_empty() {
+            return Ok(turn.content);
+        }
+
+        // Record the assistant's tool-call turn in history.
+        history.push(AgentMessage::AssistantWithTools {
+            content: turn.content.clone(),
+            tool_calls: turn.tool_calls.clone(),
+        });
+
+        // Execute each tool call, emitting a visibility delta first.
+        let mut results: Vec<ToolResult> = Vec::new();
+        for tc in &turn.tool_calls {
+            let args: serde_json::Value =
+                serde_json::from_str(&tc.arguments).unwrap_or_else(|_| serde_json::json!({}));
+
+            // Visibility — a short activity line, emitted with kind:"tool".
+            let _ = app.emit(
+                "chat://delta",
+                ChatDelta {
+                    conversation_id: conversation_id.clone(),
+                    chunk: chat_tool_label(&tc.name, &args),
+                    kind: "tool",
+                    done: false,
+                },
+            );
+
+            // Execute against the real workspace (or report it's missing).
+            let (content, is_error) = match &root {
+                Some(r) => execute_chat_tool(&tc.name, &args, r, write_enabled, journal),
+                None => (
+                    "aucun workspace ouvert — impossible d'exécuter l'outil".to_string(),
+                    true,
+                ),
+            };
+
+            results.push(ToolResult {
+                id: tc.id.clone(),
+                name: tc.name.clone(),
+                is_error,
+                content,
+            });
+        }
+
+        // Feed the results back and loop again.
+        history.push(AgentMessage::ToolResults(results));
+    }
+
+    // Unreachable in practice: the last iteration runs with_tools=false, so the
+    // model must return a tool-call-free answer (handled above). Defensive.
+    Err(format!(
+        "chat tool loop exceeded {CHAT_TOOL_MAX_ITERS} iterations without a final answer"
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Public command
 // ---------------------------------------------------------------------------
 
@@ -722,6 +969,13 @@ pub async fn chat_send(
     // Ignored by the ollama path (Ollama vision uses a different payload
     // shape that's out of MVP scope).
     attached_image: Option<String>,
+    // Lot A — Task 11/12: chat fs tool loop toggles. Tauri maps the camelCase JS
+    // args (`readTools` / `writeTools`) onto these snake_case params. When
+    // `read_tools == Some(true)` and the protocol natively supports tool-use,
+    // chat_send drives a bounded fs tool loop (read always, write if write_tools).
+    // Absent/None ⇒ legacy single-call path (zero regression).
+    read_tools: Option<bool>,
+    write_tools: Option<bool>,
     abort_registry: tauri::State<'_, ChatAbortRegistry>,
 ) -> Result<String, String> {
     let model = if model.is_empty() {
@@ -773,34 +1027,77 @@ pub async fn chat_send(
     // return type carries `content` + `tool_calls`; we use only `content`
     // here (the `tool_calls` field will be empty since with_tools is false).
     let img_ref = attached_image.as_deref();
-    let result: Result<AssistantTurn, String> = match protocol_str {
-        "anthropic" => {
-            let key = resolve_key(protocol_str, &api_key)?;
-            call_anthropic(&client, &base_url, &model, &messages, &key, /* with_tools */ false, img_ref, abort_flag.clone(), &mut on_chunk).await
-        }
-        "openai" | "custom" => {
-            let key = resolve_key(protocol_str, &api_key)?;
-            call_openai_compat(&client, &base_url, &model, &messages, &key, protocol_str, &chat_template_kwargs, /* with_tools */ false, img_ref, abort_flag.clone(), &mut on_chunk).await
-        }
-        "ollama" => {
-            // Ollama vision uses a different shape (a top-level `images` field
-            // of base64 strings, not multimodal content blocks). Out of MVP
-            // scope — image is silently ignored for the ollama path.
-            call_ollama(&client, &base_url, &model, &messages, abort_flag.clone(), &mut on_chunk).await
-        }
-        "codex" => {
-            // Codex (ChatGPT subscription, no API key) over the native app-server.
-            // It takes a SINGLE prompt, so we serialize the non-system turns into a
-            // transcript. ALWAYS read-only here — a chat answer must never mutate
-            // files. `model` + `reasoning_effort` come from the picker and are
-            // passed natively to `turn/start`. Image attachments out of MVP scope.
-            let prompt = build_codex_prompt(&messages);
-            let effort = reasoning_effort.as_deref();
-            crate::commands::codex::codex_chat_turn(&app, &prompt, Some(model.as_str()), effort, &mut on_chunk)
-                .await
-                .map(|content| AssistantTurn { content, tool_calls: Vec::new() })
-        }
-        other => Err(format!("unsupported protocol: {}", other)),
+
+    // Lot A — Task 11: decide whether to drive the bounded fs tool loop.
+    //
+    // ALL of these must hold:
+    //   * `read_tools == Some(true)` — the frontend toggle is ON. Absent/false
+    //     ⇒ the legacy single-call path (zero regression while Task 12 is not
+    //     yet wired, and whenever the user turns tools off).
+    //   * protocol ∈ {anthropic, openai, custom} — native tool-use wire shape.
+    //     ollama/codex keep their existing single-call (and read-only) behavior.
+    //   * NO attached image — the structured helpers + AgentMessage builders
+    //     don't carry multimodal content, so a vision turn falls back to the
+    //     single-call path (vision + tools together is out of scope here).
+    let protocol_supports_tools = matches!(protocol_str, "anthropic" | "openai" | "custom");
+    let use_tool_loop =
+        read_tools == Some(true) && protocol_supports_tools && attached_image.is_none();
+
+    // Journal of writes performed during this turn (stays empty unless the loop
+    // runs WITH write tools enabled). Emitted on `chat://writes` at the end so
+    // the frontend can offer "undo this message's changes" (Task 12/13).
+    let mut journal: Vec<crate::commands::chat_tools::ChatWriteRecord> = Vec::new();
+
+    let result: Result<String, String> = if use_tool_loop {
+        let write_enabled = write_tools == Some(true);
+        let key = resolve_key(protocol_str, &api_key)?;
+        run_chat_tool_loop(
+            &app,
+            &client,
+            protocol_str,
+            &base_url,
+            &model,
+            &key,
+            &chat_template_kwargs,
+            &messages,
+            write_enabled,
+            &conversation_id,
+            abort_flag.clone(),
+            &mut journal,
+        )
+        .await
+    } else {
+        // ── Legacy single-call path (behavior unchanged) ──────────────────
+        let turn_result: Result<AssistantTurn, String> = match protocol_str {
+            "anthropic" => {
+                let key = resolve_key(protocol_str, &api_key)?;
+                call_anthropic(&client, &base_url, &model, &messages, &key, /* with_tools */ false, img_ref, abort_flag.clone(), &mut on_chunk).await
+            }
+            "openai" | "custom" => {
+                let key = resolve_key(protocol_str, &api_key)?;
+                call_openai_compat(&client, &base_url, &model, &messages, &key, protocol_str, &chat_template_kwargs, /* with_tools */ false, img_ref, abort_flag.clone(), &mut on_chunk).await
+            }
+            "ollama" => {
+                // Ollama vision uses a different shape (a top-level `images` field
+                // of base64 strings, not multimodal content blocks). Out of MVP
+                // scope — image is silently ignored for the ollama path.
+                call_ollama(&client, &base_url, &model, &messages, abort_flag.clone(), &mut on_chunk).await
+            }
+            "codex" => {
+                // Codex (ChatGPT subscription, no API key) over the native app-server.
+                // It takes a SINGLE prompt, so we serialize the non-system turns into a
+                // transcript. ALWAYS read-only here — a chat answer must never mutate
+                // files. `model` + `reasoning_effort` come from the picker and are
+                // passed natively to `turn/start`. Image attachments out of MVP scope.
+                let prompt = build_codex_prompt(&messages);
+                let effort = reasoning_effort.as_deref();
+                crate::commands::codex::codex_chat_turn(&app, &prompt, Some(model.as_str()), effort, &mut on_chunk)
+                    .await
+                    .map(|content| AssistantTurn { content, tool_calls: Vec::new() })
+            }
+            other => Err(format!("unsupported protocol: {}", other)),
+        };
+        turn_result.map(|turn| turn.content)
     };
 
     // Clean up the abort flag from the registry (always, regardless of result).
@@ -810,7 +1107,18 @@ pub async fn chat_send(
         }
     }
 
-    let result: Result<String, String> = result.map(|turn| turn.content);
+    // Emit the write journal (if any) so the frontend can offer reversal. Only a
+    // tool loop with write tools enabled ever populates this — the legacy path
+    // and read-only loops leave it empty.
+    if !journal.is_empty() {
+        let _ = app.emit(
+            "chat://writes",
+            serde_json::json!({
+                "conversationId": conversation_id,
+                "records": journal,
+            }),
+        );
+    }
 
     // Emit a terminal `done` delta regardless of success/failure so the
     // frontend always receives a completion signal.

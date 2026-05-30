@@ -272,6 +272,7 @@ export async function sendChatMessage(
   modelId: string,
   imageDataUrl?: string,
   agentDefPath?: string,
+  editorCtx?: { path: string; content: string; selection?: { text: string; startLine: number; endLine: number } },
 ): Promise<void> {
   const trimmed = text.trim();
   // Allow empty text when an image is provided (image-only messages are valid).
@@ -398,6 +399,22 @@ export async function sendChatMessage(
     apiMessages.push({ role: "user", content: trimmed });
   }
 
+  // Lot A — contexte éditeur auto. Injecté dans le dernier message user envoyé
+  // au modèle (jamais persisté). On saute le fichier actif s'il est déjà
+  // @-mentionné (dédoublonnage). Désactivable via settings (le composer ne
+  // passe `editorCtx` que si le toggle est ON et le chip pas retiré).
+  if (editorCtx) {
+    const { buildEditorContext } = await import("./editorContext");
+    const skipPaths = parseMentions(trimmed);
+    const ectx = buildEditorContext(editorCtx, { skipPaths });
+    if (ectx) {
+      const lastUserIdx = apiMessages.map((m) => m.role).lastIndexOf("user");
+      if (lastUserIdx >= 0) {
+        apiMessages[lastUserIdx].content = `${ectx}\n\n---\n\n${apiMessages[lastUserIdx].content}`;
+      }
+    }
+  }
+
   // Lot 4 — @-mentions : résout les fichiers @-mentionnés du message courant et
   // injecte leur contenu dans le dernier message user ENVOYÉ au modèle. Le
   // message persité (SQLite, affiché) garde le texte `@…` propre — l'injection
@@ -453,6 +470,21 @@ export async function sendChatMessage(
   // 50-200 ms of reasoning would race the listener registration).
   let reasoningAcc = "";
   let unlistenReasoning: (() => void) | null = null;
+  // Lot A — Task 12 : journal d'annulation du tour. Quand chat_send tourne avec
+  // write_tools=ON, le backend écrit des fichiers dans le workspace puis émet
+  // `chat://writes` { conversationId, records:[{path, before}] } à la fin (cf.
+  // chat.rs:1097). On capte ces records ICI et on les associe au message AI une
+  // fois persisté (setChatWrites) → le bouton « Annuler les modifications de ce
+  // message » (views-chat.tsx) les relit via useChatWrites.
+  //
+  // ⚠ Race connue (acceptée) : `chat://writes` et `chat://delta done` sont des
+  // canaux distincts ; rien ne garantit que le callback writes a couru avant que
+  // `await invoke` ne résolve. En pratique l'emit writes précède le done delta
+  // qui précède le retour de chat_send, et l'écriture fichier n'est pas latency-
+  // critique. Si un record arrivait après l'append, le bouton n'apparaîtrait pas
+  // ce tour — l'utilisateur peut redemander. Pas de sur-ingénierie.
+  let writeRecords: import("./chatWritesStore").ChatWriteRecord[] = [];
+  let unlistenWrites: (() => void) | null = null;
   try {
     const mod = await import("@tauri-apps/api/event");
     unlistenReasoning = await mod.listen<{ kind?: string; chunk: string; done: boolean }>(
@@ -465,8 +497,18 @@ export async function sendChatMessage(
         }
       },
     );
+    unlistenWrites = await mod.listen<{
+      conversationId?: string;
+      records?: import("./chatWritesStore").ChatWriteRecord[];
+    }>("chat://writes", (e) => {
+      const p = e.payload;
+      // Filtré sur convId comme le listener reasoning : une autre conv (mascotte,
+      // édition inline) ne doit pas voir son journal attaché à CE message.
+      if (p?.conversationId !== convId) return;
+      if (Array.isArray(p.records)) writeRecords = p.records;
+    });
   } catch (err) {
-    console.warn("[chat-sync] reasoning listener attach failed:", err);
+    console.warn("[chat-sync] reasoning/writes listener attach failed:", err);
   }
 
   try {
@@ -476,6 +518,13 @@ export async function sendChatMessage(
     // separately via `attachedImage`: Rust injects it as a multimodal content
     // block on the LAST user message so vision-capable models (Claude 3.5+,
     // GPT-4o) actually see it.
+    // Lot A — Task 12 : toggles d'outils fs du chat. ON par défaut (clé absente
+    // ou ≠ "false"). camelCase → Tauri mappe vers read_tools / write_tools côté
+    // Rust (chat.rs:961). Quand readTools=ON et le protocole supporte les outils
+    // (anthropic/openai/custom, pas d'image jointe), chat_send pilote une boucle
+    // d'outils bornée au lieu d'un appel unique. writeTools autorise l'écriture.
+    const readTools = (await db.settings.get("chat.readTools")) !== "false";
+    const writeTools = (await db.settings.get("chat.writeTools")) !== "false";
     const reply = await invoke<string>("chat_send", {
       messages: apiMessages,
       model: realModel,
@@ -488,6 +537,8 @@ export async function sendChatMessage(
       // for the API protocols (Rust treats it as None / ignores it).
       reasoningEffort: protocol === "codex" ? getActiveCodexEffort() : undefined,
       attachedImage: imageDataUrl,
+      readTools,
+      writeTools,
     });
     // Parse fenced ```code blocks``` out of the reply so the UI gets the
     // structured Message.code shape (CodeBlock component highlights + the
@@ -507,6 +558,13 @@ export async function sendChatMessage(
     if (!aiMsg.body && !aiMsg.code) aiMsg.body = reply;
     if (reasoningAcc) aiMsg.reasoning = reasoningAcc;
     await appendMessage(convId, aiMsg);
+    // Lot A — Task 12 : si le tour a écrit des fichiers (write_tools ON), associe
+    // son journal d'annulation à l'id du message AI fraîchement appendé. Le
+    // bouton « Annuler les modifications de ce message » le relira par cet id.
+    if (writeRecords.length > 0) {
+      const { setChatWrites } = await import("./chatWritesStore");
+      setChatWrites(String(aiMsg.id), writeRecords);
+    }
   } catch (err) {
     await appendMessage(convId, {
       id: newMessageId("e"),
@@ -518,6 +576,7 @@ export async function sendChatMessage(
     fireMoodReaction("chat-error"); // Lot 6 — la mascotte compatit à l'échec
   } finally {
     unlistenReasoning?.();
+    unlistenWrites?.();
   }
 }
 

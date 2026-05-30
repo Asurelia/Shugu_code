@@ -72,8 +72,14 @@ export interface ShellContextValue {
    * the file is opened/created + activated, then a full-file diff is mounted
    * (Accept replaces the file with one undo step, Reject restores). Falls back
    * to openSnippetInEditor when the block declares no path.
+   *
+   * Lot A (Task 8) — `targetOverride` lets the chat "Apply" button pass an
+   * explicit target (the block's declared path, or the active file when none
+   * is declared). When set, path auto-detection is bypassed; `stripPathComment`
+   * still runs on the body. Without it, the legacy detect-or-snippet behaviour
+   * is preserved.
    */
-  applyCodeToFile: (code: string, lang: string) => Promise<void>;
+  applyCodeToFile: (code: string, lang: string, targetOverride?: string) => Promise<void>;
   /**
    * Ref to the active CodeMirror editor. Only populated while the /code route
    * is mounted. Used by find-in-file / replace-in-file commands to open the

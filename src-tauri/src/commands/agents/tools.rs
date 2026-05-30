@@ -64,8 +64,12 @@ pub(crate) struct ToolCall {
 /// from the dispatcher) — failures become `is_error: true` with the
 /// reason in `content`. The LLM consumes the next turn with this result
 /// and can adapt.
+///
+/// `pub(crate)` so the chat tool loop in `commands::chat` can build
+/// `AgentMessage::ToolResults(Vec<ToolResult>)` for its own multi-turn history
+/// (Lot A — Task 11) — same reuse as the agent runner, no duplicate type.
 #[derive(Clone, Debug, Serialize)]
-pub(super) struct ToolResult {
+pub(crate) struct ToolResult {
     pub id: String,
     pub name: String,
     pub is_error: bool,

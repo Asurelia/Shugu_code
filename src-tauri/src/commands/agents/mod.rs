@@ -90,7 +90,9 @@ pub(crate) mod skills;
 //   - `ToolCall` as the shape held in `AssistantTurn.tool_calls`
 //   - `ToolCallAccumulator` for the OpenAI streaming-fragment assembly
 //   - `tools_json_*` for injecting the `tools` body field on agent calls
-pub(crate) use tools::{tools_json_anthropic, tools_json_openai, ToolCall, ToolCallAccumulator};
+pub(crate) use tools::{
+    tools_json_anthropic, tools_json_openai, ToolCall, ToolCallAccumulator, ToolResult,
+};
 
 // ────────────────────────────────────────────────────────────────────────
 // Constants

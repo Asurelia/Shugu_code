@@ -17,12 +17,17 @@ import { Icon } from "@/components/components";
 import { invoke } from "@/lib/tauri";
 import { useChatStream } from "./useChatStream";
 import { useMessages, sendChatMessage, useActiveModel } from "./chat-sync";
+import { useEditorSelection } from "./editorSelectionStore";
+import { useChatToolActivity } from "./chatToolActivityStore";
+import { useChatWrites, setChatWrites } from "./chatWritesStore";
+import { db } from "@/lib/db";
 import { ModelPicker } from "@/features/panels/panels";
 import { resolveImageProvider } from "@/lib/imageProviders";
 import { revealAgent } from "@/lib/agents";
 import { useAgentDefs } from "@/features/agents/agentDefsQueries";
 import { useMessageDisplay } from "./useMessageDisplay";
 import { useShell } from "@/routes/shell-context";
+import { detectBlockPath } from "@/lib/markdown";
 import { CodeMirrorEditor } from "@/features/code/CodeMirrorEditor";
 import { GitDiffView } from "@/features/code/DiffView";
 import { ContextBubble } from "@/features/context-cards/ContextBubble";
@@ -79,14 +84,35 @@ export function ChatView({
   const chatStream = useChatStream(activeConv);
   const { data: messages } = useMessages(activeConv);
   const [model, setModel] = useActiveModel(modelProp);
+  // Lot A — Task 12 : libellés des tool-calls du tour en cours (« 🔍 a lu … »,
+  // « ✏️ a écrit … »), accumulés par le listener root et rendus dans le bloc de
+  // streaming ci-dessous. Vidé à la fin du tour (done delta).
+  const toolActivity = useChatToolActivity(activeConv);
 
   const navigate = useNavigate();
-  const { openFile, fileContents, setFileContents, editorPrefs, compareFile, setCompareFile } = useShell();
+  const { activeFile, openFile, fileContents, setFileContents, editorPrefs, compareFile, setCompareFile, applyCodeToFile } = useShell();
 
   // Phase 2 — Chat→Editor handoff. When a file is opened from an action card,
   // we reveal an in-chat split (chat left, CodeMirror right) instead of
   // leaving the chat view. `splitFile` null = no split.
   const [splitFile, setSplitFile] = useState<string | null>(null);
+
+  // Lot A — contexte éditeur auto. Le composer du MAIN IDE a accès à l'éditeur
+  // (activeFile + fileContents via useShell) ; il joint donc automatiquement le
+  // fichier actif (+ la sélection courante) au message envoyé. La mascotte
+  // (FloatChat) n'a pas de ShellContext réel → elle ne passe jamais editorCtx.
+  //
+  // `selection` est publiée par CodeMirrorEditor (editorSelectionStore). Le chip
+  // ci-dessous montre ce qui sera envoyé et permet de le retirer pour un tour.
+  // `ctxDropped` est remis à false après chaque envoi (le contexte se réactive
+  // au tour suivant). Le toggle `chat.autoEditorContext` (défaut ON) le coupe.
+  const selection = useEditorSelection();
+  const [ctxDropped, setCtxDropped] = useState(false);
+  const { data: autoCtxOn = true } = useQuery({
+    queryKey: ["settings", "chat.autoEditorContext"],
+    queryFn: async () => (await db.settings.get("chat.autoEditorContext")) !== "false",
+    staleTime: 30_000,
+  });
 
   // Real context chips: current git branch + workspace folder name.
   const { data: branches } = useGitBranches();
@@ -180,6 +206,20 @@ export function ChatView({
       }
     }
     if (!text && !pendingImage) return; // slash sans contenu : no-op
+
+    // Lot A — contexte éditeur auto (main IDE uniquement). On joint le fichier
+    // actif (+ sélection courante si elle le concerne) sauf si le toggle est
+    // OFF ou que l'utilisateur a retiré le chip pour ce tour. La déduplication
+    // avec les @-mentions est gérée côté sendChatMessage (chat-sync.ts).
+    let editorCtx: Parameters<typeof sendChatMessage>[5] | undefined;
+    if (autoCtxOn && !ctxDropped && activeFile && fileContents[activeFile]) {
+      const sel =
+        selection && selection.path === activeFile && selection.text.trim()
+          ? { text: selection.text, startLine: selection.startLine, endLine: selection.endLine }
+          : undefined;
+      editorCtx = { path: activeFile, content: fileContents[activeFile].text, selection: sel };
+    }
+
     setInput("");
     const imageToSend = pendingImage;
     setPendingImage(null);
@@ -192,12 +232,26 @@ export function ChatView({
         model,
         imageToSend ?? undefined,
         agentDefPath,
+        editorCtx,
       );
     } finally {
       setTyping(false);
       chatStream.stop();
+      setCtxDropped(false); // le contexte se réactive au tour suivant
     }
-  }, [input, pendingImage, model, activeConv, chatStream, enabledAgents]);
+  }, [
+    input,
+    pendingImage,
+    model,
+    activeConv,
+    chatStream,
+    enabledAgents,
+    autoCtxOn,
+    ctxDropped,
+    activeFile,
+    fileContents,
+    selection,
+  ]);
 
   const onKey = (e: React.KeyboardEvent) => {
     if (slashOpen) {
@@ -417,6 +471,39 @@ export function ChatView({
         </div>
       </div>
       <div className="cx-ctx-row">
+        {/* Lot A — chip contexte éditeur retirable. Montre le fichier actif (+
+            sélection) qui sera joint au prochain message. Le × le retire pour
+            ce tour (réactivé après envoi). Réutilise .cx-chip (charte glass). */}
+        {autoCtxOn && !ctxDropped && activeFile && (
+          <span className="cx-chip ctx-editor" title="Contexte envoyé au modèle — cliquez × pour ne pas l'envoyer">
+            <span aria-hidden>📄</span>
+            <span className="name">{basename(activeFile)}</span>
+            {selection?.path === activeFile && selection.text.trim() && (
+              <span className="sel" title="Sélection courante incluse">
+                ⊿ sélection ({selection.endLine - selection.startLine + 1} l.)
+              </span>
+            )}
+            <button
+              type="button"
+              className="ctx-x"
+              title="Ne pas envoyer ce contexte"
+              onClick={() => setCtxDropped(true)}
+              style={{
+                background: "none",
+                border: "none",
+                cursor: "pointer",
+                color: "inherit",
+                opacity: 0.6,
+                padding: 0,
+                marginLeft: 2,
+                lineHeight: 1,
+                font: "inherit",
+              }}
+            >
+              ×
+            </button>
+          </span>
+        )}
         <button className="cx-chip status" title="Accès au système de fichiers (Tauri)">
           <span className="dot" />
           Accès complet
@@ -481,12 +568,29 @@ export function ChatView({
                     <span className="sep">·</span>
                     <span className="ts">en train de travailler…</span>
                   </div>
+                  {/* Lot A — Task 12 : activité des outils du tour en cours. Une
+                      ligne discrète par tool-call (« 🔍 a lu … », « ✏️ a écrit … »),
+                      au-dessus du contenu/reasoning. Vidée à la fin du tour. */}
+                  {toolActivity.length > 0 && (
+                    <div className="cx-tool-activity">
+                      {toolActivity.map((label, i) => (
+                        <div key={i} className="cx-tool-line">
+                          {label}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   {chatStream.streaming && (chatStream.partial || chatStream.partialReasoning) ? (
                     <div className="cx-body">
                       {chatStream.partialReasoning && (
                         <ThinkBlock open text={chatStream.partialReasoning} />
                       )}
                       {chatStream.partial && <p>{chatStream.partial}</p>}
+                    </div>
+                  ) : toolActivity.length > 0 ? (
+                    <div className="cx-working">
+                      <span className="ring" />
+                      utilisation des outils · {model}
                     </div>
                   ) : (
                     <div className="cx-working">
@@ -563,14 +667,24 @@ function CxMessage({
   isLatestAgent,
   onOpenFile,
   onOpenSnippet,
+  activeFile,
+  onApply,
 }: {
   m: Message;
   model: string;
   isLatestAgent: boolean;
   onOpenFile: (path: string) => void;
   onOpenSnippet?: (code: string, lang: string) => void;
+  /** Lot A (Task 8) — active editor file: the Apply fallback target. */
+  activeFile?: string | null;
+  /** Lot A (Task 8) — apply a code block to a file (diff accept/reject). */
+  onApply?: (code: string, lang: string, target: string) => void;
 }) {
   const { displayBody, liveReasoning, isStreamingAgent, imageDataUrl } = useMessageDisplay(m);
+  // Lot A — Task 12 : journal d'annulation attaché à CE message (si le tour a
+  // écrit des fichiers, write_tools ON). Hook appelé inconditionnellement (avant
+  // tout return) ; il renvoie [] pour un message user ou un message sans écriture.
+  const writeRecords = useChatWrites(String(m.id));
 
   if (m.role === "user") {
     return (
@@ -618,11 +732,20 @@ function CxMessage({
                 lang={m.code.lang}
                 text={m.code.text}
                 onOpen={onOpenSnippet ? () => onOpenSnippet(m.code!.text, m.code!.lang) : undefined}
+                activeFile={activeFile}
+                onApply={onApply}
               />
             )}
             {m.action && <ActionCard action={m.action} onOpenFile={onOpenFile} />}
             {isLatestAgent && !m.action && <WorkspaceDiffCard onOpenFile={onOpenFile} />}
           </>
+        )}
+        {/* Lot A — Task 12 : annulation des écritures de CE message. Visible
+            uniquement quand le tour a modifié des fichiers (write_tools ON).
+            Appelle chat_revert_writes (restaure l'état d'avant) puis vide le
+            store → le bouton disparaît. */}
+        {writeRecords.length > 0 && (
+          <RevertWritesButton messageId={String(m.id)} records={writeRecords} />
         )}
         <div className="cx-react">
           <button title="Copier" onClick={() => copyText(displayBody || m.body || m.text || "")}>
@@ -630,6 +753,68 @@ function CxMessage({
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// Lot A — Task 12 — bouton « Annuler les modifications de ce message ».
+//
+// Rendu sous un message AI dont le tour a écrit des fichiers. Au clic :
+//   1. invoke("chat_revert_writes", { records }) — le backend restaure chaque
+//      fichier à son contenu d'avant le tour (ou supprime les fichiers créés).
+//   2. setChatWrites(messageId, []) — vide le store pour ce message → le bouton
+//      disparaît (l'annulation n'est pas réversible une seconde fois).
+//   3. émet workspace://changed pour rafraîchir l'arbre fichiers / l'éditeur
+//      (le fs watcher Rust notifie aussi, mais l'event explicite est immédiat).
+//
+// `busy` désactive le bouton pendant l'appel pour éviter un double-revert.
+function RevertWritesButton({
+  messageId,
+  records,
+}: {
+  messageId: string;
+  records: import("./chatWritesStore").ChatWriteRecord[];
+}) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const onRevert = useCallback(() => {
+    setBusy(true);
+    setErr(null);
+    void (async () => {
+      try {
+        await invoke("chat_revert_writes", { records });
+        setChatWrites(messageId, []); // retire le bouton
+        // Rafraîchit l'arbre fichiers + l'éditeur (best-effort, comme ailleurs).
+        try {
+          const mod = await import("@tauri-apps/api/event");
+          await mod.emit("workspace://changed", {});
+        } catch (e) {
+          console.warn("[chat] workspace://changed emit failed:", e);
+        }
+      } catch (e) {
+        setErr(String(e));
+        setBusy(false);
+      }
+    })();
+  }, [messageId, records]);
+
+  const n = records.length;
+  return (
+    <div className="cx-revert">
+      <button
+        type="button"
+        className="cx-revert-btn"
+        onClick={onRevert}
+        disabled={busy}
+        title="Restaure les fichiers à leur état d'avant ce message"
+      >
+        <Icon name="diff" size={11} />
+        {busy
+          ? "Annulation…"
+          : `Annuler les modifications de ce message (${n} fichier${n > 1 ? "s" : ""})`}
+      </button>
+      {err && <span className="cx-revert-err">⚠ {err}</span>}
     </div>
   );
 }
@@ -745,12 +930,26 @@ export function CodeBlock({
   lang,
   text,
   onOpen,
+  activeFile,
+  onApply,
 }: {
   lang: string;
   text: string;
   onOpen?: () => void;
+  /** Lot A (Task 8) — active editor file: the Apply fallback target when the
+   *  block declares no path of its own. */
+  activeFile?: string | null;
+  /** Lot A (Task 8) — apply this block to a file with inline diff (no LLM). */
+  onApply?: (code: string, lang: string, target: string) => void;
 }) {
   const [preview, setPreview] = useState(false);
+  // Lot A (Task 8) — résolution de la cible d'apply. On regarde d'abord un
+  // chemin déclaré DANS le bloc (commentaire de 1ʳᵉ ligne `// src/x.ts` — le
+  // seul indice qui survit à la persistance SQLite, l'info-string `lang path`
+  // ayant déjà été consommée en `lang` au parse). À défaut, on retombe sur le
+  // fichier actif de l'éditeur. null ⇒ rien à cibler → bouton désactivé.
+  const applyTarget = detectBlockPath(text) ?? activeFile ?? null;
+  const canApply = !!onApply && !!applyTarget;
   // HTML blocks get a live "Aperçu" — the payoff of activating a design
   // system (Design view → "Utiliser dans le chat") is SEEING the generated
   // UI. Rendered via srcdoc in a sandboxed iframe (no network, no
@@ -770,6 +969,29 @@ export function CodeBlock({
             </button>
           )}
           <button className="cx-tool" title="Copier" onClick={() => copyText(text)}><Icon name="copy" size={12} /></button>
+          {/* Lot A (Task 8) — bouton « Appliquer » : pose une ApplyRequest sur la
+              cible résolue → diff inline accept/reject, ZÉRO appel LLM. Le title
+              est porté par le <span> englobant : un <button disabled> n'émet pas
+              de tooltip natif dans WebView2, donc sans ce wrap le message d'aide
+              (« ouvre un fichier… ») resterait invisible justement quand on en a
+              besoin. */}
+          <span
+            style={{ display: "inline-flex" }}
+            title={
+              canApply
+                ? `Appliquer à ${applyTarget} (diff à accepter / refuser)`
+                : "Ouvre un fichier ou précise un chemin (```ts src/foo.ts)"
+            }
+          >
+            <button
+              className="cx-tool"
+              onClick={canApply ? () => onApply!(text, lang, applyTarget!) : undefined}
+              disabled={!canApply}
+              style={canApply ? { color: "var(--secondary)" } : undefined}
+            >
+              <Icon name="check" size={12} />
+            </button>
+          </span>
           <button
             className="cx-tool"
             title="Ouvrir dans l'éditeur"

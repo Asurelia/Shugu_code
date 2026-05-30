@@ -1065,6 +1065,31 @@ pub(crate) fn write_file_inner(
     Ok(content.len())
 }
 
+/// Delete a single workspace-relative FILE, reusing the SAME path-guard as
+/// `write_file_inner` (`safe_resolve_for_write`) — the symmetric counterpart to
+/// the write whose effect is being undone.
+///
+/// Why `safe_resolve_for_write` and not `safe_resolve`:
+///   * `safe_resolve` canonicalizes the full joined path and therefore REQUIRES
+///     the file to exist; it also rejects nothing extra we need. But the revert
+///     caller may race a file that was already removed elsewhere — we want a
+///     clean "not found" rather than a guard error. `safe_resolve_for_write`
+///     does the same `..`/absolute/null-byte rejection + ancestor-canonicalize
+///     containment check WITHOUT requiring the leaf to exist, so it is the exact
+///     guard `write_file_inner` used to create the file.
+///   * This avoids introducing a NEW path guard: deletion is gated by the very
+///     same validation as the write it reverses.
+///
+/// Only regular files are removed (`std::fs::remove_file`). This helper is
+/// intentionally file-only: chat write-tools (`fs_write_file`/`fs_edit`) never
+/// create directories as a tracked artifact, so reverting a created file is a
+/// `remove_file`. Returns `Err` on guard failure or I/O error (the chat-revert
+/// caller treats deletion as best-effort and ignores the result).
+pub(crate) fn delete_file_inner(root: &Path, rel: &str) -> Result<(), String> {
+    let target = safe_resolve_for_write(root, rel)?;
+    std::fs::remove_file(&target).map_err(|e| format!("remove_file: {e}"))
+}
+
 /// List the immediate children of a workspace-relative directory as a
 /// JSON string. Returns `[{"name":"foo","is_dir":true}, ...]`.
 ///
