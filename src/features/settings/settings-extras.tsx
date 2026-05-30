@@ -372,6 +372,8 @@ export function InterfaceSettings() {
           <SettingRow label="Use emoji icons" desc="Sur les cartes d'agents et certains badges (sinon fallback monochrome).">
             <Switch on={s.emojis} onChange={set("emojis")}/>
           </SettingRow>
+
+          <AutoEditorContextRow/>
         </div>
 
         <div className="setting-section">
@@ -437,6 +439,40 @@ export function InterfaceSettings() {
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * Toggle « Contexte auto du chat » — pilote `db.settings` `chat.autoEditorContext`.
+ *
+ * Sémantique alignée sur la lecture côté chat (views-chat.tsx / chat-sync.ts) :
+ * ON par défaut = clé absente ou ≠ "false". On stocke donc "false" quand OFF et
+ * "true" quand ON. Pattern lecture/écriture copié du toggle `rag.autoCodeContext`
+ * (views-code.tsx) : useState + useEffect (db.settings.get) + db.settings.set.
+ */
+function AutoEditorContextRow() {
+  const [on, setOn] = useState(true); // défaut ON
+
+  useEffect(() => {
+    let alive = true;
+    void db.settings.get("chat.autoEditorContext").then((v) => {
+      if (alive) setOn(v !== "false"); // ON sauf valeur explicite "false"
+    });
+    return () => { alive = false; };
+  }, []);
+
+  const change = (v: boolean) => {
+    setOn(v);
+    void db.settings.set("chat.autoEditorContext", v ? "true" : "false");
+  };
+
+  return (
+    <SettingRow
+      label="Contexte auto du chat"
+      desc="Envoie automatiquement le fichier ouvert et la sélection au chat (façon Cursor)."
+    >
+      <Switch on={on} onChange={change}/>
+    </SettingRow>
   );
 }
 
