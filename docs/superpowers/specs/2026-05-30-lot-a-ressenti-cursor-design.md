@@ -26,12 +26,31 @@ Trois sous-fonctions, livrées ensemble :
 | Décision | Choix |
 |---|---|
 | Contexte auto — quoi | **Fichier actif + sélection** (chip retirable, toggle Settings, défaut ON) |
-| Outils chat — sûreté | **Lecture seule** (read / list / grep). Aucune écriture directe par le chat. |
+| Outils chat | **Lecture + écriture directe** (read / list / grep / write / edit) — choix explicite de l'utilisateur |
 | Apply — cible | **Fichier nommé dans l'entête du bloc (```ts src/foo.ts) sinon fichier actif**, via diff accept/reject |
 
-Philosophie de sûreté respectée (mémoire « empêcher l'irréparable ») : le chat
-ne mute **jamais** le projet directement. Toute écriture passe par un diff que
-l'humain valide (apply-from-chat) ou par Grounded Run (miroir jetable existant).
+### Note sûreté (choix utilisateur vs design existant)
+
+L'utilisateur a explicitement choisi **« lecture + écriture directe »** : le chat
+peut modifier les vrais fichiers du workspace lui-même, sans étape de diff
+obligatoire. C'est plus puissant (vrai « agent dans le chat »), mais cela
+**déroge** au design actuel (chat read-only, mutations via miroir Grounded Run)
+et à la mémoire « empêcher l'irréparable ».
+
+Garde-fous retenus pour concilier le choix et ce principe (aucun ne retire la
+capacité d'écriture) :
+- **Périmètre verrouillé** : les outils d'écriture sont câblés sur les helpers
+  path-guardés existants (`fs::safe_resolve_for_write`) → strictement dans le
+  workspace, jamais `..`/chemins absolus. Pas de `run_command` (pas d'exécution).
+- **Réversibilité** : chaque tour de chat qui écrit est **réversible en un clic**.
+  On capture, avant la première écriture du tour, l'état des fichiers touchés et
+  on expose un bouton « Annuler les modifications de ce message » (même esprit
+  que `agent_reverse_patch` du Grounded Run). Détail d'implémentation au plan
+  (journal en mémoire du tour, ou snapshot léger).
+- **Visibilité** : chaque écriture est affichée dans le fil (« ✏️ a écrit
+  `src/foo.ts` »), jamais silencieuse.
+- **Réglage** : toggle `chat.writeTools` (défaut ON puisque c'est le choix
+  utilisateur ; le mettre OFF redonne un chat lecture-seule).
 
 ---
 
@@ -82,50 +101,62 @@ deux fois (on saute le fichier actif).
 
 ---
 
-## Feature 2 — Outils lecture seule au chat
+## Feature 2 — Outils fs au chat (lecture + écriture)
 
 ### Comportement
-- Le chat direct devient **multi-tour** quand le modèle demande un outil de
-  lecture : `fs_read_file`, `fs_list_dir`, `fs_search` (sous-ensemble strict des
-  outils agents existants `agents/tools.rs`).
-- **Aucune écriture** : `fs_write_file`, `fs_edit`, `run_command`, `skill_save`
-  ne sont **pas** exposés au chat. `allow_exec = false`. Path-guard via les
-  helpers `fs::safe_resolve` existants.
+- Le chat direct devient **multi-tour** quand le modèle demande un outil :
+  - **Lecture** : `fs_read_file`, `fs_list_dir`, `fs_search`.
+  - **Écriture** : `fs_write_file`, `fs_edit` (choix utilisateur). PAS de
+    `run_command` (aucune exécution), PAS de `skill_save` (réservé aux agents).
+  - Sous-ensemble des outils agents existants `agents/tools.rs` (mêmes schémas).
 - Disponible pour les protocoles qui savent faire du tool-use :
   `anthropic`, `openai`, `custom`. `ollama` (pas de tool-use) et `codex` (a ses
   propres outils via app-server) restent **inchangés** — fallback : 1 tour, pas
   d'outils.
-- Les tool-calls du chat sont **visibles** dans le fil : un mini-rendu inline
-  « 🔍 a lu `src/foo.ts` » / « 📁 a listé `src/` » / « grep `useShell` (3) »,
-  alimenté par des deltas `chat://delta` de `kind:"tool"`.
-- **Toggle Settings** `chat.readTools` (défaut `true`).
+- Les tool-calls du chat sont **visibles** dans le fil : mini-rendu inline
+  « 🔍 a lu `src/foo.ts` », « 📁 a listé `src/` », « grep `useShell` (3) »,
+  « ✏️ a écrit `src/foo.ts` », alimenté par des deltas `chat://delta`
+  de `kind:"tool"`.
+- **Réversibilité du tour** : si au moins un fichier a été écrit pendant le tour,
+  un bouton « Annuler les modifications de ce message » restaure l'état d'avant
+  (cf. Note sûreté).
+- **Toggles Settings** : `chat.readTools` (défaut ON) et `chat.writeTools`
+  (défaut ON). `writeTools` OFF ⇒ chat lecture seule.
 
 ### Découpage technique (Rust)
-`chat_send` est aujourd'hui single-shot. On ajoute une **boucle d'outils bornée
-read-only** :
-- Sous-ensemble read-only des renderers de `agents/tools.rs`
-  (`tools_json_openai` / `tools_json_anthropic` filtrés sur les 3 outils lecture).
-- Dispatcher read-only réutilisant `fs::read_file_inner`, `fs::list_dir_inner`,
-  `grep::grep_inner` (déjà existants, déjà path-guardés).
-- Boucle plafonnée (`MAX_CHAT_TOOL_ITERS = 6`), même forme que `tool_use_loop`
+`chat_send` est aujourd'hui single-shot. On ajoute une **boucle d'outils bornée** :
+- Renderers de `agents/tools.rs` filtrés sur le sous-ensemble chat
+  (lecture + write/edit, selon les toggles).
+- Dispatcher réutilisant les helpers existants déjà path-guardés :
+  `fs::read_file_inner`, `fs::list_dir_inner`, `grep::grep_inner` (lecture) et
+  `fs::write_file_inner`, l'edit chirurgical de `agents/tools.rs` (écriture via
+  `fs::safe_resolve_for_write`). `allow_exec = false` toujours.
+- Boucle plafonnée (`MAX_CHAT_TOOL_ITERS = 8`), même forme que `tool_use_loop`
   du runner, mais : émet sur `chat://delta` (pas `agent://lifecycle`), pas de
-  persistance d'événements, et arrêt dès la première réponse sans tool-call.
-- **Réutilisation maximale** : on extrait les builders de messages multi-tour
-  (`build_openai_messages` / `build_anthropic_native`) et l'accumulateur de
-  tool-calls vers un endroit partageable, ou on les appelle tels quels. Décision
-  fine (extraire vs dupliquer un mini-loop) prise au writing-plans après lecture
-  de `chat.rs` + `runner.rs` (éviter une grosse duplication ; mémoire « cleanup
-  on replace »).
-- Le `with_tools` du chat devient conditionnel (toggle + protocole compatible).
+  persistance d'événements, arrêt dès la première réponse sans tool-call.
+- **Réversibilité** : avant la 1ʳᵉ écriture d'un tour, le dispatcher capture le
+  contenu d'origine des fichiers visés (ou « absent » si création). À la fin du
+  tour, `chat_send` renvoie ce journal au front, qui l'attache au message
+  (bouton Annuler). Réutilise l'esprit de `mirror::reverse_patch` /
+  `agent_reverse_patch` ; ici un journal `{path, before|null}` suffit (pas de
+  Docker, écritures directes sur le workspace).
+- **Réutilisation maximale** : extraire les builders multi-tour
+  (`build_openai_messages` / `build_anthropic_native`) + l'accumulateur de
+  tool-calls vers un module partageable chat↔runner, plutôt que dupliquer
+  (mémoire « cleanup on replace »). Décision fine extraire vs mini-loop dédié
+  prise au writing-plans après relecture de `chat.rs` + `runner.rs`.
+- Le `with_tools` du chat devient conditionnel (toggles + protocole compatible).
 
 ### Sûreté
 - Liste d'outils **fermée** côté Rust (pas de passe-plat de noms). Tout nom
   inconnu → `unknown tool` (comportement existant).
-- Aucune mutation possible : pas d'outil d'écriture câblé, point.
+- Écriture **path-guardée** (workspace uniquement) ; pas d'exécution de commande.
+- Chaque tour à écriture est **réversible** + chaque écriture est **visible**.
 
 ### Tests
-- Rust unit : le renderer read-only n'expose QUE les 3 outils lecture ; le
-  dispatcher read-only refuse `fs_write_file` / `run_command`.
+- Rust unit : le renderer chat n'expose QUE le sous-ensemble attendu selon les
+  toggles ; le dispatcher refuse `run_command` / `skill_save` ; une écriture hors
+  workspace est rejetée ; le journal d'annulation capture bien `before`.
 
 ---
 
@@ -154,12 +185,18 @@ read-only** :
   blocs au moment de l'affichage (ou étendre `parseAiReply`). Décision : étendre
   le rendu pour exposer chaque bloc avec son entête sans changer le schéma SQLite
   (le parsing se fait au rendu depuis `body`). À préciser au plan.
-- **Branchement apply** : déterminer au plan la fonction exacte de
-  `applyController` / `aiEditController` qui accepte un « contenu proposé »
-  fourni (sans rappel LLM). Si elle n'existe pas telle quelle, on ajoute un
-  point d'entrée mince qui réutilise l'extension de diff existante.
-- Si le fichier cible n'est pas ouvert, on l'ouvre d'abord (réutilise
-  `openFile` du shell).
+- **Branchement apply (pipeline existant confirmé)** : le bouton « Appliquer »
+  appelle `applyCodeToFile(path, text, lang)` (RootLayout) qui ouvre+active le
+  fichier puis pose une `ApplyRequest` (`applyController.setApplyRequest`,
+  type `ai-edit/types.ts:ApplyRequest`). `useApplyRunner` (monté dans CodeView)
+  attend que la view du fichier cible soit prête puis lance
+  `startApply(view, { path, proposedText, lang, wasDirty })`
+  (`aiEditController.ts:383`) : diff pleine-page accept/reject **sans appel LLM**.
+  → Feature 3 = surtout du **câblage UI** + résolution de cible ; le moteur
+  existe déjà (vérifier juste que `applyCodeToFile` est exporté/atteignable
+  depuis le composant de bloc de code ; sinon exposer un point d'entrée mince).
+- Fichier cible non ouvert : `applyCodeToFile`/`openFile` l'ouvrent (création si
+  absent pour un nouveau chemin).
 
 ### Tests
 - `parseCodeBlockTarget` : avec/sans chemin, styles `lang path`, `// path`.
@@ -167,7 +204,6 @@ read-only** :
 ---
 
 ## Ce qui N'EST PAS dans ce lot (YAGNI)
-- Écriture directe par le chat (refusée — sûreté).
 - @web / @docs / @folder, règles projet (`.cursorrules`) — lots ultérieurs.
 - Tab autocomplete (FIM) — lot B.
 - Multi-fichiers « Composer » en une passe — couvert par Grounded Run, hors lot.
@@ -178,12 +214,18 @@ read-only** :
 - `pnpm test` (vitest) : nouveaux tests purs verts.
 - **Vérif en voyant** (mémoire « user évalue en voyant ») : E2E manuel —
   ouvrir un fichier, poser une question sans @-mention (le modèle cite le bon
-  fichier), demander au chat de « lire X » (tool-call visible), demander un
-  patch et l'appliquer (diff accept/reject).
+  fichier) ; demander au chat de « lire X » (tool-call de lecture visible) ;
+  demander au chat de « modifie Y » (écriture directe visible + bouton Annuler
+  qui restaure) ; demander un bloc de code et l'**Appliquer** (diff accept/reject
+  sur le bon fichier).
 
 ## Risques / points ouverts (à figer au plan)
-- Accesseur de sélection CodeMirror (existe ? sinon l'ajouter).
+- Accesseur de sélection CodeMirror (existe ? sinon l'ajouter : un getter sur le
+  `CodeMirrorEditorHandle` exposant `EditorView.state.selection.main`).
 - Refactor de la boucle multi-tour Rust : extraire un helper partagé
   chat↔runner vs mini-loop dédié au chat (éviter la duplication).
-- Point d'entrée « apply contenu fourni » dans le pipeline inline-edit.
+- Journal d'annulation des écritures du tour : forme exacte (in-mem renvoyé au
+  front vs persistance légère) + UX du bouton « Annuler » par message.
+- `applyCodeToFile` atteignable depuis le composant de bloc de code du chat
+  (sinon exposer un point d'entrée mince).
 - Rendu multi-blocs dans le chat (parsing au rendu vs extension `parseAiReply`).
