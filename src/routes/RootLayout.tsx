@@ -56,6 +56,7 @@ import { useAgentEvents } from "@/features/agents/useEvents";
 import { setSelectedAgentId, useAgentsRailDisplay } from "@/features/agents/queries";
 import { useChatEvents } from "@/features/chat/useEvents";
 import { useChatStreamListener } from "@/features/chat/useChatStream";
+import { useChatToolActivityListener } from "@/features/chat/chatToolActivityStore";
 import { runImmediate } from "@/features/code/ai-edit/aiEditController";
 import { setApplyRequest } from "@/features/code/ai-edit/applyController";
 import { detectBlockPath, stripPathComment } from "@/lib/markdown";
@@ -354,6 +355,10 @@ export function RootLayout() {
   // dans le cache TanStack pour que TOUTES les windows voient le
   // streaming (au lieu d'un acceptingRef local qui drop les chunks).
   useChatStreamListener();
+  // Lot A — Task 12 : activité des tool-calls du chat (deltas kind:"tool"),
+  // accumulée par conv pour un rendu discret au-dessus du message AI en cours
+  // de stream (views-chat.tsx). Listener au root, comme le stream listener.
+  useChatToolActivityListener();
 
   // Auto-stop/start llama-server quand le model chat passe local↔API.
   // Restauré après diagnostic — innocent du freeze (testé Plan v2 Step C).

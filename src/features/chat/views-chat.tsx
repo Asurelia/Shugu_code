@@ -18,6 +18,8 @@ import { invoke } from "@/lib/tauri";
 import { useChatStream } from "./useChatStream";
 import { useMessages, sendChatMessage, useActiveModel } from "./chat-sync";
 import { useEditorSelection } from "./editorSelectionStore";
+import { useChatToolActivity } from "./chatToolActivityStore";
+import { useChatWrites, setChatWrites } from "./chatWritesStore";
 import { db } from "@/lib/db";
 import { ModelPicker } from "@/features/panels/panels";
 import { resolveImageProvider } from "@/lib/imageProviders";
@@ -82,6 +84,10 @@ export function ChatView({
   const chatStream = useChatStream(activeConv);
   const { data: messages } = useMessages(activeConv);
   const [model, setModel] = useActiveModel(modelProp);
+  // Lot A — Task 12 : libellés des tool-calls du tour en cours (« 🔍 a lu … »,
+  // « ✏️ a écrit … »), accumulés par le listener root et rendus dans le bloc de
+  // streaming ci-dessous. Vidé à la fin du tour (done delta).
+  const toolActivity = useChatToolActivity(activeConv);
 
   const navigate = useNavigate();
   const { activeFile, openFile, fileContents, setFileContents, editorPrefs, compareFile, setCompareFile, applyCodeToFile } = useShell();
@@ -562,12 +568,29 @@ export function ChatView({
                     <span className="sep">·</span>
                     <span className="ts">en train de travailler…</span>
                   </div>
+                  {/* Lot A — Task 12 : activité des outils du tour en cours. Une
+                      ligne discrète par tool-call (« 🔍 a lu … », « ✏️ a écrit … »),
+                      au-dessus du contenu/reasoning. Vidée à la fin du tour. */}
+                  {toolActivity.length > 0 && (
+                    <div className="cx-tool-activity">
+                      {toolActivity.map((label, i) => (
+                        <div key={i} className="cx-tool-line">
+                          {label}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   {chatStream.streaming && (chatStream.partial || chatStream.partialReasoning) ? (
                     <div className="cx-body">
                       {chatStream.partialReasoning && (
                         <ThinkBlock open text={chatStream.partialReasoning} />
                       )}
                       {chatStream.partial && <p>{chatStream.partial}</p>}
+                    </div>
+                  ) : toolActivity.length > 0 ? (
+                    <div className="cx-working">
+                      <span className="ring" />
+                      utilisation des outils · {model}
                     </div>
                   ) : (
                     <div className="cx-working">
@@ -658,6 +681,10 @@ function CxMessage({
   onApply?: (code: string, lang: string, target: string) => void;
 }) {
   const { displayBody, liveReasoning, isStreamingAgent, imageDataUrl } = useMessageDisplay(m);
+  // Lot A — Task 12 : journal d'annulation attaché à CE message (si le tour a
+  // écrit des fichiers, write_tools ON). Hook appelé inconditionnellement (avant
+  // tout return) ; il renvoie [] pour un message user ou un message sans écriture.
+  const writeRecords = useChatWrites(String(m.id));
 
   if (m.role === "user") {
     return (
@@ -713,12 +740,81 @@ function CxMessage({
             {isLatestAgent && !m.action && <WorkspaceDiffCard onOpenFile={onOpenFile} />}
           </>
         )}
+        {/* Lot A — Task 12 : annulation des écritures de CE message. Visible
+            uniquement quand le tour a modifié des fichiers (write_tools ON).
+            Appelle chat_revert_writes (restaure l'état d'avant) puis vide le
+            store → le bouton disparaît. */}
+        {writeRecords.length > 0 && (
+          <RevertWritesButton messageId={String(m.id)} records={writeRecords} />
+        )}
         <div className="cx-react">
           <button title="Copier" onClick={() => copyText(displayBody || m.body || m.text || "")}>
             <Icon name="copy" size={12} />
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// Lot A — Task 12 — bouton « Annuler les modifications de ce message ».
+//
+// Rendu sous un message AI dont le tour a écrit des fichiers. Au clic :
+//   1. invoke("chat_revert_writes", { records }) — le backend restaure chaque
+//      fichier à son contenu d'avant le tour (ou supprime les fichiers créés).
+//   2. setChatWrites(messageId, []) — vide le store pour ce message → le bouton
+//      disparaît (l'annulation n'est pas réversible une seconde fois).
+//   3. émet workspace://changed pour rafraîchir l'arbre fichiers / l'éditeur
+//      (le fs watcher Rust notifie aussi, mais l'event explicite est immédiat).
+//
+// `busy` désactive le bouton pendant l'appel pour éviter un double-revert.
+function RevertWritesButton({
+  messageId,
+  records,
+}: {
+  messageId: string;
+  records: import("./chatWritesStore").ChatWriteRecord[];
+}) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const onRevert = useCallback(() => {
+    setBusy(true);
+    setErr(null);
+    void (async () => {
+      try {
+        await invoke("chat_revert_writes", { records });
+        setChatWrites(messageId, []); // retire le bouton
+        // Rafraîchit l'arbre fichiers + l'éditeur (best-effort, comme ailleurs).
+        try {
+          const mod = await import("@tauri-apps/api/event");
+          await mod.emit("workspace://changed", {});
+        } catch (e) {
+          console.warn("[chat] workspace://changed emit failed:", e);
+        }
+      } catch (e) {
+        setErr(String(e));
+        setBusy(false);
+      }
+    })();
+  }, [messageId, records]);
+
+  const n = records.length;
+  return (
+    <div className="cx-revert">
+      <button
+        type="button"
+        className="cx-revert-btn"
+        onClick={onRevert}
+        disabled={busy}
+        title="Restaure les fichiers à leur état d'avant ce message"
+      >
+        <Icon name="diff" size={11} />
+        {busy
+          ? "Annulation…"
+          : `Annuler les modifications de ce message (${n} fichier${n > 1 ? "s" : ""})`}
+      </button>
+      {err && <span className="cx-revert-err">⚠ {err}</span>}
     </div>
   );
 }
