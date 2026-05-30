@@ -608,6 +608,7 @@ pub fn run() {
             commands::llama::llama_backend_info,
             commands::fs::fs_open_folder,
             commands::fs::fs_read_dir,
+            commands::fs::fs_read_dir_shallow,
             commands::fs::fs_read_file,
             commands::fs::fs_write_file,
             commands::fs::fs_create_file,

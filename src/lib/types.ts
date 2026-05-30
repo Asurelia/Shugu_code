@@ -83,6 +83,11 @@ export interface FileNode {
   // `?` = untracked). The tree node itself doesn't carry git info from
   // Rust — it's stamped at render time by SideFiles via gitStatusMap.
   git?: "M" | "A" | "D" | "U" | "?";
+  // Lazy tree (fs_read_dir_shallow): a directory node carries `children: []`
+  // until its children are fetched on expand; a file carries
+  // `children: undefined`. So `Array.isArray(children)` still distinguishes
+  // dir vs file, and `isDir` is the explicit flag the shallow loader sets.
+  isDir?: boolean;
   children?: FileNode[];
 }
 

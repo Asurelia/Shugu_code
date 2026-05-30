@@ -13,7 +13,7 @@
 // tabs avec contenu dirty). Phase ultérieure si besoin.
 
 import { useQuery } from "@tanstack/react-query";
-import { fsReadDir, fsReadFile } from "@/lib/fs";
+import { fsReadDir, fsReadDirShallow, fsReadFile } from "@/lib/fs";
 import { queryClient } from "@/lib/queryClient";
 import type { FileNode, FileContent } from "@/lib/types";
 import { fsKeys } from "./keys";
@@ -41,12 +41,50 @@ export function useFileTree() {
 }
 
 /**
- * Invalide le cache tree — à appeler après une mutation qui change le
- * workspace (e.g. `fsOpenFolder` depuis la command palette). Le watcher
- * Rust gère les changements internes automatiquement via `useFsEvents`.
+ * Enfants directs d'UN dossier (lazy tree). `path` = "" pour la racine.
+ * `enabled` permet de ne fetch un dossier qu'une fois déplié — l'explorateur
+ * charge ainsi un niveau à la fois, sans jamais walk tout l'arbre (donc sans
+ * le cap 5000 de `fs_read_dir` qui faisait échouer Comfyui/Shugu_stream).
+ *
+ * Retourne `[]` si aucun workspace ouvert (Rust rejette "no workspace open").
+ */
+export function useDirChildren(path: string, enabled = true) {
+  return useQuery<FileNode[]>({
+    queryKey: fsKeys.dir(path),
+    queryFn: async () => {
+      try {
+        return await fsReadDirShallow(path);
+      } catch {
+        // "no workspace open" / dossier disparu — état vide, pas une erreur.
+        return [];
+      }
+    },
+    enabled,
+    staleTime: 0,
+  });
+}
+
+/**
+ * « Le workspace a changé, rafraîchis tout l'arbre. » Invalide À LA FOIS le
+ * tree complet (`fs_read_dir` — indexer + Studio) ET les niveaux lazy de
+ * l'explorateur (`fsKeys.dir(*)`). Appelé par open-folder (command palette) :
+ * sans le second, l'explorateur resterait sur l'ancien dossier (il ne lit plus
+ * `fs_read_dir`). Les chemins d'expansion périmés (autre projet) sont inertes.
  */
 export function invalidateFileTree(): void {
   void queryClient.invalidateQueries({ queryKey: fsKeys.tree() });
+  void queryClient.invalidateQueries({ queryKey: [...fsKeys.all, "dir"] });
+}
+
+/**
+ * Invalide TOUS les niveaux lazy de l'explorateur (`fsKeys.dir(*)`).
+ * Appelé sur `fs://changed` : refetch des dossiers actuellement ouverts
+ * (les queries `enabled`), en conservant l'état d'expansion (qui vit dans
+ * le state React de SideFiles). Les queries des dossiers fermés sont
+ * inactives → pas de refetch inutile.
+ */
+export function invalidateDirChildren(): void {
+  void queryClient.invalidateQueries({ queryKey: [...fsKeys.all, "dir"] });
 }
 
 /**

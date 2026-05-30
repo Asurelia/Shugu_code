@@ -6,8 +6,13 @@ export const fsKeys = {
   /** Workspace root path (le dossier ouvert). */
   workspaceRoot: () => [...fsKeys.all, "workspace-root"] as const,
 
-  /** Arbre récursif du workspace (cf. `fs_read_dir` Rust command). */
+  /** Arbre récursif COMPLET du workspace (cf. `fs_read_dir`). Utilisé par
+   *  l'indexer vectoriel et les panneaux Studio, PAS par l'explorateur. */
   tree: () => [...fsKeys.all, "tree"] as const,
+
+  /** Enfants directs d'UN dossier (lazy tree, cf. `fs_read_dir_shallow`).
+   *  `""` = racine du workspace. L'explorateur fetch un niveau à l'expansion. */
+  dir: (path: string) => [...fsKeys.all, "dir", path] as const,
 
   /** Contenu d'un fichier (workspace-relative path). */
   file: (path: string) => [...fsKeys.all, "file", path] as const,
