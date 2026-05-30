@@ -5,6 +5,7 @@ import { useState, useEffect } from "react";
 import { Icon } from "@/components/components";
 import { SettingRow, Switch } from "@/features/code/views-code";
 import { db } from "@/lib/db";
+import { queryClient } from "@/lib/queryClient";
 import { COMMANDS } from "@/lib/commands";
 
 // ─── DEFAULT_SHORTCUTS derived from COMMANDS ──────────────────
@@ -463,7 +464,12 @@ function AutoEditorContextRow() {
 
   const change = (v: boolean) => {
     setOn(v);
-    void db.settings.set("chat.autoEditorContext", v ? "true" : "false");
+    void (async () => {
+      await db.settings.set("chat.autoEditorContext", v ? "true" : "false");
+      // Le composer (views-chat) lit ce réglage via useQuery (staleTime 30s) ;
+      // invalider la clé reflète le changement immédiatement (chip + envoi).
+      await queryClient.invalidateQueries({ queryKey: ["settings", "chat.autoEditorContext"] });
+    })();
   };
 
   return (
