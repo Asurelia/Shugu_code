@@ -13,7 +13,7 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 use walkdir::WalkDir;
 
@@ -304,6 +304,61 @@ fn build_tree(root: &Path, entries: Vec<walkdir::DirEntry>) -> Vec<FsEntry> {
     collect_children(root, root, &entries, 1)
 }
 
+/// Like `build_tree`, but the hierarchy is reconstructed starting at `start`
+/// (a subdirectory of `root`) instead of `root` itself, while paths stay
+/// workspace-relative (stripped against `root`).
+///
+/// `build_tree` anchors its recursion at `root`: its first level only keeps
+/// entries whose `.parent()` equals `root`. That is correct for a whole-tree
+/// walk (where the shallowest entries ARE direct children of `root`), but WRONG
+/// for a scoped walk whose shallowest entries are children of `start` (two or
+/// more levels below `root`) — the first level would match nothing and the
+/// whole tree would come back empty. We therefore anchor recursion at `start`
+/// while keeping `root` as the path-stripping base.
+fn build_subtree(root: &Path, start: &Path, entries: Vec<walkdir::DirEntry>) -> Vec<FsEntry> {
+    fn collect_children(
+        parent: &Path,
+        root: &Path,
+        all_entries: &[walkdir::DirEntry],
+        depth: usize,
+    ) -> Vec<FsEntry> {
+        let mut children: Vec<FsEntry> = all_entries
+            .iter()
+            .filter(|e| e.path().parent() == Some(parent))
+            .map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                let rel = e
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap_or(e.path())
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let is_dir = e.file_type().is_dir();
+                let children = if is_dir && depth < 12 {
+                    collect_children(e.path(), root, all_entries, depth + 1)
+                } else {
+                    vec![]
+                };
+                FsEntry {
+                    name,
+                    path: rel,
+                    is_dir,
+                    children,
+                }
+            })
+            .collect();
+
+        children.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        children
+    }
+
+    collect_children(start, root, &entries, 1)
+}
+
 // ---------------------------------------------------------------------------
 // Tauri commands
 // ---------------------------------------------------------------------------
@@ -347,6 +402,14 @@ pub fn fs_open_folder(
     // Notify both watchers of the new root (best-effort — never fail the command).
     let _ = watcher_ctl.0.send(canonical.clone());
     let _ = git_watcher_ctl.0.send(canonical.clone());
+
+    // Broadcast the workspace change so anything anchored to the OLD root can
+    // react — notably the integrated terminal, which respawns its PTY in the
+    // new directory (VS Code behaviour). `fs_open_folder` is the ONLY runtime
+    // mutation of `root_state` (Studio's openProject writes to .shugu-forge/
+    // preview without touching it), so this single emit covers every switch.
+    // Payload is the display path (forward-slash, no `\\?\`) for the frontend.
+    let _ = app.emit("workspace://changed", display.replace('\\', "/"));
 
     Ok(Some(display))
 }
@@ -482,6 +545,154 @@ pub fn fs_read_dir(
     }
 
     Ok(build_tree(&root, flat_entries))
+}
+
+/// Recursive directory tree rooted at a SUBPATH of the workspace (not the whole
+/// root). `rel` is a workspace-relative dir (forward-slash); `None`/empty falls
+/// back to the whole-root `fs_read_dir` behaviour. No 5000-entry cap: callers
+/// use this on small, known subtrees (e.g. Studio's `.shugu-forge/preview/`),
+/// so the cap that protects the file-explorer's eager whole-tree render doesn't
+/// apply. Paths are full workspace-relative (so `fs_read_file`/`openFile` still
+/// resolve). Same `is_ignored` filter + dir-first sort as `fs_read_dir`.
+#[tauri::command]
+pub fn fs_read_dir_scoped(
+    rel: Option<String>,
+    root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
+) -> Result<Vec<FsEntry>, String> {
+    let root = {
+        let guard = root_state
+            .lock()
+            .map_err(|e| format!("workspace state lock: {e}"))?;
+        guard.clone().ok_or_else(|| "no workspace open".to_string())?
+    };
+
+    // Resolve the subtree root. `safe_resolve` enforces containment + rejects
+    // traversal; an absent/empty `rel` means "the workspace root itself".
+    let base = match rel.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => root.clone(),
+        Some(r) => {
+            let resolved = safe_resolve(&root, r)?;
+            if !resolved.is_dir() {
+                // Not a dir (or doesn't exist yet, e.g. preview not generated):
+                // return empty rather than erroring — callers treat [] as "none".
+                return Ok(Vec::new());
+            }
+            resolved
+        }
+    };
+
+    let mut flat_entries: Vec<walkdir::DirEntry> = Vec::new();
+    let walker = WalkDir::new(&base)
+        .follow_links(false)
+        .max_depth(12)
+        .min_depth(1)
+        .into_iter()
+        .filter_entry(|e| !is_ignored(&e.file_name().to_string_lossy()));
+    for result in walker {
+        match result {
+            Ok(entry) => flat_entries.push(entry),
+            Err(e) => eprintln!("[fs_read_dir_scoped] skipping entry: {e}"),
+        }
+    }
+    // `build_subtree` reconstructs the hierarchy starting at `base` (the
+    // scoped subtree's actual root — the shallowest walked entries are its
+    // children), while deriving each node's path relative to the workspace
+    // `root` (so paths stay workspace-relative and usable by fs_read_file).
+    // Using `build_tree` here would anchor recursion at `root` and, since no
+    // walked entry is a direct child of `root`, return an empty tree.
+    Ok(build_subtree(&root, &base, flat_entries))
+}
+
+/// Flat list of workspace-relative FILE paths (no directories), for the vector
+/// indexer. Walks WITHOUT the 5000-entry tree cap — that cap guards the eager
+/// DOM render of the file explorer, irrelevant to a background indexer. Applies:
+///   - `is_ignored` (dirs like node_modules/target/.git, pruned mid-walk),
+///   - an `exclude_exts` filter (binaries/models/datasets) BEFORE counting, so
+///     a 98k-file ML project's `.safetensors`/`.png` never enter the budget,
+///   - a `max_files` budget; when exceeded, returns what fit + `truncated:true`
+///     and the total seen, so the caller can SHOW what was dropped (never a
+///     silent cap, never a hard fail).
+// `rename_all = "camelCase"` so `total_seen` serializes as `totalSeen` to match
+// the TS `FileListResult` interface (cf. workspaceIndexer's `{ totalSeen }`).
+// Tauri converts camelCase ARGUMENT keys to snake_case, but return values are
+// plain serde — without this, the TS side reads `totalSeen` as `undefined` and
+// the truncation toast renders "sur undefined".
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileListResult {
+    pub paths: Vec<String>,
+    pub truncated: bool,
+    /// Total code-eligible files seen before the budget cut in (>= paths.len()).
+    pub total_seen: usize,
+}
+
+#[tauri::command]
+pub fn fs_list_files(
+    exclude_exts: Vec<String>,
+    max_files: usize,
+    root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
+) -> Result<FileListResult, String> {
+    let root = {
+        let guard = root_state
+            .lock()
+            .map_err(|e| format!("workspace state lock: {e}"))?;
+        guard.clone().ok_or_else(|| "no workspace open".to_string())?
+    };
+
+    // Lowercased extension set for O(1) membership (case-insensitive).
+    let excluded: std::collections::HashSet<String> =
+        exclude_exts.iter().map(|e| e.to_lowercase()).collect();
+
+    let mut paths: Vec<String> = Vec::new();
+    let mut total_seen = 0usize;
+    let mut truncated = false;
+
+    let walker = WalkDir::new(&root)
+        .follow_links(false)
+        .max_depth(24) // deep enough for real source trees; dirs pruned by is_ignored
+        .min_depth(1)
+        .into_iter()
+        .filter_entry(|e| !is_ignored(&e.file_name().to_string_lossy()));
+
+    for result in walker {
+        let entry = match result {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("[fs_list_files] skipping entry: {e}");
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy();
+        let ext = name
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_lowercase())
+            .unwrap_or_default();
+        // Extension filter BEFORE the budget so binaries/models never consume it.
+        if !ext.is_empty() && excluded.contains(&ext) {
+            continue;
+        }
+        total_seen += 1;
+        if paths.len() >= max_files {
+            truncated = true;
+            continue; // keep counting total_seen so the caller can report it
+        }
+        let abs = entry.path();
+        let rel = abs
+            .strip_prefix(&root)
+            .unwrap_or(abs)
+            .to_string_lossy()
+            .replace('\\', "/");
+        paths.push(rel);
+    }
+
+    Ok(FileListResult {
+        paths,
+        truncated,
+        total_seen,
+    })
 }
 
 /// Read a workspace-relative file path and return its content as a string.
@@ -1293,6 +1504,74 @@ mod tests {
         // A path like "dir/../../../etc" — safe_resolve canonicalizes and checks.
         let result = safe_resolve(&root, "dir/../../../etc");
         assert!(result.is_err());
+        cleanup(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // build_subtree / build_tree anchoring (regression for fs_read_dir_scoped)
+    // -----------------------------------------------------------------------
+
+    /// Walk a `base` subtree the same way `fs_read_dir_scoped` does, then build
+    /// the tree. This locks in the fix: `build_subtree` (anchored at `base`)
+    /// must produce a NON-EMPTY, NESTED tree with workspace-relative paths,
+    /// whereas the old `build_tree(&root, …)` (anchored at `root`) returns `[]`
+    /// because no walked entry is a direct child of `root`.
+    #[test]
+    fn build_subtree_reconstructs_nested_scoped_tree() {
+        let root = make_temp_dir("subtree_nested");
+        // root/.shugu-forge/preview/{index.html, css/style.css}
+        let preview = root.join(".shugu-forge").join("preview");
+        fs::create_dir_all(preview.join("css")).unwrap();
+        fs::write(preview.join("index.html"), b"<html></html>").unwrap();
+        fs::write(preview.join("css").join("style.css"), b"body{}").unwrap();
+
+        let base = preview.clone();
+        let entries: Vec<walkdir::DirEntry> = WalkDir::new(&base)
+            .follow_links(false)
+            .max_depth(12)
+            .min_depth(1)
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // FIXED path: anchored at `base`, stripped against `root`.
+        let tree = build_subtree(&root, &base, entries.clone());
+        assert!(
+            !tree.is_empty(),
+            "build_subtree must reconstruct the scoped tree, got empty"
+        );
+
+        // index.html present at the top level, path workspace-relative.
+        let index = tree
+            .iter()
+            .find(|n| n.name == "index.html")
+            .expect("index.html at top level of scoped tree");
+        assert!(!index.is_dir);
+        assert_eq!(index.path, ".shugu-forge/preview/index.html");
+
+        // css dir is NESTED with its child (proves recursion descends).
+        let css = tree
+            .iter()
+            .find(|n| n.name == "css")
+            .expect("css dir at top level of scoped tree");
+        assert!(css.is_dir);
+        assert_eq!(css.path, ".shugu-forge/preview/css");
+        let style = css
+            .children
+            .iter()
+            .find(|n| n.name == "style.css")
+            .expect("style.css nested under css");
+        assert_eq!(style.path, ".shugu-forge/preview/css/style.css");
+
+        // REGRESSION: the old `build_tree(&root, …)` would return empty because
+        // no walked entry's parent equals `root`.
+        let old = build_tree(&root, entries);
+        assert!(
+            old.is_empty(),
+            "build_tree anchored at root must NOT reconstruct a base-rooted walk \
+             (this is exactly the bug that returned [] for fs_read_dir_scoped)"
+        );
+
         cleanup(&root);
     }
 }

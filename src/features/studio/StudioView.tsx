@@ -46,20 +46,9 @@ import { DiscoveryForm } from "./DiscoveryForm";
 import { DirectionPicker } from "./DirectionPicker";
 import { StudioConversation } from "./StudioConversation";
 import { CodeMirrorEditor } from "@/features/code/CodeMirrorEditor";
-import { useFileTree } from "@/features/fs/queries";
-import type { FileNode } from "@/lib/types";
+import { useScopedTree } from "@/features/fs/queries";
 
-// Walk the (disk-backed) file tree to a workspace-relative path.
-function findNode(nodes: FileNode[], target: string): FileNode | null {
-  for (const n of nodes) {
-    if (n.path === target) return n;
-    if (n.children) {
-      const found = findNode(n.children, target);
-      if (found) return found;
-    }
-  }
-  return null;
-}
+const PREVIEW_DIR = ".shugu-forge/preview";
 
 export function StudioView() {
   const navigate = useNavigate();
@@ -81,10 +70,12 @@ export function StudioView() {
   // A project already exists on disk when the preview has an index.html — the
   // durable source of truth. In-memory `turns` reset on app reload but the
   // generated files don't, so we key "creation vs iteration" off the disk.
-  const { data: tree = [] } = useFileTree();
+  // Read ONLY the preview subtree (fs_read_dir_scoped) — no whole-workspace
+  // walk, so this is unaffected by the 5000-entry cap on big projects.
+  const { data: previewFiles = [] } = useScopedTree(PREVIEW_DIR);
   const hasProject = useMemo(
-    () => findNode(tree, ".shugu-forge/preview")?.children?.some((c) => c.name === "index.html") ?? false,
-    [tree],
+    () => previewFiles.some((c) => c.name === "index.html"),
+    [previewFiles],
   );
 
   // `busy` is DERIVED from the last turn's live status (agents query cache, fed

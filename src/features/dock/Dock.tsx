@@ -454,6 +454,7 @@ export function DockTerminal({ tabId, name: _name }: { tabId: string; name: stri
     let dataSub: { dispose: () => void } | null = null;
     let unlistenOut: (() => void) | null = null;
     let unlistenExit: (() => void) | null = null;
+    let unlistenWorkspace: (() => void) | null = null;
 
     // Two distinct hazards make a naive open()+write() throw
     // "Cannot read properties of undefined (reading 'dimensions')":
@@ -543,6 +544,38 @@ export function DockTerminal({ tabId, name: _name }: { tabId: string; name: stri
       });
     };
 
+    // Respawn the PTY in the NEW workspace directory when the user switches
+    // project (VS Code behaviour: a folder switch recreates terminals). The
+    // Rust side emits `workspace://changed` from fs_open_folder AFTER updating
+    // the workspace-root state, so a fresh term_spawn (which reads that state
+    // for its cwd) lands in the new folder. We kill the old PTY first because
+    // term_spawn is idempotent — it would early-return on the existing tab_id.
+    // ⚠ This interrupts whatever was running in the terminal (e.g. a dev
+    // server) — the user opted into this trade-off (respawn over stale cwd).
+    const respawnInNewCwd = async () => {
+      if (disposed) return;
+      // Tear down the current frontend stream wiring + the dead PTY.
+      dataSub?.dispose();
+      dataSub = null;
+      unlistenOut?.();
+      unlistenOut = null;
+      unlistenExit?.();
+      unlistenExit = null;
+      try {
+        await invoke('term_kill', { tabId });
+      } catch (err) {
+        console.warn('[DockTerminal] term_kill before respawn failed:', err);
+      }
+      if (disposed) return;
+      // Visually reset so the old project's scrollback doesn't bleed into the
+      // new shell (and clears the stale Rust snapshot's effect on re-mount).
+      term.reset();
+      // Re-run the full spawn → snapshot → listen → onData sequence. The PTY
+      // no longer exists for this tab_id, so term_spawn creates a new one in
+      // the new cwd.
+      await writeInitial();
+    };
+
     const initOrFit = () => {
       if (disposed) return;
       // GUARD: never resize against a 0-sized container. The "render all
@@ -597,6 +630,17 @@ export function DockTerminal({ tabId, name: _name }: { tabId: string; name: stri
     ro.observe(el);
     initOrFit(); // try immediately in case the container is already sized
 
+    // Attach the workspace-switch listener ONCE (outside writeInitial, which
+    // re-runs on every respawn — attaching there would leak a listener per
+    // switch). Survives respawns; torn down only on unmount.
+    void (async () => {
+      const un = await listen<string>('workspace://changed', () => {
+        void respawnInNewCwd();
+      });
+      if (disposed) un();
+      else unlistenWorkspace = un;
+    })();
+
     return () => {
       // Cleanup tears down the FRONTEND view (xterm instance + event
       // listeners + observers). It does NOT call term_kill — that would
@@ -612,6 +656,7 @@ export function DockTerminal({ tabId, name: _name }: { tabId: string; name: stri
       dataSub?.dispose();
       unlistenOut?.();
       unlistenExit?.();
+      unlistenWorkspace?.();
       ro.disconnect();
       term.dispose();
     };

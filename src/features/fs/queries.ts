@@ -1,44 +1,25 @@
 // Shugu Forge — TanStack Query hooks pour la feature fs.
 //
-// Remplace les useState + useEffect async qui live dans RootLayout pour
-// charger le file tree. Le pattern :
-//   - `useFileTree()` fetch via `fsReadDir` Rust command
-//   - `useEvents.ts` listen `fs://changed` (debounced 200ms côté Rust) →
-//     invalidateQueries(fsKeys.tree())
-//   - Quand l'user ouvre un nouveau dossier via `fsOpenFolder`, on
-//     invalide manuellement le cache (cf. `invalidateFileTree` export).
+// L'explorateur charge l'arbre en LAZY, un niveau à l'expansion :
+//   - `useDirChildren(path)` fetch via `fs_read_dir_shallow` (sans cap)
+//   - `useScopedTree(path)` fetch un sous-arbre récursif (Studio → preview)
+//   - `useEvents.ts` listen `fs://changed` → invalidate dir + scoped
+//   - open-folder (command palette) → `invalidateFileTree`
+//
+// L'ancien `useFileTree()` (walk récursif COMPLET via `fs_read_dir`, plafonné
+// à 5000 entrées) a été retiré : il faisait échouer silencieusement les gros
+// projets (Comfyui 98k). L'indexeur vectoriel utilise désormais `fs_list_files`
+// (liste plate, sans cap), Studio `fs_read_dir_scoped` (sous-arbre preview).
 //
 // Note : `useFileContent` est plumbed mais pas encore migré dans
 // `RootLayout.openFile` (qui garde son setFileContents state pour les
 // tabs avec contenu dirty). Phase ultérieure si besoin.
 
 import { useQuery } from "@tanstack/react-query";
-import { fsReadDir, fsReadDirShallow, fsReadFile } from "@/lib/fs";
+import { fsReadDirShallow, fsReadDirScoped, fsReadFile } from "@/lib/fs";
 import { queryClient } from "@/lib/queryClient";
 import type { FileNode, FileContent } from "@/lib/types";
 import { fsKeys } from "./keys";
-
-/**
- * Arbre récursif du workspace ouvert. Refetch sur invalidation (cf.
- * `useFsEvents` qui hook le watcher Rust + command palette open-folder).
- *
- * Retourne `[]` si aucun workspace ouvert (Rust command rejette avec
- * "no workspace open" — on swallow l'erreur).
- */
-export function useFileTree() {
-  return useQuery<FileNode[]>({
-    queryKey: fsKeys.tree(),
-    queryFn: async () => {
-      try {
-        return await fsReadDir();
-      } catch {
-        // "no workspace open" — pas une vraie erreur, juste un état initial.
-        return [];
-      }
-    },
-    staleTime: 0,
-  });
-}
 
 /**
  * Enfants directs d'UN dossier (lazy tree). `path` = "" pour la racine.
@@ -65,26 +46,48 @@ export function useDirChildren(path: string, enabled = true) {
 }
 
 /**
- * « Le workspace a changé, rafraîchis tout l'arbre. » Invalide À LA FOIS le
- * tree complet (`fs_read_dir` — indexer + Studio) ET les niveaux lazy de
- * l'explorateur (`fsKeys.dir(*)`). Appelé par open-folder (command palette) :
- * sans le second, l'explorateur resterait sur l'ancien dossier (il ne lit plus
- * `fs_read_dir`). Les chemins d'expansion périmés (autre projet) sont inertes.
+ * Sous-arbre récursif d'un sous-chemin du workspace (Studio → `.shugu-forge/
+ * preview/`). Lit SEULEMENT ce sous-dossier via `fs_read_dir_scoped` (pas de
+ * cap 5000 — découplé de la taille du projet, donc Studio marche même sur
+ * Comfyui). Retourne `[]` si le sous-chemin n'existe pas encore (preview pas
+ * générée). Rafraîchi par le watcher (`fs://changed` invalide `fsKeys.scoped`).
+ */
+export function useScopedTree(path: string) {
+  return useQuery<FileNode[]>({
+    queryKey: fsKeys.scoped(path),
+    queryFn: async () => {
+      try {
+        return await fsReadDirScoped(path);
+      } catch {
+        return [];
+      }
+    },
+    staleTime: 0,
+  });
+}
+
+/**
+ * « Le workspace a changé, rafraîchis l'arbre. » Invalide le tree complet
+ * (`fs_read_dir`, encore lu par d'éventuels consommateurs legacy), les niveaux
+ * lazy de l'explorateur (`fsKeys.dir(*)`) ET les sous-arbres scoped Studio
+ * (`fsKeys.scoped(*)`). Appelé par open-folder (command palette).
  */
 export function invalidateFileTree(): void {
   void queryClient.invalidateQueries({ queryKey: fsKeys.tree() });
   void queryClient.invalidateQueries({ queryKey: [...fsKeys.all, "dir"] });
+  void queryClient.invalidateQueries({ queryKey: [...fsKeys.all, "scoped"] });
 }
 
 /**
- * Invalide TOUS les niveaux lazy de l'explorateur (`fsKeys.dir(*)`).
- * Appelé sur `fs://changed` : refetch des dossiers actuellement ouverts
- * (les queries `enabled`), en conservant l'état d'expansion (qui vit dans
- * le state React de SideFiles). Les queries des dossiers fermés sont
- * inactives → pas de refetch inutile.
+ * Invalide les niveaux lazy de l'explorateur (`fsKeys.dir(*)`) ET les
+ * sous-arbres scoped Studio (`fsKeys.scoped(*)`). Appelé sur `fs://changed` :
+ * refetch des dossiers ouverts + de la preview Studio, en conservant l'état
+ * d'expansion (qui vit dans le state React de SideFiles). Les queries des
+ * dossiers fermés sont inactives → pas de refetch inutile.
  */
 export function invalidateDirChildren(): void {
   void queryClient.invalidateQueries({ queryKey: [...fsKeys.all, "dir"] });
+  void queryClient.invalidateQueries({ queryKey: [...fsKeys.all, "scoped"] });
 }
 
 /**
