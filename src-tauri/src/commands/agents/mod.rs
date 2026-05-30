@@ -675,6 +675,7 @@ pub async fn agent_spawn(
             None,  // workspace_override — chat works on the real open workspace
             false, // allow_exec — chat never executes; only the Atelier does
             system_prompt_override_for_task, // None ⇒ seed_prompt ; Some ⇒ .md custom
+            Vec::new(), // exec_ro_mounts — chat never execs
         )
         .await;
     });
@@ -791,6 +792,7 @@ pub async fn agent_atelier_run(
             Some(ws_for_task), // workspace_override — the disposable mirror
             true,              // allow_exec — the Atelier is the ONLY exec path
             Some(runner::ATELIER_PROMPT.to_string()),
+            Vec::new(), // exec_ro_mounts — Atelier builds from scratch, no deps mount
         )
         .await;
         // The mirror dir is intentionally left on disk so the preview pane can
@@ -923,6 +925,24 @@ pub async fn agent_grounded_run(
             .ok_or_else(|| "agent handle vanished between insert and spawn".to_string())?
     };
 
+    // Gate JS — mount the LIVE project's `node_modules` read-only at
+    // `/work/node_modules` so `pnpm`/`tsc`/etc. resolve OFFLINE inside the
+    // network-isolated sandbox (the mirror excludes node_modules; Docker creates
+    // the mount point). Verified: pnpm's relative symlinks stay valid when the
+    // whole dir is mounted as a unit. Read-only ⇒ the agent's exec can never
+    // mutate the real deps. Absent ⇒ no mount (a depless project still works).
+    let mut exec_ro_mounts: Vec<(String, String)> = Vec::new();
+    let real_node_modules = real_root.join("node_modules");
+    if real_node_modules.is_dir() {
+        match std::fs::canonicalize(&real_node_modules) {
+            Ok(nm) => exec_ro_mounts.push((
+                nm.to_string_lossy().to_string(),
+                "/work/node_modules".to_string(),
+            )),
+            Err(e) => eprintln!("[grounded] node_modules canonicalize failed, skipping mount: {e}"),
+        }
+    }
+
     let app_for_task = app.clone();
     let agent_state = state.0.clone();
     let agent_id_for_task = agent_id.clone();
@@ -944,6 +964,7 @@ pub async fn agent_grounded_run(
             Some(mirror_for_task.clone()), // workspace_override — the disposable mirror
             true,                          // allow_exec — grounded execs on the copy
             Some(system_prompt),
+            exec_ro_mounts, // node_modules:ro so pnpm/tsc resolve offline (gate JS)
         )
         .await;
 

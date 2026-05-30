@@ -41,48 +41,69 @@ pub(super) struct SandboxResult {
     pub(super) timed_out: bool,
 }
 
+/// Normalise a Windows host path for a Docker `-v` mount: strip the `\\?\`
+/// verbatim prefix that `canonicalize` adds (Docker Desktop rejects it) and turn
+/// backslashes into forward slashes.
+fn docker_host_path(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    s.strip_prefix(r"\\?\").unwrap_or(&s).replace('\\', "/")
+}
+
 /// Run `command` inside a throwaway, network-isolated container with the sandbox
 /// workspace mounted at `/work`. BLOCKS (call under `spawn_blocking`). Never
 /// panics: a docker-level failure (binary missing, daemon down, image absent) is
 /// returned as a non-zero result with the reason in `stderr`, so a bench run
 /// degrades to a clean "exec unavailable" verdict instead of crashing.
-pub(super) fn run_in_sandbox(ws: &Path, command: &str, timeout_secs: u64) -> SandboxResult {
-    // Docker Desktop wants a forward-slash host path and rejects the Windows
-    // `\\?\` verbatim prefix that `canonicalize` adds. Strip it, normalise slashes.
-    let ws_str = ws.to_string_lossy();
-    let mount = ws_str
-        .strip_prefix(r"\\?\")
-        .unwrap_or(&ws_str)
-        .replace('\\', "/");
+///
+/// `extra_ro_mounts` are `(host_path, container_path)` pairs mounted read-only —
+/// Grounded Run uses this to expose the live project's `node_modules` at
+/// `/work/node_modules` so `pnpm`/`tsc` resolve OFFLINE (verified: pnpm's
+/// relative symlinks stay valid when the whole dir is mounted as a unit). The
+/// mounts are READ-ONLY, so the agent's exec can never mutate the real deps.
+/// Atelier passes `&[]` (unchanged behaviour).
+pub(super) fn run_in_sandbox(
+    ws: &Path,
+    command: &str,
+    timeout_secs: u64,
+    extra_ro_mounts: &[(String, String)],
+) -> SandboxResult {
+    let mount = docker_host_path(ws);
 
     // `timeout SECS CMD` (GNU coreutils, present in the jammy base) caps
     // wall-clock INSIDE the container; it exits 124 when it kills the command.
     let inner = format!("timeout {timeout_secs} {command}");
 
-    let output = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "--network",
-            "none",
-            "--cpus",
-            "2",
-            "--memory",
-            "2g",
-            "--shm-size",
-            "1g",
-            "--pids-limit",
-            "512",
-            "-v",
-            &format!("{mount}:/work"),
-            "-w",
-            "/work",
-            SANDBOX_IMAGE,
-            "sh",
-            "-c",
-            &inner,
-        ])
-        .output();
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--rm".into(),
+        "--network".into(),
+        "none".into(),
+        "--cpus".into(),
+        "2".into(),
+        "--memory".into(),
+        "2g".into(),
+        "--shm-size".into(),
+        "1g".into(),
+        "--pids-limit".into(),
+        "512".into(),
+        "-v".into(),
+        format!("{mount}:/work"),
+    ];
+    for (host, container) in extra_ro_mounts {
+        // host is already a canonicalized path from the caller; normalise the
+        // `\\?\` prefix + slashes exactly like the workspace mount above.
+        let host_norm = docker_host_path(Path::new(host));
+        args.push("-v".into());
+        args.push(format!("{host_norm}:{container}:ro"));
+    }
+    args.push("-w".into());
+    args.push("/work".into());
+    args.push(SANDBOX_IMAGE.into());
+    args.push("sh".into());
+    args.push("-c".into());
+    args.push(inner);
+
+    let output = Command::new("docker").args(&args).output();
 
     match output {
         Ok(out) => {

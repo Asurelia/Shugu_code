@@ -269,6 +269,10 @@ pub(super) async fn run_agent_task(
     workspace_override: Option<PathBuf>,
     allow_exec: bool,
     system_prompt_override: Option<String>,
+    // Read-only `(host, container)` mounts added to the exec sandbox. Grounded
+    // Run passes the live project's `node_modules` so `pnpm`/`tsc` resolve
+    // OFFLINE; chat/atelier pass an empty vec (no extra mounts).
+    exec_ro_mounts: Vec<(String, String)>,
 ) {
     let start = std::time::Instant::now();
     let protocol = protocol.unwrap_or_else(|| "openai".to_string());
@@ -360,6 +364,7 @@ pub(super) async fn run_agent_task(
             &mut loop_metrics,
             workspace_override,
             allow_exec,
+            exec_ro_mounts,
         ) => r,
         _ = abort.notified() => {
             mark_killed(&app, &agent_id);
@@ -454,6 +459,9 @@ pub(super) async fn tool_use_loop(
     // arbitrary commands a path-guard can't contain, so only the bench (which
     // works on a disposable copy) passes `true`; real chat agents pass `false`.
     allow_exec: bool,
+    // Read-only mounts threaded to `run_command`'s sandbox (Grounded Run's
+    // `node_modules`); empty for chat/atelier.
+    exec_ro_mounts: Vec<(String, String)>,
 ) -> Result<(String, String), String> {
     // Stall-detection state: repeated identical tool-call signatures and
     // consecutive tool-error rounds are the two cheap "stuck" signals, recorded
@@ -609,6 +617,7 @@ pub(super) async fn tool_use_loop(
                 let app_clone = app.clone();
                 let role_clone = role.to_string();
                 let last_exec_clone = last_exec_exit.clone();
+                let mounts_clone = exec_ro_mounts.clone();
                 async move {
                     // `spawn_blocking` because the fs ops are synchronous —
                     // running them on the async runtime thread would starve
@@ -616,7 +625,7 @@ pub(super) async fn tool_use_loop(
                     // a JoinError (panic in the closure); `execute_tool`
                     // itself never panics for normal fs failures.
                     tokio::task::spawn_blocking(move || {
-                        execute_tool(&tc_clone, &root_clone, allow_exec, &app_clone, &role_clone, &last_exec_clone)
+                        execute_tool(&tc_clone, &root_clone, allow_exec, &app_clone, &role_clone, &last_exec_clone, &mounts_clone)
                     })
                         .await
                         .unwrap_or_else(|join_err| ToolResult {

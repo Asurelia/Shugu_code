@@ -398,8 +398,9 @@ pub(super) fn execute_tool(
     app: &AppHandle,
     role: &str,
     last_exec_exit: &AtomicI64,
+    exec_ro_mounts: &[(String, String)],
 ) -> ToolResult {
-    match dispatch_inner(call, workspace_root, allow_exec, app, role, last_exec_exit) {
+    match dispatch_inner(call, workspace_root, allow_exec, app, role, last_exec_exit, exec_ro_mounts) {
         Ok(content) => ToolResult {
             id: call.id.clone(),
             name: call.name.clone(),
@@ -422,6 +423,7 @@ fn dispatch_inner(
     app: &AppHandle,
     role: &str,
     last_exec_exit: &AtomicI64,
+    exec_ro_mounts: &[(String, String)],
 ) -> Result<String, String> {
     let args: serde_json::Value = serde_json::from_str(&call.arguments)
         .map_err(|e| format!("argument parse error: {e}"))?;
@@ -524,7 +526,7 @@ fn dispatch_inner(
                 .as_str()
                 .ok_or_else(|| "missing required field: command".to_string())?;
             let timeout_secs = args["timeoutSecs"].as_u64().unwrap_or(60).clamp(1, 300);
-            let res = super::sandbox::run_in_sandbox(root, command, timeout_secs);
+            let res = super::sandbox::run_in_sandbox(root, command, timeout_secs, exec_ro_mounts);
             // Record the exit code for the skill gate: `skill_save` only persists
             // when the LAST run_command exited 0 (env-verified success). Timeout
             // (sentinel -2) and infra failure (-1) both block saving a skill.
