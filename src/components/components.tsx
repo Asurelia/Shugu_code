@@ -9,6 +9,8 @@ import { useGitStatusMap, type GitStatusChar } from "@/features/git/useGitStatus
 // Lazy tree — each folder fetches its direct children on first expand
 // (fs_read_dir_shallow), so huge projects open instantly (no 5000-entry cap).
 import { useDirChildren } from "@/features/fs/queries";
+// Colored file-type icons (Shugu's hand-made VS Code-style set).
+import { FileTypeIcon } from "@/components/fileIcons";
 
 // ── Icons (24x24 stroke) ────────────────────────────────────
 export function Icon({ name, size = 18, className = "" }: { name: string; size?: number; className?: string }) {
@@ -488,9 +490,9 @@ export function FileNode({
               onClick={(e) => { e.stopPropagation(); onToggleExpanded(node.path); }}
             >{isOpen ? "▾" : "▸"}</span>
           : <span className="file-chevron-spacer" />}
-        {isDir
-          ? <Icon name="folder" size={13} className="ico" />
-          : <Icon name="file" size={13} className="ico" />}
+        <span className="ico" style={{ display: "inline-flex", alignItems: "center" }}>
+          <FileTypeIcon name={node.name} isDir={isDir} isOpen={isOpen} size={15} />
+        </span>
         {isRenaming
           ? <FileRenameInput
               initial={node.name}
@@ -634,7 +636,9 @@ function FileCreateRow({ depth, kind, onCommit, onCancel }: { depth: number; kin
   return (
     <div className="side-item side-item-create" style={{ paddingLeft: pad }}>
       <span className="file-chevron-spacer" />
-      <Icon name={kind === "folder" ? "folder" : "file"} size={13} className="ico" />
+      <span className="ico" style={{ display: "inline-flex", alignItems: "center" }}>
+        <FileTypeIcon name={kind === "folder" ? "folder" : "new"} isDir={kind === "folder"} size={15} />
+      </span>
       <input
         ref={inputRef}
         className="file-rename-input"
