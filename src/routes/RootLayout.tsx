@@ -815,13 +815,19 @@ export function RootLayout() {
   // cache. useApplyRunner (monté dans CodeView) attend que la view du fichier
   // soit prête et démarre le diff. Sans chemin déclaré → repli non destructif
   // vers openSnippetInEditor (jamais de remplacement fichier-entier implicite).
-  const applyCodeToFile = useCallback(async (code: string, lang: string) => {
-    const detected = detectBlockPath(code);
-    if (!detected) {
+  //
+  // Lot A (Task 8) — `targetOverride` : quand le bouton « Appliquer » d'un bloc
+  // de chat résout sa cible (chemin déclaré dans le bloc OU, à défaut, le
+  // fichier actif), il la passe ici directement. On court-circuite alors la
+  // détection automatique : on n'a plus besoin d'un chemin déclaré dans le
+  // code pour cibler le fichier actif. `stripPathComment` reste appliqué dans
+  // tous les cas (retire un éventuel commentaire de chemin en 1ʳᵉ ligne).
+  const applyCodeToFile = useCallback(async (code: string, lang: string, targetOverride?: string) => {
+    const path = targetOverride ?? detectBlockPath(code);
+    if (!path) {
       await openSnippetInEditor(code, lang);
       return;
     }
-    const path = detected;
     const proposed = stripPathComment(code);
     try {
       // openFile lit le disque (fsReadFile throw si absent) puis active le tab.

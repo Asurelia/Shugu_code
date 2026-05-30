@@ -25,6 +25,7 @@ import { revealAgent } from "@/lib/agents";
 import { useAgentDefs } from "@/features/agents/agentDefsQueries";
 import { useMessageDisplay } from "./useMessageDisplay";
 import { useShell } from "@/routes/shell-context";
+import { detectBlockPath } from "@/lib/markdown";
 import { CodeMirrorEditor } from "@/features/code/CodeMirrorEditor";
 import { GitDiffView } from "@/features/code/DiffView";
 import { ContextBubble } from "@/features/context-cards/ContextBubble";
@@ -83,7 +84,7 @@ export function ChatView({
   const [model, setModel] = useActiveModel(modelProp);
 
   const navigate = useNavigate();
-  const { activeFile, openFile, fileContents, setFileContents, editorPrefs, compareFile, setCompareFile } = useShell();
+  const { activeFile, openFile, fileContents, setFileContents, editorPrefs, compareFile, setCompareFile, applyCodeToFile } = useShell();
 
   // Phase 2 — Chat→Editor handoff. When a file is opened from an action card,
   // we reveal an in-chat split (chat left, CodeMirror right) instead of
@@ -643,12 +644,18 @@ function CxMessage({
   isLatestAgent,
   onOpenFile,
   onOpenSnippet,
+  activeFile,
+  onApply,
 }: {
   m: Message;
   model: string;
   isLatestAgent: boolean;
   onOpenFile: (path: string) => void;
   onOpenSnippet?: (code: string, lang: string) => void;
+  /** Lot A (Task 8) — active editor file: the Apply fallback target. */
+  activeFile?: string | null;
+  /** Lot A (Task 8) — apply a code block to a file (diff accept/reject). */
+  onApply?: (code: string, lang: string, target: string) => void;
 }) {
   const { displayBody, liveReasoning, isStreamingAgent, imageDataUrl } = useMessageDisplay(m);
 
@@ -698,6 +705,8 @@ function CxMessage({
                 lang={m.code.lang}
                 text={m.code.text}
                 onOpen={onOpenSnippet ? () => onOpenSnippet(m.code!.text, m.code!.lang) : undefined}
+                activeFile={activeFile}
+                onApply={onApply}
               />
             )}
             {m.action && <ActionCard action={m.action} onOpenFile={onOpenFile} />}
@@ -825,12 +834,26 @@ export function CodeBlock({
   lang,
   text,
   onOpen,
+  activeFile,
+  onApply,
 }: {
   lang: string;
   text: string;
   onOpen?: () => void;
+  /** Lot A (Task 8) — active editor file: the Apply fallback target when the
+   *  block declares no path of its own. */
+  activeFile?: string | null;
+  /** Lot A (Task 8) — apply this block to a file with inline diff (no LLM). */
+  onApply?: (code: string, lang: string, target: string) => void;
 }) {
   const [preview, setPreview] = useState(false);
+  // Lot A (Task 8) — résolution de la cible d'apply. On regarde d'abord un
+  // chemin déclaré DANS le bloc (commentaire de 1ʳᵉ ligne `// src/x.ts` — le
+  // seul indice qui survit à la persistance SQLite, l'info-string `lang path`
+  // ayant déjà été consommée en `lang` au parse). À défaut, on retombe sur le
+  // fichier actif de l'éditeur. null ⇒ rien à cibler → bouton désactivé.
+  const applyTarget = detectBlockPath(text) ?? activeFile ?? null;
+  const canApply = !!onApply && !!applyTarget;
   // HTML blocks get a live "Aperçu" — the payoff of activating a design
   // system (Design view → "Utiliser dans le chat") is SEEING the generated
   // UI. Rendered via srcdoc in a sandboxed iframe (no network, no
@@ -850,6 +873,29 @@ export function CodeBlock({
             </button>
           )}
           <button className="cx-tool" title="Copier" onClick={() => copyText(text)}><Icon name="copy" size={12} /></button>
+          {/* Lot A (Task 8) — bouton « Appliquer » : pose une ApplyRequest sur la
+              cible résolue → diff inline accept/reject, ZÉRO appel LLM. Le title
+              est porté par le <span> englobant : un <button disabled> n'émet pas
+              de tooltip natif dans WebView2, donc sans ce wrap le message d'aide
+              (« ouvre un fichier… ») resterait invisible justement quand on en a
+              besoin. */}
+          <span
+            style={{ display: "inline-flex" }}
+            title={
+              canApply
+                ? `Appliquer à ${applyTarget} (diff à accepter / refuser)`
+                : "Ouvre un fichier ou précise un chemin (```ts src/foo.ts)"
+            }
+          >
+            <button
+              className="cx-tool"
+              onClick={canApply ? () => onApply!(text, lang, applyTarget!) : undefined}
+              disabled={!canApply}
+              style={canApply ? { color: "var(--secondary)" } : undefined}
+            >
+              <Icon name="check" size={12} />
+            </button>
+          </span>
           <button
             className="cx-tool"
             title="Ouvrir dans l'éditeur"
