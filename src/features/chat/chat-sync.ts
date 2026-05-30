@@ -272,6 +272,7 @@ export async function sendChatMessage(
   modelId: string,
   imageDataUrl?: string,
   agentDefPath?: string,
+  editorCtx?: { path: string; content: string; selection?: { text: string; startLine: number; endLine: number } },
 ): Promise<void> {
   const trimmed = text.trim();
   // Allow empty text when an image is provided (image-only messages are valid).
@@ -396,6 +397,22 @@ export async function sendChatMessage(
   // since we just inserted the user message), at least send the current prompt.
   if (apiMessages.length === 0) {
     apiMessages.push({ role: "user", content: trimmed });
+  }
+
+  // Lot A — contexte éditeur auto. Injecté dans le dernier message user envoyé
+  // au modèle (jamais persisté). On saute le fichier actif s'il est déjà
+  // @-mentionné (dédoublonnage). Désactivable via settings (le composer ne
+  // passe `editorCtx` que si le toggle est ON et le chip pas retiré).
+  if (editorCtx) {
+    const { buildEditorContext } = await import("./editorContext");
+    const skipPaths = parseMentions(trimmed);
+    const ectx = buildEditorContext(editorCtx, { skipPaths });
+    if (ectx) {
+      const lastUserIdx = apiMessages.map((m) => m.role).lastIndexOf("user");
+      if (lastUserIdx >= 0) {
+        apiMessages[lastUserIdx].content = `${ectx}\n\n---\n\n${apiMessages[lastUserIdx].content}`;
+      }
+    }
   }
 
   // Lot 4 — @-mentions : résout les fichiers @-mentionnés du message courant et
