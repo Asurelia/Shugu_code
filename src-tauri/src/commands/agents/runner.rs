@@ -71,8 +71,12 @@ const MAX_ITERATIONS_EXEC: u32 = 24;
 ///     to the LLM as the user-side of the next turn. OpenAI uses
 ///     `role: "tool"` per result; Anthropic packs all results into a
 ///     single `role: "user"` message with `content: [tool_result, ...]`.
+// `pub(crate)` (was `pub(super)`) so the chat tool loop in `commands::chat`
+// reuses the SAME multi-turn history shape + provider builders instead of
+// duplicating them (Lot A — Task 9/11, cleanup-on-replace / no-dup policy).
+// The variant fields must be `pub` too so `chat.rs` can construct them.
 #[allow(dead_code)] // variants used in match arms but rustc sees only construction
-pub(super) enum AgentMessage {
+pub(crate) enum AgentMessage {
     Text { role: String, content: String },
     AssistantWithTools { content: String, tool_calls: Vec<ToolCall> },
     ToolResults(Vec<ToolResult>),
@@ -87,7 +91,7 @@ pub(super) enum AgentMessage {
 /// each carrying its `tool_call_id`). Lot 3 — now the active builder for the
 /// openai/custom agent path via `call_openai_compat_structured`, replacing the
 /// former text projection.
-fn build_openai_messages(history: &[AgentMessage]) -> Vec<serde_json::Value> {
+pub(crate) fn build_openai_messages(history: &[AgentMessage]) -> Vec<serde_json::Value> {
     let mut out: Vec<serde_json::Value> = Vec::new();
     for msg in history {
         match msg {
@@ -162,7 +166,9 @@ fn push_coalesced(out: &mut Vec<serde_json::Value>, role: &str, blocks: Vec<serd
 /// coalesced (the loop appends a system-nudge user message right after a
 /// tool_results user message; Anthropic rejects two consecutive user turns).
 /// Lot 3 — replaces the former JSON-in-text projection.
-fn build_anthropic_native(history: &[AgentMessage]) -> (Vec<serde_json::Value>, Option<String>) {
+pub(crate) fn build_anthropic_native(
+    history: &[AgentMessage],
+) -> (Vec<serde_json::Value>, Option<String>) {
     let mut system_parts: Vec<String> = Vec::new();
     let mut out: Vec<serde_json::Value> = Vec::new();
 
@@ -236,7 +242,7 @@ fn build_anthropic_native(history: &[AgentMessage]) -> (Vec<serde_json::Value>, 
 /// is open — the dispatcher then returns an "is_error: true" ToolResult
 /// for every call this iteration so the model sees the situation and
 /// can ask the user to open a workspace.
-pub(super) fn get_workspace_root(app: &AppHandle) -> Option<PathBuf> {
+pub(crate) fn get_workspace_root(app: &AppHandle) -> Option<PathBuf> {
     let state = app.state::<Mutex<Option<PathBuf>>>();
     let guard = state.lock().ok()?;
     guard.clone()
@@ -812,6 +818,7 @@ async fn call_agent_llm_with_tools(
             chat::call_anthropic_structured(
                 client, base_url, model, messages, system, api_key,
                 /* with_tools */ true,
+                /* tools (default full agent set) */ None,
                 /* abort */ None,
                 &mut on_chunk,
             )
@@ -830,6 +837,7 @@ async fn call_agent_llm_with_tools(
                 protocol,
                 chat_template_kwargs,
                 /* with_tools */ true,
+                /* tools (default full agent set) */ None,
                 /* abort */ None,
                 &mut on_chunk,
             )
