@@ -185,7 +185,10 @@ fn path_to_file_uri(path: &std::path::Path) -> String {
 /// Résout le binaire LSP pour un langId. Retourne (path, args) ou None
 /// si le binaire n'est pas installé sur la machine (et qu'on n'a pas de
 /// sidecar bundlé pour ce langage).
-fn resolve_lsp_binary(lang_id: &str) -> Option<(PathBuf, Vec<String>)> {
+fn resolve_lsp_binary(
+    lang_id: &str,
+    workspace_root: &std::path::Path,
+) -> Option<(PathBuf, Vec<String>)> {
     // Note : seuls les langIds que `langFromPath` (src/lib/fs.ts) produit
     // sont matchés ici. Les `typescriptreact`/`javascriptreact` LSP-standard
     // ne sont pas traités séparément car `.tsx`/`.jsx` mappent à
@@ -194,11 +197,38 @@ fn resolve_lsp_binary(lang_id: &str) -> Option<(PathBuf, Vec<String>)> {
         "typescript" | "javascript" => ("typescript-language-server", vec!["--stdio"]),
         "rust" => ("rust-analyzer", vec![]),
         "python" => ("pylsp", vec![]),
+        "go" => ("gopls", vec![]),
+        // clangd couvre C et C++ ; jdtls (Java) est best-effort (lanceur
+        // complexe : data dir + JVM args). S'il ne handshake pas, le reader
+        // verra EOF et émettra lsp://exited — l'app ne casse pas.
+        "c" | "cpp" => ("clangd", vec![]),
+        "java" => ("jdtls", vec![]),
         _ => return None,
     };
-    // detect-installed : PATH system
+    let args: Vec<String> = args.into_iter().map(String::from).collect();
+
+    // 1) node_modules/.bin du workspace — la toolchain fournie PAR le projet,
+    //    comme VS Code/Cursor. Sur Windows, npm crée un shim `.cmd` qui n'est
+    //    pas exécutable directement par CreateProcess → build_command wrappe
+    //    `.cmd`/`.bat` via `cmd /d /c`. Sans ce check, typescript-language-server
+    //    (jamais sur le PATH système, mais présent dans node_modules/.bin du
+    //    repo) ne se résolvait pas → LSP TS muet sur le langage principal.
+    let bin_dir = workspace_root.join("node_modules").join(".bin");
+    let candidates: &[&str] = if cfg!(windows) {
+        &[".cmd", ".CMD", ""]
+    } else {
+        &[""]
+    };
+    for ext in candidates {
+        let candidate = bin_dir.join(format!("{binary_name}{ext}"));
+        if candidate.is_file() {
+            return Some((candidate, args));
+        }
+    }
+
+    // 2) PATH système (LSP installé manuellement : rustup, pip, winget, brew…).
     let path = which::which(binary_name).ok()?;
-    Some((path, args.into_iter().map(String::from).collect()))
+    Some((path, args))
 }
 
 /// Construit la Command à spawn, avec wrapping cmd.exe sur Windows pour
@@ -436,7 +466,7 @@ pub async fn lsp_init(
 
     // Resolve binary (hybride : which-first ; sidecar fallback à wirer
     // plus tard, retourne Err pour MVP).
-    let (path, bin_args) = resolve_lsp_binary(&args.lang_id).ok_or_else(|| {
+    let (path, bin_args) = resolve_lsp_binary(&args.lang_id, &workspace_root).ok_or_else(|| {
         format!(
             "LSP binary not found for '{}'. Install it: \
              typescript-language-server via npm, rust-analyzer via rustup, \
@@ -518,5 +548,42 @@ pub fn kill_all(state: &LspServerRegistry) {
         for (_, session) in guard.drain() {
             session.force_kill();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// Crée un faux node_modules/.bin/<name>(.cmd) dans un tempdir et vérifie
+    /// que resolve_lsp_binary le préfère au PATH système.
+    #[test]
+    fn resolves_from_node_modules_bin_first() {
+        let tmp = std::env::temp_dir().join(format!("shugu_lsp_test_{}", std::process::id()));
+        let bin_dir = tmp.join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        // Sur Windows le shim npm est un .cmd ; sur Unix c'est un exécutable.
+        let bin_name = if cfg!(windows) {
+            "typescript-language-server.cmd"
+        } else {
+            "typescript-language-server"
+        };
+        let bin_path = bin_dir.join(bin_name);
+        fs::write(&bin_path, "echo stub").unwrap();
+
+        let resolved = resolve_lsp_binary("typescript", &tmp);
+        assert!(resolved.is_some(), "should resolve from node_modules/.bin");
+        let (path, args) = resolved.unwrap();
+        assert_eq!(path, bin_path, "should pick the workspace-local binary");
+        assert_eq!(args, vec!["--stdio".to_string()]);
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn returns_none_for_unknown_language() {
+        let tmp = std::env::temp_dir();
+        assert!(resolve_lsp_binary("cobol", &tmp).is_none());
     }
 }
