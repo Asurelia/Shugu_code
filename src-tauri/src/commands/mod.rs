@@ -13,6 +13,7 @@ pub mod git_watcher;
 pub mod grep;
 pub mod llama;
 pub mod lsp;
+pub mod mcp;
 pub mod model_bundle;
 pub mod preview;
 pub mod studio;
