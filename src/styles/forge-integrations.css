@@ -373,3 +373,424 @@
   color: var(--on-surface-variant);
 }
 .side-search-meta .hint { font-size: 9px; color: var(--on-surface-muted); text-transform: none; letter-spacing: 0.04em; }
+
+/* ─── Mascot in-panel ctx card (la carte ctx REMPLACE le fil de chat) ────────
+   Retour utilisateur : plutôt que flotter au-dessus du chibi, la carte ctx
+   (Git / Prévisu / Plan / Tâches / Sources / Env) s'affiche DANS le panneau,
+   à la place du chat. En-tête compact : titre + bouton ⤢ plein écran (bascule
+   la fenêtre principale sur la vraie vue) + fermer (retour au chat). Le corps
+   réutilise `.float-history` (scroll). Le lanceur reste la barre d'onglets ctx
+   existante (`.float-tabs` → CTX_TABS) — aucun doublon, aucun rail dédié. */
+.ctx-inpanel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  flex: 0 0 auto;
+}
+.ctx-inpanel-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--primary, #e08efe);
+  font-family: var(--font-mono);
+}
+.ctx-inpanel-actions {
+  display: inline-flex;
+  gap: 4px;
+}
+.ctx-inpanel-btn {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--on-surface-muted);
+  cursor: pointer;
+  transition: 0.12s ease;
+}
+.ctx-inpanel-btn:hover {
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--on-surface);
+}
+.ctx-inpanel-body {
+  padding: 8px;
+}
+
+/* ─── Bouton-menu (chevron du composer) — petit & discret, TOUJOURS présent ──
+   Ouvre/ferme le menu en cascade ; le chevron pivote quand le menu est ouvert. */
+.float-toolbar-toggle {
+  width: 26px;
+  height: 26px;
+  background: transparent;
+  border-color: transparent;
+  color: var(--on-surface-muted);
+}
+.float-toolbar-toggle:hover {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.10);
+}
+.float-toolbar-toggle .ftt-chevron {
+  transition: transform 220ms ease;
+}
+.float-toolbar-toggle .ftt-chevron.up {
+  transform: rotate(180deg);
+}
+
+/* ─── Menu de la mascotte en cascade (MascotToolbar) ────────────────────────
+   BARRE-PILULE verticale d'ICÔNES de catégorie (façon « fenêtre de prompt »),
+   collée au côté du chibi (`side`). Une catégorie sélectionnée DÉPLOIE ses
+   cartes en RANGÉE HORIZONTALE à côté de son icône, vers le chat (à l'opposé du
+   chibi). Cliquer une carte referme tout (géré en JS). */
+.mtb-menu {
+  position: relative;
+  display: flex;
+  padding: 4px 8px 8px;
+  z-index: 5;
+}
+.mtb-menu.side-left  { justify-content: flex-start; }
+.mtb-menu.side-right { justify-content: flex-end; }
+
+/* Scrim transparent plein-cadre derrière les bulles (clic = fermer). */
+.mtb-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: default;
+}
+
+/* La BARRE-PILULE : un seul conteneur arrondi (façon prompt) qui englobe les
+   icônes de catégorie empilées. overflow visible → les déploiements sortent. */
+.mtb-cat-bar {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 5px;
+  border-radius: 16px;
+  /* Couleur/matière IDENTIQUE à la barre de prompt
+     (.float-panel.cstyle-pill .float-composer) — demande utilisateur. */
+  background: rgba(20, 16, 38, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 12px 28px -14px rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(18px) saturate(160%);
+  -webkit-backdrop-filter: blur(18px) saturate(160%);
+  overflow: visible;
+  animation: mtb-pop 150ms ease-out;
+}
+@keyframes mtb-pop {
+  from { opacity: 0; transform: translateY(6px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* Chaque créneau = référence de position pour son déploiement. */
+.mtb-cat-slot { position: relative; }
+
+/* Icône de catégorie (pas de mot — libellé en tooltip). */
+.mtb-cat-icon {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 11px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--on-surface-variant);
+  cursor: pointer;
+  transition: 0.12s ease;
+}
+.mtb-cat-icon:hover { background: rgba(255, 255, 255, 0.06); color: var(--on-surface); }
+.mtb-cat-icon.on {
+  background: rgba(224, 142, 254, 0.18);
+  border-color: var(--primary, #e08efe);
+  color: var(--primary, #e08efe);
+}
+
+/* Déploiement horizontal des cartes — « bulle en longueur », en ABSOLU à côté
+   de l'icône active (haut aligné), du côté opposé au chibi. */
+.mtb-flyout {
+  position: absolute;
+  top: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 7px;
+  border-radius: 13px;
+  /* Même matière que la barre de prompt + un léger liseré d'accent (déploiement
+     actif). */
+  background: rgba(20, 16, 38, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 0 0 2px rgba(224, 142, 254, 0.10), 0 12px 28px -14px rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(18px) saturate(160%);
+  -webkit-backdrop-filter: blur(18px) saturate(160%);
+  white-space: nowrap;
+  z-index: 2;
+  animation: mtb-flyout-pop 160ms ease-out;
+}
+.mtb-menu.side-right .mtb-flyout { right: calc(100% + 8px); transform-origin: right center; }
+.mtb-menu.side-left  .mtb-flyout { left: calc(100% + 8px);  transform-origin: left center; }
+@keyframes mtb-flyout-pop {
+  from { opacity: 0; transform: scale(0.96); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+/* Icône d'une carte dans le déploiement. */
+.mtb-item {
+  position: relative;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--on-surface-muted);
+  cursor: pointer;
+  transition: 0.12s ease;
+}
+.mtb-item:hover { background: rgba(224, 142, 254, 0.10); color: var(--on-surface); }
+.mtb-item.on {
+  background: rgba(224, 142, 254, 0.18);
+  border-color: var(--primary, #e08efe);
+  color: var(--primary, #e08efe);
+}
+.mtb-item-count {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 7px;
+  background: var(--primary, #e08efe);
+  color: #1a0f33;
+  font-size: 8px;
+  font-weight: 800;
+  line-height: 14px;
+  text-align: center;
+  font-family: var(--font-mono);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .float-toolbar-toggle .ftt-chevron,
+  .mtb-cat-bar,
+  .mtb-flyout {
+    transition: none;
+    animation: none;
+  }
+}
+
+/* Bouton « organiser les catégories » (bas de la barre). */
+.mtb-edit-toggle {
+  margin-top: 2px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 0 0 11px 11px;
+  color: var(--on-surface-muted);
+}
+/* Flyout d'une catégorie vide. */
+.mtb-flyout-empty {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--on-surface-muted);
+  padding: 0 6px;
+}
+
+/* ─── Éditeur de catégories (rename / icône / add / remove / DnD) ────────────
+   Même matière que la barre de prompt. */
+.mtb-editor {
+  position: relative;
+  z-index: 1;
+  width: 300px;
+  max-width: calc(100vw - 40px);
+  max-height: 60vh;
+  display: flex;
+  flex-direction: column;
+  border-radius: 16px;
+  background: rgba(20, 16, 38, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 12px 28px -14px rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(18px) saturate(160%);
+  -webkit-backdrop-filter: blur(18px) saturate(160%);
+  overflow: hidden;
+  animation: mtb-pop 150ms ease-out;
+}
+.mtb-editor-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  flex: 0 0 auto;
+}
+.mtb-editor-title {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--primary, #e08efe);
+}
+.mtb-editor-actions { display: inline-flex; gap: 4px; }
+.mtb-editor-btn {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--on-surface-muted);
+  cursor: pointer;
+  transition: 0.12s ease;
+}
+.mtb-editor-btn:hover { background: rgba(255, 255, 255, 0.07); color: var(--on-surface); }
+.mtb-editor-btn.done { color: var(--primary, #e08efe); }
+.mtb-editor-btn.done:hover { background: rgba(224, 142, 254, 0.16); }
+
+.mtb-editor-list {
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.mtb-edit-group {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 11px;
+  padding: 7px;
+  background: rgba(255, 255, 255, 0.02);
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.mtb-edit-group.drop {
+  border-color: var(--primary, #e08efe);
+  background: rgba(224, 142, 254, 0.10);
+}
+.mtb-edit-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.mtb-edit-icon {
+  width: 26px;
+  height: 26px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: rgba(224, 142, 254, 0.12);
+  border: 1px solid rgba(224, 142, 254, 0.25);
+  color: var(--primary, #e08efe);
+  cursor: pointer;
+  transition: 0.12s ease;
+}
+.mtb-edit-icon:hover { background: rgba(224, 142, 254, 0.22); }
+.mtb-edit-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: rgba(15, 10, 30, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 7px;
+  padding: 5px 8px;
+  color: var(--on-surface);
+  font-family: var(--font-display, var(--font-body));
+  font-size: 12px;
+}
+.mtb-edit-name:focus { outline: none; border-color: rgba(224, 142, 254, 0.4); }
+.mtb-edit-del {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--on-surface-muted);
+  cursor: pointer;
+  transition: 0.12s ease;
+}
+.mtb-edit-del:hover:not(:disabled) { background: rgba(224, 90, 90, 0.15); color: #ef9a9a; }
+.mtb-edit-del:disabled { opacity: 0.3; cursor: not-allowed; }
+
+.mtb-icon-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 7px;
+  padding: 6px;
+  border-radius: 9px;
+  background: rgba(15, 10, 30, 0.5);
+}
+.mtb-icon-opt {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--on-surface-variant);
+  cursor: pointer;
+  transition: 0.12s ease;
+}
+.mtb-icon-opt:hover { background: rgba(255, 255, 255, 0.06); color: var(--on-surface); }
+.mtb-icon-opt.on {
+  background: rgba(224, 142, 254, 0.18);
+  border-color: var(--primary, #e08efe);
+  color: var(--primary, #e08efe);
+}
+
+.mtb-edit-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 7px;
+  min-height: 24px;
+}
+.mtb-edit-empty {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--on-surface-muted);
+  font-style: italic;
+  padding: 3px 2px;
+}
+.mtb-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  color: var(--on-surface);
+  font-family: var(--font-display, var(--font-body));
+  font-size: 11px;
+  cursor: grab;
+  user-select: none;
+}
+.mtb-chip:active { cursor: grabbing; }
+.mtb-chip-label { line-height: 1; }
+/* Chip en cours de glissement : estompée + transparente aux events pour que
+   elementFromPoint « voie » la catégorie cible en dessous. */
+.mtb-chip.dragging { opacity: 0.3; pointer-events: none; }
+/* Fantôme qui suit le curseur (position fixe, hors flux, inerte). */
+.mtb-chip-ghost {
+  position: fixed;
+  z-index: 9999;
+  transform: translate(-45%, -55%);
+  pointer-events: none;
+  background: rgba(40, 30, 62, 0.96);
+  border-color: var(--primary, #e08efe);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.55);
+}

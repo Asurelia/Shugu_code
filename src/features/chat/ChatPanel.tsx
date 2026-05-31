@@ -36,8 +36,19 @@ import { useFloatShell } from "@/features/floating/FloatShell";
 import { setChatBusy, useChatBusy } from "@/features/chat/chatBusy";
 import { setChatUnread } from "@/features/chat/chatUnread";
 import { bumpInteract } from "@/features/mascot/idleStore";
+import { MascotToolbar } from "@/features/mascot/MascotToolbar";
 import { useMessageDisplay } from "./useMessageDisplay";
 import type { Message } from "@/lib/types";
+
+// Surface ctx → route plein écran du main IDE (bouton ⤢ de l'en-tête de carte).
+// Absente = pas de bouton (pas de vue dédiée pour cette surface).
+const CTX_FULLSCREEN_ROUTE: Partial<Record<CtxTabId, string>> = {
+  git: "/git",
+  env: "/git",
+  plan: "/agents",
+  tasks: "/agents",
+  sources: "/code",
+};
 
 // Bulle d'un message dans le chat mascotte (variant compact).
 //
@@ -281,7 +292,7 @@ export interface ChatPanelProps {
 }
 
 export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
-  const { mode, setMode, edge } = useFloatShell();
+  const { mode, setMode, edge, side } = useFloatShell();
   const { data: discoveredModels } = useDiscoveredModels();
   const hasKey = discoveredModels.length > 0;
   const [model] = useActiveModel();
@@ -343,9 +354,16 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
   // Tab can be one of the chat tabs OR a contextual card id (Phase 4). The
   // ctx tabs swap the mascot panel content to the matching card (local to the
   // mascot — they do NOT drive the main chat's ContextBubble).
+  // Onglet actif : chat/historique/agents OU une carte contextuelle (Plan/
+  // Tâches/Git/Prévisu/Sources/Env). Quand c'est une carte, elle REMPLACE le
+  // fil de chat dans le panneau (pas de flottant) — cf. retour utilisateur.
   const [tab, setTab] = useState<"feed" | "history" | "agents" | CtxTabId>("feed");
   const ctxCounts = useCtxCounts(activeConv);
-  const isCtxTab = CTX_TABS.some((t) => t.id === tab);
+  // Non-null quand l'onglet actif est une carte ctx → elle s'affiche en panneau.
+  const ctxMeta = CTX_TABS.find((t) => t.id === tab) ?? null;
+  // Le menu-bulle en cascade est-il ouvert ? Piloté par le bouton-menu du
+  // composer. Au repos (fermé) : juste la carte/chat + la barre de prompt.
+  const [menuOpen, setMenuOpen] = useState(false);
 
   // Opening a file from a mascot ctx card crosses windows: emit app://open-file
   // (RootLayout opens it in the editor) and focus the main IDE window.
@@ -356,6 +374,28 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
         await eventMod.emit("app://open-file", { path });
       } catch (err) {
         console.warn("[ChatPanel] open-file emit failed", err);
+      }
+      try {
+        const winMod = await import("@tauri-apps/api/webviewWindow");
+        const main = await winMod.WebviewWindow.getByLabel("main");
+        if (main) { await main.show(); await main.unminimize(); await main.setFocus(); }
+      } catch (err) {
+        console.warn("[ChatPanel] focus main window failed", err);
+      }
+    })();
+  }, []);
+
+  // Plein écran d'une carte ctx (bouton ⤢) : bascule la fenêtre principale sur
+  // la vraie vue (app://navigate, écouté par main.tsx) et lui donne le focus.
+  const mascotFullscreen = useCallback((ctxTab: CtxTabId) => {
+    const route = CTX_FULLSCREEN_ROUTE[ctxTab];
+    if (!route) return;
+    void (async () => {
+      try {
+        const eventMod = await import("@tauri-apps/api/event");
+        await eventMod.emit("app://navigate", { path: route });
+      } catch (err) {
+        console.warn("[ChatPanel] navigate emit failed", err);
       }
       try {
         const winMod = await import("@tauri-apps/api/webviewWindow");
@@ -514,12 +554,37 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
 
   return (
     <>
-      {mode === "full" && (
+      {/* Le chat / la carte sont MASQUÉS tant que le menu ou l'éditeur est
+          ouvert : le menu remplace la zone (il ne se superpose pas au chat).
+          Demande utilisateur — « fermer le chat comme les autres menus ». */}
+      {mode === "full" && !menuOpen && (
         <div className="float-history-shell">
-          {isCtxTab ? (
+          {ctxMeta ? (
             <ShellContext.Provider value={detachedShell}>
-              <div className="float-history-list ctx-in-float" style={{ padding: 0 }}>
-                <ContextCard tab={tab as CtxTabId} convId={activeConv} onOpenFile={mascotOpenFile} />
+              <div className="ctx-inpanel-head">
+                <span className="ctx-inpanel-title">
+                  <Icon name={ctxMeta.icon} size={12} /> {ctxMeta.label}
+                </span>
+                <span className="ctx-inpanel-actions">
+                  {CTX_FULLSCREEN_ROUTE[ctxMeta.id] && (
+                    <button
+                      className="ctx-inpanel-btn"
+                      title={"Plein écran — ouvrir « " + ctxMeta.label + " » dans la fenêtre principale"}
+                      onClick={() => mascotFullscreen(ctxMeta.id)}
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" />
+                        <line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" />
+                      </svg>
+                    </button>
+                  )}
+                  <button className="ctx-inpanel-btn" title="Revenir au chat" onClick={() => setTab("feed")}>
+                    <Icon name="x" size={12} />
+                  </button>
+                </span>
+              </div>
+              <div className="float-history ctx-inpanel-body">
+                <ContextCard tab={ctxMeta.id} convId={activeConv} onOpenFile={mascotOpenFile} />
               </div>
             </ShellContext.Provider>
           ) : tab === "feed" ? (
@@ -605,58 +670,21 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
         </div>
       )}
 
-      {mode === "full" && (
-        <div className="float-tabs">
-          <button className={"float-tab" + (tab === "feed" ? " on" : "")} onClick={() => setTab("feed")} title="Chat">
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
-            </svg>
-            <span>Chat</span>
-            {msgs.length > 0 && <span className="float-tab-count">{msgs.length}</span>}
-          </button>
-          <button className="float-tab new" onClick={() => { void newConvo(); }} title="Nouvelle conversation">
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-            </svg>
-            <span>Nouveau</span>
-          </button>
-          <button className={"float-tab" + (tab === "history" ? " on" : "")} onClick={() => setTab("history")} title="Historique">
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
-            </svg>
-            <span>Historique</span>
-            {historyConvs.length > 0 && <span className="float-tab-count">{historyConvs.length}</span>}
-          </button>
-          {/* Agents tab — third sibling, shows the multi-agent observability
-              view (runtime tree, transcripts). Org-chart-style icon to read
-              instantly as "agent hierarchy" without needing a label scan. */}
-          <button className={"float-tab" + (tab === "agents" ? " on" : "")} onClick={() => setTab("agents")} title="Agents">
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <rect x="9" y="2" width="6" height="5" rx="1"/>
-              <rect x="2" y="17" width="6" height="5" rx="1"/>
-              <rect x="16" y="17" width="6" height="5" rx="1"/>
-              <path d="M12 7v4M5 17v-2a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v2"/>
-            </svg>
-            <span>Agents</span>
-            {agentsCount > 0 && <span className="float-tab-count">{agentsCount}</span>}
-          </button>
-          {/* Phase 4 — contextual card shortcuts (Plan / Tâches / Git / Prévisu
-              / Sources / Env). Icon-only to fit the narrow panel; the strip
-              scrolls horizontally if needed (scrollbar hidden via CSS). */}
-          <span className="float-ctx-sep" />
-          {CTX_TABS.map((t) => (
-            <button
-              key={t.id}
-              className={"float-tab float-ctx-btn" + (tab === t.id ? " on" : "")}
-              onClick={() => setTab(t.id)}
-              title={t.label}
-            >
-              <Icon name={t.icon} size={12} />
-              {ctxCounts[t.id] > 0 && <span className="float-tab-count">{ctxCounts[t.id]}</span>}
-            </button>
-          ))}
-        </div>
-      )}
+      {/* Menu en cascade — rendu en permanence (ne s'affiche que si `open`),
+          pour que le bouton-menu marche aussi en mode compact. Sélectionner une
+          carte passe en mode étendu pour la montrer. */}
+      <MascotToolbar
+        open={menuOpen}
+        onClose={() => setMenuOpen(false)}
+        side={side}
+        activeTab={tab}
+        onSelectTab={(t) => { setTab(t); setMode("full"); }}
+        onNewConvo={() => { void newConvo(); }}
+        msgsCount={msgs.length}
+        historyCount={historyConvs.length}
+        agentsCount={agentsCount}
+        ctxCounts={ctxCounts}
+      />
 
       <div className="float-panel cchrome-naked cstyle-pill csize-thin csend-kbd cfoot-hidden">
         {pinnedAnno && (
@@ -744,6 +772,23 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
             )}
           </div>
           <div className="float-actions-col">
+            {/* Bouton MENU — TOUJOURS présent dans la barre de prompt (petit,
+                discret). Ouvre/ferme le menu en cascade (catégories → cartes). */}
+            <button
+              className="float-icon-btn float-toolbar-toggle"
+              onClick={() => setMenuOpen((o) => !o)}
+              aria-expanded={menuOpen}
+              aria-label={menuOpen ? "Fermer le menu" : "Ouvrir le menu"}
+              title={menuOpen ? "Fermer le menu" : "Ouvrir le menu"}
+            >
+              <svg
+                className={"ftt-chevron" + (menuOpen ? " up" : "")}
+                width="12" height="12" viewBox="0 0 24 24" fill="none"
+                stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"
+              >
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+            </button>
             {busy ? (
               <button
                 className="float-icon-btn"
@@ -773,6 +818,7 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
           </div>
         </div>
       </div>
+
     </>
   );
 }
