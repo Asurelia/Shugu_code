@@ -554,7 +554,10 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
 
   return (
     <>
-      {mode === "full" && (
+      {/* Le chat / la carte sont MASQUÉS tant que le menu ou l'éditeur est
+          ouvert : le menu remplace la zone (il ne se superpose pas au chat).
+          Demande utilisateur — « fermer le chat comme les autres menus ». */}
+      {mode === "full" && !menuOpen && (
         <div className="float-history-shell">
           {ctxMeta ? (
             <ShellContext.Provider value={detachedShell}>
