@@ -10,13 +10,21 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 ```bash
 pnpm install                 # deps
-pnpm dev                     # Vite web mode — http://localhost:5173 (runs WITHOUT Tauri/Convex, see below)
+pnpm tauri dev               # desktop app — THE dev loop (needs VS Developer env on Windows; use tauri-dev.cmd)
+pnpm dev                     # Vite dev server ALONE — webview UI only, NO Rust backend.
+                             #   The app is Tauri-only (no web fallback): every invoke() rejects,
+                             #   getDb() has no SQLite. Useful ONLY for pure UI/CSS iteration.
 pnpm typecheck               # tsc -b --noEmit  — the TS gate
+pnpm test                    # vitest run — unit tests (see Testing below)
 pnpm build                   # tsc -b --noEmit && vite build
-pnpm tauri dev               # desktop app (needs the VS Developer env on Windows — see below)
 pnpm tauri build             # package the desktop app
 pnpm convex dev              # OPTIONAL — provisions a Convex deployment, generates convex/_generated/ + VITE_CONVEX_URL
 ```
+
+On Windows use **`tauri-dev.cmd`** (loads MSVC env via vcvars64 before `pnpm tauri dev`). For a
+timestamped, crash-traceable run, use **`tauri-dev-log.cmd`** — it tees stdout+stderr into
+`dev-logs/run-<timestamp>.log`, so a native crash (e.g. `STATUS_ILLEGAL_INSTRUCTION`) is captured
+to disk instead of scrolling past in a closed terminal.
 
 **Rust / `cargo` on Windows:** a plain shell fails with `cl.exe`/`kernel32.lib` not found — Git's `link.exe` shadows MSVC's on PATH. Run cargo through the VS Developer environment:
 
@@ -26,24 +34,35 @@ cmd /c "\"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\B
 
 `.cargo/config.toml` exists locally as a partial linker fix but is **gitignored** (hardcoded machine-specific MSVC path) — don't rely on it cross-machine.
 
-**No test runner is configured yet.** `pnpm build` + `pnpm typecheck` + `cargo check` are the only verification gates today.
+## Testing
 
-## Two run modes — the app degrades gracefully
+- **Vitest** is the unit test runner: `pnpm test` (one-shot) / `pnpm test:watch`. Tests live next to
+  code as `*.test.ts` (chat context, mentions, git status map, minimap, folding, autocomplete,
+  chunker, markdown, …). Add a `*.test.ts` for pure logic you change.
+- **Rust** unit tests run via `cargo test` (through the VS Developer env on Windows — see above).
+- Verification gates before merge: `pnpm typecheck` + `pnpm test` + `cargo check`/`cargo test`.
 
-This is the single most important architectural fact. The app runs in **either**:
-- **Web mode** (`pnpm dev`, plain browser): no Tauri, no Convex required. `src/lib/tauri.ts`'s `invoke()` falls back to an in-file `mocks` map; `src/lib/db.ts`'s `getDb()` returns `null` and every repository method no-ops/returns `[]`; `ConvexProvider` only mounts when `VITE_CONVEX_URL` is set.
-- **Desktop mode** (`pnpm tauri dev`): real `invoke()` to Rust commands, real SQLite, optional Convex.
+## Tauri-only — there is NO web fallback
 
-**Every new data/IPC call must keep this duality** — guard on `inTauri` / `getDb() === null` and degrade, never assume Tauri is present.
+This is the single most important architectural fact, and it changed: **the app ships as a Tauri
+desktop app exclusively.** The former "web mode" (a `mocks` map in `src/lib/tauri.ts` + a null-returning
+`getDb()`) was **removed** — see the header comment in `src/lib/tauri.ts`. Consequences:
+- `pnpm dev` (Vite alone) serves the UI but has **no Rust backend**: every `invoke()` rejects and
+  there is no SQLite. Use it only for pure UI/CSS work, never for IPC/data features.
+- The real dev loop is **`pnpm tauri dev`** (via `tauri-dev.cmd` on Windows).
+- New IPC/data code does NOT need a web-mode guard or a mock — assume Tauri is present (it always is).
 
 ## Data architecture — LOCAL-FIRST (mandate)
 
 Three tiers, in priority order:
 1. **SQLite = source of truth** (`src/lib/db.ts` + `tauri-plugin-sql`). Holds conversations, messages, projects, generations, jobs, logs, settings. The `db` export is a repository API (`db.conversations.list/create/rename/...`) — it is NOT a cache of Convex. Schema lives in `src-tauri/src/lib.rs` as declarative migrations (`MIGRATION_V1`, `MIGRATION_V2`).
 2. **Vector layer** (`src-tauri/src/commands/vector.rs`): `sqlite-vec` + `fastembed`, embeddings stored as `vec0` virtual tables **in the same `shugu.db` file** (one file, atomic with relational data). Frontend wrapper: `src/lib/vector.ts`. Plumbed but not yet wired into any UI.
-3. **Convex = OPTIONAL sync mirror** — realtime / multi-device only, never required. `convex/` holds the schema (mirrors SQLite) + queries. SQLite always wins; Convex is a one-way sync target, never pulled down as authoritative.
+3. **Convex = OPTIONAL sync mirror** — realtime / multi-device only, never required. `convex/` holds the schema (mirrors SQLite) + queries. SQLite always wins; Convex is a one-way sync target, never pulled down as authoritative. Currently dormant (no active deployment) — the app is fully local-first.
 
 Heavy/private/binary data (images, models, checkpoints, raw logs, ComfyUI cache) stays strictly local — never Convex. `src/mocks/seed*.ts` are bootstrap data (loaded once via `seedIfEmpty()`), not the live source.
+
+> Note: the vector layer (`vector.rs`, tier 2) IS now wired into the UI (chat RAG + workspace
+> indexer), contrary to the older "plumbed but not yet wired" note above.
 
 ## Composition & routing
 

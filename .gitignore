@@ -71,3 +71,6 @@ src-tauri/.fastembed_cache/
 # Design Studio — agent-generated preview project (when shugu_code itself is
 # the open workspace, e.g. dogfooding). Disposable output served by preview://.
 .shugu-forge/
+
+# Timestamped dev-run logs (tauri-dev-log.cmd)
+dev-logs/
