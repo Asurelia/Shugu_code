@@ -22,6 +22,7 @@ import { invoke, listen } from "@/lib/tauri";
 import { diag } from "@/lib/diag";
 import { createTauriTransport, type TauriLspTransport } from "./transport";
 import { sanitizeLspHtml } from "./sanitize";
+import { setLspStatus } from "./lspStatusStore";
 
 /**
  * Format defensif d'une erreur de provenance inconnue (peut être Error,
@@ -88,6 +89,8 @@ const inProgressInits = new Map<
 async function doInit(
   langId: string,
 ): Promise<{ client: LSPClient; workspaceUri: string } | null> {
+  // Lot B §4 — transition visible : démarrage en cours (spinner statusbar).
+  setLspStatus(langId, "starting");
   // Spawn le LSP server côté Rust + récupère le workspaceUri.
   let workspaceUri: string;
   try {
@@ -98,7 +101,9 @@ async function doInit(
   } catch (err) {
     // Binaire pas installé OU pas de workspace ouvert OU spawn failed.
     // C'est le cas "gracieux" — le caller affiche l'éditeur sans LSP.
+    // Lot B §4 — "absent" = binaire non installé (l'indicateur propose l'install).
     diag("lsp", `init failed for ${langId}: ${fmtErr(err)}`);
+    setLspStatus(langId, "absent");
     return null;
   }
 
@@ -119,8 +124,10 @@ async function doInit(
     client.connect(transport);
     await client.initializing;
     diag("lsp", `${langId} ready (rootUri=${workspaceUri})`);
+    setLspStatus(langId, "ready");
   } catch (err) {
     diag("lsp", `${langId} initialize failed: ${fmtErr(err)}`);
+    setLspStatus(langId, "error");
     transport.dispose();
     return null;
   }
@@ -205,6 +212,9 @@ function clearClient(langId: string, reason: string): void {
   }
   cached.transport.dispose();
   clients.delete(langId);
+  // Lot B §4 — le serveur a crashé (EOF/erreur framing) : état "error" visible
+  // (l'indicateur propose de relancer en rouvrant le fichier).
+  setLspStatus(langId, "error");
 }
 
 /**
