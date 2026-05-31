@@ -80,9 +80,13 @@ export class ShuguWorkspace extends Workspace {
 
   openFile(uri: string, languageId: string, view: EditorView): void {
     // Mono-éditeur : un fichier = au plus une view. Si déjà suivi, on remplace
-    // (re-mount sur changement de fichier même-langage).
+    // (re-mount sur changement de fichier même-langage). On envoie d'ABORD un
+    // didClose : le protocole LSP interdit deux didOpen consécutifs pour la même
+    // URI (tsserver rejette le 2e et casse la synchro du document). Symétrie
+    // didClose→didOpen garantie.
     if (this.getFile(uri)) {
       this.files = this.files.filter((f) => f.uri !== uri);
+      this.client.didClose(uri);
     }
     const file = new ShuguWorkspaceFile(
       uri,

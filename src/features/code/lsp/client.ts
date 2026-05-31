@@ -130,6 +130,12 @@ async function doInit(
   const transport = await createTauriTransport(langId);
   const client = new LSPClient({
     rootUri: workspaceUri,
+    // §2 — Workspace custom : displayFile branché sur le système d'onglets de
+    // Shugu (via lspBridge) pour la navigation cross-fichier (F12/Ctrl+Clic/
+    // références). SANS ça, la lib utilise DefaultWorkspace dont displayFile
+    // retourne null → « Aller à la définition » vers un AUTRE fichier ne fait
+    // rien (tout le §2 serait du code mort).
+    workspace: (c) => new ShuguWorkspace(c, workspaceUri),
     extensions: languageServerExtensions(),
     // Défaut @codemirror/lsp-client = 3000 ms. On le porte à 20 s : marge de
     // sécurité pour un cold-start lent (un gros projet TS qui charge ~10 Mo, un
