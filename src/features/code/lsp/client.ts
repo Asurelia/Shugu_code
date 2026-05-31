@@ -210,20 +210,10 @@ export async function getLspClient(
   return pending;
 }
 
-/**
- * Construit le fileUri à passer à `client.plugin(uri, langId)`. Combine
- * le workspaceUri (file:///F:/Dev/shugu_code) avec un path relatif
- * (src/lib/fs.ts). Encode le path relatif pour gérer espaces/accents
- * (rust-analyzer/pylsp rejettent les URI non-RFC3986).
- *
- * `encodeURI` est préféré à `encodeURIComponent` car il préserve `/`
- * (séparateur de path) ; on encode juste les espaces, `?`, `#`, accents.
- */
-export function fileUriForPath(workspaceUri: string, relativePath: string): string {
-  const ws = workspaceUri.replace(/\/+$/, "");
-  const rel = encodeURI(relativePath.replace(/^\/+/, ""));
-  return `${ws}/${rel}`;
-}
+// fileUriForPath est défini dans ./uri (avec son inverse relativePathFromUri,
+// utilisé par ShuguWorkspace). Ré-exporté ici pour ne pas casser les call sites
+// existants (CodeMirrorEditor importe fileUriForPath depuis ./client).
+export { fileUriForPath } from "./uri";
 
 /**
  * Cleanup interne d'un client cached. Appelle disconnect() ET dispose le
