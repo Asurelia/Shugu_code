@@ -276,49 +276,63 @@ pub async fn connect(app: &AppHandle, mgr: &McpManager, name: &str) -> Result<Ar
         .remove(name)
         .ok_or_else(|| format!("serveur MCP inconnu : {name}"))?;
 
-    let client: McpClient = match cfg.transport() {
-        "stdio" => {
-            let command = cfg
-                .command
-                .clone()
-                .ok_or_else(|| format!("config MCP {name} : `command` manquant"))?;
-            // `tokio::process::Command` se configure via ses méthodes inhérentes
-            // (`args`/`env`) — pas besoin du trait `ConfigureCommandExt` de rmcp.
-            // `TokioChildProcess::new` accepte `impl Into<CommandWrap>`, satisfait
-            // par `tokio::process::Command`.
-            let mut tcmd = tokio::process::Command::new(&command);
-            tcmd.args(&cfg.args);
-            for (k, v) in &cfg.env {
-                tcmd.env(k, v);
+    // BLOCKER 2 — timeout sur tout le handshake (serve + tools/list). Un serveur
+    // qui spawn mais ne répond jamais au handshake gèlerait le run sinon. On borne
+    // serve+list_all_tools à 30 s ; l'expiration devient une `Err` explicite.
+    let handshake = async {
+        let client: McpClient = match cfg.transport() {
+            "stdio" => {
+                let command = cfg
+                    .command
+                    .clone()
+                    .ok_or_else(|| format!("config MCP {name} : `command` manquant"))?;
+                // `tokio::process::Command` se configure via ses méthodes inhérentes
+                // (`args`/`env`) — pas besoin du trait `ConfigureCommandExt` de rmcp.
+                // `TokioChildProcess::new` accepte `impl Into<CommandWrap>`, satisfait
+                // par `tokio::process::Command`.
+                let mut tcmd = tokio::process::Command::new(&command);
+                tcmd.args(&cfg.args);
+                for (k, v) in &cfg.env {
+                    tcmd.env(k, v);
+                }
+                // Windows : pas de fenêtre console parasite (réutilise le helper codex).
+                crate::commands::codex::apply_no_window_pub(&mut tcmd);
+                let transport = TokioChildProcess::new(tcmd)
+                    .map_err(|e| format!("spawn MCP {name} : {e}"))?;
+                ().serve(transport)
+                    .await
+                    .map_err(|e| format!("handshake MCP {name} : {e}"))?
             }
-            // Windows : pas de fenêtre console parasite (réutilise le helper codex).
-            crate::commands::codex::apply_no_window_pub(&mut tcmd);
-            let transport =
-                TokioChildProcess::new(tcmd).map_err(|e| format!("spawn MCP {name} : {e}"))?;
-            ().serve(transport)
-                .await
-                .map_err(|e| format!("handshake MCP {name} : {e}"))?
-        }
-        "http" => {
-            let url = cfg
-                .url
-                .clone()
-                .ok_or_else(|| format!("config MCP {name} : `url` manquant"))?;
-            let transport = StreamableHttpClientTransport::from_uri(url.as_str());
-            ().serve(transport)
-                .await
-                .map_err(|e| format!("connexion MCP {name} : {e}"))?
-        }
-        _ => return Err(format!("config MCP {name} invalide (ni command ni url)")),
+            "http" => {
+                let url = cfg
+                    .url
+                    .clone()
+                    .ok_or_else(|| format!("config MCP {name} : `url` manquant"))?;
+                let transport = StreamableHttpClientTransport::from_uri(url.as_str());
+                ().serve(transport)
+                    .await
+                    .map_err(|e| format!("connexion MCP {name} : {e}"))?
+            }
+            _ => return Err(format!("config MCP {name} invalide (ni command ni url)")),
+        };
+
+        // Découverte des outils au handshake (toutes les pages). `list_all_tools`
+        // vit sur `Peer<RoleClient>` → on passe par `.peer()` (cf. `call_tool`).
+        let tools = client
+            .peer()
+            .list_all_tools()
+            .await
+            .map_err(|e| format!("tools/list {name} : {e}"))?;
+
+        Ok::<(McpClient, Vec<rmcp::model::Tool>), String>((client, tools))
     };
 
-    // Découverte des outils au handshake (toutes les pages). `list_all_tools`
-    // vit sur `Peer<RoleClient>` → on passe par `.peer()` (cf. `call_tool`).
-    let tools = client
-        .peer()
-        .list_all_tools()
-        .await
-        .map_err(|e| format!("tools/list {name} : {e}"))?;
+    let (client, tools) =
+        match tokio::time::timeout(std::time::Duration::from_secs(30), handshake).await {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(format!("timeout handshake MCP {name} (30s)")),
+        };
 
     let conn = Arc::new(McpConn { client, tools });
     mgr.0.lock().await.insert(name.to_string(), conn.clone());
@@ -356,7 +370,13 @@ pub async fn enabled_tools_json(
         }
         let conn = match connect(app, mgr, server).await {
             Ok(c) => c,
-            Err(_) => continue, // serveur indisponible : on l'ignore proprement.
+            Err(_) => {
+                // BLOCKER 3 (complément) — serveur indisponible : on l'ignore
+                // proprement ET on évince toute connexion morte éventuellement
+                // restée en cache, pour ne pas la réutiliser au prochain appel.
+                mgr.0.lock().await.remove(server);
+                continue;
+            }
         };
         for t in &conn.tools {
             let full = namespaced(server, &t.name);
@@ -417,8 +437,18 @@ pub async fn mcp_execute(
     let fut = conn.client.peer().call_tool(call);
     match tokio::time::timeout(std::time::Duration::from_secs(60), fut).await {
         Ok(Ok(res)) => flatten_tool_result(&res),
-        Ok(Err(e)) => (format!("appel MCP {full_name} : {e}"), true),
-        Err(_) => (format!("appel MCP {full_name} : délai dépassé (60s)"), true),
+        // BLOCKER 3 — un échec d'appel (erreur protocole OU timeout) laisse une
+        // `McpConn` potentiellement morte en cache ; tous les appels suivants la
+        // réutiliseraient. On l'évince du HashMap avant de renvoyer l'erreur pour
+        // forcer une reconnexion propre au prochain appel.
+        Ok(Err(e)) => {
+            mgr.0.lock().await.remove(&server);
+            (format!("appel MCP {full_name} : {e}"), true)
+        }
+        Err(_) => {
+            mgr.0.lock().await.remove(&server);
+            (format!("appel MCP {full_name} : délai dépassé (60s)"), true)
+        }
     }
 }
 
