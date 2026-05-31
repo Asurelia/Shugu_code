@@ -55,9 +55,13 @@ export function fmtErr(err: unknown): string {
 }
 
 /** Langages pour lesquels on tente une init LSP. Évite un round-trip Rust
- *  pour les langages non supportés. Doit rester en phase avec la
- *  `resolve_lsp_binary` de src-tauri/src/commands/lsp.rs. */
-const SUPPORTED_LANG_IDS = new Set(["typescript", "javascript", "rust", "python"]);
+ *  pour les langages non supportés. DOIT rester en phase avec la
+ *  `resolve_lsp_binary` de src-tauri/src/commands/lsp.rs — sinon go/c/cpp/java
+ *  sont du code mort côté Rust (jamais atteints car ce gate les bloque).
+ *  Un test de parité (client.test.ts) empêche la régression. */
+export const SUPPORTED_LANG_IDS = new Set([
+  "typescript", "javascript", "rust", "python", "go", "c", "cpp", "java",
+]);
 
 export function isLspSupported(langId: string): boolean {
   return SUPPORTED_LANG_IDS.has(langId);
@@ -99,11 +103,25 @@ async function doInit(
     });
     workspaceUri = result.workspaceUri;
   } catch (err) {
-    // Binaire pas installé OU pas de workspace ouvert OU spawn failed.
-    // C'est le cas "gracieux" — le caller affiche l'éditeur sans LSP.
-    // Lot B §4 — "absent" = binaire non installé (l'indicateur propose l'install).
-    diag("lsp", `init failed for ${langId}: ${fmtErr(err)}`);
-    setLspStatus(langId, "absent");
+    // lsp_init peut échouer pour 2 raisons distinctes qu'il faut DISTINGUER
+    // (sinon une vraie erreur — « no workspace open », spawn raté — est
+    // masquée derrière « non installé », et l'utilisateur croit à tort qu'il
+    // manque juste le binaire) :
+    //   • binaire absent du PATH/node_modules → "absent" (l'indicateur propose
+    //     la commande d'install — c'est le cas gracieux normal) ;
+    //   • toute autre erreur → "error" + on MÉMORISE le message réel pour que
+    //     le toast l'affiche (fini le diagnostic à l'aveugle).
+    // Le message Rust pour binaire manquant commence par « LSP binary not found »
+    // (cf. lsp_init dans src-tauri/src/commands/lsp.rs).
+    const msg = fmtErr(err);
+    diag("lsp", `init failed for ${langId}: ${msg}`);
+    const isMissingBinary = /binary not found/i.test(msg);
+    if (isMissingBinary) {
+      setLspStatus(langId, "absent");
+    } else {
+      setLspError(langId, msg);
+      setLspStatus(langId, "error");
+    }
     return null;
   }
 
