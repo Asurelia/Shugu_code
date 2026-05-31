@@ -16,6 +16,9 @@ import { useQuery, type UseQueryResult } from "@tanstack/react-query";
 import { syntaxTree } from "@codemirror/language";
 import type { EditorState } from "@codemirror/state";
 import { outlineKeys } from "./keys";
+import { langFromPath } from "@/lib/fs";
+import { getLspClient, isLspSupported, fileUriForPath } from "../lsp/client";
+import { lspSymbolsToOutline, type LspDocumentSymbol } from "../lsp/lspSymbols";
 
 /**
  * Symbole structurel (fonction, classe, heading…). Aligné sur LSP
@@ -228,6 +231,54 @@ function extractSymbolName(
  * Hook React : retourne les symboles outline du fichier ouvert, mis à jour
  * automatiquement quand le doc change (docVersion bumped).
  */
+/**
+ * §6.3 — Source des symboles : LSP `textDocument/documentSymbol` quand un
+ * serveur est prêt pour la langue, sinon fallback Lezer (statu quo). Le LSP
+ * donne une hiérarchie sémantique typée (classes › méthodes), Lezer ne voit
+ * que la grammaire. Aucune régression : sans LSP, comportement identique.
+ *
+ * `state` sert au fallback Lezer ET au mapping ligne 0-based (LSP) → offset
+ * document via `state.doc.line(n).from`.
+ */
+export async function fetchOutlineSymbols(
+  filePath: string,
+  state: EditorState,
+): Promise<OutlineSymbol[]> {
+  const langId = langFromPath(filePath);
+  if (isLspSupported(langId)) {
+    try {
+      const res = await getLspClient(langId);
+      if (res) {
+        const uri = fileUriForPath(res.workspaceUri, filePath);
+        const symbols = await res.client.request<
+          { textDocument: { uri: string } },
+          unknown
+        >("textDocument/documentSymbol", { textDocument: { uri } });
+        // Le serveur peut renvoyer DocumentSymbol[] (hiérarchique, avec `range`)
+        // OU SymbolInformation[] (plat, avec `location`). On ne gère que le
+        // premier ; sinon fallback Lezer.
+        if (
+          Array.isArray(symbols) &&
+          symbols.length > 0 &&
+          symbols[0] != null &&
+          typeof symbols[0] === "object" &&
+          "range" in (symbols[0] as object)
+        ) {
+          const lineToOffset = (line0: number) => {
+            // LSP est 0-based ; doc.line() est 1-based, borné au nb de lignes.
+            const lineNo = Math.min(Math.max(line0 + 1, 1), state.doc.lines);
+            return state.doc.line(lineNo).from;
+          };
+          return lspSymbolsToOutline(symbols as LspDocumentSymbol[], lineToOffset);
+        }
+      }
+    } catch {
+      // LSP indispo / timeout / SymbolInformation[] non géré → fallback Lezer.
+    }
+  }
+  return parseLezerSymbols(state);
+}
+
 export function useOutline(
   filePath: string | null,
   docVersion: number,
@@ -235,9 +286,9 @@ export function useOutline(
 ): UseQueryResult<OutlineSymbol[]> {
   return useQuery({
     queryKey: outlineKeys.forFile(filePath ?? "", docVersion),
-    queryFn: () => {
-      if (!state) return [];
-      return parseLezerSymbols(state);
+    queryFn: async () => {
+      if (!state || !filePath) return [];
+      return fetchOutlineSymbols(filePath, state);
     },
     enabled: !!filePath && !!state,
     staleTime: Infinity, // la docVersion fait office d'invalidation key.
