@@ -6,6 +6,7 @@ import { Icon } from "@/components/components";
 import { CodeMirrorEditor } from "./CodeMirrorEditor";
 import { Breadcrumbs } from "./Breadcrumbs";
 import { OutlinePanel } from "./OutlinePanel";
+import { LspStatusIndicator } from "./LspStatusIndicator";
 import { ShortcutsSettings, InterfaceSettings } from "@/features/settings/settings-extras";
 import { MascotCalibration } from "@/features/settings/MascotCalibration";
 import { ConnectionsView, ProfileView } from "@/features/panels/panels";
@@ -155,6 +156,8 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
           <GitDiffStats />
           <span className="item">UTF-8</span>
           <span className="item">{activeFile ? (fileContents[activeFile]?.lang || "text") : "—"}</span>
+          {/* Lot B §4 — statut LSP du langage du fichier actif (vide si pas de LSP). */}
+          <LspStatusIndicator activeFile={activeFile} />
           <span className="spacer"></span>
           {/* Fix 3: save-state indicator + transient "Saved ✓" flash */}
           {activeFile && (
@@ -218,6 +221,8 @@ export function FilesView({ activeFile, fileContents }: any) {
         <div className="statusbar">
           <span className="item branch">main</span>
           <span className="item">{f.dirty ? "● unsaved" : "saved"}</span>
+          {/* Lot B §4 — statut LSP du langage du fichier actif (vide si pas de LSP). */}
+          <LspStatusIndicator activeFile={activeFile} />
           <span className="spacer"></span>
           <span className="item">{f.text.split("\n").length} lines</span>
         </div>
