@@ -181,6 +181,40 @@ git add src-tauri/src/commands/lsp.rs
 git commit -m "🔧 fix(lsp): résout les binaires depuis node_modules/.bin (TS) + ajoute go/c/cpp/java"
 ```
 
+### Task 1.2 — JALON DE VÉRIFICATION : le socle LSP s'allume-t-il ? (utilisateur, « en voyant »)
+
+> **Pourquoi ICI, avant tout le reste.** Toute la prémisse « LSP ~75 % fait » repose
+> sur l'hypothèse que le socle Rust existant produit DÉJÀ diagnostics/hover/completion
+> aujourd'hui — vérifié par PATH + lecture de code, **jamais en voyant**. Si le socle
+> ne s'allume pas, le diagnostic bascule (bug latent dans le câblage existant, pas
+> features manquantes) et les §2/§3/§6 seraient prématurées. Ce jalon est **bloquant**
+> pour la suite, mais PAS pour §1 (déjà committé).
+
+- [ ] **Step 1: Relancer l'app avec le code de §1**
+
+L'utilisateur lance `tauri-dev.cmd` (recompile le backend avec la résolution node_modules/.bin).
+
+- [ ] **Step 2: SMOKE LIVE rust-analyzer (déjà installé sur le PATH)**
+
+Ouvrir un fichier `.rs` (ex. `src-tauri/src/commands/lsp.rs`). Vérifier :
+- **Diagnostics** : introduire une erreur volontaire (ex. supprimer un `;`) → squiggle rouge + entrée lintGutter.
+- **Hover** : survoler un symbole (ex. `LspSession`) → tooltip typé.
+- **Completion** : taper `self.` dans une méthode → propositions sémantiques.
+
+- [ ] **Step 3: SMOKE LIVE typescript-language-server (résolu via §1 depuis node_modules/.bin)**
+
+Ouvrir un `.ts` (ex. `src/features/code/lsp/client.ts`). Mêmes vérifications (diagnostics/hover/completion).
+**C'est le test direct de §1** : avant le fix, le TS ne résolvait pas ; maintenant il doit s'allumer.
+
+- [ ] **Step 4: VERDICT**
+
+- ✅ **Les deux s'allument** → la prémisse tient, continuer vers §5/§4/§2/§3/§6.
+- ⚠️ **Rust marche, TS non** → bug spécifique à la résolution §1 (vérifier le `.cmd` shim,
+  les logs `[lsp:typescript:stderr]` via `tauri-dev-log.cmd`). Corriger avant §2.
+- 🔴 **Rust non plus** → la prémisse « 75 % fait » est fausse : STOP, repasser en
+  debugging systématique sur le câblage existant (lsp.rs ↔ transport ↔ compartment)
+  AVANT d'ajouter quoi que ce soit. Ne pas construire §2-§6 sur un socle mort.
+
 ---
 
 # SECTION 5 — Sanitisation HTML (DOMPurify) — couplée à §1
@@ -801,92 +835,140 @@ git commit -m "✨ feat(lsp): pont lspBridge (openFile + getViewForPath) publié
 
 `src/features/code/lsp/workspace.ts` :
 
+> ⚠️ **POINT CLÉ (vérifié dans le code du package)** : les méthodes `syncFiles`,
+> `openFile`, `closeFile` de la classe de base `Workspace` sont **`abstract`**
+> (cf. `node_modules/@codemirror/lsp-client/dist/index.d.ts`). On NE PEUT PAS
+> faire `super.openFile(...)` (erreur TS2513 — pas de corps de base). La vraie
+> implémentation par défaut est `DefaultWorkspace` (classe concrète NON exportée,
+> `dist/index.js` l.244). On **réplique** ses 3 méthodes (vérifié dans le bundle)
+> et on n'override QUE `displayFile`. Le constructeur reçoit `workspaceUri` en
+> argument (le `rootUri` n'est pas exposé publiquement par `LSPClient`).
+
 ```typescript
 // Shugu Forge — Workspace LSP custom (Lot B §2).
 //
-// Le Workspace par défaut de @codemirror/lsp-client a displayFile()→null :
-// "Aller à la définition" vers un AUTRE fichier ne fait rien. ShuguWorkspace
-// branche displayFile sur lspBridge.openFile (le système d'onglets de Shugu).
+// Le Workspace par défaut de @codemirror/lsp-client (DefaultWorkspace, non
+// exporté) a displayFile()→null : "Aller à la définition" vers un AUTRE fichier
+// ne fait rien. ShuguWorkspace réplique le suivi de fichiers de DefaultWorkspace
+// (les méthodes de la classe de base Workspace sont ABSTRAITES, donc pas de
+// super.* possible) et branche displayFile sur lspBridge.openFile.
 //
 // Contrainte : architecture mono-éditeur (un seul EditorView vivant = le
-// fichier actif). displayFile ouvre donc le fichier (→ devient actif) puis
-// attend que son EditorView soit monté.
-import { Workspace, type WorkspaceFile } from "@codemirror/lsp-client";
+// fichier actif). displayFile ouvre le fichier (→ devient actif) puis attend
+// que son EditorView AIT le plugin LSP attaché (pas juste qu'il existe : le
+// plugin s'attache dans un useEffect async APRÈS le mount).
+import {
+  Workspace,
+  LSPPlugin,
+  type LSPClient,
+  type WorkspaceFile,
+} from "@codemirror/lsp-client";
 import type { EditorView } from "@codemirror/view";
+import type { Text } from "@codemirror/state";
 import { getLspBridge } from "./lspBridge";
 import { relativePathFromUri } from "./uri";
 import { diag } from "@/lib/diag";
 
+/** Réplique DefaultWorkspaceFile (dist/index.js l.234) : un fichier ouvert. */
+class ShuguWorkspaceFile implements WorkspaceFile {
+  constructor(
+    public uri: string,
+    public languageId: string,
+    public version: number,
+    public doc: Text,
+    public view: EditorView,
+  ) {}
+  getView(): EditorView { return this.view; }
+}
+
 export class ShuguWorkspace extends Workspace {
-  // On délègue le suivi des fichiers ouverts au comportement par défaut via
-  // openFile/closeFile hérités ; on ne surcharge QUE displayFile (navigation).
-  files: WorkspaceFile[] = [];
+  files: ShuguWorkspaceFile[] = [];
+  private fileVersions: Record<string, number> = Object.create(null);
+  private readonly workspaceUri: string;
 
-  // Hérité : syncFiles, openFile, closeFile (suffisants pour le fichier actif).
-  syncFiles() {
-    return super.syncFiles();
+  constructor(client: LSPClient, workspaceUri: string) {
+    super(client);
+    this.workspaceUri = workspaceUri;
   }
+
+  private nextFileVersion(uri: string): number {
+    const v = (this.fileVersions[uri] ?? -1) + 1;
+    this.fileVersions[uri] = v;
+    return v;
+  }
+
+  // ── Répliques de DefaultWorkspace (dist/index.js l.254-282) ──────────────
+  syncFiles(): readonly { file: WorkspaceFile; changes: import("@codemirror/state").ChangeSet; prevDoc: Text }[] {
+    const result: { file: WorkspaceFile; changes: import("@codemirror/state").ChangeSet; prevDoc: Text }[] = [];
+    for (const file of this.files) {
+      const plugin = LSPPlugin.get(file.view);
+      if (!plugin) continue;
+      const changes = plugin.unsyncedChanges;
+      if (!changes.empty) {
+        result.push({ changes, file, prevDoc: file.doc });
+        file.doc = file.view.state.doc;
+        file.version = this.nextFileVersion(file.uri);
+        plugin.clear();
+      }
+    }
+    return result;
+  }
+
   openFile(uri: string, languageId: string, view: EditorView): void {
-    super.openFile(uri, languageId, view);
-  }
-  closeFile(uri: string, view: EditorView): void {
-    super.closeFile(uri, view);
+    if (this.getFile(uri)) {
+      // Mono-éditeur : un fichier = au plus une view. Si déjà ouvert, on
+      // remplace (re-mount sur changement de fichier même-langage).
+      this.files = this.files.filter((f) => f.uri !== uri);
+    }
+    const file = new ShuguWorkspaceFile(
+      uri,
+      languageId,
+      this.nextFileVersion(uri),
+      view.state.doc,
+      view,
+    );
+    this.files.push(file);
+    this.client.didOpen(file);
   }
 
-  /** Ouvre le fichier cible et retourne son EditorView une fois monté.
-   *  rootUri = this.client config rootUri (workspaceUri). */
+  closeFile(uri: string): void {
+    const file = this.getFile(uri);
+    if (file) {
+      this.files = this.files.filter((f) => f !== file);
+      this.client.didClose(uri);
+    }
+  }
+
+  // ── Le seul vrai ajout : navigation cross-fichier ────────────────────────
+  /** Ouvre le fichier cible et retourne son EditorView une fois le PLUGIN LSP
+   *  attaché (le plugin s'attache async après le mount — attendre juste la view
+   *  donnerait au lsp-client une view sans plugin → jump no-op). */
   async displayFile(uri: string): Promise<EditorView | null> {
     const bridge = getLspBridge();
     if (!bridge) {
       diag("lsp", "displayFile: no bridge (RootLayout not mounted?)");
       return null;
     }
-    const rootUri = (this.client as unknown as { config?: { rootUri?: string } }).config?.rootUri
-      ?? this.rootUriFallback();
-    const relPath = rootUri ? relativePathFromUri(rootUri, uri) : null;
+    const relPath = relativePathFromUri(this.workspaceUri, uri);
     if (!relPath) {
       diag("lsp", `displayFile: uri outside workspace: ${uri}`);
       return null;
     }
     await bridge.openFile(relPath);
-    // Attendre que l'EditorView du fichier actif corresponde (poll borné).
-    for (let i = 0; i < 50; i++) {
+    // Poll borné : attendre que la view existe ET que LSPPlugin.get(view) soit
+    // truthy (plugin câblé). ~2.4 s max (60 × 40 ms).
+    for (let i = 0; i < 60; i++) {
       const v = bridge.getViewForPath(relPath);
-      if (v) return v;
-      await new Promise((r) => setTimeout(r, 40)); // ~2 s max
+      if (v && LSPPlugin.get(v)) return v;
+      await new Promise((r) => setTimeout(r, 40));
     }
-    diag("lsp", `displayFile: view never appeared for ${relPath}`);
-    return null;
-  }
-
-  // rootUri n'est pas exposé publiquement par LSPClient ; fallback défensif.
-  private rootUriFallback(): string | null {
+    diag("lsp", `displayFile: view+plugin never ready for ${relPath}`);
     return null;
   }
 }
 ```
 
-> Note d'implémentation : `LSPClient` n'expose pas publiquement `rootUri`. Pour
-> fiabiliser `relativePathFromUri`, passer le `workspaceUri` au constructeur du
-> Workspace plutôt que de le lire sur le client. Voir Step 2.
-
-- [ ] **Step 2: Passer workspaceUri explicitement + brancher dans client.ts**
-
-Modifier `ShuguWorkspace` pour recevoir `workspaceUri` (plus robuste que lire `client.config`) :
-
-Remplacer le constructeur implicite — ajouter au début de la classe :
-```typescript
-  private readonly workspaceUri: string;
-  constructor(client: ConstructorParameters<typeof Workspace>[0], workspaceUri: string) {
-    super(client);
-    this.workspaceUri = workspaceUri;
-  }
-```
-Et dans `displayFile`, remplacer le bloc `rootUri` par :
-```typescript
-    const relPath = relativePathFromUri(this.workspaceUri, uri);
-```
-Supprimer `rootUriFallback`.
+- [ ] **Step 2: Brancher le workspace dans client.ts**
 
 Dans `client.ts::doInit`, brancher le workspace sur le LSPClient. Modifier la création :
 ```typescript
@@ -905,7 +987,11 @@ import { ShuguWorkspace } from "./workspace";
 - [ ] **Step 3: typecheck**
 
 Run : `pnpm typecheck`
-Expected: pas d'erreur. Si `ConstructorParameters<typeof Workspace>[0]` pose souci de typage, utiliser le type `LSPClient` importé et `constructor(client: LSPClient, workspaceUri: string)`.
+Expected: pas d'erreur. Si le type de retour de `syncFiles` (avec `ChangeSet`)
+diverge de la signature attendue par la lib, importer `ChangeSet` depuis
+`@codemirror/state` en tête et typer explicitement plutôt qu'inline. Vérifier
+aussi que `WorkspaceFile` est bien satisfait par `ShuguWorkspaceFile` (champs
+`uri/languageId/version/doc/getView`).
 
 - [ ] **Step 4: Commit**
 
@@ -1030,6 +1116,13 @@ function lspView(ctx: CommandContext): EditorView | null {
 
 - [ ] **Step 3: Ajouter les commandes au tableau COMMANDS**
 
+> ⚠️ **PAS de champ `keybinding:`** sur ces commandes. `languageServerExtensions()`
+> bind DÉJÀ F12 / Shift+F12 / F2 au niveau du keymap CodeMirror. Si on remettait
+> `keybinding:["F12"]` ici (scope global par défaut), le dispatcher global ET le
+> keymap CM se déclencheraient tous les deux → double-saut / comportement erratique.
+> On expose les commandes dans la palette pour la **découvrabilité** (cherchables),
+> et on montre la touche dans `description` (texte), pas comme binding actif.
+
 Ajouter (catégorie `Go`/`Edit`) dans le tableau `COMMANDS` :
 ```typescript
   {
@@ -1037,7 +1130,7 @@ Ajouter (catégorie `Go`/`Edit`) dans le tableau `COMMANDS` :
     title: "Go to Definition",
     category: "Go",
     icon: "search",
-    keybinding: ["F12"],
+    description: "LSP — raccourci éditeur : F12",
     when: (ctx) => lspView(ctx) !== null,
     run: (ctx) => { const v = lspView(ctx); if (v) jumpToDefinition(v); },
   },
@@ -1046,6 +1139,7 @@ Ajouter (catégorie `Go`/`Edit`) dans le tableau `COMMANDS` :
     title: "Go to Type Definition",
     category: "Go",
     icon: "search",
+    description: "LSP",
     when: (ctx) => lspView(ctx) !== null,
     run: (ctx) => { const v = lspView(ctx); if (v) jumpToTypeDefinition(v); },
   },
@@ -1054,6 +1148,7 @@ Ajouter (catégorie `Go`/`Edit`) dans le tableau `COMMANDS` :
     title: "Go to Implementation",
     category: "Go",
     icon: "search",
+    description: "LSP",
     when: (ctx) => lspView(ctx) !== null,
     run: (ctx) => { const v = lspView(ctx); if (v) jumpToImplementation(v); },
   },
@@ -1062,7 +1157,7 @@ Ajouter (catégorie `Go`/`Edit`) dans le tableau `COMMANDS` :
     title: "Find All References",
     category: "Go",
     icon: "search",
-    keybinding: ["Shift", "F12"],
+    description: "LSP — raccourci éditeur : Shift+F12",
     when: (ctx) => lspView(ctx) !== null,
     run: (ctx) => { const v = lspView(ctx); if (v) findReferences(v); },
   },
@@ -1071,7 +1166,7 @@ Ajouter (catégorie `Go`/`Edit`) dans le tableau `COMMANDS` :
     title: "Rename Symbol",
     category: "Edit",
     icon: "sparkle",
-    keybinding: ["F2"],
+    description: "LSP — raccourci éditeur : F2",
     when: (ctx) => lspView(ctx) !== null,
     run: (ctx) => { const v = lspView(ctx); if (v) renameSymbol(v); },
   },
@@ -1080,14 +1175,15 @@ Ajouter (catégorie `Go`/`Edit`) dans le tableau `COMMANDS` :
     title: "Format Document (LSP)",
     category: "Edit",
     icon: "sparkle",
+    description: "LSP — raccourci éditeur : Shift+Alt+F",
     when: (ctx) => lspView(ctx) !== null,
     run: (ctx) => { const v = lspView(ctx); if (v) formatDocument(v); },
   },
 ```
 
-> Note : `category: "Go"` est déjà dans le type `CommandCategory`. Le keybinding
-> F12/Shift+F12/F2 est aussi bindé par `languageServerExtensions()` au niveau
-> éditeur ; la palette les expose pour la découvrabilité (cherchables + libellés).
+> Note : `category: "Go"` est déjà dans le type `CommandCategory`. Le `when:`
+> garantit que ces commandes n'apparaissent dans la palette QUE quand une view
+> avec plugin LSP est active (sinon invisibles — pas d'option fantôme).
 
 - [ ] **Step 4: typecheck**
 
@@ -1106,6 +1202,22 @@ git commit -m "✨ feat(lsp): commandes palette (definition/type/impl/references
 **Files:**
 - Create: `src/features/code/LspContextMenu.tsx`
 - Modify: `src/features/code/CodeMirrorEditor.tsx`
+- Modify: `package.json` (devDep type)
+
+- [ ] **Step 0: Garantir le type ServerCapabilities**
+
+`vscode-languageserver-protocol@3.17.5` est dans le store pnpm (dép de
+`@codemirror/lsp-client`) mais, en pnpm strict, une dép transitive n'est pas
+toujours importable depuis le code applicatif. On l'ajoute donc explicitement
+(devDep, types seulement) :
+```bash
+pnpm add -D vscode-languageserver-protocol@^3.17.5
+```
+Commit séparé :
+```bash
+git add package.json pnpm-lock.yaml
+git commit -m "📦 deps: vscode-languageserver-protocol (types ServerCapabilities, devDep)"
+```
 
 - [ ] **Step 1: Implémenter le menu (réutilise les classes CSS .ctx-*)**
 
@@ -1119,8 +1231,12 @@ git commit -m "✨ feat(lsp): commandes palette (definition/type/impl/references
 // menu DÉDIÉ au LSP, ouvert par l'événement contextmenu de l'éditeur. Il
 // réutilise les classes CSS existantes (.ctx-menu/.ctx-item/.ctx-section) pour
 // rester cohérent visuellement, sans toucher le menu d'annotation.
+//
+// Spec §3b : chaque entrée est GRISÉE si le serveur ne déclare pas la capacité
+// correspondante (serverCapabilities) — pas d'action morte.
 import type { EditorView } from "@codemirror/view";
 import {
+  LSPPlugin,
   jumpToDefinition,
   jumpToTypeDefinition,
   jumpToImplementation,
@@ -1128,6 +1244,7 @@ import {
   renameSymbol,
   formatDocument,
 } from "@codemirror/lsp-client";
+import type { ServerCapabilities } from "vscode-languageserver-protocol";
 
 export interface LspMenuState {
   x: number;
@@ -1139,15 +1256,23 @@ interface Action {
   label: string;
   kbd?: string;
   run: (v: EditorView) => void;
+  /** La capacité LSP requise — l'entrée est grisée si le serveur ne la déclare pas. */
+  cap: (c: ServerCapabilities) => boolean;
 }
 
 const ACTIONS: Action[] = [
-  { label: "Aller à la définition", kbd: "F12", run: jumpToDefinition },
-  { label: "Aller au type", run: jumpToTypeDefinition },
-  { label: "Aller à l'implémentation", run: jumpToImplementation },
-  { label: "Rechercher les références", kbd: "⇧F12", run: findReferences },
-  { label: "Renommer le symbole", kbd: "F2", run: renameSymbol },
-  { label: "Formater le document", kbd: "⇧⌥F", run: formatDocument },
+  { label: "Aller à la définition", kbd: "F12", run: jumpToDefinition,
+    cap: (c) => !!c.definitionProvider },
+  { label: "Aller au type", run: jumpToTypeDefinition,
+    cap: (c) => !!c.typeDefinitionProvider },
+  { label: "Aller à l'implémentation", run: jumpToImplementation,
+    cap: (c) => !!c.implementationProvider },
+  { label: "Rechercher les références", kbd: "⇧F12", run: findReferences,
+    cap: (c) => !!c.referencesProvider },
+  { label: "Renommer le symbole", kbd: "F2", run: renameSymbol,
+    cap: (c) => !!c.renameProvider },
+  { label: "Formater le document", kbd: "⇧⌥F", run: formatDocument,
+    cap: (c) => !!c.documentFormattingProvider },
 ];
 
 export function LspContextMenu({
@@ -1162,8 +1287,14 @@ export function LspContextMenu({
   const left = Math.min(state.x, window.innerWidth - W - 8);
   const top = Math.min(state.y, window.innerHeight - H - 8);
 
-  const onItem = (run: (v: EditorView) => void) => {
-    run(state.view);
+  // Capacités du serveur attaché à cette view (null si pas encore initialisé →
+  // tout est activé par défaut, le serveur rejettera proprement si besoin).
+  const caps: ServerCapabilities | null =
+    LSPPlugin.get(state.view)?.client.serverCapabilities ?? null;
+
+  const onItem = (a: Action, enabled: boolean) => {
+    if (!enabled) return;
+    a.run(state.view);
     onClose();
   };
 
@@ -1176,17 +1307,34 @@ export function LspContextMenu({
       />
       <div className="ctx-menu" style={{ left, top }} onContextMenu={(e) => e.preventDefault()}>
         <div className="ctx-section">Language Server</div>
-        {ACTIONS.map((a) => (
-          <button key={a.label} className="ctx-item" type="button" onClick={() => onItem(a.run)}>
-            <span className="label">{a.label}</span>
-            {a.kbd && <span className="kbd">{a.kbd}</span>}
-          </button>
-        ))}
+        {ACTIONS.map((a) => {
+          // Pas de capacités connues → on active (le serveur tranchera) ; sinon
+          // on respecte la capacité déclarée.
+          const enabled = caps ? a.cap(caps) : true;
+          return (
+            <button
+              key={a.label}
+              className="ctx-item"
+              type="button"
+              disabled={!enabled}
+              style={enabled ? undefined : { opacity: 0.4, cursor: "default" }}
+              onClick={() => onItem(a, enabled)}
+            >
+              <span className="label">{a.label}</span>
+              {a.kbd && <span className="kbd">{a.kbd}</span>}
+            </button>
+          );
+        })}
       </div>
     </>
   );
 }
 ```
+
+> Note typage : `ServerCapabilities` vient de `vscode-languageserver-protocol`,
+> dépendance transitive de `@codemirror/lsp-client` (le `.d.ts` l'importe déjà).
+> Si l'import direct n'est pas résolu, le déclarer en devDep :
+> `pnpm add -D vscode-languageserver-protocol` (Task 3.3 Step 0).
 
 - [ ] **Step 2: Ouvrir le menu depuis l'éditeur (quand LSP attaché)**
 
