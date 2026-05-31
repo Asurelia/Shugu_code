@@ -23,6 +23,7 @@ import { diag } from "@/lib/diag";
 import { createTauriTransport, type TauriLspTransport } from "./transport";
 import { sanitizeLspHtml } from "./sanitize";
 import { setLspStatus, setLspError } from "./lspStatusStore";
+import { ShuguWorkspace } from "./workspace";
 
 /**
  * Format defensif d'une erreur de provenance inconnue (peut être Error,
