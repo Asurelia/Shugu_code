@@ -781,6 +781,66 @@ export const COMMANDS: Command[] = [
     },
   },
 
+  // ── §3b : commandes LSP (palette) ─────────────────────────────────────────
+  // PAS de `keybinding:` : languageServerExtensions() bind DÉJÀ F12/Shift+F12/F2
+  // au niveau du keymap CodeMirror ; un keybinding global ici ferait
+  // double-déclenchement. On expose pour la DÉCOUVRABILITÉ (cherchable), touche
+  // montrée en description. `when: lspView !== null` masque la commande sans LSP.
+  {
+    id: "lsp-go-to-definition",
+    title: "Go to Definition",
+    category: "Go",
+    icon: "search",
+    description: "LSP — raccourci éditeur : F12",
+    when: (ctx) => lspView(ctx) !== null,
+    run: (ctx) => { const v = lspView(ctx); if (v) jumpToDefinition(v); },
+  },
+  {
+    id: "lsp-go-to-type-definition",
+    title: "Go to Type Definition",
+    category: "Go",
+    icon: "search",
+    description: "LSP",
+    when: (ctx) => lspView(ctx) !== null,
+    run: (ctx) => { const v = lspView(ctx); if (v) jumpToTypeDefinition(v); },
+  },
+  {
+    id: "lsp-go-to-implementation",
+    title: "Go to Implementation",
+    category: "Go",
+    icon: "search",
+    description: "LSP",
+    when: (ctx) => lspView(ctx) !== null,
+    run: (ctx) => { const v = lspView(ctx); if (v) jumpToImplementation(v); },
+  },
+  {
+    id: "lsp-find-references",
+    title: "Find All References",
+    category: "Go",
+    icon: "search",
+    description: "LSP — raccourci éditeur : Shift+F12",
+    when: (ctx) => lspView(ctx) !== null,
+    run: (ctx) => { const v = lspView(ctx); if (v) findReferences(v); },
+  },
+  {
+    id: "lsp-rename-symbol",
+    title: "Rename Symbol",
+    category: "Edit",
+    icon: "sparkle",
+    description: "LSP — raccourci éditeur : F2",
+    when: (ctx) => lspView(ctx) !== null,
+    run: (ctx) => { const v = lspView(ctx); if (v) renameSymbol(v); },
+  },
+  {
+    id: "lsp-format-document",
+    title: "Format Document (LSP)",
+    category: "Edit",
+    icon: "sparkle",
+    description: "LSP — raccourci éditeur : Shift+Alt+F",
+    when: (ctx) => lspView(ctx) !== null,
+    run: (ctx) => { const v = lspView(ctx); if (v) formatDocument(v); },
+  },
+
   // ── Image ─────────────────────────────────────────────────
   {
     id: "img-generate",
