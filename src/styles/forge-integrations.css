@@ -781,3 +781,16 @@
 }
 .mtb-chip:active { cursor: grabbing; }
 .mtb-chip-label { line-height: 1; }
+/* Chip en cours de glissement : estompée + transparente aux events pour que
+   elementFromPoint « voie » la catégorie cible en dessous. */
+.mtb-chip.dragging { opacity: 0.3; pointer-events: none; }
+/* Fantôme qui suit le curseur (position fixe, hors flux, inerte). */
+.mtb-chip-ghost {
+  position: fixed;
+  z-index: 9999;
+  transform: translate(-45%, -55%);
+  pointer-events: none;
+  background: rgba(40, 30, 62, 0.96);
+  border-color: var(--primary, #e08efe);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.55);
+}

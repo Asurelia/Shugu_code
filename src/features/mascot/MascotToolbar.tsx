@@ -15,7 +15,7 @@
 // calibration.ts) ; dérogation assumée à « TanStack par défaut ».
 // `reconcileGroups` garantit qu'aucun item connu n'est perdu ni dupliqué.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { Icon } from "@/components/components";
 import { CTX_TABS, type CtxTabId } from "@/features/context-cards/cards";
 import type { FloatSide } from "@/features/floating/useFloatPosition";
@@ -301,10 +301,38 @@ interface CategoryEditorProps {
 }
 
 function CategoryEditor({ groups, onRename, onSetIcon, onAdd, onRemove, onMoveItem, onDone }: CategoryEditorProps) {
-  // Item en cours de glissement (dataTransfer peu fiable → ref).
-  const drag = useRef<{ id: ToolbarItemId; from: string } | null>(null);
+  // DnD par ÉVÉNEMENTS POINTEUR : le DnD HTML5 ne démarre pas dans la webview
+  // mascotte (transparente + click-through). Le pointer-based est fiable et
+  // indépendant de Tauri/WebView2. Le drop est détecté via elementFromPoint.
+  const [dragging, setDragging] = useState<{ id: ToolbarItemId; from: string } | null>(null);
+  const [ghost, setGhost] = useState<{ x: number; y: number } | null>(null);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
   const [iconPickerFor, setIconPickerFor] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!dragging) return;
+    const groupAt = (x: number, y: number): string | null => {
+      const el = document.elementFromPoint(x, y);
+      return el ? (el.closest(".mtb-edit-group")?.getAttribute("data-group-id") ?? null) : null;
+    };
+    const onMove = (e: PointerEvent) => {
+      setGhost({ x: e.clientX, y: e.clientY });
+      setDropTarget(groupAt(e.clientX, e.clientY));
+    };
+    const onUp = (e: PointerEvent) => {
+      const to = groupAt(e.clientX, e.clientY);
+      if (to) onMoveItem(dragging.id, dragging.from, to);
+      setDragging(null);
+      setGhost(null);
+      setDropTarget(null);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+  }, [dragging, onMoveItem]);
 
   return (
     <div className="mtb-editor" role="dialog" aria-label="Organiser les catégories">
@@ -324,16 +352,8 @@ function CategoryEditor({ groups, onRename, onSetIcon, onAdd, onRemove, onMoveIt
         {groups.map((g) => (
           <div
             key={g.id}
+            data-group-id={g.id}
             className={"mtb-edit-group" + (dropTarget === g.id ? " drop" : "")}
-            onDragOver={(e) => { if (drag.current) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; } }}
-            onDragEnter={() => { if (drag.current) setDropTarget(g.id); }}
-            onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDropTarget((t) => (t === g.id ? null : t)); }}
-            onDrop={() => {
-              const d = drag.current;
-              if (d) onMoveItem(d.id, d.from, g.id);
-              drag.current = null;
-              setDropTarget(null);
-            }}
           >
             <div className="mtb-edit-head">
               <button className="mtb-edit-icon" title="Changer l'icône" onClick={() => setIconPickerFor((c) => (c === g.id ? null : g.id))}>
@@ -375,30 +395,38 @@ function CategoryEditor({ groups, onRename, onSetIcon, onAdd, onRemove, onMoveIt
               {g.items.length === 0 ? (
                 <span className="mtb-edit-empty">Glisse des cartes ici</span>
               ) : (
-                g.items.map((id) => (
-                  <span
-                    key={id}
-                    className="mtb-chip"
-                    draggable
-                    onDragStart={(e) => {
-                      drag.current = { id, from: g.id };
-                      e.dataTransfer.effectAllowed = "move";
-                      // setData EST REQUIS pour que WebView2 DÉMARRE le drag —
-                      // sans ça le glisser ne s'initie pas (cf. chat-sidebar).
-                      e.dataTransfer.setData("text/plain", String(id));
-                    }}
-                    onDragEnd={() => { drag.current = null; setDropTarget(null); }}
-                    title={"Glisser « " + ITEM_LABEL[id] + " » vers une autre catégorie"}
-                  >
-                    <ItemIcon id={id} />
-                    <span className="mtb-chip-label">{ITEM_LABEL[id]}</span>
-                  </span>
-                ))
+                g.items.map((id) => {
+                  const isDragged = !!dragging && dragging.id === id && dragging.from === g.id;
+                  return (
+                    <span
+                      key={id}
+                      className={"mtb-chip" + (isDragged ? " dragging" : "")}
+                      onPointerDown={(e) => {
+                        e.preventDefault();
+                        setDragging({ id, from: g.id });
+                        setGhost({ x: e.clientX, y: e.clientY });
+                        setDropTarget(g.id);
+                      }}
+                      title={"Glisser « " + ITEM_LABEL[id] + " » vers une autre catégorie"}
+                    >
+                      <ItemIcon id={id} />
+                      <span className="mtb-chip-label">{ITEM_LABEL[id]}</span>
+                    </span>
+                  );
+                })
               )}
             </div>
           </div>
         ))}
       </div>
+
+      {/* Fantôme qui suit le curseur pendant le glissement. */}
+      {dragging && ghost && (
+        <span className="mtb-chip mtb-chip-ghost" style={{ left: ghost.x, top: ghost.y }}>
+          <ItemIcon id={dragging.id} />
+          <span className="mtb-chip-label">{ITEM_LABEL[dragging.id]}</span>
+        </span>
+      )}
     </div>
   );
 }
