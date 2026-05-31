@@ -74,6 +74,7 @@ import { SideGit } from "@/features/git/SideGit";
 // page reload on every HMR edit, which in turn caused the intermittent
 // "useShell must be used inside RootLayout" errors in the Tauri webview).
 import { ShellContext, type ShellContextValue, type EditorPrefs, DEFAULT_EDITOR_PREFS } from "./shell-context";
+import { setLspBridge } from "@/features/code/lsp/lspBridge";
 import { loadJSON, saveJSON } from "@/features/settings/settings-extras";
 import { formatCurrentDocumentCli, formatCodeDirect } from "@/features/code/format";
 
@@ -727,6 +728,20 @@ export function RootLayout() {
     setActiveFile(path);
     setFilesPanelActive(path);
   }, []);
+
+  // Lot B §2 — publie openFile + l'accès à l'EditorView actif au pont LSP, pour
+  // que ShuguWorkspace.displayFile puisse naviguer cross-fichier (F12, Ctrl+Clic
+  // vers une définition dans un autre fichier, panneau de références).
+  useEffect(() => {
+    setLspBridge({
+      openFile,
+      getViewForPath: (path) => {
+        const v = editorViewRef.current;
+        if (!v) return null;
+        return v.getPath() === path ? (v.getView() ?? null) : null;
+      },
+    });
+  }, [openFile]);
 
   const saveFile = useCallback(async (path: string) => {
     const content = fileContents[path];
