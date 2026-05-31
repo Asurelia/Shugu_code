@@ -17,10 +17,18 @@ import {
   LSPPlugin,
   type LSPClient,
   type WorkspaceFile,
-  type WorkspaceFileUpdate,
 } from "@codemirror/lsp-client";
 import type { EditorView } from "@codemirror/view";
-import type { Text } from "@codemirror/state";
+import type { Text, ChangeSet } from "@codemirror/state";
+
+// @codemirror/lsp-client définit l'interface WorkspaceFileUpdate dans son .d.ts
+// mais NE L'EXPORTE PAS. On réplique sa forme structurelle (vérifiée dans le
+// .d.ts : { file, prevDoc, changes }) pour typer le retour de syncFiles().
+interface WorkspaceFileUpdate {
+  file: WorkspaceFile;
+  prevDoc: Text;
+  changes: ChangeSet;
+}
 import { getLspBridge } from "./lspBridge";
 import { relativePathFromUri } from "./uri";
 import { diag } from "@/lib/diag";
