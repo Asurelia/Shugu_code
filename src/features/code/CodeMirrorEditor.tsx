@@ -41,6 +41,7 @@ import { diag } from "@/lib/diag";
 import { bracketPairColors } from "./extensions/bracketPairColors";
 import { snippetCompletionSource } from "./snippets/loader";
 import { getLspClient, isLspSupported, fileUriForPath, fmtErr } from "./lsp/client";
+import { clickToDefinition } from "./lsp/clickToDefinition";
 import { gitDiffCompartment, buildGitDecorations } from "./git-decorations";
 import { blameCompartment, buildBlameGutter } from "./blame-decorations";
 import { aiEditCompartment, aiEditStreamAnnotation } from "./ai-edit/unifiedDiffExtension";
@@ -526,7 +527,12 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
       const fileUri = fileUriForPath(result.workspaceUri, path);
       try {
         view.dispatch({
-          effects: lspCompartment.reconfigure(result.client.plugin(fileUri, langId)),
+          effects: lspCompartment.reconfigure([
+            result.client.plugin(fileUri, langId),
+            // §3a — Ctrl/Cmd+Clic = Aller à la définition (monté avec le plugin
+            // donc actif seulement quand un LSP est attaché).
+            clickToDefinition(),
+          ]),
         });
         diag("lsp", `attached plugin for ${fileUri}`);
       } catch (err) {
