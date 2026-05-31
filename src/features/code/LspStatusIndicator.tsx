@@ -5,7 +5,7 @@
 // l'utilisateur décide (modèle de sûreté « empêcher l'irréparable »).
 import { langFromPath } from "@/lib/fs";
 import { isLspSupported } from "./lsp/client";
-import { useLspStatus, type LspStatus } from "./lsp/lspStatusStore";
+import { useLspStatus, getLspError, type LspStatus } from "./lsp/lspStatusStore";
 import { pushToast } from "@/components/toast";
 
 // Commande d'installation par langage (affichée au clic quand "absent").
@@ -46,7 +46,16 @@ export function LspStatusIndicator({ activeFile }: { activeFile: string | null }
       const hint = INSTALL_HINT[langId] ?? "voir la doc du serveur LSP";
       pushToast(`Pour activer le LSP ${langId} : ${hint}`, "info", 8000);
     } else if (status === "error") {
-      pushToast(`LSP ${langId} en erreur — rouvre le fichier pour relancer.`, "info", 6000);
+      // Montre la VRAIE raison (ex. « Request timed out ») au lieu d'un message
+      // générique — diagnostic visible sans DevTools.
+      const detail = getLspError(langId);
+      pushToast(
+        detail
+          ? `LSP ${langId} en erreur : ${detail} — rouvre le fichier pour relancer.`
+          : `LSP ${langId} en erreur — rouvre le fichier pour relancer.`,
+        "info",
+        8000,
+      );
     }
   };
 

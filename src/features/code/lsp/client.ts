@@ -22,7 +22,7 @@ import { invoke, listen } from "@/lib/tauri";
 import { diag } from "@/lib/diag";
 import { createTauriTransport, type TauriLspTransport } from "./transport";
 import { sanitizeLspHtml } from "./sanitize";
-import { setLspStatus } from "./lspStatusStore";
+import { setLspStatus, setLspError } from "./lspStatusStore";
 
 /**
  * Format defensif d'une erreur de provenance inconnue (peut être Error,
@@ -112,6 +112,13 @@ async function doInit(
   const client = new LSPClient({
     rootUri: workspaceUri,
     extensions: languageServerExtensions(),
+    // Lot B (debug) — le timeout par défaut de @codemirror/lsp-client est 3000 ms,
+    // ce qui suffit pour rust-analyzer (.exe natif, initialize <100 ms) mais PAS
+    // pour typescript-language-server au PREMIER open : cmd→node→cli.mjs→charger
+    // ~10 Mo de TypeScript (+ scan Defender sur Windows) dépasse 3 s à froid →
+    // l'initialize rejette « Request timed out » → statut "error" alors que le
+    // serveur est juste en train de booter. 20 s couvre le cold-start.
+    timeout: 20000,
     // Lot B §5 — sanitize le HTML des hovers/diagnostics (Markdown→HTML).
     // Ferme la surface XSS ouverte par §1 : depuis la résolution
     // node_modules/.bin, le serveur LSP peut être fourni PAR le dépôt ouvert
@@ -126,7 +133,9 @@ async function doInit(
     diag("lsp", `${langId} ready (rootUri=${workspaceUri})`);
     setLspStatus(langId, "ready");
   } catch (err) {
-    diag("lsp", `${langId} initialize failed: ${fmtErr(err)}`);
+    const msg = fmtErr(err);
+    diag("lsp", `${langId} initialize failed: ${msg}`);
+    setLspError(langId, msg);
     setLspStatus(langId, "error");
     transport.dispose();
     return null;
