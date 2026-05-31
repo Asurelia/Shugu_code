@@ -30,6 +30,7 @@ import {
 import { db } from "@/lib/db";
 import { getInstalledIds, getModelPath } from "@/lib/modelBundle";
 import { parseThinkingMode, serializeThinkingMode, type ThinkingMode } from "@/lib/thinkingHeuristic";
+import { McpServersSection } from "@/features/mcp/McpServersSection";
 
 // Storage key for the persisted list of user-added custom providers. JSON-encoded
 // array of ConnCardData rows (display metadata only — secrets/configs live in
@@ -67,6 +68,7 @@ export function ConnectionsView() {
   const tabs = [
     { v: "models",    l: "AI Providers" },
     { v: "tools",     l: "Dev tools" },
+    { v: "mcp",       l: "Serveurs MCP" },
     { v: "image",     l: "Image services" },
     { v: "storage",   l: "Storage" },
   ];
@@ -174,6 +176,7 @@ export function ConnectionsView() {
             )}
           </div>
           {tab === "models" && <RoutingSection />}
+          {tab === "mcp" && <McpServersSection />}
         </div>
       </div>
       {adding && <AddProviderModal onClose={() => setAdding(false)} onAdd={async (c: ConnCardData) => {

@@ -504,6 +504,29 @@ pub(super) async fn tool_use_loop(
     // exec, never saves a skill). Shared (Arc) into each parallel tool task.
     let last_exec_exit = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN));
 
+    // Lot C — MCP : assemble the tools manifest ONCE per run (not per iteration).
+    // `enabled_tools_json` does real I/O — it connects to each ENABLED MCP server
+    // and lists its tools — so we pay that cost a single time. The merged array is
+    // `native tools (tools_json_*) ++ MCP tools (enabled servers)`, rendered for
+    // THIS protocol. With no enabled server, `enabled_tools_json` returns `[]` and
+    // the array is byte-identical to the native default — the no-MCP path is
+    // unchanged. `None` is threaded for the `ollama` branch (which ignores tools).
+    let agent_tools: Option<serde_json::Value> = if protocol == "ollama" {
+        None
+    } else {
+        let mut arr = if protocol == "anthropic" {
+            super::tools::tools_json_anthropic()
+        } else {
+            super::tools::tools_json_openai()
+        };
+        let mgr = app.state::<crate::commands::mcp::McpManager>();
+        let mcp_tools = crate::commands::mcp::enabled_tools_json(app, &mgr, protocol).await;
+        if let Some(a) = arr.as_array_mut() {
+            a.extend(mcp_tools);
+        }
+        Some(arr)
+    };
+
     while iteration < budget {
         metrics.iterations = iteration + 1;
         // ── 0. Inject "approaching budget" nudge messages — aide les
@@ -529,7 +552,7 @@ pub(super) async fn tool_use_loop(
 
         // ── 1. Call the LLM with the current history + tools manifest ──
         let (turn, reasoning) =
-            call_agent_llm_with_tools(app, client, protocol, base_url, model, history, api_key, chat_template_kwargs, agent_id).await?;
+            call_agent_llm_with_tools(app, client, protocol, base_url, model, history, api_key, chat_template_kwargs, agent_id, &agent_tools).await?;
 
         // ── 2. Persist Message event for this assistant turn ───────────
         let _ = persist_and_emit(
@@ -602,12 +625,81 @@ pub(super) async fn tool_use_loop(
             );
         }
 
-        // ── 5. Resolve workspace + execute tools in parallel ───────────
+        // ── 5. Resolve workspace + execute tools ───────────────────────
         let workspace_root = workspace_override
             .as_ref()
             .cloned()
             .or_else(|| get_workspace_root(app));
-        let results: Vec<ToolResult> = if let Some(root) = workspace_root {
+
+        // Lot C — MCP routing. MCP tools (`mcp__server__tool`) are executed via
+        // `mcp::mcp_execute`, which is ASYNC and CANNOT run inside the sync
+        // `spawn_blocking` closure used for the native fs tools. So when at least
+        // ONE call this round is an MCP tool, we drop to a SEQUENTIAL path that
+        // handles both kinds in their original order (the order matters: OpenAI
+        // pairs each result to its `tool_call_id`, Anthropic batches them but all
+        // ids must be present). Simplicity over parallelism here — the plan
+        // explicitly blesses sequential-when-any-MCP. MCP tools act OUTSIDE the
+        // workspace, so they run even when no workspace is open (routed BEFORE the
+        // workspace-root gate). When NO call is MCP, the original parallel block
+        // runs VERBATIM → the no-MCP hot path (and its tests) is unchanged.
+        let any_mcp = turn
+            .tool_calls
+            .iter()
+            .any(|tc| tc.name.starts_with("mcp__"));
+
+        let results: Vec<ToolResult> = if any_mcp {
+            let mgr = app.state::<crate::commands::mcp::McpManager>();
+            let mut acc: Vec<ToolResult> = Vec::with_capacity(turn.tool_calls.len());
+            for tc in &turn.tool_calls {
+                if tc.name.starts_with("mcp__") {
+                    // MCP tool: async dispatch, no workspace needed. Parse args
+                    // like the native path (runner.rs ToolCall events) — bad/empty
+                    // args become `{}` so the call stays well-formed.
+                    let args: serde_json::Value =
+                        serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
+                    let (content, is_error) =
+                        crate::commands::mcp::mcp_execute(app, &mgr, &tc.name, &args).await;
+                    acc.push(ToolResult {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        is_error,
+                        content,
+                    });
+                } else if let Some(root) = workspace_root.as_ref() {
+                    // Native fs tool: sync dispatch on a blocking thread, same as
+                    // the parallel path but awaited one at a time.
+                    let tc_clone = tc.clone();
+                    let fallback_id = tc_clone.id.clone();
+                    let fallback_name = tc_clone.name.clone();
+                    let root_clone = Arc::new(root.clone());
+                    let app_clone = app.clone();
+                    let role_clone = role.to_string();
+                    let last_exec_clone = last_exec_exit.clone();
+                    let mounts_clone = exec_ro_mounts.clone();
+                    let r = tokio::task::spawn_blocking(move || {
+                        execute_tool(&tc_clone, &root_clone, allow_exec, &app_clone, &role_clone, &last_exec_clone, &mounts_clone)
+                    })
+                    .await
+                    .unwrap_or_else(|join_err| ToolResult {
+                        id: fallback_id,
+                        name: fallback_name,
+                        is_error: true,
+                        content: format!("tool execution panicked: {join_err}"),
+                    });
+                    acc.push(r);
+                } else {
+                    // Native tool but no workspace open — same clean error as the
+                    // parallel else-branch below.
+                    acc.push(ToolResult {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        is_error: true,
+                        content: "no workspace open".to_string(),
+                    });
+                }
+            }
+            acc
+        } else if let Some(root) = workspace_root {
             let root_arc = Arc::new(root);
             let futures = turn.tool_calls.iter().map(|tc| {
                 let tc_clone = tc.clone();
@@ -760,6 +852,12 @@ async fn call_agent_llm_with_tools(
     api_key: &str,
     chat_template_kwargs: &Option<serde_json::Value>,
     agent_id: &str,
+    // Lot C — merged tools manifest (native ++ enabled MCP) for THIS protocol,
+    // assembled once per run by the caller. `None` only for the `ollama` branch
+    // (which ignores tools). Passed through to the structured helpers, replacing
+    // the former hard-coded `tools: None` (= native-default) so MCP tools reach
+    // the model's request body.
+    tools: &Option<serde_json::Value>,
 ) -> Result<(AssistantTurn, String), String> {
     // Live streaming restauré post-migration TanStack (2026-05-17).
     //
@@ -818,7 +916,7 @@ async fn call_agent_llm_with_tools(
             chat::call_anthropic_structured(
                 client, base_url, model, messages, system, api_key,
                 /* with_tools */ true,
-                /* tools (default full agent set) */ None,
+                /* tools (native ++ enabled MCP) */ tools.clone(),
                 /* abort */ None,
                 &mut on_chunk,
             )
@@ -837,7 +935,7 @@ async fn call_agent_llm_with_tools(
                 protocol,
                 chat_template_kwargs,
                 /* with_tools */ true,
-                /* tools (default full agent set) */ None,
+                /* tools (native ++ enabled MCP) */ tools.clone(),
                 /* abort */ None,
                 &mut on_chunk,
             )

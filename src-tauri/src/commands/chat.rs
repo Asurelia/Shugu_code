@@ -1,6 +1,6 @@
 use futures_util::StreamExt;
 use serde::Deserialize;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
@@ -735,6 +735,13 @@ fn chat_tool_label(name: &str, args: &serde_json::Value) -> String {
         }
         "fs_write_file" => format!("✏️ a écrit `{p}`"),
         "fs_edit" => format!("✏️ a modifié `{p}`"),
+        // BLOCKER 1 — libellé propre pour un outil MCP : `🔌 server__tool`.
+        name if name.starts_with("mcp__") => {
+            match crate::commands::mcp::split_namespaced(name) {
+                Some((server, tool)) => format!("🔌 {server}__{tool}"),
+                None => format!("🔌 {}", name.strip_prefix("mcp__").unwrap_or(name)),
+            }
+        }
         other => format!("⚙️ {other}"),
     }
 }
@@ -812,11 +819,21 @@ async fn run_chat_tool_loop(
         let (system, msgs) = chat_build_request(&history, protocol);
 
         // The chat tool schema for this protocol (only when tools are allowed).
+        // BLOCKER 1 — on fusionne les outils des serveurs MCP ACTIVÉS au tableau
+        // de base. Sans serveur MCP activé, `enabled_tools_json` renvoie `[]` →
+        // comportement chat strictement identique à avant (non-régression).
         let tools_json: Option<serde_json::Value> = if with_tools {
-            Some(match protocol {
+            let mut arr = match protocol {
                 "anthropic" => chat_tools_json_anthropic(write_enabled),
                 _ => chat_tools_json_openai(write_enabled),
-            })
+            };
+            let mgr = app.state::<crate::commands::mcp::McpManager>();
+            let mcp_tools =
+                crate::commands::mcp::enabled_tools_json(app, &mgr, protocol).await;
+            if let Some(a) = arr.as_array_mut() {
+                a.extend(mcp_tools);
+            }
+            Some(arr)
         } else {
             None
         };
@@ -896,13 +913,22 @@ async fn run_chat_tool_loop(
                 },
             );
 
-            // Execute against the real workspace (or report it's missing).
-            let (content, is_error) = match &root {
-                Some(r) => execute_chat_tool(&tc.name, &args, r, write_enabled, journal),
-                None => (
-                    "aucun workspace ouvert — impossible d'exécuter l'outil".to_string(),
-                    true,
-                ),
+            // Execute the tool. BLOCKER 1 — les outils MCP (`mcp__server__tool`)
+            // sont routés vers le manager MCP AVANT les outils fs workspace. Ils
+            // ne dépendent pas du workspace et n'alimentent PAS le journal
+            // d'annulation (qui ne concerne que les écritures fs locales).
+            let (content, is_error) = if tc.name.starts_with("mcp__") {
+                let mgr = app.state::<crate::commands::mcp::McpManager>();
+                crate::commands::mcp::mcp_execute(app, &mgr, &tc.name, &args).await
+            } else {
+                // Outils fs : exécutés contre le vrai workspace (ou erreur si aucun).
+                match &root {
+                    Some(r) => execute_chat_tool(&tc.name, &args, r, write_enabled, journal),
+                    None => (
+                        "aucun workspace ouvert — impossible d'exécuter l'outil".to_string(),
+                        true,
+                    ),
+                }
             };
 
             results.push(ToolResult {
