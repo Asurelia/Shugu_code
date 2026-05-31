@@ -380,7 +380,13 @@ function CategoryEditor({ groups, onRename, onSetIcon, onAdd, onRemove, onMoveIt
                     key={id}
                     className="mtb-chip"
                     draggable
-                    onDragStart={(e) => { drag.current = { id, from: g.id }; e.dataTransfer.effectAllowed = "move"; }}
+                    onDragStart={(e) => {
+                      drag.current = { id, from: g.id };
+                      e.dataTransfer.effectAllowed = "move";
+                      // setData EST REQUIS pour que WebView2 DÉMARRE le drag —
+                      // sans ça le glisser ne s'initie pas (cf. chat-sidebar).
+                      e.dataTransfer.setData("text/plain", String(id));
+                    }}
                     onDragEnd={() => { drag.current = null; setDropTarget(null); }}
                     title={"Glisser « " + ITEM_LABEL[id] + " » vers une autre catégorie"}
                   >
