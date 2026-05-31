@@ -449,6 +449,8 @@ pub fn run() {
         .manage(commands::terminal::PtyRegistry::default())
         .manage(commands::llama::LlamaServerState::default())
         .manage(commands::agents::AgentManagerState::default())
+        // Lot C — registre des connexions MCP vives (un RunningService par serveur).
+        .manage(commands::mcp::McpManager::default())
         .manage(commands::chat::ChatAbortRegistry::default())
         // LOT 3 — LSP server registry (un LspSession par langId).
         .manage(commands::lsp::LspServerRegistry::default())
@@ -707,6 +709,13 @@ pub fn run() {
             // Raw `.md` read/write — pour l'onglet "Source `.md`" du drawer.
             commands::agent_defs::agent_def_read_raw,
             commands::agent_defs::agent_def_write_raw,
+            // Lot C — serveurs MCP (Model Context Protocol) : config, test, activation, appel.
+            commands::mcp::mcp_list_servers,
+            commands::mcp::mcp_test_server,
+            commands::mcp::mcp_set_enabled,
+            commands::mcp::mcp_add_server,
+            commands::mcp::mcp_remove_server,
+            commands::mcp::mcp_call_tool,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

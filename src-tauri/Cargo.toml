@@ -80,8 +80,12 @@ percent-encoding = "2"
 # message d'erreur cargo qui liste les features valides si l'une bouge) :
 #   client : rôle client — on CONSOMME des serveurs MCP, on n'en est pas un.
 #   transport-child-process : lance un serveur MCP local en sous-process (stdio).
-#   transport-streamable-http-client : serveurs MCP distants (HTTP streamable/SSE).
-rmcp = { version = "1", features = ["client", "transport-child-process", "transport-streamable-http-client"] }
+#   transport-streamable-http-client-reqwest : serveurs MCP distants (HTTP
+#     streamable/SSE). La variante `-reqwest` (et NON le `transport-streamable-
+#     http-client` nu) est REQUISE en rmcp 1.7 : c'est elle qui tire `reqwest` et
+#     expose `StreamableHttpClientTransport::from_uri(..)` + le re-export crate-root
+#     (vérifié contre rmcp-1.7.0/src/transport.rs + streamable_http_client.rs).
+rmcp = { version = "1", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 
 # keyring v3 has NO default features — without an explicit platform feature
 # it compiles but provides no real backend (a fall-through "sample" store
