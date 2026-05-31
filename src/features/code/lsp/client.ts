@@ -21,6 +21,7 @@ import { LSPClient, languageServerExtensions } from "@codemirror/lsp-client";
 import { invoke, listen } from "@/lib/tauri";
 import { diag } from "@/lib/diag";
 import { createTauriTransport, type TauriLspTransport } from "./transport";
+import { sanitizeLspHtml } from "./sanitize";
 
 /**
  * Format defensif d'une erreur de provenance inconnue (peut être Error,
@@ -106,12 +107,12 @@ async function doInit(
   const client = new LSPClient({
     rootUri: workspaceUri,
     extensions: languageServerExtensions(),
-    // Note : sanitizeHTML omis pour LOT 3 MVP. Les hover/diagnostics LSP
-    // peuvent retourner du markdown rendu en HTML — sans sanitize, on est
-    // vulnérables à un LSP malveillant qui injecterait du JS via hover.
-    // Mitigation : on ne lance QUE des LSP servers résolus via which()
-    // (donc installés par l'utilisateur, pas par Shugu). Risk acceptable
-    // pour MVP, à ajouter DOMPurify en hardening.
+    // Lot B §5 — sanitize le HTML des hovers/diagnostics (Markdown→HTML).
+    // Ferme la surface XSS ouverte par §1 : depuis la résolution
+    // node_modules/.bin, le serveur LSP peut être fourni PAR le dépôt ouvert
+    // (et plus seulement installé par l'utilisateur via le PATH). DOMPurify
+    // strip <script>/on*/href:javascript: — voir ./sanitize.ts.
+    sanitizeHTML: sanitizeLspHtml,
   });
 
   try {
