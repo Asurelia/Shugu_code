@@ -74,3 +74,6 @@ src-tauri/.fastembed_cache/
 
 # Timestamped dev-run logs (tauri-dev-log.cmd)
 dev-logs/
+
+# Superpowers brainstorming visual-companion mockups (throwaway design artifacts)
+.superpowers/
