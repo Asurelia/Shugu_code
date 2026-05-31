@@ -231,6 +231,32 @@ fn resolve_lsp_binary(
     Some((path, args))
 }
 
+/// STRIP le préfixe Windows extended-length `\\?\` d'un chemin.
+///
+/// **Pourquoi c'est critique ici (cause racine du LSP TS muet)** :
+/// `workspace_root` provient de `fs::canonicalize()`, qui sur Windows préfixe
+/// les chemins avec `\\?\` (extended-length). Le `.cmd` résolu hérite donc de
+/// ce préfixe : `\\?\F:\…\typescript-language-server.cmd`. Or **`cmd.exe`
+/// REFUSE les chemins `\\?\`** (il ne supporte pas l'extended-length syntax) →
+/// « Le chemin d'accès spécifié est introuvable. » → le child meurt au spawn
+/// (reader EOF avant l'`initialize`, broken pipe os error 232) → l'init LSP
+/// timeout. rust-analyzer échappe au bug car il est lancé DIRECTEMENT
+/// (CreateProcess accepte `\\?\`), pas via cmd.exe.
+///
+/// Vérifié au repro : `cmd /d /c "\\?\…\…​.cmd" --version` → exit 1 ; le même
+/// sans préfixe → `5.2.0`. Même normalisation que `path_to_file_uri` et que
+/// `normalize_cwd_for_shell` (terminal.rs).
+fn strip_extended_prefix(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    if let Some(rest) = s.strip_prefix("//?/") {
+        return PathBuf::from(rest);
+    }
+    path
+}
+
 /// Construit la Command à spawn, avec wrapping cmd.exe sur Windows pour
 /// les .cmd/.bat (e.g. typescript-language-server installé via npm crée un
 /// .cmd shim qui n'est PAS exécutable directement par CreateProcess).
@@ -245,14 +271,20 @@ fn build_command(path: PathBuf, args: Vec<String>) -> Command {
         .unwrap_or(false);
 
     if cfg!(windows) && is_script {
+        // STRIP `\\?\` AVANT de passer le chemin à cmd.exe (qui le rejette).
+        let clean = strip_extended_prefix(path);
         let mut cmd = Command::new("cmd.exe");
-        cmd.arg("/d").arg("/c").arg(path);
+        cmd.arg("/d").arg("/c").arg(clean);
         for a in args {
             cmd.arg(a);
         }
         cmd
     } else {
-        let mut cmd = Command::new(path);
+        // Branche directe (CreateProcess) : `\\?\` est accepté, mais on strip
+        // quand même par cohérence — un chemin propre n'a aucun inconvénient
+        // et évite des surprises si un autre serveur passait un jour par ici.
+        let clean = strip_extended_prefix(path);
+        let mut cmd = Command::new(clean);
         for a in args {
             cmd.arg(a);
         }
@@ -585,5 +617,31 @@ mod tests {
     fn returns_none_for_unknown_language() {
         let tmp = std::env::temp_dir();
         assert!(resolve_lsp_binary("cobol", &tmp).is_none());
+    }
+
+    /// Cause racine du LSP TS muet : un chemin canonicalisé Windows porte le
+    /// préfixe `\\?\` que cmd.exe rejette. strip_extended_prefix doit le retirer.
+    #[test]
+    fn strips_windows_extended_prefix() {
+        // Forme Windows `\\?\`.
+        let prefixed = PathBuf::from(r"\\?\F:\Dev\shugu_code\node_modules\.bin\tsls.cmd");
+        let cleaned = strip_extended_prefix(prefixed);
+        assert_eq!(
+            cleaned,
+            PathBuf::from(r"F:\Dev\shugu_code\node_modules\.bin\tsls.cmd"),
+        );
+    }
+
+    #[test]
+    fn strips_forward_slash_extended_prefix() {
+        // Forme normalisée `//?/` (peut apparaître après un replace).
+        let prefixed = PathBuf::from("//?/F:/Dev/x.cmd");
+        assert_eq!(strip_extended_prefix(prefixed), PathBuf::from("F:/Dev/x.cmd"));
+    }
+
+    #[test]
+    fn leaves_plain_path_untouched() {
+        let plain = PathBuf::from(r"F:\Dev\shugu_code\node_modules\.bin\tsls.cmd");
+        assert_eq!(strip_extended_prefix(plain.clone()), plain);
     }
 }

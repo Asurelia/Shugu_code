@@ -112,12 +112,11 @@ async function doInit(
   const client = new LSPClient({
     rootUri: workspaceUri,
     extensions: languageServerExtensions(),
-    // Lot B (debug) — le timeout par défaut de @codemirror/lsp-client est 3000 ms,
-    // ce qui suffit pour rust-analyzer (.exe natif, initialize <100 ms) mais PAS
-    // pour typescript-language-server au PREMIER open : cmd→node→cli.mjs→charger
-    // ~10 Mo de TypeScript (+ scan Defender sur Windows) dépasse 3 s à froid →
-    // l'initialize rejette « Request timed out » → statut "error" alors que le
-    // serveur est juste en train de booter. 20 s couvre le cold-start.
+    // Défaut @codemirror/lsp-client = 3000 ms. On le porte à 20 s : marge de
+    // sécurité pour un cold-start lent (un gros projet TS qui charge ~10 Mo, un
+    // disque froid + Defender). NB : ce n'était PAS la cause du bug TS muet —
+    // celle-là était le préfixe Windows `\\?\` que cmd.exe rejetait (corrigé
+    // dans lsp.rs::strip_extended_prefix). On garde 20 s comme bon défaut.
     timeout: 20000,
     // Lot B §5 — sanitize le HTML des hovers/diagnostics (Markdown→HTML).
     // Ferme la surface XSS ouverte par §1 : depuis la résolution
@@ -138,6 +137,15 @@ async function doInit(
     setLspError(langId, msg);
     setLspStatus(langId, "error");
     transport.dispose();
+    // Défense en profondeur — tuer la session Rust en échec. lsp_init est
+    // IDEMPOTENT : laisser une session à moitié initialisée dans le registre
+    // ferait réutiliser le même process au prochain open → un 2e `initialize`
+    // qu'un serveur LSP ignore → re-timeout en boucle. Le kill garantit que la
+    // tentative suivante repart d'un process neuf, quelle que soit la cause de
+    // l'échec. (Best-effort, non bloquant.)
+    void invoke("lsp_shutdown", { langId }).catch((e) => {
+      diag("lsp", `${langId} cleanup shutdown failed: ${fmtErr(e)}`);
+    });
     return null;
   }
 
