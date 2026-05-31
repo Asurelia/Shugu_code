@@ -13,6 +13,15 @@ import { openPrompt, runImmediate } from "@/features/code/ai-edit/aiEditControll
 import { reindexWorkspace } from "@/features/fs/workspaceIndexer";
 import { pushToast } from "@/components/toast";
 import { openReviewDialog } from "@/features/git/reviewDialogStore";
+import {
+  LSPPlugin,
+  jumpToDefinition,
+  jumpToTypeDefinition,
+  jumpToImplementation,
+  findReferences,
+  renameSymbol,
+  formatDocument,
+} from "@codemirror/lsp-client";
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -145,6 +154,14 @@ function aiEditTarget(ctx: CommandContext): {
   const coords = view.coordsAtPos(sel.from);
   const anchor = coords ? { x: coords.left, y: coords.bottom + 6 } : { x: 80, y: 80 };
   return { view, path: ctx.activeFile, lang: fc.lang ?? "", wasDirty: !!fc.dirty, anchor };
+}
+
+// §3 — la view active a-t-elle un plugin LSP attaché ? (sinon les commandes LSP
+// ne doivent pas apparaître dans la palette sur un fichier sans serveur).
+function lspView(ctx: CommandContext): EditorView | null {
+  const view = ctx.editorViewRef?.current?.getView() ?? null;
+  if (!view) return null;
+  return LSPPlugin.get(view) ? view : null;
 }
 
 // ─── COMMANDS array ───────────────────────────────────────────
