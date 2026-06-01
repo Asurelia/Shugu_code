@@ -1143,7 +1143,7 @@ export function RootLayout() {
             menu={view === "code" ? <MenuBar ctx={cmdCtx}/> : null}
           />
           <div className="main">
-            <Rail view={view} setView={navigateTo}/>
+            <Rail view={view} setView={navigateTo} onAvatar={() => setAccountOpen(o => !o)}/>
             <SidePanel width={sideWidth} setWidth={setSideWidth} collapsed={sideCollapsed}>
               {sidePanel}
             </SidePanel>

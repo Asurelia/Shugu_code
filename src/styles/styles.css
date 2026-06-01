@@ -400,7 +400,11 @@ body {
   font-size: 12px; color: #1a0a24;
   cursor: pointer;
   box-shadow: 0 6px 18px -8px rgba(224,142,254,0.6);
+  border: 0;
+  transition: opacity 160ms ease, box-shadow 160ms ease;
 }
+.rail-avatar:hover { opacity: 0.85; box-shadow: 0 6px 22px -6px rgba(224,142,254,0.75); }
+.rail-avatar:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 
 /* Side panel (context: file tree, history, etc) — width is controlled by .side-wrap */
 .side {

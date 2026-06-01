@@ -71,8 +71,8 @@ export function RightPanel({ active }: { active: SurfaceId }) {
         <span style={{ flex: 1 }} />
 
         {/* Close (collapse) the right panel. */}
-        <button className="lgb lgb-sm" title="Fermer le panneau" onClick={() => setRightPanelOpen(false)}>
-          <Icon name="x" size={11} />
+        <button className="lgb lgb-sm" aria-label="Fermer le panneau" title="Fermer le panneau" onClick={() => setRightPanelOpen(false)}>
+          <Icon name="x" size={13} />
         </button>
       </div>
 

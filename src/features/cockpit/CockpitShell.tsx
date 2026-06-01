@@ -73,15 +73,22 @@ export function CockpitShell({ activeConv }: { activeConv: string }) {
         <Panel id="cockpit-chat" order={1} minSize={30} defaultSize={layout.sizes[0]}>
           <div style={{ position: "relative", height: "100%" }}>
             <ChatView activeConv={activeConv} onOpenSnippet={shell.openSnippetInEditor} />
-            {/* Floating "open panel" button when the right panel is collapsed. */}
+            {/* Floating "open panel" toggle — icon-only, top-right of the chat pane.
+                Mirrors the titlebar's left side-panel toggle SVG but for the RIGHT panel:
+                divider on the right side (x=15) and chevron pointing left (open). */}
             {!layout.rightPanelOpen && (
               <button
-                className="lgb lgb-sm lgb-primary"
-                title="Ouvrir le panneau (Éditeur / Révision)"
-                style={{ position: "absolute", top: 10, right: 10, zIndex: 20 }}
+                className="cockpit-panel-toggle"
+                aria-label="Afficher le panneau"
+                title="Afficher le panneau (Éditeur / Révision)"
+                style={{ position: "absolute", top: 8, right: 8, zIndex: 10 }}
                 onClick={() => openSurface(layout.activeSurface)}
               >
-                <Icon name="code" size={11} /> Panneau
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="3" y="4" width="18" height="16" rx="2"/>
+                  <line x1="15" y1="4" x2="15" y2="20"/>
+                  <path d="M18 9l3 3-3 3"/>
+                </svg>
               </button>
             )}
           </div>

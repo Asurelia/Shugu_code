@@ -161,17 +161,12 @@ export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettin
       <button className="tb-action" title="History"><Icon name="history" size={15}/></button>
       {/* TODO(Pass 2): wire to command */}
       <button className="tb-action" title="Notifications"><Icon name="bell" size={15}/></button>
-      <button className="tb-action" title="Settings" onClick={onSettings}><Icon name="gear" size={15}/></button>
-      <button className="tb-avatar" title="Account" onClick={onAvatar}>
-        <span>VU</span>
-        <span className="online"></span>
-      </button>
     </div>
   );
 }
 
 // ── Activity Rail ───────────────────────────────────────────
-export function Rail({ view, setView }: any) {
+export function Rail({ view, setView, onAvatar }: any) {
   const items = [
     { id: "chat",    icon: "chat",    label: "Chat" },
     { id: "code",    icon: "code",    label: "Editor" },
@@ -205,7 +200,7 @@ export function Rail({ view, setView }: any) {
           <Icon name="gear" size={18}/>
           <span className="rail-tip">Settings</span>
         </button>
-        <div className="rail-avatar" title="Account">SH</div>
+        <button className="rail-avatar" aria-label="Account" title="Account" onClick={onAvatar}>SH</button>
       </div>
     </nav>
   );

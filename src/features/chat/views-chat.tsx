@@ -657,8 +657,8 @@ export function ChatView({
               <span className="sep">·</span>
               <span className="path">{splitFile}</span>
               <span style={{ flex: 1 }} />
-              <button className="lgb lgb-sm" onClick={openFullEditor} title="Ouvrir en plein écran">
-                <Icon name="code" size={11} /> Plein écran
+              <button className="lgb lgb-sm" onClick={openFullEditor} aria-label="Ouvrir en plein écran" title="Ouvrir en plein écran">
+                <Icon name="code" size={13} />
               </button>
               <button className="split-close" onClick={closeSplit} title="Fermer le split">
                 <Icon name="x" size={12} />
