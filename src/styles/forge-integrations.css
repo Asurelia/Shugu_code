@@ -5,6 +5,22 @@
    Celestial Veil tokens only — no new color/font tokens.
    ============================================================ */
 
+/* ── Cockpit right panel — opaque surface ─────────────────────
+   Prevents chat text from bleeding through the right panel and its surfaces.
+   Uses --surface-container-low (same as the side panels in the main IDE). */
+.cockpit-right {
+  background: var(--surface-container-low, #12121e);
+}
+/* Tab bar header: subtly distinct shade so it reads as a toolbar. */
+.cockpit-right-tabs {
+  background: var(--surface-container, #16162a);
+}
+/* Surface host wrapper: explicit opaque fill so every surface (editor,
+   review, terminal, files, browser) sits on a solid base, not on chat. */
+.cockpit-right > div:last-child {
+  background: var(--surface-container-low, #12121e);
+}
+
 /* ── Cockpit right-panel toggle ───────────────────────────────
    Icon-only ghost button — mirrors the titlebar's tb-side-toggle style
    but floats inside the chat pane (position:absolute from CockpitShell).

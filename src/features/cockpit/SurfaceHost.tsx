@@ -36,7 +36,7 @@ export function SurfaceHost({ active }: { active: SurfaceId }) {
   const has = (id: SurfaceId) => opened.current.has(id);
 
   return (
-    <div style={{ position: "relative", flex: 1, minHeight: 0 }}>
+    <div style={{ position: "relative", flex: 1, minHeight: 0, background: "var(--surface-container-low, #12121e)" }}>
       {has("editor") && (
         <SurfaceFill visible={active === "editor"}>
           <CodeView

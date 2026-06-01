@@ -132,7 +132,7 @@ export function CockpitShell({ activeConv }: { activeConv: string }) {
           onCollapse={() => setRightPanelOpen(false)}
           onExpand={() => setRightPanelOpen(true)}
         >
-          <RightPanel active={layout.activeSurface} />
+          <RightPanel />
         </Panel>
       </PanelGroup>
     </div>

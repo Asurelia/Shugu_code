@@ -45,13 +45,37 @@ export function setRightPanelOpen(open: boolean): void {
   write({ ...read(), rightPanelOpen: open });
 }
 
-/** Open the right panel AND focus a surface (used by the "+"-menu / toggle). */
+/** Open the right panel AND focus a surface. Adds `id` to openedSurfaces if
+ *  not already present (used by the "+"-menu, titlebar toggle, and file-pick). */
 export function openSurface(id: SurfaceId): void {
-  write({ ...read(), rightPanelOpen: true, activeSurface: id });
+  const current = read();
+  const opened = current.openedSurfaces.includes(id)
+    ? current.openedSurfaces
+    : [...current.openedSurfaces, id];
+  write({ ...current, rightPanelOpen: true, activeSurface: id, openedSurfaces: opened });
 }
 
+/** Remove `id` from openedSurfaces. If it was active, move to the last
+ *  remaining opened surface. Never allows openedSurfaces to become empty. */
+export function closeSurface(id: SurfaceId): void {
+  const current = read();
+  const remaining = current.openedSurfaces.filter((s) => s !== id);
+  if (remaining.length === 0) return; // Guard: keep at least 1 tab.
+  const activeSurface =
+    current.activeSurface === id
+      ? remaining[remaining.length - 1]
+      : current.activeSurface;
+  write({ ...current, openedSurfaces: remaining, activeSurface });
+}
+
+/** Make `id` the active surface. Adds it to openedSurfaces if missing
+ *  (e.g. file-pick in the Files surface triggers setActiveSurface("editor")). */
 export function setActiveSurface(id: SurfaceId): void {
-  write({ ...read(), activeSurface: id });
+  const current = read();
+  const opened = current.openedSurfaces.includes(id)
+    ? current.openedSurfaces
+    : [...current.openedSurfaces, id];
+  write({ ...current, activeSurface: id, openedSurfaces: opened });
 }
 
 export function setSizes(sizes: [number, number]): void {
