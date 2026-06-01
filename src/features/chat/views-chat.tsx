@@ -35,6 +35,8 @@ import { useGitBranches } from "@/features/git/queries";
 import { useWorkspaceChanges } from "@/features/git/useWorkspaceChanges";
 import { fsGetWorkspaceRoot } from "@/lib/fs";
 import { fsKeys } from "@/features/fs/keys";
+import { CommentTray } from "@/features/cockpit/CommentTray";
+import { getComments, clearComments } from "@/features/cockpit/commentStore";
 import type { Message, MessageAction } from "@/lib/types";
 
 type ImageResult = {
@@ -220,6 +222,24 @@ export function ChatView({
       editorCtx = { path: activeFile, content: fileContents[activeFile].text, selection: sel };
     }
 
+    // C2.4 — inline comments from the Révision diff. Read at send time so any
+    // note added after the last keystroke is captured. The block is appended to
+    // `text` (same message slot) so it travels through the normal send path
+    // without touching sendChatMessage's signature or the editorCtx structure.
+    // GATED: only built when comments exist → the no-comments path is identical
+    // to today (no extra string, no different code branch reached).
+    const pendingComments = getComments();
+    let finalText = text;
+    if (pendingComments.length > 0) {
+      const block = [
+        "",
+        "---",
+        "Commentaires inline (Révision diff) :",
+        ...pendingComments.map((c) => `- ${c.path}:${c.line} — ${c.note}   (\`${c.snippet}\`)`),
+      ].join("\n");
+      finalText = text ? `${text}${block}` : block.trimStart();
+    }
+
     setInput("");
     const imageToSend = pendingImage;
     setPendingImage(null);
@@ -228,12 +248,15 @@ export function ChatView({
     try {
       await sendChatMessage(
         activeConv,
-        text,
+        finalText,
         model,
         imageToSend ?? undefined,
         agentDefPath,
         editorCtx,
       );
+      // Clear ONLY after dispatch succeeds — if sendChatMessage throws, the
+      // comments are preserved so the user can retry without losing their notes.
+      if (pendingComments.length > 0) clearComments();
     } finally {
       setTyping(false);
       chatStream.stop();
@@ -335,6 +358,10 @@ export function ChatView({
 
   const composer = (
     <>
+      {/* C2.4 — pending inline comments tray. Returns null when empty (no-comments
+          path unchanged). Visible only when the user has queued notes from the
+          Révision diff, independently of the cockpit flag. */}
+      <CommentTray />
       <div className="cx-composer" style={{ position: "relative" }}>
         {slashOpen && (
           <div

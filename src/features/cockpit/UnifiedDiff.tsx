@@ -12,7 +12,7 @@
 //   - Side-by-side vs. unified toggle.
 //   - Per-hunk stage/revert controls.
 
-import React, { useMemo } from "react";
+import React, { useMemo, useState } from "react";
 
 // ---------------------------------------------------------------------------
 // Parser
@@ -180,10 +180,231 @@ interface UnifiedDiffProps {
    * are not jump targets.
    */
   onRevealLine?: (newLine: number) => void;
+  /**
+   * C2.4 — called when the user submits an inline note on a diff line.
+   * Only fired for lines that have a new-side line number (add + context).
+   * @param line     1-based new-file line number
+   * @param snippet  trimmed line text (without diff +/- gutter marker)
+   * @param note     user-typed note
+   */
+  onAddComment?: (line: number, snippet: string, note: string) => void;
 }
 
-export function UnifiedDiff({ text, onRevealLine }: UnifiedDiffProps): JSX.Element {
+// ---------------------------------------------------------------------------
+// Inline comment input (tiny floating form per line)
+// ---------------------------------------------------------------------------
+
+interface InlineNoteInputProps {
+  onSubmit: (note: string) => void;
+  onCancel: () => void;
+}
+
+function InlineNoteInput({ onSubmit, onCancel }: InlineNoteInputProps): JSX.Element {
+  const [note, setNote] = useState("");
+  return (
+    <div
+      onClick={(e) => e.stopPropagation()}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 4,
+        background: "rgba(20,16,38,0.97)",
+        border: "1px solid rgba(var(--primary-rgb,130,100,255),0.35)",
+        borderRadius: 6,
+        padding: "3px 6px",
+        marginLeft: 8,
+        flexShrink: 0,
+        maxWidth: 320,
+        boxShadow: "0 4px 16px -4px rgba(0,0,0,0.6)",
+      }}
+    >
+      <input
+        autoFocus
+        value={note}
+        onChange={(e) => setNote(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            if (note.trim()) onSubmit(note.trim());
+          }
+          if (e.key === "Escape") {
+            e.preventDefault();
+            onCancel();
+          }
+        }}
+        placeholder="Note à l'agent… (↵ envoyer)"
+        style={{
+          background: "transparent",
+          border: "none",
+          outline: "none",
+          color: "var(--on-surface)",
+          fontFamily: "var(--font-mono)",
+          fontSize: 10,
+          width: 200,
+          padding: "1px 2px",
+        }}
+      />
+      <button
+        type="button"
+        disabled={!note.trim()}
+        onClick={() => { if (note.trim()) onSubmit(note.trim()); }}
+        style={{
+          background: "rgba(var(--primary-rgb,130,100,255),0.25)",
+          border: "1px solid rgba(var(--primary-rgb,130,100,255),0.4)",
+          borderRadius: 4,
+          color: "var(--primary)",
+          cursor: note.trim() ? "pointer" : "default",
+          fontSize: 9,
+          padding: "1px 6px",
+          lineHeight: "16px",
+          opacity: note.trim() ? 1 : 0.4,
+        }}
+      >
+        OK
+      </button>
+      <button
+        type="button"
+        onClick={onCancel}
+        style={{
+          background: "none",
+          border: "none",
+          cursor: "pointer",
+          color: "var(--on-surface-muted)",
+          fontSize: 11,
+          lineHeight: 1,
+          padding: "0 2px",
+        }}
+      >
+        ×
+      </button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// DiffLineRow — one line of the diff, with hover-visible comment affordance
+// ---------------------------------------------------------------------------
+
+interface DiffLineRowProps {
+  line: DiffLine;
+  isTarget: boolean;
+  isCommentable: boolean;
+  noteKey: string;
+  openNoteKey: string | null;
+  setOpenNoteKey: (k: string | null) => void;
+  onRevealLine?: (n: number) => void;
+  onAddComment?: (line: number, snippet: string, note: string) => void;
+}
+
+function DiffLineRow({
+  line,
+  isTarget,
+  isCommentable,
+  noteKey,
+  openNoteKey,
+  setOpenNoteKey,
+  onRevealLine,
+  onAddComment,
+}: DiffLineRowProps): JSX.Element {
+  const [hovered, setHovered] = useState(false);
+  const noteOpen = openNoteKey === noteKey;
+
+  return (
+    <div
+      onClick={isTarget ? (e) => {
+        if (e.ctrlKey || e.metaKey) {
+          e.preventDefault();
+          onRevealLine!(line.newLine!);
+        }
+      } : undefined}
+      title={isTarget ? "Ctrl+clic → ouvrir dans l'éditeur à cette ligne" : undefined}
+      onMouseEnter={isCommentable ? () => setHovered(true) : undefined}
+      onMouseLeave={isCommentable ? () => setHovered(false) : undefined}
+      style={{
+        display: "flex",
+        alignItems: "baseline",
+        minHeight: 18,
+        cursor: isTarget ? "pointer" : undefined,
+        position: "relative",
+        ...kindStyle[line.kind],
+      }}
+    >
+      <LineNum n={line.oldLine} />
+      <LineNum n={line.newLine} />
+      {/* +/- gutter indicator */}
+      <span
+        style={{
+          width: 14,
+          minWidth: 14,
+          textAlign: "center",
+          userSelect: "none",
+          flexShrink: 0,
+          color: line.kind === "add" ? "var(--success)" : line.kind === "remove" ? "var(--danger)" : "transparent",
+        }}
+      >
+        {line.kind === "add" ? "+" : line.kind === "remove" ? "−" : " "}
+      </span>
+      <span
+        style={{
+          flex: 1,
+          whiteSpace: "pre",
+          paddingRight: 16,
+          overflowX: "auto",
+        }}
+      >
+        {line.text}
+      </span>
+      {/* C2.4 — comment affordance */}
+      {isCommentable && (
+        noteOpen ? (
+          <InlineNoteInput
+            onSubmit={(note) => {
+              onAddComment!(line.newLine!, line.text.trim(), note);
+              setOpenNoteKey(null);
+              setHovered(false);
+            }}
+            onCancel={() => { setOpenNoteKey(null); setHovered(false); }}
+          />
+        ) : (
+          <button
+            type="button"
+            title="Ajouter une note à l'agent pour cette ligne"
+            onClick={(e) => {
+              e.stopPropagation();
+              setOpenNoteKey(noteKey);
+            }}
+            style={{
+              flexShrink: 0,
+              marginRight: 8,
+              padding: "0 5px",
+              height: 14,
+              lineHeight: "13px",
+              fontSize: 10,
+              fontWeight: 700,
+              borderRadius: 4,
+              border: "1px solid rgba(var(--primary-rgb,130,100,255),0.4)",
+              background: "rgba(var(--primary-rgb,130,100,255),0.18)",
+              color: "var(--primary)",
+              cursor: "pointer",
+              // Shown only on row hover — avoids cluttering the diff view.
+              opacity: hovered ? 1 : 0,
+              pointerEvents: hovered ? "auto" : "none",
+              transition: "opacity 0.1s",
+            }}
+          >
+            +
+          </button>
+        )
+      )}
+    </div>
+  );
+}
+
+export function UnifiedDiff({ text, onRevealLine, onAddComment }: UnifiedDiffProps): JSX.Element {
   const parsed = useMemo(() => parseDiff(text), [text]);
+  // C2.4 — track which line has an open note input (null = none open).
+  // Key is `hunkIndex:lineIndex` — stable for the lifetime of this render.
+  const [openNoteKey, setOpenNoteKey] = useState<string | null>(null);
 
   if (parsed.isBinary) {
     return (
@@ -237,50 +458,22 @@ export function UnifiedDiff({ text, onRevealLine }: UnifiedDiffProps): JSX.Eleme
             // onRevealLine is wired (cockpit context). Pure-removed lines
             // (newLine === null) have no position in the new file → skip.
             const isTarget = onRevealLine != null && line.newLine !== null;
+            // C2.4 — a line is a comment target if onAddComment is wired AND
+            // it has a new-side line number (add + context lines only).
+            const isCommentable = onAddComment != null && line.newLine !== null;
+            const noteKey = `${hi}:${li}`;
             return (
-            <div
-              key={li}
-              onClick={isTarget ? (e) => {
-                if (e.ctrlKey || e.metaKey) {
-                  e.preventDefault();
-                  onRevealLine!(line.newLine!);
-                }
-              } : undefined}
-              title={isTarget ? "Ctrl+clic → ouvrir dans l'éditeur à cette ligne" : undefined}
-              style={{
-                display: "flex",
-                alignItems: "baseline",
-                minHeight: 18,
-                cursor: isTarget ? "pointer" : undefined,
-                ...kindStyle[line.kind],
-              }}
-            >
-              <LineNum n={line.oldLine} />
-              <LineNum n={line.newLine} />
-              {/* +/- gutter indicator */}
-              <span
-                style={{
-                  width: 14,
-                  minWidth: 14,
-                  textAlign: "center",
-                  userSelect: "none",
-                  flexShrink: 0,
-                  color: line.kind === "add" ? "var(--success)" : line.kind === "remove" ? "var(--danger)" : "transparent",
-                }}
-              >
-                {line.kind === "add" ? "+" : line.kind === "remove" ? "−" : " "}
-              </span>
-              <span
-                style={{
-                  flex: 1,
-                  whiteSpace: "pre",
-                  paddingRight: 16,
-                  overflowX: "auto",
-                }}
-              >
-                {line.text}
-              </span>
-            </div>
+              <DiffLineRow
+                key={li}
+                line={line}
+                isTarget={isTarget}
+                isCommentable={isCommentable}
+                noteKey={noteKey}
+                openNoteKey={openNoteKey}
+                setOpenNoteKey={setOpenNoteKey}
+                onRevealLine={onRevealLine}
+                onAddComment={onAddComment}
+              />
             );
           })}
         </div>

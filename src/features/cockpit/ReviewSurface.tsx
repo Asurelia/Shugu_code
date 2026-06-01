@@ -26,6 +26,7 @@ import { setActiveSurface } from "./layoutStore";
 import { useShell } from "@/routes/shell-context";
 import { UnifiedDiff } from "./UnifiedDiff";
 import { requestReveal } from "./revealStore";
+import { addComment } from "./commentStore";
 import type { DiffSource, GitFileStatus } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -477,10 +478,12 @@ function DiffPane({
   path,
   vs,
   onRevealLine,
+  onAddComment,
 }: {
   path: string | null;
   vs: DiffSource;
   onRevealLine?: (line: number) => void;
+  onAddComment?: (line: number, snippet: string, note: string) => void;
 }): JSX.Element {
   const { data: diff, isLoading, isError } = useGitDiff(path, vs);
 
@@ -585,7 +588,7 @@ function DiffPane({
             </div>
           ) : (
             <div style={{ position: "relative", minHeight: "100%" }}>
-              <UnifiedDiff text={diff} onRevealLine={onRevealLine} />
+              <UnifiedDiff text={diff} onRevealLine={onRevealLine} onAddComment={onAddComment} />
             </div>
           )
         )}
@@ -732,7 +735,15 @@ export function ReviewSurface(): JSX.Element {
           onOpenFile={handleOpenFile}
           onDiscard={(path) => setConfirmDiscard(path)}
         />
-        <DiffPane path={selectedPath} vs={vs} onRevealLine={handleRevealLine} />
+        <DiffPane
+          path={selectedPath}
+          vs={vs}
+          onRevealLine={handleRevealLine}
+          onAddComment={(line, snippet, note) => {
+            if (!selectedPath) return;
+            addComment({ path: selectedPath, line, snippet, note });
+          }}
+        />
       </div>
 
       {/* Discard confirmation modal */}
