@@ -59,6 +59,7 @@ export function Icon({ name, size = 18, className = "" }: { name: string; size?:
     case "check":  return p(<><path d="M20 6 9 17l-5-5"/></>);
     case "chevron-left":  return p(<><path d="m15 18-6-6 6-6"/></>);
     case "chevron-right": return p(<><path d="m9 18 6-6-6-6"/></>);
+    case "list":   return p(<><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></>);
     default: return p(<circle cx="12" cy="12" r="6"/>);
   }
 }

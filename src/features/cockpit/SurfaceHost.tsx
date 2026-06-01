@@ -47,6 +47,7 @@ export function SurfaceHost({ active }: { active: SurfaceId }) {
             fileContents={shell.fileContents}
             setFileContents={shell.setFileContents}
             editorViewRef={shell.editorViewRef}
+            embedded
           />
         </SurfaceFill>
       )}

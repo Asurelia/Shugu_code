@@ -23,6 +23,9 @@ interface OutlinePanelProps {
   editorHandle: RefObject<CodeMirrorEditorHandle> | undefined;
   /** Path du fichier actif (utilisé comme cache key). */
   filePath: string | null;
+  /** Callback optionnel appelé après chaque navigation vers un symbole.
+   *  Utilisé en mode embedded pour fermer la bulle outline. */
+  onNavigate?: () => void;
 }
 
 /**
@@ -104,7 +107,7 @@ const COLOR_FOR_KIND: Record<SymbolKind, string> = {
   mutation: "var(--secondary)", // pink — write
 };
 
-export function OutlinePanel({ editorHandle, filePath }: OutlinePanelProps) {
+export function OutlinePanel({ editorHandle, filePath, onNavigate }: OutlinePanelProps) {
   const view = useEditorView(editorHandle, filePath);
   const docVersion = useDocVersion(editorHandle);
   const { data: symbols } = useOutline(filePath, docVersion, view?.state ?? null);
@@ -132,6 +135,7 @@ export function OutlinePanel({ editorHandle, filePath }: OutlinePanelProps) {
       scrollIntoView: true,
     });
     view.focus();
+    onNavigate?.();
   };
 
   return (

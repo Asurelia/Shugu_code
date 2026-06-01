@@ -1680,6 +1680,89 @@ body {
   text-overflow: ellipsis;
 }
 
+/* ── Cockpit embedded editor — slim tabs + outline bubble ─────
+   .ide-tabs--embedded : réduit le poids visuel des onglets fichiers
+   dans le cockpit (hauteur + fond plus léger) pour qu'ils ne
+   doublent pas visuellement les surface-tabs du panneau droit.
+   .outline-bubble-toggle : bouton icône flottant en haut à droite
+   de .ide-editor (position:absolute, ancré au coin top-right).
+   .outline-bubble-card : carte flottante (overlay) qui s'affiche
+   sous le bouton — ne pousse pas le layout (position:absolute). */
+
+.ide-tabs--embedded {
+  height: 30px;
+  background: rgba(10, 10, 18, 0.3);
+  border-bottom-color: rgba(255, 255, 255, 0.03);
+}
+.ide-tabs--embedded .ide-tab {
+  height: 22px;
+  font-size: 11px;
+  color: var(--on-surface-muted);
+  margin-top: 4px;
+}
+.ide-tabs--embedded .ide-tab.active {
+  color: var(--on-surface-variant);
+  background: rgba(7, 7, 16, 0.6);
+}
+.ide-tabs--embedded .ide-tab.active::after {
+  background: linear-gradient(90deg, var(--primary), var(--secondary));
+  opacity: 0.6;
+}
+
+/* Toggle button — anchored top-right inside .ide-editor (position:relative). */
+.outline-bubble-toggle {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  z-index: 120;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(10, 10, 18, 0.6);
+  color: var(--on-surface-muted);
+  cursor: pointer;
+  transition: color 140ms ease, background 140ms ease, border-color 140ms ease;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+.outline-bubble-toggle:hover,
+.outline-bubble-toggle[aria-pressed="true"] {
+  color: var(--primary);
+  background: rgba(224, 142, 254, 0.1);
+  border-color: rgba(224, 142, 254, 0.3);
+}
+
+/* Floating outline card — overlays the editor, does NOT shift layout. */
+.outline-bubble-card {
+  position: absolute;
+  top: 44px;  /* just below the toggle button */
+  right: 10px;
+  z-index: 120;
+  width: 220px;
+  max-height: 50%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: var(--surface-container-high);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(224, 142, 254, 0.06);
+  backdrop-filter: blur(16px) saturate(1.4);
+  -webkit-backdrop-filter: blur(16px) saturate(1.4);
+}
+/* Override the outline-panel's default left-border (comes from its own CSS)
+   since the card already has a full border + rounded corners. */
+.outline-bubble-card .outline-panel {
+  border-left: none;
+  border-radius: inherit;
+  max-height: 100%;
+  overflow-y: auto;
+}
+
 /* ── Find panel (LOT 2.1) ─────────────────────────────────────
    Overlay flottant centré sur la fenêtre, ressemble à VS Code
    Cmd+Shift+F mais avec la charte Veil. Couvre le contenu IDE

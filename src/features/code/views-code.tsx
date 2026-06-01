@@ -1,7 +1,7 @@
 // Shugu Forge — Code IDE / Files / Agents / Gallery / Settings dispatcher
 // Ported from views-code.jsx. CodeMirror moved to CodeMirrorEditor.tsx (ESM npm).
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { Icon } from "@/components/components";
 import { CodeMirrorEditor } from "./CodeMirrorEditor";
 import { Breadcrumbs } from "./Breadcrumbs";
@@ -26,7 +26,10 @@ import { InlineEditWidget } from "./ai-edit/InlineEditWidget";
 import { useApplyRunner } from "./ai-edit/applyController";
 
 // ─── Code view (editor + tabs + statusbar) ──────────────────
-export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, fileContents, setFileContents, editorViewRef }: any) {
+export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, fileContents, setFileContents, editorViewRef, embedded }: any) {
+  // embedded?: boolean — passed by SurfaceHost (cockpit editor surface) to strip
+  // the statusbar, hide the fixed outline column (replace with floating bubble),
+  // and force minimap off. The /code route passes nothing → false → unchanged.
   // LOT 1 — read wordWrap from ShellContext (the source of truth for editor prefs).
   // useShell() is safe here: CodeView is rendered inside the <Outlet> which is
   // inside <ShellContext.Provider> in RootLayout.tsx.
@@ -53,6 +56,21 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
   // Reset the ref when the active file changes to avoid cross-tab false positives.
   const prevDirtyRef = useRef<boolean | undefined>(undefined);
   const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // embedded mode — outline bubble state (default closed).
+  const [outlineBubbleOpen, setOutlineBubbleOpen] = useState(false);
+  const closeOutlineBubble = useCallback(() => setOutlineBubbleOpen(false), []);
+
+  // Esc key closes the outline bubble in embedded mode. Listener is only
+  // attached when the bubble is actually open, to avoid a global leak.
+  useEffect(() => {
+    if (!embedded || !outlineBubbleOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOutlineBubbleOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [embedded, outlineBubbleOpen]);
 
   const activeDirty = fileContents[activeFile]?.dirty;
 
@@ -89,7 +107,7 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
 
   return (
     <div className="ide-shell">
-      <div className="ide-tabs scroll-x">
+      <div className={"ide-tabs scroll-x" + (embedded ? " ide-tabs--embedded" : "")}>
         {openFiles.map((p: string) => {
           const f = fileContents[p] || {};
           return (
@@ -130,7 +148,7 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
                 language={fileContents[activeFile].lang}
                 wordWrap={editorPrefs.wordWrap}
                 stickyScroll={editorPrefs.stickyScroll}
-                minimap={editorPrefs.minimap}
+                minimap={embedded ? false : editorPrefs.minimap}
                 gitHeadOriginal={gitHeadOriginal}
                 gitDecorations={editorPrefs.gitDecorations}
                 blame={blame}
@@ -146,29 +164,59 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
                 Rendu en position:fixed (ancré à la sélection) ; ne rend rien
                 quand la session est idle. */}
             <InlineEditWidget />
+            {/* embedded mode — outline toggle button + floating bubble card.
+                Anchored inside .ide-editor (position:relative), so it overlays
+                the editor without touching .ide-main's flex layout.
+                Non-embedded: nothing rendered here. */}
+            {embedded && (
+              <>
+                <button
+                  className="outline-bubble-toggle"
+                  aria-label="Plan / Outline"
+                  title="Plan / Outline"
+                  onClick={() => setOutlineBubbleOpen(o => !o)}
+                  aria-pressed={outlineBubbleOpen}
+                >
+                  <Icon name="list" size={15} />
+                </button>
+                {outlineBubbleOpen && (
+                  <div className="outline-bubble-card">
+                    <OutlinePanel
+                      editorHandle={editorViewRef}
+                      filePath={activeFile}
+                      onNavigate={closeOutlineBubble}
+                    />
+                  </div>
+                )}
+              </>
+            )}
           </div>
-          <OutlinePanel editorHandle={editorViewRef} filePath={activeFile} />
+          {/* Fixed outline column — only in non-embedded mode (unchanged path). */}
+          {!embedded && <OutlinePanel editorHandle={editorViewRef} filePath={activeFile} />}
         </div>
-        <div className="statusbar">
-          {/* LOT git-ui: live branch switcher (clickable) replaces the hardcoded "main" label. */}
-          <BranchSwitcherCompact />
-          {/* LOT git-ui: live diff stats (file counts) replace the hardcoded "+12 −4". */}
-          <GitDiffStats />
-          <span className="item">UTF-8</span>
-          <span className="item">{activeFile ? (fileContents[activeFile]?.lang || "text") : "—"}</span>
-          {/* Lot B §4 — statut LSP du langage du fichier actif (vide si pas de LSP). */}
-          <LspStatusIndicator activeFile={activeFile} />
-          <span className="spacer"></span>
-          {/* Fix 3: save-state indicator + transient "Saved ✓" flash */}
-          {activeFile && (
-            savedFlash
-              ? <span className="item" style={{color:"var(--success)"}}>Saved ✓</span>
-              : <span className="item">{activeDirty ? "● unsaved" : "saved"}</span>
-          )}
-          <span className="item"><Icon name="shield" size={11}/> Sandbox · trusted</span>
-          <span className="item">Ln 24, Col 18</span>
-          <span className="item" style={{color:"var(--tertiary)"}}>● connected</span>
-        </div>
+        {/* Statusbar — hidden in embedded mode (cockpit panel is already chrome-heavy). */}
+        {!embedded && (
+          <div className="statusbar">
+            {/* LOT git-ui: live branch switcher (clickable) replaces the hardcoded "main" label. */}
+            <BranchSwitcherCompact />
+            {/* LOT git-ui: live diff stats (file counts) replace the hardcoded "+12 −4". */}
+            <GitDiffStats />
+            <span className="item">UTF-8</span>
+            <span className="item">{activeFile ? (fileContents[activeFile]?.lang || "text") : "—"}</span>
+            {/* Lot B §4 — statut LSP du langage du fichier actif (vide si pas de LSP). */}
+            <LspStatusIndicator activeFile={activeFile} />
+            <span className="spacer"></span>
+            {/* Fix 3: save-state indicator + transient "Saved ✓" flash */}
+            {activeFile && (
+              savedFlash
+                ? <span className="item" style={{color:"var(--success)"}}>Saved ✓</span>
+                : <span className="item">{activeDirty ? "● unsaved" : "saved"}</span>
+            )}
+            <span className="item"><Icon name="shield" size={11}/> Sandbox · trusted</span>
+            <span className="item">Ln 24, Col 18</span>
+            <span className="item" style={{color:"var(--tertiary)"}}>● connected</span>
+          </div>
+        )}
       </div>
     </div>
   );
