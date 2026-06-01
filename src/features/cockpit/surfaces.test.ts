@@ -19,9 +19,9 @@ describe("surfaces registry", () => {
     expect(review?.comingSoon).toBeFalsy();
   });
 
-  it("menu marks terminal/files/browser as comingSoon (Lot C4)", () => {
+  it("menu marks terminal/files/browser as available (Lot C4 shipped)", () => {
     for (const id of ["terminal", "files", "browser"] as const) {
-      expect(SURFACE_MENU.find((s) => s.id === id)?.comingSoon).toBe(true);
+      expect(SURFACE_MENU.find((s) => s.id === id)?.comingSoon).toBeFalsy();
     }
   });
 

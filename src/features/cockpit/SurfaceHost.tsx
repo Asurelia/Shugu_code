@@ -9,7 +9,11 @@ import { useShell } from "@/routes/shell-context";
 import { CodeView } from "@/features/code/views-code";
 import { ReviewSurface } from "./ReviewSurface";
 import { SURFACE_META } from "./surfaces";
+import { setActiveSurface } from "./layoutStore";
 import { useRevealRunner } from "./revealStore";
+import { DockTerminal } from "@/features/dock/Dock";
+import { SideFiles } from "@/components/components";
+import { BrowserSurface } from "./BrowserSurface";
 import type { SurfaceId } from "./layout";
 
 function SurfaceFill({ visible, children }: { visible: boolean; children: ReactNode }) {
@@ -51,7 +55,35 @@ export function SurfaceHost({ active }: { active: SurfaceId }) {
           <ReviewSurface />
         </SurfaceFill>
       )}
-      {/* comingSoon surfaces: a single shared "bientôt" panel when one is active. */}
+      {/* Terminal surface — DockTerminal is keep-warm: PTY spawns on first reveal,
+          survives hide/show cycles (display:none guard inside DockTerminal). */}
+      {has("terminal") && (
+        <SurfaceFill visible={active === "terminal"}>
+          <DockTerminal tabId="cockpit-terminal-1" name="Terminal" />
+        </SurfaceFill>
+      )}
+      {/* Files surface — SideFiles tree browser; picking a file opens it in the
+          editor and switches the active surface to "editor". */}
+      {has("files") && (
+        <SurfaceFill visible={active === "files"}>
+          <div style={{ height: "100%", overflowY: "auto" }}>
+            <SideFiles
+              active={shell.activeFile}
+              onPick={(p: string) => {
+                void shell.openFile(p);
+                setActiveSurface("editor");
+              }}
+            />
+          </div>
+        </SurfaceFill>
+      )}
+      {/* Browser surface — minimal URL bar + iframe for localhost / preview URLs. */}
+      {has("browser") && (
+        <SurfaceFill visible={active === "browser"}>
+          <BrowserSurface />
+        </SurfaceFill>
+      )}
+      {/* Fallback for any future comingSoon surface. */}
       {SURFACE_META[active].comingSoon && (
         <SurfaceFill visible>
           <div
@@ -66,7 +98,7 @@ export function SurfaceHost({ active }: { active: SurfaceId }) {
               fontSize: 12,
             }}
           >
-            {SURFACE_META[active].label} — bientôt (Lot Cockpit-4).
+            {SURFACE_META[active].label} — bientôt.
           </div>
         </SurfaceFill>
       )}

@@ -5,7 +5,7 @@
 import { useState } from "react";
 import { Icon } from "@/components/components";
 import { SurfaceHost } from "./SurfaceHost";
-import { SURFACE_MENU, surfaceLabel } from "./surfaces";
+import { SURFACE_MENU } from "./surfaces";
 import { setActiveSurface, openSurface, setRightPanelOpen } from "./layoutStore";
 import type { SurfaceId } from "./layout";
 
@@ -24,14 +24,14 @@ export function RightPanel({ active }: { active: SurfaceId }) {
           borderBottom: "1px solid rgba(255,255,255,0.07)",
         }}
       >
-        {/* Tabs for the two C1 surfaces (editor/review). */}
-        {(["editor", "review"] as SurfaceId[]).map((id) => (
+        {/* Tabs for all available (non-comingSoon) surfaces. */}
+        {SURFACE_MENU.filter((s) => !s.comingSoon).map((s) => (
           <button
-            key={id}
-            className={"lgb lgb-sm" + (active === id ? " lgb-primary" : "")}
-            onClick={() => setActiveSurface(id)}
+            key={s.id}
+            className={"lgb lgb-sm" + (active === s.id ? " lgb-primary" : "")}
+            onClick={() => setActiveSurface(s.id)}
           >
-            {surfaceLabel(id)}
+            {s.label}
           </button>
         ))}
 
