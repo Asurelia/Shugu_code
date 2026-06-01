@@ -103,14 +103,20 @@ export function CockpitShell({ activeConv }: { activeConv: string }) {
         }}
       >
         <Panel id="cockpit-chat" order={1} minSize={30} defaultSize={layout.sizes[0]}>
-          {/* disableSplit: suppress the old in-chat split — the right panel IS
-              the editor surface in the cockpit. Opening a file routes only to
-              the right-panel Éditeur surface, never to the in-chat split. */}
-          <ChatView
-            activeConv={activeConv}
-            onOpenSnippet={shell.openSnippetInEditor}
-            disableSplit
-          />
+          {/* position:relative + overflow:hidden is REQUIRED here: ChatView's
+              root `.cx` is `position:absolute; inset:0`, so without a positioned
+              wrapper it fills the whole `.cockpit` instead of this panel — the
+              chat would overflow full-width under the right panel. This wrapper
+              confines the chat to its panel so the split actually shrinks it.
+              disableSplit: suppress the old in-chat split — the right panel IS
+              the editor surface in the cockpit. */}
+          <div style={{ position: "relative", height: "100%", overflow: "hidden" }}>
+            <ChatView
+              activeConv={activeConv}
+              onOpenSnippet={shell.openSnippetInEditor}
+              disableSplit
+            />
+          </div>
         </Panel>
 
         <PanelResizeHandle className="dock-rrp-handle v" />
