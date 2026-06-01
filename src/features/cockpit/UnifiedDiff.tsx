@@ -173,9 +173,16 @@ function HunkHeader({ text }: { text: string }) {
 interface UnifiedDiffProps {
   /** Raw unified-diff text from `useGitDiff`. */
   text: string;
+  /**
+   * C2.2 — called when the user Ctrl/Cmd+clicks a diff line that has a
+   * new-side line number (add or context lines). Receives the 1-based line
+   * number in the new version of the file. Pure-removed lines (newLine === null)
+   * are not jump targets.
+   */
+  onRevealLine?: (newLine: number) => void;
 }
 
-export function UnifiedDiff({ text }: UnifiedDiffProps): JSX.Element {
+export function UnifiedDiff({ text, onRevealLine }: UnifiedDiffProps): JSX.Element {
   const parsed = useMemo(() => parseDiff(text), [text]);
 
   if (parsed.isBinary) {
@@ -225,13 +232,26 @@ export function UnifiedDiff({ text }: UnifiedDiffProps): JSX.Element {
       {parsed.hunks.map((hunk, hi) => (
         <div key={hi} data-hunk={hi}>
           <HunkHeader text={hunk.header} />
-          {hunk.lines.map((line, li) => (
+          {hunk.lines.map((line, li) => {
+            // C2.2 — a line is a jump target if it has a new-side number AND
+            // onRevealLine is wired (cockpit context). Pure-removed lines
+            // (newLine === null) have no position in the new file → skip.
+            const isTarget = onRevealLine != null && line.newLine !== null;
+            return (
             <div
               key={li}
+              onClick={isTarget ? (e) => {
+                if (e.ctrlKey || e.metaKey) {
+                  e.preventDefault();
+                  onRevealLine!(line.newLine!);
+                }
+              } : undefined}
+              title={isTarget ? "Ctrl+clic → ouvrir dans l'éditeur à cette ligne" : undefined}
               style={{
                 display: "flex",
                 alignItems: "baseline",
                 minHeight: 18,
+                cursor: isTarget ? "pointer" : undefined,
                 ...kindStyle[line.kind],
               }}
             >
@@ -261,7 +281,8 @@ export function UnifiedDiff({ text }: UnifiedDiffProps): JSX.Element {
                 {line.text}
               </span>
             </div>
-          ))}
+            );
+          })}
         </div>
       ))}
     </div>

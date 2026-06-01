@@ -22,6 +22,7 @@ import { useIsGitRepo, useGitStatus, useGitDiff } from "@/features/git/queries";
 import { setActiveSurface } from "./layoutStore";
 import { useShell } from "@/routes/shell-context";
 import { UnifiedDiff } from "./UnifiedDiff";
+import { requestReveal } from "./revealStore";
 import type { GitFileStatus } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -195,7 +196,7 @@ function FileList({ files, selected, onSelect, onOpenFile }: FileListProps): JSX
 // DiffPane — fetches + renders the diff for the selected file
 // ---------------------------------------------------------------------------
 
-function DiffPane({ path }: { path: string | null }): JSX.Element {
+function DiffPane({ path, onRevealLine }: { path: string | null; onRevealLine?: (line: number) => void }): JSX.Element {
   // NOTE: vs="head" = diff_tree_to_workdir_with_index (HEAD vs working tree,
   // index included) — i.e. ALL uncommitted changes (staged + unstaged). This is
   // the correct default "modifications non-commitées" scope (matches Codex) and
@@ -304,7 +305,7 @@ function DiffPane({ path }: { path: string | null }): JSX.Element {
             </div>
           ) : (
             <div style={{ position: "relative", minHeight: "100%" }}>
-              <UnifiedDiff text={diff} />
+              <UnifiedDiff text={diff} onRevealLine={onRevealLine} />
             </div>
           )
         )}
@@ -342,6 +343,20 @@ export function ReviewSurface(): JSX.Element {
   const handleOpenFile = (path: string) => {
     void openFile(path)
       .then(() => setActiveSurface("editor"))
+      .catch(() => {});
+  };
+
+  // C2.2 — Ctrl/Cmd+click on a diff line: open the file in the editor surface
+  // at the clicked line. openFile is async (disk read + CodeMirror remount);
+  // useRevealRunner (in SurfaceHost) polls until the view is ready before
+  // dispatching the cursor + scroll.
+  const handleRevealLine = (line: number) => {
+    if (!selectedPath) return;
+    void openFile(selectedPath)
+      .then(() => {
+        setActiveSurface("editor");
+        requestReveal({ path: selectedPath, line });
+      })
       .catch(() => {});
   };
 
@@ -428,7 +443,7 @@ export function ReviewSurface(): JSX.Element {
         onSelect={setSelectedPath}
         onOpenFile={handleOpenFile}
       />
-      <DiffPane path={selectedPath} />
+      <DiffPane path={selectedPath} onRevealLine={handleRevealLine} />
     </div>
   );
 }

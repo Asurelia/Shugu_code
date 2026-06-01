@@ -9,6 +9,7 @@ import { useShell } from "@/routes/shell-context";
 import { CodeView } from "@/features/code/views-code";
 import { ReviewSurface } from "./ReviewSurface";
 import { SURFACE_META } from "./surfaces";
+import { useRevealRunner } from "./revealStore";
 import type { SurfaceId } from "./layout";
 
 function SurfaceFill({ visible, children }: { visible: boolean; children: ReactNode }) {
@@ -21,6 +22,9 @@ function SurfaceFill({ visible, children }: { visible: boolean; children: ReactN
 
 export function SurfaceHost({ active }: { active: SurfaceId }) {
   const shell = useShell();
+  // C2.2 — run the reveal-runner: waits for the target file's CodeMirror view
+  // to be mounted + loaded, then jumps the cursor to the requested line.
+  useRevealRunner(shell.editorViewRef, shell.activeFile, shell.fileContents);
   // Track which surfaces have been opened at least once (keep-warm set).
   const opened = useRef<Set<SurfaceId>>(new Set());
   opened.current.add(active);
