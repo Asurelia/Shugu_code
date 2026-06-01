@@ -128,16 +128,59 @@ du panneau droit + **`+`-menu** ; (3) les **gouttières du diff** (commentaire +
     ouvre le panneau.
   - C-4 : terminal en bas **et** en onglet droit ; Fichiers + Navigateur comme surfaces.
 
-## Risques / points ouverts (à figer au writing-plans)
+## Décisions techniques (tranchées)
 
-- **Stratégie de montage keep-warm vs unmount** (perf webview Tauri) : quelles surfaces restent chaudes
-  (éditeur + terminal), lesquelles lazy (navigateur, fichiers). Budget explicite, pas « tout monté ».
-- **Où vit l'état de layout** : store TanStack vs `ShellContext` ; **persistance par workspace** (tailles,
-  surface active, panneau ouvert).
-- **Routing** : le cockpit devient la route par défaut ; destinations (image/studio/gallery/settings) en
-  routes séparées via le rail. Vérifier que `Rail` / palette de commandes / keybindings continuent.
-- **Terminal partagé** : une seule instance `Dock` pour bas **et** droite, ou deux instances (PTY
-  partagé ?).
-- **Forme du commentaire de ligne** (`+`) : structure du message de suivi pré-rempli (chemin + lignes).
-- **Migration progressive** : garder `/code` et `/chat` fonctionnels derrière un *feature flag cockpit*
-  pendant la transition (éviter un big-bang qui casse l'app le temps du refactor).
+Ces points étaient ouverts ; ils sont **tranchés** ci-dessous — ancrés dans le code existant + bonnes
+pratiques vérifiées (l'utilisateur a délégué « fais au mieux »). Le détail d'implémentation final se fige
+au writing-plans, mais la **direction** est arrêtée.
+
+### Montage des surfaces — keep-warm ciblé (pas « tout monté »)
+- **Montage à la 1ʳᵉ ouverture**, puis on garde **chaudes** (visibilité CSS, **jamais** d'unmount React
+  tant que le cockpit vit) les surfaces **à état lourd** : **Éditeur** (CodeMirror — scroll, curseur,
+  historique undo, folds) et **Terminal** (xterm + PTY).
+- **Lazy + démontables** : **Navigateur** (`preview://` — webview lourde, on rend la mémoire à la
+  fermeture) et **Fichiers** (remontage bon marché).
+- Cohérent avec ta philosophie Dock actuelle : les PTY survivent déjà à l'unmount côté backend
+  (`term_kill` seulement à la fermeture intentionnelle, reattach via `term_snapshot` —
+  [Dock.tsx:78-83](../../../src/features/dock/Dock.tsx)).
+
+### État de layout — store TanStack, persisté SQLite (LOCAL-FIRST)
+- L'état réactif (panneau ouvert, surface active, tailles) vit dans un **petit store TanStack dédié** —
+  **pas** dans `ShellContext`. Raison : le resize est haute-fréquence ; dans `ShellContext` il re-rendrait
+  **tous** les consumers `useShell` (footgun déjà combattu dans RootLayout via `fileContentsRef` +
+  callbacks stables). Conforme « TanStack par défaut ».
+- **Persistance par workspace** via `db.settings` (SQLite), debouncée — **exactement le pattern
+  `ide-state`** ([ide-state.ts](../../../src/lib/ide-state.ts)) : LOCAL-FIRST, survit aux fenêtres (IDE +
+  mascotte), dans `shugu.db`. Clé `ide.layout.v1`. (≠ `localStorage`, réservé à `editorPrefs` pour sa
+  propagation same-window.)
+
+### Terminal partagé — UNE instance, comme aujourd'hui ✅
+- **Ton instinct est le bon : on partage comme actuellement.** Un seul `Dock` + **un seul pool de PTY
+  backend**. Le « Terminal » en onglet droit et le dock bas (`Cmd+J`) sont **deux positions de rendu des
+  mêmes tabs** — jamais dupliqués, **une position à la fois** (bascule/déplacement = reattach via
+  `term_snapshot`, déjà le comportement sur changement de `DockState.side`).
+- Le cockpit ajoute juste « Terminal » comme surface hôte du même `Dock` ; `DockState.side` gère déjà
+  `bottom/top/left/right`.
+
+### Migration progressive — feature flag, pas de big-bang
+- Cockpit **derrière un flag** (réglage `ui.cockpit`, OFF au début → ON quand stable). `/code` et `/chat`
+  **restent fonctionnels** en parallèle pendant la transition (*strangler-fig*). Le cockpit devient route
+  par défaut **seulement** flag ON.
+- **Cleanup on replace** : l'ancien arrangement route-commuté est supprimé une fois le cockpit validé « en
+  voyant ».
+
+### Routing — cockpit par défaut, destinations séparées
+- Cockpit = route par défaut ; Image Studio / Gallery / Studio / Settings = routes séparées via le `Rail`.
+- La **palette de commandes + keybindings** sont pilotées par `CommandContext` (quasi route-agnostique) →
+  simple vérif de non-régression au plan.
+
+### Forme du commentaire de ligne (`+`)
+- Le `+` empile un commentaire structuré `{ path, startLine, endLine, snippet, note }` dans un **bac
+  « commentaires inline »** sur le composer ; à l'envoi, sérialisé en bloc structuré dans le message user,
+  **injection éphémère** (même pattern que mentions / RAG / `editorContext` du Lot A), jamais persisté brut.
+
+## Risque résiduel principal
+
+Le seul vrai risque est le **virage du shell** (routes commutées → surfaces persistantes) — concentré dans
+RootLayout, donc à faible rayon d'explosion, et **protégé par le feature flag** ci-dessus. Tout le reste
+est du remontage de briques existantes.
