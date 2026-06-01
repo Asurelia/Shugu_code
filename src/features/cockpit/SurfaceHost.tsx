@@ -4,13 +4,14 @@
 // never unmounted while the cockpit lives. Keeping CodeView mounted is what
 // keeps editorViewRef alive outside /code.
 import { useRef } from "react";
+import type { ReactNode } from "react";
 import { useShell } from "@/routes/shell-context";
 import { CodeView } from "@/features/code/views-code";
 import { ReviewSurface } from "./ReviewSurface";
 import { SURFACE_META } from "./surfaces";
 import type { SurfaceId } from "./layout";
 
-function SurfaceFill({ visible, children }: { visible: boolean; children: React.ReactNode }) {
+function SurfaceFill({ visible, children }: { visible: boolean; children: ReactNode }) {
   return (
     <div style={{ position: "absolute", inset: 0, display: visible ? "block" : "none" }}>
       {children}
