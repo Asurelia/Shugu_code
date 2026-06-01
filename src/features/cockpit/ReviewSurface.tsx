@@ -196,11 +196,13 @@ function FileList({ files, selected, onSelect, onOpenFile }: FileListProps): JSX
 // ---------------------------------------------------------------------------
 
 function DiffPane({ path }: { path: string | null }): JSX.Element {
-  // NOTE: vs="worktree" = diff_index_to_workdir (working tree vs index).
-  // A fully-staged file with no additional worktree changes will show an
-  // empty diff here. The portée toggle (head/index/worktree) lands in a
-  // later slice to address this case.
-  const { data: diff, isLoading, isError } = useGitDiff(path, "worktree");
+  // NOTE: vs="head" = diff_tree_to_workdir_with_index (HEAD vs working tree,
+  // index included) — i.e. ALL uncommitted changes (staged + unstaged). This is
+  // the correct default "modifications non-commitées" scope (matches Codex) and
+  // avoids the empty-diff-for-staged-files confusion that vs="worktree" caused
+  // (the latter only shows UNSTAGED changes). The portée toggle (head/index/
+  // worktree) lands in a later slice.
+  const { data: diff, isLoading, isError } = useGitDiff(path, "head");
 
   if (!path) {
     return (
@@ -250,8 +252,9 @@ function DiffPane({ path }: { path: string | null }): JSX.Element {
             textTransform: "uppercase",
             letterSpacing: 0.5,
           }}
+          title="HEAD → répertoire de travail (toutes modifications non-commitées)"
         >
-          worktree
+          vs HEAD
         </span>
       </div>
 
@@ -296,8 +299,8 @@ function DiffPane({ path }: { path: string | null }): JSX.Element {
                 fontStyle: "italic",
               }}
             >
-              Aucune modification dans le répertoire de travail.
-              {/* Note: fichier peut être entièrement dans l'index (staged). */}
+              Aucun diff vs HEAD — fichier peut-être non suivi (nouveau). Le
+              toggle de portée arrive dans une prochaine tranche.
             </div>
           ) : (
             <div style={{ position: "relative", minHeight: "100%" }}>
