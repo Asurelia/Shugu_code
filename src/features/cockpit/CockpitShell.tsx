@@ -9,7 +9,7 @@ import { Icon } from "@/components/components";
 import { ChatView } from "@/features/chat/views-chat";
 import { useShell } from "@/routes/shell-context";
 import { RightPanel } from "./RightPanel";
-import { useCockpitLayout, hydrateLayout, setRightPanelOpen, openSurface, setSizes } from "./layoutStore";
+import { useCockpitLayout, hydrateLayout, isLayoutHydrated, setRightPanelOpen, openSurface, setSizes } from "./layoutStore";
 import { loadLayout } from "./layoutPersistence";
 
 export function CockpitShell({ activeConv }: { activeConv: string }) {
@@ -23,7 +23,11 @@ export function CockpitShell({ activeConv }: { activeConv: string }) {
   // both shows a minSize sliver instead of the saved width AND fires onLayout
   // with [80,20], overwriting the persisted [55,45]. Gating on hydration makes
   // `defaultSize` carry the real sizes at first registration.
-  const [hydrated, setHydrated] = useState(false);
+  //
+  // Seed from the session query cache: after the first mount the layout stays
+  // cached, so re-navigating into the cockpit skips the loader flash (the
+  // spinner only ever shows on the very first mount of the session).
+  const [hydrated, setHydrated] = useState(() => isLayoutHydrated());
 
   // Hydrate the store from SQLite once at mount (LOCAL-FIRST restore).
   useEffect(() => {

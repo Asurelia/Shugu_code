@@ -26,6 +26,16 @@ export function hydrateLayout(layout: CockpitLayout): void {
   queryClient.setQueryData<CockpitLayout>([...KEY], layout);
 }
 
+/**
+ * True once the layout has been put in the store this session. Lets the shell
+ * skip its loading spinner on subsequent navigations into the cockpit (the
+ * cache survives unmount/remount within a session), so the flash only ever
+ * shows on the very first mount.
+ */
+export function isLayoutHydrated(): boolean {
+  return queryClient.getQueryData<CockpitLayout>([...KEY]) !== undefined;
+}
+
 /** Non-hook read (for imperative callers). */
 export function getLayout(): CockpitLayout {
   return read();
