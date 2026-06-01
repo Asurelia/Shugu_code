@@ -266,6 +266,14 @@ export async function resolveChatTarget(modelId: string): Promise<ResolveChatTar
 // fails. The AI message (real or error) is persisted on completion.
 // Streaming partials are NOT broadcast — useChatStream remains local to
 // whichever window initiated the send (documented v1 trade-off).
+/** Shape of a single inline comment from the Révision diff (C2.4). */
+export interface InlineCommentForSend {
+  path: string;
+  line: number;
+  snippet: string;
+  note: string;
+}
+
 export async function sendChatMessage(
   convId: string,
   text: string,
@@ -273,6 +281,7 @@ export async function sendChatMessage(
   imageDataUrl?: string,
   agentDefPath?: string,
   editorCtx?: { path: string; content: string; selection?: { text: string; startLine: number; endLine: number } },
+  inlineComments?: InlineCommentForSend[],
 ): Promise<void> {
   const trimmed = text.trim();
   // Allow empty text when an image is provided (image-only messages are valid).
@@ -412,6 +421,22 @@ export async function sendChatMessage(
       if (lastUserIdx >= 0) {
         apiMessages[lastUserIdx].content = `${ectx}\n\n---\n\n${apiMessages[lastUserIdx].content}`;
       }
+    }
+  }
+
+  // C2.4 — commentaires inline de la Révision diff. Injectés de façon ÉPHÉMÈRE
+  // dans le dernier message user envoyé au modèle, EXACTEMENT comme editorCtx
+  // ci-dessus (jamais persistés en SQLite, jamais affichés dans la bulle user).
+  // Le message SQLite garde le texte propre. Désactivable en ne passant pas le
+  // param (mascot/FloatChat ne le passe jamais → comportement identique à aujourd'hui).
+  if (inlineComments && inlineComments.length > 0) {
+    const block = [
+      "Commentaires inline (Révision diff) :",
+      ...inlineComments.map((c) => `- ${c.path}:${c.line} — ${c.note}   (\`${c.snippet}\`)`),
+    ].join("\n");
+    const lastUserIdx = apiMessages.map((m) => m.role).lastIndexOf("user");
+    if (lastUserIdx >= 0) {
+      apiMessages[lastUserIdx].content = `${block}\n\n---\n\n${apiMessages[lastUserIdx].content}`;
     }
   }
 

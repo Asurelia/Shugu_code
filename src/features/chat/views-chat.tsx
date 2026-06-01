@@ -222,23 +222,15 @@ export function ChatView({
       editorCtx = { path: activeFile, content: fileContents[activeFile].text, selection: sel };
     }
 
-    // C2.4 — inline comments from the Révision diff. Read at send time so any
-    // note added after the last keystroke is captured. The block is appended to
-    // `text` (same message slot) so it travels through the normal send path
-    // without touching sendChatMessage's signature or the editorCtx structure.
-    // GATED: only built when comments exist → the no-comments path is identical
-    // to today (no extra string, no different code branch reached).
+    // C2.4 — inline comments from the Révision diff. Read at send time (so any
+    // note added after the last keystroke is captured). Passed as an optional
+    // 7th param to sendChatMessage, which injects them EPHEMERALLY into the
+    // API payload only (same pattern as editorCtx — never written to SQLite,
+    // never shown in the user bubble). Passing undefined when empty → no-op,
+    // identical code path to today. clearComments() only after success so the
+    // queue is preserved if sendChatMessage throws (user can retry).
     const pendingComments = getComments();
-    let finalText = text;
-    if (pendingComments.length > 0) {
-      const block = [
-        "",
-        "---",
-        "Commentaires inline (Révision diff) :",
-        ...pendingComments.map((c) => `- ${c.path}:${c.line} — ${c.note}   (\`${c.snippet}\`)`),
-      ].join("\n");
-      finalText = text ? `${text}${block}` : block.trimStart();
-    }
+    const commentsArg = pendingComments.length > 0 ? pendingComments : undefined;
 
     setInput("");
     const imageToSend = pendingImage;
@@ -248,15 +240,15 @@ export function ChatView({
     try {
       await sendChatMessage(
         activeConv,
-        finalText,
+        text,
         model,
         imageToSend ?? undefined,
         agentDefPath,
         editorCtx,
+        commentsArg,
       );
-      // Clear ONLY after dispatch succeeds — if sendChatMessage throws, the
-      // comments are preserved so the user can retry without losing their notes.
-      if (pendingComments.length > 0) clearComments();
+      // Clear ONLY after dispatch succeeds.
+      if (commentsArg) clearComments();
     } finally {
       setTyping(false);
       chatStream.stop();
