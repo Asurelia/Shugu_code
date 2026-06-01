@@ -385,6 +385,7 @@ export function InterfaceSettings() {
             label="Le chat peut modifier les fichiers"
             desc="Autorise le chat à écrire / éditer des fichiers. Chaque tour reste réversible via « Annuler les modifications de ce message »."
           />
+          <CockpitRow />
         </div>
 
         <div className="setting-section">
@@ -543,5 +544,39 @@ export function SegRow({ value, onChange, options }: any) {
         <button key={o.v} className="lg-tab" aria-selected={o.v === value} onClick={() => onChange(o.v)}>{o.l}</button>
       ))}
     </div>
+  );
+}
+
+/**
+ * Lot Cockpit-1 — toggle du flag `ui.cockpit` (défaut OFF).
+ * Active la disposition « cockpit » (chat + IDE en surfaces) sur la vue Chat.
+ * Pattern identique à ChatToolsRow MAIS défaut OFF : ON seulement si "true".
+ */
+function CockpitRow() {
+  const [on, setOn] = useState(false); // défaut OFF (nouvelle feature)
+
+  useEffect(() => {
+    let alive = true;
+    void db.settings.get("ui.cockpit").then((v) => {
+      if (alive) setOn(v === "true"); // ON uniquement si "true"
+    });
+    return () => { alive = false; };
+  }, []);
+
+  const change = (v: boolean) => {
+    setOn(v);
+    void (async () => {
+      await db.settings.set("ui.cockpit", v ? "true" : "false");
+      await queryClient.invalidateQueries({ queryKey: ["settings", "ui.cockpit"] });
+    })();
+  };
+
+  return (
+    <SettingRow
+      label="Cockpit (chat + IDE) — expérimental"
+      desc="Affiche la vue Chat comme un cockpit : chat à gauche, éditeur/révision en panneau droit redimensionnable."
+    >
+      <Switch on={on} onChange={change} />
+    </SettingRow>
   );
 }
