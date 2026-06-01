@@ -4,8 +4,8 @@
 // Panel is `collapsible` and never unmounted, so the editor surface (and thus
 // editorViewRef) stays alive while the panel is "closed".
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Panel, PanelGroup, PanelResizeHandle, type ImperativePanelHandle } from "react-resizable-panels";
-import { Icon } from "@/components/components";
 import { ChatView } from "@/features/chat/views-chat";
 import { useShell } from "@/routes/shell-context";
 import { RightPanel } from "./RightPanel";
@@ -60,8 +60,40 @@ export function CockpitShell({ activeConv }: { activeConv: string }) {
     return <div className="loading"><div className="ring"></div></div>;
   }
 
+  // Portal the right-panel toggle into the titlebar slot (sits with
+  // History/Bell, mirroring the left side-panel toggle). Guard for null so
+  // the cockpit is safe even when mounted before the titlebar DOM is ready.
+  const tbRightSlot = document.getElementById("tb-right-panel-slot");
+  const rightPanelToggle = (
+    <button
+      className="tb-action"
+      aria-label="Afficher/Masquer le panneau"
+      title="Afficher/Masquer le panneau (Éditeur / Révision)"
+      onClick={() => {
+        if (layout.rightPanelOpen) {
+          setRightPanelOpen(false);
+        } else {
+          openSurface(layout.activeSurface);
+        }
+      }}
+    >
+      {/* Mirrors the left tb-side-toggle but flipped: divider on the right
+          side (x=15) and chevron direction reflects panel open/closed state. */}
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+        <rect x="3" y="4" width="18" height="16" rx="2"/>
+        <line x1="15" y1="4" x2="15" y2="20"/>
+        {layout.rightPanelOpen
+          ? <path d="M18 9l3 3-3 3"/>
+          : <path d="M12 9l3 3-3 3"/>}
+      </svg>
+    </button>
+  );
+
   return (
     <div className="cockpit" style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column" }}>
+      {/* Portal the toggle into the titlebar right cluster (next to History/Bell). */}
+      {tbRightSlot && createPortal(rightPanelToggle, tbRightSlot)}
+
       <PanelGroup
         direction="horizontal"
         style={{ flex: 1, minHeight: 0 }}
@@ -71,27 +103,14 @@ export function CockpitShell({ activeConv }: { activeConv: string }) {
         }}
       >
         <Panel id="cockpit-chat" order={1} minSize={30} defaultSize={layout.sizes[0]}>
-          <div style={{ position: "relative", height: "100%" }}>
-            <ChatView activeConv={activeConv} onOpenSnippet={shell.openSnippetInEditor} />
-            {/* Floating "open panel" toggle — icon-only, top-right of the chat pane.
-                Mirrors the titlebar's left side-panel toggle SVG but for the RIGHT panel:
-                divider on the right side (x=15) and chevron pointing left (open). */}
-            {!layout.rightPanelOpen && (
-              <button
-                className="cockpit-panel-toggle"
-                aria-label="Afficher le panneau"
-                title="Afficher le panneau (Éditeur / Révision)"
-                style={{ position: "absolute", top: 8, right: 8, zIndex: 10 }}
-                onClick={() => openSurface(layout.activeSurface)}
-              >
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
-                  <rect x="3" y="4" width="18" height="16" rx="2"/>
-                  <line x1="15" y1="4" x2="15" y2="20"/>
-                  <path d="M18 9l3 3-3 3"/>
-                </svg>
-              </button>
-            )}
-          </div>
+          {/* disableSplit: suppress the old in-chat split — the right panel IS
+              the editor surface in the cockpit. Opening a file routes only to
+              the right-panel Éditeur surface, never to the in-chat split. */}
+          <ChatView
+            activeConv={activeConv}
+            onOpenSnippet={shell.openSnippetInEditor}
+            disableSplit
+          />
         </Panel>
 
         <PanelResizeHandle className="dock-rrp-handle v" />

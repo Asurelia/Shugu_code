@@ -158,6 +158,10 @@ export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettin
           display:contents — the span vanishes from layout, the button becomes a
           direct flex child of .titlebar. */}
       <span id="tb-ctx-slot" className="tb-ctx-slot" />
+      {/* Portal target for the cockpit right-panel toggle. CockpitShell portals
+          its toggle button here so it sits with History/Bell, mirroring the left
+          side-panel toggle. display:contents — same trick as tb-ctx-slot. */}
+      <span id="tb-right-panel-slot" className="tb-ctx-slot" />
       {/* TODO(Pass 2): wire to command */}
       <button className="tb-action" title="History"><Icon name="history" size={15}/></button>
       {/* TODO(Pass 2): wire to command */}

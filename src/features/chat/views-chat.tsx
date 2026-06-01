@@ -70,10 +70,16 @@ export function ChatView({
   activeConv,
   model: modelProp,
   onOpenSnippet,
+  disableSplit,
 }: {
   activeConv: string;
   model?: string;
   onOpenSnippet?: (code: string, lang: string) => void;
+  /** When true, suppress the in-chat split editor (used by the cockpit where
+   *  the right panel IS the editor surface). Opening a file calls openFile()
+   *  without ever setting splitFile. The /chat route (flag OFF) leaves this
+   *  false so split behavior is unchanged there. */
+  disableSplit?: boolean;
 }) {
   const [input, setInput] = useState("");
   const [typing, setTyping] = useState(false);
@@ -304,13 +310,15 @@ export function ChatView({
   // Open a workspace file from an action card → reveal the in-chat split
   // (chat left, editor right), staying in the chat view. `openFile` loads the
   // content into the shared fileContents store first.
+  // When `disableSplit` is true (cockpit), skip the split reveal so the file
+  // only lands in the right-panel Éditeur surface (openFile alone is enough).
   const handleOpenFile = useCallback((path: string) => {
     setCompareFile(null); // opening a file for editing supersedes any open diff
     void (async () => {
       await openFile(path);
-      setSplitFile(path);
+      if (!disableSplit) setSplitFile(path);
     })();
-  }, [openFile, setCompareFile]);
+  }, [openFile, setCompareFile, disableSplit]);
 
   const closeSplit = useCallback(() => setSplitFile(null), []);
   const openFullEditor = useCallback(() => {
@@ -635,6 +643,9 @@ export function ChatView({
   );
 
   if (!splitFile && !compareFile) return chatMain;
+  // In the cockpit (disableSplit), never render the in-chat split — the right
+  // panel is the editor surface. Return chatMain only.
+  if (disableSplit) return chatMain;
 
   // Phase 2 — handoff split: chat on the left, the opened file on the right.
   // The right pane shows a read-only git diff (working tree vs HEAD) when a
