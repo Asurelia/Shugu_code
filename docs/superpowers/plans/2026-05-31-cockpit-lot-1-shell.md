@@ -924,3 +924,15 @@ git commit -m "✨ feat(cockpit): branche le cockpit dans /chat derrière ui.coc
 **Pas de placeholder de plan** : chaque step montre le code réel. **Cohérence de types** : `SurfaceId`/`CockpitLayout` définis en Task 1 et réutilisés tels quels partout ; fonctions du store (`openSurface`, `setActiveSurface`, `setRightPanelOpen`, `setSizes`, `useCockpitLayout`, `hydrateLayout`) définies en Task 4 et appelées en Tasks 7-8.
 
 **Point à confirmer à l'exécution (non bloquant)** : noms d'icônes `<Icon name="code"|"git"|"sparkle"|"x" />` — tous déjà utilisés ailleurs dans le projet (Rail, content-head, DockToggleButton), donc sûrs.
+
+---
+
+## Corrections post-implémentation (revue)
+
+Le code de la **Tâche 8 ci-dessus contenait un bug** attrapé par la revue finale (et corrigé dans le code livré ; le bloc de code ci-dessus n'a pas été réécrit, voir les commits) :
+
+- **Bug** : le `PanelGroup` se montait **avant** la résolution async de `loadLayout()`, donc enregistrait ses panneaux avec `DEFAULT_LAYOUT` (replié, `defaultSize 0`) puis tentait un `expand()` impératif. Conséquences : ouverture à `minSize` (20 %) au lieu de la largeur persistée, **et** `onLayout([80,20])` écrasait la taille sauvegardée → la persistance (Task 9 step 6) ne tenait pas.
+- **Correctif** (commit `42a0bd2`) : **gate du rendu du `PanelGroup` sur l'hydratation** (`hydrated` state + early-return loader) pour que `defaultSize` porte la taille persistée au 1ᵉʳ enregistrement ; et `p.expand(layout.sizes[1])` pour les ouvertures runtime.
+- **Polish** (commit `1e3138b`) : `isLayoutHydrated()` amorce le gate depuis le cache React Query de session → le spinner ne s'affiche qu'au tout premier montage (pas de flash à chaque navigation vers `/chat`).
+
+Implémenteurs des lots futurs (C2+) : prendre la version **du dépôt** de `CockpitShell.tsx` comme référence, pas le bloc de code de la Tâche 8.
