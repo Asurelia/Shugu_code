@@ -6,7 +6,7 @@ import { useState } from "react";
 import { Icon } from "@/components/components";
 import { SurfaceHost } from "./SurfaceHost";
 import { SURFACE_MENU } from "./surfaces";
-import { closeSurface, openSurface, setActiveSurface, setRightPanelOpen, useCockpitLayout } from "./layoutStore";
+import { closeSurface, openSurface, setActiveSurface, setBottomDockOpen, setRightPanelOpen, useCockpitLayout } from "./layoutStore";
 
 export function RightPanel() {
   const layout = useCockpitLayout();
@@ -15,7 +15,9 @@ export function RightPanel() {
 
   // Surfaces available to add via "+" = those not yet in openedSurfaces.
   const addableSurfaces = SURFACE_MENU.filter((s) => !openedSurfaces.includes(s.id));
-  const allOpen = addableSurfaces.length === 0;
+  // "allOpen" means all RIGHT-PANEL surfaces are open — but we always show
+  // the Terminal bottom-dock entry in the menu, so we never fully disable "+".
+  const allRightSurfacesOpen = addableSurfaces.length === 0;
 
   return (
     <div className="cockpit-right" style={{ display: "flex", flexDirection: "column", height: "100%", minWidth: 0 }}>
@@ -62,17 +64,16 @@ export function RightPanel() {
           );
         })}
 
-        {/* "+"-menu — lists surfaces not yet opened. */}
+        {/* "+"-menu — lists surfaces not yet opened + Terminal bottom-dock toggle. */}
         <span style={{ position: "relative" }}>
           <button
             className="lgb lgb-sm"
-            title={allOpen ? "Toutes les surfaces sont ouvertes" : "Ajouter une surface"}
-            disabled={allOpen}
+            title="Ajouter une surface"
             onClick={() => setMenuOpen((o) => !o)}
           >
             <Icon name="sparkle" size={11} /> +
           </button>
-          {menuOpen && !allOpen && (
+          {menuOpen && (
             <>
               <div style={{ position: "fixed", inset: 0, zIndex: 9997 }} onClick={() => setMenuOpen(false)} />
               <div
@@ -92,6 +93,21 @@ export function RightPanel() {
                     <span className="label">{s.label}</span>
                   </button>
                 ))}
+                {allRightSurfacesOpen && addableSurfaces.length === 0 && (
+                  <div className="chat-ctx-target" style={{ opacity: 0.5, fontSize: 11 }}>
+                    Toutes les surfaces sont ouvertes
+                  </div>
+                )}
+                {/* Terminal lives in the bottom dock — always offered. */}
+                <button
+                  className="chat-ctx-item"
+                  onClick={() => {
+                    setBottomDockOpen(true);
+                    setMenuOpen(false);
+                  }}
+                >
+                  <span className="label">Terminal (bas)</span>
+                </button>
               </div>
             </>
           )}

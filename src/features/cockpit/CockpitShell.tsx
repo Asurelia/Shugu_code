@@ -1,21 +1,34 @@
 // src/features/cockpit/CockpitShell.tsx
 // The cockpit: chat (left) + a resizable, collapsible right panel (kept mounted
-// for keep-warm). Mirrors the Dock's react-resizable-panels usage. The right
-// Panel is `collapsible` and never unmounted, so the editor surface (and thus
-// editorViewRef) stays alive while the panel is "closed".
+// for keep-warm). An outer VERTICAL PanelGroup splits the whole cockpit into
+// a top area (chat | right) and a collapsible bottom terminal dock.
+// Both panels mirror the same imperative collapse/expand pattern (panelRef +
+// layout.rightPanelOpen / bottomRef + layout.bottomDockOpen).
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Panel, PanelGroup, PanelResizeHandle, type ImperativePanelHandle } from "react-resizable-panels";
 import { ChatView } from "@/features/chat/views-chat";
 import { useShell } from "@/routes/shell-context";
 import { RightPanel } from "./RightPanel";
-import { useCockpitLayout, hydrateLayout, isLayoutHydrated, setRightPanelOpen, openSurface, setSizes } from "./layoutStore";
+import { BottomDock } from "./BottomDock";
+import {
+  useCockpitLayout,
+  hydrateLayout,
+  isLayoutHydrated,
+  setRightPanelOpen,
+  openSurface,
+  setSizes,
+  setBottomDockOpen,
+  setBottomDockSize,
+  getLayout,
+} from "./layoutStore";
 import { loadLayout } from "./layoutPersistence";
 
 export function CockpitShell({ activeConv }: { activeConv: string }) {
   const shell = useShell();
   const layout = useCockpitLayout();
   const panelRef = useRef<ImperativePanelHandle>(null);
+  const bottomRef = useRef<ImperativePanelHandle>(null);
   const didHydrate = useRef(false);
   // Render-gate: the PanelGroup must NOT mount before the persisted layout is
   // in the store. Otherwise it registers panels with DEFAULT_LAYOUT sizes
@@ -42,16 +55,40 @@ export function CockpitShell({ activeConv }: { activeConv: string }) {
     return () => { alive = false; };
   }, []);
 
-  // Drive the imperative collapse/expand from the store's rightPanelOpen.
+  // Drive the imperative collapse/expand of the RIGHT panel from the store.
   // expand() takes the persisted width so opening-from-closed restores the
-  // saved size rather than snapping to minSize (the panel's prev-size map is
-  // empty until it has collapsed at least once).
+  // saved size rather than snapping to minSize.
   useEffect(() => {
     const p = panelRef.current;
     if (!p) return;
     if (layout.rightPanelOpen && p.isCollapsed()) p.expand(layout.sizes[1]);
     if (!layout.rightPanelOpen && !p.isCollapsed()) p.collapse();
   }, [layout.rightPanelOpen]);
+
+  // Drive the imperative collapse/expand of the BOTTOM dock from the store.
+  // Same pattern as above: expand with the persisted size.
+  useEffect(() => {
+    const b = bottomRef.current;
+    if (!b) return;
+    if (layout.bottomDockOpen && b.isCollapsed()) b.expand(layout.bottomDockSize);
+    if (!layout.bottomDockOpen && !b.isCollapsed()) b.collapse();
+  }, [layout.bottomDockOpen]);
+
+  // Ctrl+` keyboard shortcut: toggle the bottom terminal dock.
+  // Uses getLayout() (non-hook) to read live state without stale closure.
+  // Guards against input/textarea/contenteditable so the backtick is not eaten.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!e.ctrlKey || e.key !== "`") return;
+      const target = e.target as HTMLElement;
+      const tag = target.tagName.toLowerCase();
+      if (tag === "input" || tag === "textarea" || target.isContentEditable) return;
+      e.preventDefault();
+      setBottomDockOpen(!getLayout().bottomDockOpen);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   // Wait for the persisted layout before mounting the PanelGroup so defaultSize
   // is correct at first registration. `.loading .ring` is the app's standard
@@ -94,45 +131,78 @@ export function CockpitShell({ activeConv }: { activeConv: string }) {
       {/* Portal the toggle into the titlebar right cluster (next to History/Bell). */}
       {tbRightSlot && createPortal(rightPanelToggle, tbRightSlot)}
 
+      {/* OUTER vertical PanelGroup: top area (chat | right) + bottom dock. */}
       <PanelGroup
-        direction="horizontal"
+        direction="vertical"
         style={{ flex: 1, minHeight: 0 }}
         onLayout={(sizes) => {
-          // Persist only when the panel is expanded (two real sizes).
-          if (sizes.length === 2 && sizes[1] > 1) setSizes([sizes[0], sizes[1]]);
+          // Persist bottom dock size only when it is expanded (size > 1).
+          if (sizes.length === 2 && sizes[1] > 1) setBottomDockSize(sizes[1]);
         }}
       >
-        <Panel id="cockpit-chat" order={1} minSize={30} defaultSize={layout.sizes[0]}>
-          {/* position:relative + overflow:hidden is REQUIRED here: ChatView's
-              root `.cx` is `position:absolute; inset:0`, so without a positioned
-              wrapper it fills the whole `.cockpit` instead of this panel — the
-              chat would overflow full-width under the right panel. This wrapper
-              confines the chat to its panel so the split actually shrinks it.
-              disableSplit: suppress the old in-chat split — the right panel IS
-              the editor surface in the cockpit. */}
-          <div style={{ position: "relative", height: "100%", overflow: "hidden" }}>
-            <ChatView
-              activeConv={activeConv}
-              onOpenSnippet={shell.openSnippetInEditor}
-              disableSplit
-            />
-          </div>
+        {/* TOP panel: contains the horizontal chat | right PanelGroup. */}
+        <Panel id="cockpit-top" order={1} minSize={30}>
+          {/* INNER horizontal PanelGroup: chat (left) | right panel.
+              height:100% because the parent is an rrp Panel div (not flex). */}
+          <PanelGroup
+            direction="horizontal"
+            style={{ width: "100%", height: "100%", minHeight: 0 }}
+            onLayout={(sizes) => {
+              // Persist only when the panel is expanded (two real sizes).
+              if (sizes.length === 2 && sizes[1] > 1) setSizes([sizes[0], sizes[1]]);
+            }}
+          >
+            <Panel id="cockpit-chat" order={1} minSize={30} defaultSize={layout.sizes[0]}>
+              {/* position:relative + overflow:hidden is REQUIRED here: ChatView's
+                  root `.cx` is `position:absolute; inset:0`, so without a positioned
+                  wrapper it fills the whole `.cockpit` instead of this panel — the
+                  chat would overflow full-width under the right panel. This wrapper
+                  confines the chat to its panel so the split actually shrinks it.
+                  disableSplit: suppress the old in-chat split — the right panel IS
+                  the editor surface in the cockpit. */}
+              <div style={{ position: "relative", height: "100%", overflow: "hidden" }}>
+                <ChatView
+                  activeConv={activeConv}
+                  onOpenSnippet={shell.openSnippetInEditor}
+                  disableSplit
+                />
+              </div>
+            </Panel>
+
+            <PanelResizeHandle className="dock-rrp-handle v" />
+
+            <Panel
+              id="cockpit-right"
+              order={2}
+              ref={panelRef}
+              collapsible
+              collapsedSize={0}
+              minSize={20}
+              defaultSize={layout.rightPanelOpen ? layout.sizes[1] : 0}
+              onCollapse={() => setRightPanelOpen(false)}
+              onExpand={() => setRightPanelOpen(true)}
+            >
+              <RightPanel />
+            </Panel>
+          </PanelGroup>
         </Panel>
 
-        <PanelResizeHandle className="dock-rrp-handle v" />
+        {/* Horizontal resize handle (divides top from bottom). */}
+        <PanelResizeHandle className="dock-rrp-handle h" />
 
+        {/* BOTTOM dock: collapsible terminal dock (Codex-style). */}
         <Panel
-          id="cockpit-right"
+          id="cockpit-bottom"
           order={2}
-          ref={panelRef}
+          ref={bottomRef}
           collapsible
           collapsedSize={0}
-          minSize={20}
-          defaultSize={layout.rightPanelOpen ? layout.sizes[1] : 0}
-          onCollapse={() => setRightPanelOpen(false)}
-          onExpand={() => setRightPanelOpen(true)}
+          minSize={12}
+          defaultSize={layout.bottomDockOpen ? layout.bottomDockSize : 0}
+          onCollapse={() => setBottomDockOpen(false)}
+          onExpand={() => setBottomDockOpen(true)}
         >
-          <RightPanel />
+          <BottomDock />
         </Panel>
       </PanelGroup>
     </div>

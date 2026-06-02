@@ -82,6 +82,14 @@ export function setSizes(sizes: [number, number]): void {
   write({ ...read(), sizes });
 }
 
+export function setBottomDockOpen(open: boolean): void {
+  write({ ...read(), bottomDockOpen: open });
+}
+
+export function setBottomDockSize(n: number): void {
+  write({ ...read(), bottomDockSize: n });
+}
+
 /** Reactive hook for the shell components. */
 export function useCockpitLayout(): CockpitLayout {
   const { data = { ...DEFAULT_LAYOUT } } = useQuery<CockpitLayout>({

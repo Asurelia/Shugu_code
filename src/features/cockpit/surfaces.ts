@@ -19,11 +19,11 @@ export const SURFACE_META: Record<SurfaceId, SurfaceMeta> = {
   browser:  { id: "browser",  label: "Navigateur" },
 };
 
-/** Ordered list for the "+"-menu. */
+/** Ordered list for the right-panel "+"-menu.
+ *  "terminal" is intentionally absent — it lives in the bottom dock now. */
 export const SURFACE_MENU: SurfaceMeta[] = [
   SURFACE_META.editor,
   SURFACE_META.review,
-  SURFACE_META.terminal,
   SURFACE_META.files,
   SURFACE_META.browser,
 ];

@@ -4,7 +4,11 @@
 
 export type SurfaceId = "editor" | "review" | "terminal" | "files" | "browser";
 
-export const SURFACES: SurfaceId[] = ["editor", "review", "terminal", "files", "browser"];
+// "terminal" is kept in the union (type + SURFACE_META) but removed from
+// SURFACES so isSurface("terminal") returns false — normalizeLayout
+// automatically drops it from openedSurfaces / activeSurface on load.
+// The terminal now lives in the bottom dock, not the right panel.
+export const SURFACES: SurfaceId[] = ["editor", "review", "files", "browser"];
 
 export interface CockpitLayout {
   /** Right panel expanded (true) or collapsed/keep-warm (false). */
@@ -16,6 +20,10 @@ export interface CockpitLayout {
   /** Ordered list of surfaces the user has opened (shown as tabs). The "+"
    *  menu adds surfaces not yet present. Always has ≥ 1 element. */
   openedSurfaces: SurfaceId[];
+  /** Bottom terminal dock open (true) or collapsed (false). Default false. */
+  bottomDockOpen: boolean;
+  /** Bottom dock height as a percentage (12–70). Default 30. */
+  bottomDockSize: number;
 }
 
 export const DEFAULT_LAYOUT: CockpitLayout = {
@@ -23,6 +31,8 @@ export const DEFAULT_LAYOUT: CockpitLayout = {
   activeSurface: "editor",
   sizes: [55, 45],
   openedSurfaces: ["editor", "review"],
+  bottomDockOpen: false,
+  bottomDockSize: 30,
 };
 
 function isSurface(v: unknown): v is SurfaceId {
@@ -51,12 +61,17 @@ function normalizeOpenedSurfaces(raw: unknown): SurfaceId[] {
   return result.length > 0 ? result : [...DEFAULT_LAYOUT.openedSurfaces];
 }
 
+function isBottomDockSize(v: unknown): v is number {
+  return typeof v === "number" && v >= 12 && v < 100;
+}
+
 /** Coerce any persisted/unknown value into a valid CockpitLayout. */
 export function normalizeLayout(raw: unknown): CockpitLayout {
   if (!raw || typeof raw !== "object") return { ...DEFAULT_LAYOUT };
   const o = raw as Record<string, unknown>;
 
   // Normalize openedSurfaces first — needed to coerce activeSurface below.
+  // "terminal" is not in SURFACES any more, so it is automatically dropped.
   const openedSurfaces = normalizeOpenedSurfaces(o.openedSurfaces);
 
   // activeSurface must be a valid SurfaceId AND be within openedSurfaces.
@@ -73,5 +88,10 @@ export function normalizeLayout(raw: unknown): CockpitLayout {
     activeSurface,
     sizes: isSizes(o.sizes) ? o.sizes : DEFAULT_LAYOUT.sizes,
     openedSurfaces,
+    bottomDockOpen:
+      typeof o.bottomDockOpen === "boolean" ? o.bottomDockOpen : DEFAULT_LAYOUT.bottomDockOpen,
+    bottomDockSize: isBottomDockSize(o.bottomDockSize)
+      ? o.bottomDockSize
+      : DEFAULT_LAYOUT.bottomDockSize,
   };
 }
