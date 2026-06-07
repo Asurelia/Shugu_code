@@ -700,9 +700,20 @@ export function ChatView({
 // Local state tracks which button is selected for this render cycle;
 // no re-fetch needed — the DB write is the source of truth.
 export function ReviewFeedback({ reviewerId }: { reviewerId: string }) {
-  // null = not yet voted; 1 = thumbs-up; 0 = thumbs-down
+  // null = état inconnu ; 1 = retenue (👍 / auto-validée) ; 0 = exclue (👎 / auto-exclue)
   const [vote, setVote] = useState<1 | 0 | null>(null);
   const [saving, setSaving] = useState(false);
+
+  // Reflète l'état VALIDÉ actuel de la review (auto par R3, ou un vote précédent),
+  // pour que l'utilisateur voie si elle est déjà retenue/exclue avant de voter.
+  useEffect(() => {
+    let cancelled = false;
+    void db.reviews
+      .getValidatedByReviewer(reviewerId)
+      .then((v) => { if (!cancelled && v !== null) setVote(v === 1 ? 1 : 0); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [reviewerId]);
 
   const handleVote = async (value: 1 | 0) => {
     if (saving) return;
@@ -769,7 +780,9 @@ export function ReviewFeedback({ reviewerId }: { reviewerId: string }) {
         👎
       </button>
       {vote !== null && (
-        <span style={{ fontSize: 10, opacity: 0.7 }}>✓ pris en compte</span>
+        <span style={{ fontSize: 10, opacity: 0.7 }}>
+          {vote === 1 ? "✓ retenue (leçon)" : "✗ exclue de l'apprentissage"}
+        </span>
       )}
     </div>
   );

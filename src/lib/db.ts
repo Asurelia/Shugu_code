@@ -658,6 +658,17 @@ const reviews = {
       [validated, reviewerId]
     );
   },
+
+  /** Current `validated` flag (0|1) of a deliverable review, or null if absent.
+   *  Lets the UI reflect the auto (R3) state before a manual 👍/👎. */
+  async getValidatedByReviewer(reviewerId: string): Promise<number | null> {
+    const db = await getDb();
+    const rows = (await db.select(
+      "SELECT validated FROM agent_reviews WHERE reviewer_id = $1 AND kind = 'deliverable' LIMIT 1",
+      [reviewerId]
+    )) as Array<{ validated: number }>;
+    return rows.length > 0 ? rows[0].validated : null;
+  },
 };
 
 // ---------------------------------------------------------------------------

@@ -46,41 +46,47 @@ pub(super) fn lessons_prompt_block(
             return (String::new(), 0);
         }
     };
-    let conn = match conn_mutex.lock() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("[lessons] conn lock failed: {e}");
-            return (String::new(), 0);
-        }
-    };
-
     // Collect ALL validated deliverable reviews among the hits (keeping their
     // semantic rank), then prioritise ACTIONABLE verdicts before taking the top
     // 3: a BLOQUÉ / À CORRIGER review teaches more than an APPROUVÉ one. Semantic
     // relevance (rank) breaks ties within a priority bucket.
     // reviewer_id is the bare UUID stored in vec_patterns; agent_reviews.reviewer_id
     // matches the vec id directly (PK is "rev_<uuid>", not used for the join).
-    let mut candidates: Vec<(u8, usize, String, String)> = Vec::new(); // (prio, rank, verdict, body)
-    for (rank, hit) in hits.iter().enumerate() {
-        let result: rusqlite::Result<(String, String)> = conn.query_row(
-            "SELECT body, verdict FROM agent_reviews \
-              WHERE reviewer_id = ?1 AND kind = 'deliverable' AND validated = 1",
-            rusqlite::params![hit.id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        );
-        if let Ok((body, verdict)) = result {
-            let prio = match verdict.as_str() {
-                "BLOQUÉ" => 0u8,
-                "À CORRIGER" => 1,
-                "APPROUVÉ" => 2,
-                _ => 3,
-            };
-            // Truncate at 600 Unicode scalar values, not bytes (French text has
-            // multi-byte chars — byte-indexing would panic mid-character).
-            let truncated: String = body.chars().take(600).collect();
-            candidates.push((prio, rank, verdict, truncated));
+    //
+    // The AGENTS_CONN lock is scoped to THIS block only (released before the
+    // lock-free sort + formatting below) — hold shared DB locks as briefly as
+    // possible.
+    let mut candidates: Vec<(u8, usize, String, String)> = {
+        let conn = match conn_mutex.lock() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[lessons] conn lock failed: {e}");
+                return (String::new(), 0);
+            }
+        };
+        let mut acc: Vec<(u8, usize, String, String)> = Vec::new(); // (prio, rank, verdict, body)
+        for (rank, hit) in hits.iter().enumerate() {
+            let result: rusqlite::Result<(String, String)> = conn.query_row(
+                "SELECT body, verdict FROM agent_reviews \
+                  WHERE reviewer_id = ?1 AND kind = 'deliverable' AND validated = 1",
+                rusqlite::params![hit.id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            );
+            if let Ok((body, verdict)) = result {
+                let prio = match verdict.as_str() {
+                    "BLOQUÉ" => 0u8,
+                    "À CORRIGER" => 1,
+                    "APPROUVÉ" => 2,
+                    _ => 3,
+                };
+                // Truncate at 600 Unicode scalar values, not bytes (French text has
+                // multi-byte chars — byte-indexing would panic mid-character).
+                let truncated: String = body.chars().take(600).collect();
+                acc.push((prio, rank, verdict, truncated));
+            }
         }
-    }
+        acc
+    };
     candidates.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
     let lessons: Vec<(String, String)> =
         candidates.into_iter().take(3).map(|(_, _, v, b)| (v, b)).collect();
