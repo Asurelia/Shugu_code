@@ -753,7 +753,15 @@ async function handleDelegate(
     } catch (err) {
       // readAgentDef a échoué (fichier absent, frontmatter cassé…) — on continue
       // avec les credentials de l'orchestrateur global plutôt que de bloquer.
+      // Mais on le SIGNALE visiblement : sinon l'agent démarrerait silencieusement
+      // avec le mauvais modèle/provider (revue chantier 3 — pas d'échec muet).
       console.warn("[chat-sync] handleDelegate: readAgentDef failed, falling back to orchestrator config", err);
+      await appendMessage(convId, {
+        id: newMessageId("e"),
+        role: "ai",
+        body: `⚠ Impossible de lire la définition de l'agent (${agentDefPath}). L'orchestrateur par défaut est utilisé à la place.`,
+        ts: nowHHMM(),
+      });
     }
   }
 

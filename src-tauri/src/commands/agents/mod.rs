@@ -552,6 +552,12 @@ pub async fn agent_spawn(
     // role/model par ses valeurs. Le body devient le `system_prompt_override`
     // — le runner accepte déjà ce levier ([runner.rs] system_prompt_override).
     // Sinon : comportement historique (role brut, seed_prompt par défaut).
+    //
+    // ⚠ CONTRAT : on ne résout ici QUE `role` + `model` (nom nu). Le provider du
+    // modèle épinglé (protocol / base_url / api_key) reste la responsabilité de
+    // l'appelant TS (handleDelegate → resolveProvider + loadProviderConfig). Un
+    // futur appelant qui passerait `agent_def_path` SANS résoudre le provider en
+    // amont enverrait le bon model mais les mauvais protocol/clé.
     let system_prompt_override: Option<String> = match args.agent_def_path.as_deref() {
         Some(p) if !p.is_empty() => {
             let def = crate::commands::agent_defs::load_def(p)?;
