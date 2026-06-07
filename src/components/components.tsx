@@ -59,6 +59,7 @@ export function Icon({ name, size = 18, className = "" }: { name: string; size?:
     case "check":  return p(<><path d="M20 6 9 17l-5-5"/></>);
     case "chevron-left":  return p(<><path d="m15 18-6-6 6-6"/></>);
     case "chevron-right": return p(<><path d="m9 18 6-6-6-6"/></>);
+    case "list":   return p(<><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></>);
     default: return p(<circle cx="12" cy="12" r="6"/>);
   }
 }
@@ -157,21 +158,20 @@ export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettin
           display:contents — the span vanishes from layout, the button becomes a
           direct flex child of .titlebar. */}
       <span id="tb-ctx-slot" className="tb-ctx-slot" />
+      {/* Portal target for the cockpit right-panel toggle. CockpitShell portals
+          its toggle button here so it sits with History/Bell, mirroring the left
+          side-panel toggle. display:contents — same trick as tb-ctx-slot. */}
+      <span id="tb-right-panel-slot" className="tb-ctx-slot" />
       {/* TODO(Pass 2): wire to command */}
       <button className="tb-action" title="History"><Icon name="history" size={15}/></button>
       {/* TODO(Pass 2): wire to command */}
       <button className="tb-action" title="Notifications"><Icon name="bell" size={15}/></button>
-      <button className="tb-action" title="Settings" onClick={onSettings}><Icon name="gear" size={15}/></button>
-      <button className="tb-avatar" title="Account" onClick={onAvatar}>
-        <span>VU</span>
-        <span className="online"></span>
-      </button>
     </div>
   );
 }
 
 // ── Activity Rail ───────────────────────────────────────────
-export function Rail({ view, setView }: any) {
+export function Rail({ view, setView, onAvatar }: any) {
   const items = [
     { id: "chat",    icon: "chat",    label: "Chat" },
     { id: "code",    icon: "code",    label: "Editor" },
@@ -205,7 +205,7 @@ export function Rail({ view, setView }: any) {
           <Icon name="gear" size={18}/>
           <span className="rail-tip">Settings</span>
         </button>
-        <div className="rail-avatar" title="Account">SH</div>
+        <button className="rail-avatar" aria-label="Account" title="Account" onClick={onAvatar}>SH</button>
       </div>
     </nav>
   );

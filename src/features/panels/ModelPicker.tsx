@@ -22,6 +22,7 @@ const PROVIDER_LABELS_DISPLAY: Record<string, string> = {
   llamacpp:  "llama.cpp",
   mistral:   "Mistral",
   groq:      "Groq",
+  minimax:   "MiniMax",
 };
 
 export interface ModelPickerProps {

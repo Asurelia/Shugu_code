@@ -5,6 +5,7 @@ import { useState, useEffect } from "react";
 import { Icon } from "@/components/components";
 import { SettingRow, Switch } from "@/features/code/views-code";
 import { db } from "@/lib/db";
+import { queryClient } from "@/lib/queryClient";
 import { COMMANDS } from "@/lib/commands";
 
 // ─── DEFAULT_SHORTCUTS derived from COMMANDS ──────────────────
@@ -372,6 +373,19 @@ export function InterfaceSettings() {
           <SettingRow label="Use emoji icons" desc="Sur les cartes d'agents et certains badges (sinon fallback monochrome).">
             <Switch on={s.emojis} onChange={set("emojis")}/>
           </SettingRow>
+
+          <AutoEditorContextRow/>
+          <ChatToolsRow
+            settingKey="chat.readTools"
+            label="Le chat peut lire les fichiers"
+            desc="Autorise le chat à lire, lister et chercher dans le workspace pour fonder ses réponses (façon Cursor)."
+          />
+          <ChatToolsRow
+            settingKey="chat.writeTools"
+            label="Le chat peut modifier les fichiers"
+            desc="Autorise le chat à écrire / éditer des fichiers. Chaque tour reste réversible via « Annuler les modifications de ce message »."
+          />
+          <CockpitRow />
         </div>
 
         <div className="setting-section">
@@ -440,6 +454,89 @@ export function InterfaceSettings() {
   );
 }
 
+/**
+ * Toggle « Contexte auto du chat » — pilote `db.settings` `chat.autoEditorContext`.
+ *
+ * Sémantique alignée sur la lecture côté chat (views-chat.tsx / chat-sync.ts) :
+ * ON par défaut = clé absente ou ≠ "false". On stocke donc "false" quand OFF et
+ * "true" quand ON. Pattern lecture/écriture copié du toggle `rag.autoCodeContext`
+ * (views-code.tsx) : useState + useEffect (db.settings.get) + db.settings.set.
+ */
+function AutoEditorContextRow() {
+  const [on, setOn] = useState(true); // défaut ON
+
+  useEffect(() => {
+    let alive = true;
+    void db.settings.get("chat.autoEditorContext").then((v) => {
+      if (alive) setOn(v !== "false"); // ON sauf valeur explicite "false"
+    });
+    return () => { alive = false; };
+  }, []);
+
+  const change = (v: boolean) => {
+    setOn(v);
+    void (async () => {
+      await db.settings.set("chat.autoEditorContext", v ? "true" : "false");
+      // Le composer (views-chat) lit ce réglage via useQuery (staleTime 30s) ;
+      // invalider la clé reflète le changement immédiatement (chip + envoi).
+      await queryClient.invalidateQueries({ queryKey: ["settings", "chat.autoEditorContext"] });
+    })();
+  };
+
+  return (
+    <SettingRow
+      label="Contexte auto du chat"
+      desc="Envoie automatiquement le fichier ouvert et la sélection au chat (façon Cursor)."
+    >
+      <Switch on={on} onChange={change}/>
+    </SettingRow>
+  );
+}
+
+/**
+ * Lot A — Task 12 — toggles d'outils fs du chat (`chat.readTools` /
+ * `chat.writeTools`).
+ *
+ * Même sémantique/pattern que AutoEditorContextRow (ci-dessus) : ON par défaut
+ * (clé absente ou ≠ "false"), stockage "true"/"false", invalidation de la
+ * queryKey ["settings", <clé>] après écriture pour toute UI réactive future.
+ * Lu côté envoi par sendChatMessage (chat-sync.ts) via db.settings.get direct ;
+ * passé à chat_send en readTools/writeTools (→ read_tools/write_tools côté Rust).
+ */
+function ChatToolsRow({
+  settingKey,
+  label,
+  desc,
+}: {
+  settingKey: "chat.readTools" | "chat.writeTools";
+  label: string;
+  desc: string;
+}) {
+  const [on, setOn] = useState(true); // défaut ON
+
+  useEffect(() => {
+    let alive = true;
+    void db.settings.get(settingKey).then((v) => {
+      if (alive) setOn(v !== "false"); // ON sauf valeur explicite "false"
+    });
+    return () => { alive = false; };
+  }, [settingKey]);
+
+  const change = (v: boolean) => {
+    setOn(v);
+    void (async () => {
+      await db.settings.set(settingKey, v ? "true" : "false");
+      await queryClient.invalidateQueries({ queryKey: ["settings", settingKey] });
+    })();
+  };
+
+  return (
+    <SettingRow label={label} desc={desc}>
+      <Switch on={on} onChange={change}/>
+    </SettingRow>
+  );
+}
+
 export function SegRow({ value, onChange, options }: any) {
   return (
     <div className="lg-tabs" style={{padding:3}}>
@@ -447,5 +544,39 @@ export function SegRow({ value, onChange, options }: any) {
         <button key={o.v} className="lg-tab" aria-selected={o.v === value} onClick={() => onChange(o.v)}>{o.l}</button>
       ))}
     </div>
+  );
+}
+
+/**
+ * Lot Cockpit-1 — toggle du flag `ui.cockpit` (défaut OFF).
+ * Active la disposition « cockpit » (chat + IDE en surfaces) sur la vue Chat.
+ * Pattern identique à ChatToolsRow MAIS défaut OFF : ON seulement si "true".
+ */
+function CockpitRow() {
+  const [on, setOn] = useState(false); // défaut OFF (nouvelle feature)
+
+  useEffect(() => {
+    let alive = true;
+    void db.settings.get("ui.cockpit").then((v) => {
+      if (alive) setOn(v === "true"); // ON uniquement si "true"
+    });
+    return () => { alive = false; };
+  }, []);
+
+  const change = (v: boolean) => {
+    setOn(v);
+    void (async () => {
+      await db.settings.set("ui.cockpit", v ? "true" : "false");
+      await queryClient.invalidateQueries({ queryKey: ["settings", "ui.cockpit"] });
+    })();
+  };
+
+  return (
+    <SettingRow
+      label="Cockpit (chat + IDE) — expérimental"
+      desc="Affiche la vue Chat comme un cockpit : chat à gauche, éditeur/révision en panneau droit redimensionnable."
+    >
+      <Switch on={on} onChange={change} />
+    </SettingRow>
   );
 }

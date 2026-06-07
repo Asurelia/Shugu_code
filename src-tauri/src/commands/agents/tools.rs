@@ -64,8 +64,12 @@ pub(crate) struct ToolCall {
 /// from the dispatcher) — failures become `is_error: true` with the
 /// reason in `content`. The LLM consumes the next turn with this result
 /// and can adapt.
+///
+/// `pub(crate)` so the chat tool loop in `commands::chat` can build
+/// `AgentMessage::ToolResults(Vec<ToolResult>)` for its own multi-turn history
+/// (Lot A — Task 11) — same reuse as the agent runner, no duplicate type.
 #[derive(Clone, Debug, Serialize)]
-pub(super) struct ToolResult {
+pub(crate) struct ToolResult {
     pub id: String,
     pub name: String,
     pub is_error: bool,
@@ -573,7 +577,7 @@ fn dispatch_inner(
             if name.trim().is_empty() || body.trim().is_empty() {
                 return Err("skill_save needs a non-empty name and body".to_string());
             }
-            super::skills::save_skill(app, role, name, when_to_use, body)?;
+            super::skills::save_skill(app, role, name, when_to_use, body, "agent")?;
             Ok(format!(
                 "skill '{name}' saved for role '{role}' — it will load automatically in future runs"
             ))

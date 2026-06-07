@@ -13,6 +13,15 @@ import { openPrompt, runImmediate } from "@/features/code/ai-edit/aiEditControll
 import { reindexWorkspace } from "@/features/fs/workspaceIndexer";
 import { pushToast } from "@/components/toast";
 import { openReviewDialog } from "@/features/git/reviewDialogStore";
+import {
+  LSPPlugin,
+  jumpToDefinition,
+  jumpToTypeDefinition,
+  jumpToImplementation,
+  findReferences,
+  renameSymbol,
+  formatDocument,
+} from "@codemirror/lsp-client";
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -145,6 +154,14 @@ function aiEditTarget(ctx: CommandContext): {
   const coords = view.coordsAtPos(sel.from);
   const anchor = coords ? { x: coords.left, y: coords.bottom + 6 } : { x: 80, y: 80 };
   return { view, path: ctx.activeFile, lang: fc.lang ?? "", wasDirty: !!fc.dirty, anchor };
+}
+
+// §3 — la view active a-t-elle un plugin LSP attaché ? (sinon les commandes LSP
+// ne doivent pas apparaître dans la palette sur un fichier sans serveur).
+function lspView(ctx: CommandContext): EditorView | null {
+  const view = ctx.editorViewRef?.current?.getView() ?? null;
+  if (!view) return null;
+  return LSPPlugin.get(view) ? view : null;
 }
 
 // ─── COMMANDS array ───────────────────────────────────────────
@@ -762,6 +779,66 @@ export const COMMANDS: Command[] = [
       if (ctx.currentView !== "code") ctx.navigateTo("code");
       ctx.setFindPanelOpen?.(true);
     },
+  },
+
+  // ── §3b : commandes LSP (palette) ─────────────────────────────────────────
+  // PAS de `keybinding:` : languageServerExtensions() bind DÉJÀ F12/Shift+F12/F2
+  // au niveau du keymap CodeMirror ; un keybinding global ici ferait
+  // double-déclenchement. On expose pour la DÉCOUVRABILITÉ (cherchable), touche
+  // montrée en description. `when: lspView !== null` masque la commande sans LSP.
+  {
+    id: "lsp-go-to-definition",
+    title: "Go to Definition",
+    category: "Go",
+    icon: "search",
+    description: "LSP — raccourci éditeur : F12",
+    when: (ctx) => lspView(ctx) !== null,
+    run: (ctx) => { const v = lspView(ctx); if (v) jumpToDefinition(v); },
+  },
+  {
+    id: "lsp-go-to-type-definition",
+    title: "Go to Type Definition",
+    category: "Go",
+    icon: "search",
+    description: "LSP",
+    when: (ctx) => lspView(ctx) !== null,
+    run: (ctx) => { const v = lspView(ctx); if (v) jumpToTypeDefinition(v); },
+  },
+  {
+    id: "lsp-go-to-implementation",
+    title: "Go to Implementation",
+    category: "Go",
+    icon: "search",
+    description: "LSP",
+    when: (ctx) => lspView(ctx) !== null,
+    run: (ctx) => { const v = lspView(ctx); if (v) jumpToImplementation(v); },
+  },
+  {
+    id: "lsp-find-references",
+    title: "Find All References",
+    category: "Go",
+    icon: "search",
+    description: "LSP — raccourci éditeur : Shift+F12",
+    when: (ctx) => lspView(ctx) !== null,
+    run: (ctx) => { const v = lspView(ctx); if (v) findReferences(v); },
+  },
+  {
+    id: "lsp-rename-symbol",
+    title: "Rename Symbol",
+    category: "Edit",
+    icon: "sparkle",
+    description: "LSP — raccourci éditeur : F2",
+    when: (ctx) => lspView(ctx) !== null,
+    run: (ctx) => { const v = lspView(ctx); if (v) renameSymbol(v); },
+  },
+  {
+    id: "lsp-format-document",
+    title: "Format Document (LSP)",
+    category: "Edit",
+    icon: "sparkle",
+    description: "LSP — raccourci éditeur : Shift+Alt+F",
+    when: (ctx) => lspView(ctx) !== null,
+    run: (ctx) => { const v = lspView(ctx); if (v) formatDocument(v); },
   },
 
   // ── Image ─────────────────────────────────────────────────

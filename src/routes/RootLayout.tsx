@@ -56,6 +56,7 @@ import { useAgentEvents } from "@/features/agents/useEvents";
 import { setSelectedAgentId, useAgentsRailDisplay } from "@/features/agents/queries";
 import { useChatEvents } from "@/features/chat/useEvents";
 import { useChatStreamListener } from "@/features/chat/useChatStream";
+import { useChatToolActivityListener } from "@/features/chat/chatToolActivityStore";
 import { runImmediate } from "@/features/code/ai-edit/aiEditController";
 import { setApplyRequest } from "@/features/code/ai-edit/applyController";
 import { detectBlockPath, stripPathComment } from "@/lib/markdown";
@@ -73,6 +74,7 @@ import { SideGit } from "@/features/git/SideGit";
 // page reload on every HMR edit, which in turn caused the intermittent
 // "useShell must be used inside RootLayout" errors in the Tauri webview).
 import { ShellContext, type ShellContextValue, type EditorPrefs, DEFAULT_EDITOR_PREFS } from "./shell-context";
+import { setLspBridge } from "@/features/code/lsp/lspBridge";
 import { loadJSON, saveJSON } from "@/features/settings/settings-extras";
 import { formatCurrentDocumentCli, formatCodeDirect } from "@/features/code/format";
 
@@ -354,6 +356,10 @@ export function RootLayout() {
   // dans le cache TanStack pour que TOUTES les windows voient le
   // streaming (au lieu d'un acceptingRef local qui drop les chunks).
   useChatStreamListener();
+  // Lot A — Task 12 : activité des tool-calls du chat (deltas kind:"tool"),
+  // accumulée par conv pour un rendu discret au-dessus du message AI en cours
+  // de stream (views-chat.tsx). Listener au root, comme le stream listener.
+  useChatToolActivityListener();
 
   // Auto-stop/start llama-server quand le model chat passe local↔API.
   // Restauré après diagnostic — innocent du freeze (testé Plan v2 Step C).
@@ -723,6 +729,20 @@ export function RootLayout() {
     setFilesPanelActive(path);
   }, []);
 
+  // Lot B §2 — publie openFile + l'accès à l'EditorView actif au pont LSP, pour
+  // que ShuguWorkspace.displayFile puisse naviguer cross-fichier (F12, Ctrl+Clic
+  // vers une définition dans un autre fichier, panneau de références).
+  useEffect(() => {
+    setLspBridge({
+      openFile,
+      getViewForPath: (path) => {
+        const v = editorViewRef.current;
+        if (!v) return null;
+        return v.getPath() === path ? (v.getView() ?? null) : null;
+      },
+    });
+  }, [openFile]);
+
   const saveFile = useCallback(async (path: string) => {
     const content = fileContents[path];
     if (!content) return;
@@ -815,13 +835,19 @@ export function RootLayout() {
   // cache. useApplyRunner (monté dans CodeView) attend que la view du fichier
   // soit prête et démarre le diff. Sans chemin déclaré → repli non destructif
   // vers openSnippetInEditor (jamais de remplacement fichier-entier implicite).
-  const applyCodeToFile = useCallback(async (code: string, lang: string) => {
-    const detected = detectBlockPath(code);
-    if (!detected) {
+  //
+  // Lot A (Task 8) — `targetOverride` : quand le bouton « Appliquer » d'un bloc
+  // de chat résout sa cible (chemin déclaré dans le bloc OU, à défaut, le
+  // fichier actif), il la passe ici directement. On court-circuite alors la
+  // détection automatique : on n'a plus besoin d'un chemin déclaré dans le
+  // code pour cibler le fichier actif. `stripPathComment` reste appliqué dans
+  // tous les cas (retire un éventuel commentaire de chemin en 1ʳᵉ ligne).
+  const applyCodeToFile = useCallback(async (code: string, lang: string, targetOverride?: string) => {
+    const path = targetOverride ?? detectBlockPath(code);
+    if (!path) {
       await openSnippetInEditor(code, lang);
       return;
     }
-    const path = detected;
     const proposed = stripPathComment(code);
     try {
       // openFile lit le disque (fsReadFile throw si absent) puis active le tab.
@@ -1117,7 +1143,7 @@ export function RootLayout() {
             menu={view === "code" ? <MenuBar ctx={cmdCtx}/> : null}
           />
           <div className="main">
-            <Rail view={view} setView={navigateTo}/>
+            <Rail view={view} setView={navigateTo} onAvatar={() => setAccountOpen(o => !o)}/>
             <SidePanel width={sideWidth} setWidth={setSideWidth} collapsed={sideCollapsed}>
               {sidePanel}
             </SidePanel>

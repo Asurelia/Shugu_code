@@ -351,6 +351,42 @@ CREATE TABLE IF NOT EXISTS codex_limit_events (
 CREATE INDEX IF NOT EXISTS idx_codex_limit_ts ON codex_limit_events(ts);
 ";
 
+// V13 — revues produites par un agent reviewer (agent_reviews).
+//
+// `agent_reviews` stocke une revue par (reviewer_id, agent_id, kind). Le
+// champ `kind` distingue le type de livrable revu : 'deliverable' (sortie
+// finale de l'agent), 'plan' (plan soumis avant exécution) ou 'plan-review'
+// (méta-revue d'un plan déjà revu). `verdict` est le résultat textuel de la
+// revue ('APPROUVÉ' | 'BLOQUÉ' | 'À CORRIGER' | 'unknown') ; `validated` est
+// le booléen SQLite (0/1) indiquant si la revue a été acceptée par le pipeline.
+// `body` contient le texte complet de la revue (feedback, justification).
+// INSERT OR REPLACE sur `id` permet de ré-émettre une revue (idempotent).
+const MIGRATION_V13: &str = "
+CREATE TABLE IF NOT EXISTS agent_reviews (
+  id          TEXT    PRIMARY KEY,
+  agent_id    TEXT    NOT NULL,
+  reviewer_id TEXT    NOT NULL,
+  kind        TEXT    NOT NULL DEFAULT 'deliverable',
+  verdict     TEXT    NOT NULL DEFAULT 'unknown',
+  validated   INTEGER NOT NULL DEFAULT 0,
+  body        TEXT    NOT NULL DEFAULT '',
+  ts          INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_reviews_agent ON agent_reviews(agent_id);
+CREATE INDEX IF NOT EXISTS idx_agent_reviews_ts    ON agent_reviews(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_reviews_kind  ON agent_reviews(kind);
+";
+
+// V14 — traçage de la source d'un skill (agent ou advisor).
+//
+// `created_by` distingue les skills sauvés par l'agent lui-même via le tool
+// `skill_save` ('agent') de ceux créés par la commande Tauri `skill_save_advisor`
+// ('advisor'). DEFAULT 'agent' = rétro-compat : tous les skills existants
+// (sauvés avant V14) restent attribués à 'agent', ce qui est correct.
+const MIGRATION_V14: &str = "
+ALTER TABLE agent_skills ADD COLUMN created_by TEXT NOT NULL DEFAULT 'agent';
+";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = vec![
@@ -426,6 +462,18 @@ pub fn run() {
             sql: MIGRATION_V12,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 13,
+            description: "agent_reviews store",
+            sql: MIGRATION_V13,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 14,
+            description: "agent_skills_created_by",
+            sql: MIGRATION_V14,
+            kind: MigrationKind::Up,
+        },
     ];
 
     tauri::Builder::default()
@@ -449,6 +497,8 @@ pub fn run() {
         .manage(commands::terminal::PtyRegistry::default())
         .manage(commands::llama::LlamaServerState::default())
         .manage(commands::agents::AgentManagerState::default())
+        // Lot C — registre des connexions MCP vives (un RunningService par serveur).
+        .manage(commands::mcp::McpManager::default())
         .manage(commands::chat::ChatAbortRegistry::default())
         // LOT 3 — LSP server registry (un LspSession par langId).
         .manage(commands::lsp::LspServerRegistry::default())
@@ -597,6 +647,7 @@ pub fn run() {
             commands::chat::chat_send,
             commands::chat::chat_abort,
             commands::chat::fim_complete,
+            commands::chat_tools::chat_revert_writes,
             commands::credentials::cred_set,
             commands::credentials::cred_get,
             commands::credentials::cred_delete,
@@ -654,6 +705,7 @@ pub fn run() {
             // Skill library (Voyager / Hermes) — learned reusable skills.
             commands::agents::skills::skills_list,
             commands::agents::skills::skills_clear,
+            commands::agents::skills::skill_save_advisor,
             // Codex CLI bridge — auth status + real usage tracking (ChatGPT subscription).
             commands::codex::codex_auth_status,
             commands::codex::codex_login,
@@ -706,6 +758,13 @@ pub fn run() {
             // Raw `.md` read/write — pour l'onglet "Source `.md`" du drawer.
             commands::agent_defs::agent_def_read_raw,
             commands::agent_defs::agent_def_write_raw,
+            // Lot C — serveurs MCP (Model Context Protocol) : config, test, activation, appel.
+            commands::mcp::mcp_list_servers,
+            commands::mcp::mcp_test_server,
+            commands::mcp::mcp_set_enabled,
+            commands::mcp::mcp_add_server,
+            commands::mcp::mcp_remove_server,
+            commands::mcp::mcp_call_tool,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

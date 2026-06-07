@@ -266,6 +266,7 @@ export function TranscriptDrawer({
   // skills the env-verified gate accepted. An "atelier" run is detected by the
   // presence of run_command tool calls (chat agents never execute).
   const skillEvents = events.filter((e) => e.kind === "skillLearned");
+  const lessonEvents = events.filter((e) => e.kind === "lessonsInjected");
   const runCalls = events.filter((e) => e.kind === "toolCall" && e.tool === "run_command");
   // Both Atelier and Grounded execute via run_command, so the "real-env tests"
   // view applies to either. The browser-preview iframe is Atelier-ONLY; the
@@ -486,20 +487,63 @@ export function TranscriptDrawer({
         <div style={{ marginTop: 10, display: "flex", flexWrap: "wrap", gap: 6 }}>
           {skillEvents.map((e, i) =>
             e.kind === "skillLearned" ? (
+              e.source === "advisor" ? (
+                <span
+                  key={i}
+                  title="Skill distillé par l'advisor (reviewer externe) — leçon synthétisée après revue"
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    padding: "3px 8px",
+                    borderRadius: 99,
+                    background: "rgba(124, 58, 237, 0.15)",
+                    color: "var(--primary, #7c3aed)",
+                    border: "1px solid rgba(124, 58, 237, 0.35)",
+                  }}
+                >
+                  🧠 skill distillé par l'advisor : {e.name}
+                </span>
+              ) : (
+                <span
+                  key={i}
+                  title="Skill vérifié par un vrai test (exit 0) — pas une opinion du LLM"
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    padding: "3px 8px",
+                    borderRadius: 99,
+                    background: "rgba(74, 222, 128, 0.15)",
+                    color: "var(--success, #4ade80)",
+                    border: "1px solid rgba(74, 222, 128, 0.35)",
+                  }}
+                >
+                  🎓 appris : {e.name}
+                </span>
+              )
+            ) : null,
+          )}
+        </div>
+      )}
+
+      {/* S3 — leçons de runs passés réinjectées dans le contexte de ce run */}
+      {lessonEvents.length > 0 && (
+        <div style={{ marginTop: 10, display: "flex", flexWrap: "wrap", gap: 6 }}>
+          {lessonEvents.map((e, i) =>
+            e.kind === "lessonsInjected" ? (
               <span
                 key={i}
-                title="Skill vérifié par un vrai test (exit 0) — pas une opinion du LLM"
+                title="Leçons validées (runs passés réussis, similaires à cette tâche) réinjectées dans le contexte — boucle d'apprentissage S3"
                 style={{
                   fontSize: 10,
                   fontWeight: 700,
                   padding: "3px 8px",
                   borderRadius: 99,
-                  background: "rgba(74, 222, 128, 0.15)",
-                  color: "var(--success, #4ade80)",
-                  border: "1px solid rgba(74, 222, 128, 0.35)",
+                  background: "rgba(124, 58, 237, 0.15)",
+                  color: "var(--primary, #7c3aed)",
+                  border: "1px solid rgba(124, 58, 237, 0.35)",
                 }}
               >
-                🎓 appris : {e.name}
+                📚 {e.count} leçon{e.count > 1 ? "s" : ""} réinjectée{e.count > 1 ? "s" : ""}
               </span>
             ) : null,
           )}
@@ -1123,7 +1167,9 @@ export function AgentsPanel() {
         />
       )}
 
-      <SkillsSection role="atelier" />
+      {(["atelier", "orchestrator", "coder"] as const).map((r) => (
+        <SkillsSection key={r} role={r} />
+      ))}
     </div>
   );
 }
@@ -1158,7 +1204,7 @@ function SkillsSection({ role }: { role: string }) {
           padding: 0,
         }}
       >
-        🎓 Compétences apprises ({skills.length}) {open ? "▾" : "▸"}
+        🎓 Compétences apprises — {role} ({skills.length}) {open ? "▾" : "▸"}
       </button>
       {open && (
         <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 8 }}>
@@ -1168,14 +1214,37 @@ function SkillsSection({ role }: { role: string }) {
               style={{
                 padding: "6px 8px",
                 borderRadius: 6,
-                background: "rgba(74, 222, 128, 0.06)",
-                border: "1px solid rgba(74, 222, 128, 0.18)",
+                background: s.createdBy === "advisor"
+                  ? "rgba(124, 58, 237, 0.06)"
+                  : "rgba(74, 222, 128, 0.06)",
+                border: s.createdBy === "advisor"
+                  ? "1px solid rgba(124, 58, 237, 0.18)"
+                  : "1px solid rgba(74, 222, 128, 0.18)",
               }}
             >
-              <div
-                style={{ fontSize: 11, fontWeight: 600, color: "var(--on-surface, #ddd)" }}
-              >
-                {s.name}
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <div
+                  style={{ fontSize: 11, fontWeight: 600, color: "var(--on-surface, #ddd)" }}
+                >
+                  {s.name}
+                </div>
+                {s.createdBy === "advisor" && (
+                  <span
+                    title="Distillé par l'advisor (reviewer externe)"
+                    style={{
+                      fontSize: 9,
+                      fontWeight: 700,
+                      padding: "1px 5px",
+                      borderRadius: 99,
+                      background: "rgba(124, 58, 237, 0.2)",
+                      color: "var(--primary, #7c3aed)",
+                      border: "1px solid rgba(124, 58, 237, 0.4)",
+                      lineHeight: "14px",
+                    }}
+                  >
+                    via advisor
+                  </span>
+                )}
               </div>
               {s.whenToUse && (
                 <div

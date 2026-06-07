@@ -1,20 +1,22 @@
-// Lazy route module for /chat — loaded on first navigation to /chat.
+// Lazy route module for /chat.
 //
-// The chat route is a thin wrapper that passes the active conversation
-// id + a snippet-opener (for "Open in editor" buttons on code blocks)
-// down to ChatView. Messages + send-logic both live inside ChatView via
-// the chat-sync layer (SQLite + cross-window events).
+// Lot Cockpit-1 — quand le flag `ui.cockpit` est ON, cette route rend le
+// CockpitShell (chat + IDE en surfaces) au lieu du ChatView simple. Flag OFF =
+// comportement historique strictement inchangé (strangler-fig).
 import { ChatView } from "@/features/chat/views-chat";
 import { useActiveConv } from "@/features/chat/chat-sync";
 import { useShell } from "@/routes/shell-context";
+import { useCockpitFlag } from "@/features/cockpit/useCockpitFlag";
+import { CockpitShell } from "@/features/cockpit/CockpitShell";
 
 export default function ChatRouteComponent() {
   const [activeConv] = useActiveConv();
   const { openSnippetInEditor } = useShell();
-  return (
-    <ChatView
-      activeConv={activeConv}
-      onOpenSnippet={openSnippetInEditor}
-    />
-  );
+  const cockpit = useCockpitFlag();
+
+  if (cockpit) {
+    return <CockpitShell activeConv={activeConv} />;
+  }
+
+  return <ChatView activeConv={activeConv} onOpenSnippet={openSnippetInEditor} />;
 }

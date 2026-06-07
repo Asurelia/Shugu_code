@@ -31,6 +31,7 @@ export type AgentEventKind =
   | "complete"
   | "error"
   | "skillLearned"
+  | "lessonsInjected"
   | "diff";
 
 // ────────────────────────────────────────────────────────────────────
@@ -125,6 +126,18 @@ export type AgentEvent =
       /** Name of the reusable skill the agent just saved — VERIFIED by a real
        * passing test (the env gate). The chat UI shows an inline "🎓 appris" badge. */
       name: string;
+      /** Who created this skill: "agent" (via skill_save tool during a run) or
+       * "advisor" (distilled by the external reviewer via skill_save_advisor). */
+      source: "agent" | "advisor";
+    }
+  | {
+      kind: "lessonsInjected";
+      agentId: string;
+      role: string;
+      /** Number of validated past-review lessons re-injected into this run's
+       * context at start (S3 closed loop). The Agents panel shows a
+       * "📚 N leçons réinjectées" badge. */
+      count: number;
     }
   | {
       kind: "diff";
@@ -319,6 +332,10 @@ export interface SkillRow {
   whenToUse: string;
   body: string;
   createdAt: number;
+  /** Who created this skill: "agent" (via skill_save) or "advisor" (distilled by
+   * the external reviewer). Undefined until Rust's load_skills SELECT includes
+   * the created_by column. */
+  createdBy?: string;
 }
 
 /** List the skills a role has learned + saved (loaded into its context each run). */

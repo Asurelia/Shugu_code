@@ -37,8 +37,10 @@ import { parseMentions, resolveMentions, buildMentionContext } from "./mentions"
 import { resolveCodeContext, buildCodeContext } from "./codeContext";
 import { fireMoodReaction } from "@/features/mascot/moodReactionStore";
 import { parseThinkingMode, resolveThinking } from "@/lib/thinkingHeuristic";
-import { resolveRoute, parseDelegateOverride } from "@/lib/routingHeuristic";
+import { resolveRoute, parseDelegateOverride, classifyComplexity } from "@/lib/routingHeuristic";
 import { spawnAgent, awaitAgentComplete } from "@/lib/agents";
+import { readAgentDef } from "@/lib/agentDefs";
+import { superviseDeliverable, supervisePlan } from "@/lib/supervisors";
 import { getActiveDesignSystem, buildDesignSystemPrompt } from "@/features/design/activeDesignSystem";
 import { queryClient } from "@/lib/queryClient";
 import { diag } from "@/lib/diag";
@@ -266,12 +268,22 @@ export async function resolveChatTarget(modelId: string): Promise<ResolveChatTar
 // fails. The AI message (real or error) is persisted on completion.
 // Streaming partials are NOT broadcast — useChatStream remains local to
 // whichever window initiated the send (documented v1 trade-off).
+/** Shape of a single inline comment from the Révision diff (C2.4). */
+export interface InlineCommentForSend {
+  path: string;
+  line: number;
+  snippet: string;
+  note: string;
+}
+
 export async function sendChatMessage(
   convId: string,
   text: string,
   modelId: string,
   imageDataUrl?: string,
   agentDefPath?: string,
+  editorCtx?: { path: string; content: string; selection?: { text: string; startLine: number; endLine: number } },
+  inlineComments?: InlineCommentForSend[],
 ): Promise<void> {
   const trimmed = text.trim();
   // Allow empty text when an image is provided (image-only messages are valid).
@@ -398,6 +410,38 @@ export async function sendChatMessage(
     apiMessages.push({ role: "user", content: trimmed });
   }
 
+  // Lot A — contexte éditeur auto. Injecté dans le dernier message user envoyé
+  // au modèle (jamais persisté). On saute le fichier actif s'il est déjà
+  // @-mentionné (dédoublonnage). Désactivable via settings (le composer ne
+  // passe `editorCtx` que si le toggle est ON et le chip pas retiré).
+  if (editorCtx) {
+    const { buildEditorContext } = await import("./editorContext");
+    const skipPaths = parseMentions(trimmed);
+    const ectx = buildEditorContext(editorCtx, { skipPaths });
+    if (ectx) {
+      const lastUserIdx = apiMessages.map((m) => m.role).lastIndexOf("user");
+      if (lastUserIdx >= 0) {
+        apiMessages[lastUserIdx].content = `${ectx}\n\n---\n\n${apiMessages[lastUserIdx].content}`;
+      }
+    }
+  }
+
+  // C2.4 — commentaires inline de la Révision diff. Injectés de façon ÉPHÉMÈRE
+  // dans le dernier message user envoyé au modèle, EXACTEMENT comme editorCtx
+  // ci-dessus (jamais persistés en SQLite, jamais affichés dans la bulle user).
+  // Le message SQLite garde le texte propre. Désactivable en ne passant pas le
+  // param (mascot/FloatChat ne le passe jamais → comportement identique à aujourd'hui).
+  if (inlineComments && inlineComments.length > 0) {
+    const block = [
+      "Commentaires inline (Révision diff) :",
+      ...inlineComments.map((c) => `- ${c.path}:${c.line} — ${c.note}   (\`${c.snippet}\`)`),
+    ].join("\n");
+    const lastUserIdx = apiMessages.map((m) => m.role).lastIndexOf("user");
+    if (lastUserIdx >= 0) {
+      apiMessages[lastUserIdx].content = `${block}\n\n---\n\n${apiMessages[lastUserIdx].content}`;
+    }
+  }
+
   // Lot 4 — @-mentions : résout les fichiers @-mentionnés du message courant et
   // injecte leur contenu dans le dernier message user ENVOYÉ au modèle. Le
   // message persité (SQLite, affiché) garde le texte `@…` propre — l'injection
@@ -453,6 +497,21 @@ export async function sendChatMessage(
   // 50-200 ms of reasoning would race the listener registration).
   let reasoningAcc = "";
   let unlistenReasoning: (() => void) | null = null;
+  // Lot A — Task 12 : journal d'annulation du tour. Quand chat_send tourne avec
+  // write_tools=ON, le backend écrit des fichiers dans le workspace puis émet
+  // `chat://writes` { conversationId, records:[{path, before}] } à la fin (cf.
+  // chat.rs:1097). On capte ces records ICI et on les associe au message AI une
+  // fois persisté (setChatWrites) → le bouton « Annuler les modifications de ce
+  // message » (views-chat.tsx) les relit via useChatWrites.
+  //
+  // ⚠ Race connue (acceptée) : `chat://writes` et `chat://delta done` sont des
+  // canaux distincts ; rien ne garantit que le callback writes a couru avant que
+  // `await invoke` ne résolve. En pratique l'emit writes précède le done delta
+  // qui précède le retour de chat_send, et l'écriture fichier n'est pas latency-
+  // critique. Si un record arrivait après l'append, le bouton n'apparaîtrait pas
+  // ce tour — l'utilisateur peut redemander. Pas de sur-ingénierie.
+  let writeRecords: import("./chatWritesStore").ChatWriteRecord[] = [];
+  let unlistenWrites: (() => void) | null = null;
   try {
     const mod = await import("@tauri-apps/api/event");
     unlistenReasoning = await mod.listen<{ kind?: string; chunk: string; done: boolean }>(
@@ -465,8 +524,18 @@ export async function sendChatMessage(
         }
       },
     );
+    unlistenWrites = await mod.listen<{
+      conversationId?: string;
+      records?: import("./chatWritesStore").ChatWriteRecord[];
+    }>("chat://writes", (e) => {
+      const p = e.payload;
+      // Filtré sur convId comme le listener reasoning : une autre conv (mascotte,
+      // édition inline) ne doit pas voir son journal attaché à CE message.
+      if (p?.conversationId !== convId) return;
+      if (Array.isArray(p.records)) writeRecords = p.records;
+    });
   } catch (err) {
-    console.warn("[chat-sync] reasoning listener attach failed:", err);
+    console.warn("[chat-sync] reasoning/writes listener attach failed:", err);
   }
 
   try {
@@ -476,6 +545,13 @@ export async function sendChatMessage(
     // separately via `attachedImage`: Rust injects it as a multimodal content
     // block on the LAST user message so vision-capable models (Claude 3.5+,
     // GPT-4o) actually see it.
+    // Lot A — Task 12 : toggles d'outils fs du chat. ON par défaut (clé absente
+    // ou ≠ "false"). camelCase → Tauri mappe vers read_tools / write_tools côté
+    // Rust (chat.rs:961). Quand readTools=ON et le protocole supporte les outils
+    // (anthropic/openai/custom, pas d'image jointe), chat_send pilote une boucle
+    // d'outils bornée au lieu d'un appel unique. writeTools autorise l'écriture.
+    const readTools = (await db.settings.get("chat.readTools")) !== "false";
+    const writeTools = (await db.settings.get("chat.writeTools")) !== "false";
     const reply = await invoke<string>("chat_send", {
       messages: apiMessages,
       model: realModel,
@@ -488,6 +564,8 @@ export async function sendChatMessage(
       // for the API protocols (Rust treats it as None / ignores it).
       reasoningEffort: protocol === "codex" ? getActiveCodexEffort() : undefined,
       attachedImage: imageDataUrl,
+      readTools,
+      writeTools,
     });
     // Parse fenced ```code blocks``` out of the reply so the UI gets the
     // structured Message.code shape (CodeBlock component highlights + the
@@ -507,6 +585,13 @@ export async function sendChatMessage(
     if (!aiMsg.body && !aiMsg.code) aiMsg.body = reply;
     if (reasoningAcc) aiMsg.reasoning = reasoningAcc;
     await appendMessage(convId, aiMsg);
+    // Lot A — Task 12 : si le tour a écrit des fichiers (write_tools ON), associe
+    // son journal d'annulation à l'id du message AI fraîchement appendé. Le
+    // bouton « Annuler les modifications de ce message » le relira par cet id.
+    if (writeRecords.length > 0) {
+      const { setChatWrites } = await import("./chatWritesStore");
+      setChatWrites(String(aiMsg.id), writeRecords);
+    }
   } catch (err) {
     await appendMessage(convId, {
       id: newMessageId("e"),
@@ -518,6 +603,7 @@ export async function sendChatMessage(
     fireMoodReaction("chat-error"); // Lot 6 — la mascotte compatit à l'échec
   } finally {
     unlistenReasoning?.();
+    unlistenWrites?.();
   }
 }
 
@@ -612,7 +698,106 @@ async function handleDelegate(
     return;
   }
 
-  const { model: realModel, protocol, baseUrl, apiKey } = orch;
+  // Résolution finale : protocol / baseUrl / apiKey / model.
+  // Par défaut = provider de l'orchestrateur global. Mais si l'agent custom
+  // (.md) épingle son propre model (ex. `openai/gpt-4o`), on re-résout
+  // depuis CE model : sinon le spawn enverrait le nom complet "openai/gpt-4o"
+  // verbatim à l'API (HTTP 404), et utiliserait les credentials de l'orchestrateur
+  // même si le provider diffère.
+  let realModel = orch.model;
+  let protocol  = orch.protocol;
+  let baseUrl   = orch.baseUrl;
+  let apiKey    = orch.apiKey;
+
+  if (agentDefPath) {
+    try {
+      const def = await readAgentDef(agentDefPath);
+      if (def.model) {
+        // Même logique que resolveOrchestrator : resolveProvider + loadProviderConfig.
+        const {
+          providerId: defProviderId,
+          protocol: defDefaultProto,
+          baseUrl: defDefaultBase,
+          model: defRealModel,
+        } = resolveProvider(def.model);
+
+        const defEnabled = await getProviderEnabled(defProviderId);
+        if (defEnabled !== "true") {
+          await appendMessage(convId, {
+            id: newMessageId("e"),
+            role: "ai",
+            body: `⚠ L'agent "${def.name}" utilise le provider "${defProviderId}" qui n'est pas activé. Ouvre Settings → Connections, configure-le et clique Save.`,
+            ts: nowHHMM(),
+          });
+          return;
+        }
+
+        const defCfg = await loadProviderConfig(defProviderId);
+        let defProto: Protocol = defDefaultProto;
+        if (defDefaultProto === "custom") {
+          const stored = await getConfig(defProviderId, "protocol");
+          if (
+            stored === "anthropic" ||
+            stored === "openai" ||
+            stored === "ollama" ||
+            stored === "custom"
+          ) {
+            defProto = stored;
+          }
+        }
+
+        realModel = defRealModel;
+        protocol  = defProto;
+        baseUrl   = defCfg.baseUrl && defCfg.baseUrl !== "" ? defCfg.baseUrl : defDefaultBase;
+        apiKey    = defCfg.apiKey && defCfg.apiKey !== "" ? defCfg.apiKey : undefined;
+      }
+    } catch (err) {
+      // readAgentDef a échoué (fichier absent, frontmatter cassé…) — on continue
+      // avec les credentials de l'orchestrateur global plutôt que de bloquer.
+      // Mais on le SIGNALE visiblement : sinon l'agent démarrerait silencieusement
+      // avec le mauvais modèle/provider (revue chantier 3 — pas d'échec muet).
+      console.warn("[chat-sync] handleDelegate: readAgentDef failed, falling back to orchestrator config", err);
+      await appendMessage(convId, {
+        id: newMessageId("e"),
+        role: "ai",
+        body: `⚠ Impossible de lire la définition de l'agent (${agentDefPath}). L'orchestrateur par défaut est utilisé à la place.`,
+        ts: nowHHMM(),
+      });
+    }
+  }
+
+  // ── S2 + S1 shared gate ────────────────────────────────────────────────────
+  // Compute ONCE whether supervision is active for this invocation. Used by
+  // both S2 (pre-execution plan review) and S1 (post-execution deliverable
+  // review). Factored out here to avoid duplicating the db.settings read.
+  const superviseRaw = await db.settings.get("routing.superviseComplex");
+  const superviseOn = superviseRaw == null ? true : superviseRaw === "true";
+  const isReviewerInvocation = !!agentDefPath && /reviewer|planner/i.test(agentDefPath);
+  const wantSupervise =
+    superviseOn &&
+    !isReviewerInvocation &&
+    classifyComplexity(task, realModel) === "complex";
+
+  // ── S2 — plan review before execution ──────────────────────────────────────
+  // If supervision is active, spawn the orchestrator in "plan-only" mode, have
+  // the reviewer evaluate the plan, and optionally augment the task with the
+  // reviewer's concerns (advisory — never blocks execution).
+  let execTask = task;
+  if (wantSupervise) {
+    try {
+      const planResult = await supervisePlan({
+        convId,
+        task,
+        orch: { model: realModel, protocol, baseUrl, apiKey },
+      });
+      if (planResult) {
+        execTask = planResult.augmentedTask;
+      }
+    } catch (s2Err) {
+      console.warn("[chat-sync] S2 supervisePlan gate failed:", s2Err);
+      // execTask stays as `task` — proceed normally.
+    }
+  }
 
   // Spawn the agent FIRST. We need the agentId to attach to the placeholder
   // so the reconciler (on mount) can match an orphan placeholder back to
@@ -623,7 +808,7 @@ async function handleDelegate(
   try {
     agentId = await spawnAgent({
       role: "orchestrator",
-      task,
+      task: execTask,
       model: realModel,
       conversationId: convId,
       protocol,
@@ -728,6 +913,22 @@ async function handleDelegate(
       viaAgent: true,
       agentId,
     });
+
+    // ── S1 — review automatique du livrable ────────────────────────────────
+    // Sur une tâche jugée complexe POUR LE MODÈLE qui a exécuté (seuil bas pour
+    // un petit modèle, haut pour un fort), on chaîne un reviewer qui relit la
+    // sortie de l'orchestrateur et la persiste en DB. Fire-and-forget :
+    // l'utilisateur n'est pas bloqué, la review-card arrive quand elle est
+    // prête. Jamais déclenché sur une invocation explicite du reviewer
+    // (anti-récursion via agentDefPath). Gated par routing.superviseComplex
+    // (défaut ON — l'utilisateur l'a demandé ; le gate complexité empêche de
+    // tirer sur le trivial).
+    // `wantSupervise` is computed once above (shared with S2) — no re-read.
+    // The review always uses the ORIGINAL `task` as the reference, not
+    // `execTask` (which may carry the S2 warning injection).
+    if (wantSupervise) {
+      void superviseDeliverable({ convId, agentId, task });
+    }
   } catch (err) {
     // The JS listener gave up (timeout, window thrash, etc.) — but the
     // Rust agent may have completed anyway. Do ONE last SQLite check

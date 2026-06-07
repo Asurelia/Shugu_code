@@ -1,6 +1,7 @@
 pub mod agent_defs;
 pub mod agents;
 pub mod chat;
+pub mod chat_tools;
 pub mod codex;
 pub mod codex_app_server;
 pub mod credentials;
@@ -12,6 +13,7 @@ pub mod git_watcher;
 pub mod grep;
 pub mod llama;
 pub mod lsp;
+pub mod mcp;
 pub mod model_bundle;
 pub mod preview;
 pub mod studio;

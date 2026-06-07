@@ -21,6 +21,9 @@ import { LSPClient, languageServerExtensions } from "@codemirror/lsp-client";
 import { invoke, listen } from "@/lib/tauri";
 import { diag } from "@/lib/diag";
 import { createTauriTransport, type TauriLspTransport } from "./transport";
+import { sanitizeLspHtml } from "./sanitize";
+import { setLspStatus, setLspError } from "./lspStatusStore";
+import { ShuguWorkspace } from "./workspace";
 
 /**
  * Format defensif d'une erreur de provenance inconnue (peut être Error,
@@ -53,9 +56,13 @@ export function fmtErr(err: unknown): string {
 }
 
 /** Langages pour lesquels on tente une init LSP. Évite un round-trip Rust
- *  pour les langages non supportés. Doit rester en phase avec la
- *  `resolve_lsp_binary` de src-tauri/src/commands/lsp.rs. */
-const SUPPORTED_LANG_IDS = new Set(["typescript", "javascript", "rust", "python"]);
+ *  pour les langages non supportés. DOIT rester en phase avec la
+ *  `resolve_lsp_binary` de src-tauri/src/commands/lsp.rs — sinon go/c/cpp/java
+ *  sont du code mort côté Rust (jamais atteints car ce gate les bloque).
+ *  Un test de parité (client.test.ts) empêche la régression. */
+export const SUPPORTED_LANG_IDS = new Set([
+  "typescript", "javascript", "rust", "python", "go", "c", "cpp", "java",
+]);
 
 export function isLspSupported(langId: string): boolean {
   return SUPPORTED_LANG_IDS.has(langId);
@@ -87,6 +94,8 @@ const inProgressInits = new Map<
 async function doInit(
   langId: string,
 ): Promise<{ client: LSPClient; workspaceUri: string } | null> {
+  // Lot B §4 — transition visible : démarrage en cours (spinner statusbar).
+  setLspStatus(langId, "starting");
   // Spawn le LSP server côté Rust + récupère le workspaceUri.
   let workspaceUri: string;
   try {
@@ -95,9 +104,25 @@ async function doInit(
     });
     workspaceUri = result.workspaceUri;
   } catch (err) {
-    // Binaire pas installé OU pas de workspace ouvert OU spawn failed.
-    // C'est le cas "gracieux" — le caller affiche l'éditeur sans LSP.
-    diag("lsp", `init failed for ${langId}: ${fmtErr(err)}`);
+    // lsp_init peut échouer pour 2 raisons distinctes qu'il faut DISTINGUER
+    // (sinon une vraie erreur — « no workspace open », spawn raté — est
+    // masquée derrière « non installé », et l'utilisateur croit à tort qu'il
+    // manque juste le binaire) :
+    //   • binaire absent du PATH/node_modules → "absent" (l'indicateur propose
+    //     la commande d'install — c'est le cas gracieux normal) ;
+    //   • toute autre erreur → "error" + on MÉMORISE le message réel pour que
+    //     le toast l'affiche (fini le diagnostic à l'aveugle).
+    // Le message Rust pour binaire manquant commence par « LSP binary not found »
+    // (cf. lsp_init dans src-tauri/src/commands/lsp.rs).
+    const msg = fmtErr(err);
+    diag("lsp", `init failed for ${langId}: ${msg}`);
+    const isMissingBinary = /binary not found/i.test(msg);
+    if (isMissingBinary) {
+      setLspStatus(langId, "absent");
+    } else {
+      setLspError(langId, msg);
+      setLspStatus(langId, "error");
+    }
     return null;
   }
 
@@ -105,22 +130,47 @@ async function doInit(
   const transport = await createTauriTransport(langId);
   const client = new LSPClient({
     rootUri: workspaceUri,
+    // §2 — Workspace custom : displayFile branché sur le système d'onglets de
+    // Shugu (via lspBridge) pour la navigation cross-fichier (F12/Ctrl+Clic/
+    // références). SANS ça, la lib utilise DefaultWorkspace dont displayFile
+    // retourne null → « Aller à la définition » vers un AUTRE fichier ne fait
+    // rien (tout le §2 serait du code mort).
+    workspace: (c) => new ShuguWorkspace(c, workspaceUri),
     extensions: languageServerExtensions(),
-    // Note : sanitizeHTML omis pour LOT 3 MVP. Les hover/diagnostics LSP
-    // peuvent retourner du markdown rendu en HTML — sans sanitize, on est
-    // vulnérables à un LSP malveillant qui injecterait du JS via hover.
-    // Mitigation : on ne lance QUE des LSP servers résolus via which()
-    // (donc installés par l'utilisateur, pas par Shugu). Risk acceptable
-    // pour MVP, à ajouter DOMPurify en hardening.
+    // Défaut @codemirror/lsp-client = 3000 ms. On le porte à 20 s : marge de
+    // sécurité pour un cold-start lent (un gros projet TS qui charge ~10 Mo, un
+    // disque froid + Defender). NB : ce n'était PAS la cause du bug TS muet —
+    // celle-là était le préfixe Windows `\\?\` que cmd.exe rejetait (corrigé
+    // dans lsp.rs::strip_extended_prefix). On garde 20 s comme bon défaut.
+    timeout: 20000,
+    // Lot B §5 — sanitize le HTML des hovers/diagnostics (Markdown→HTML).
+    // Ferme la surface XSS ouverte par §1 : depuis la résolution
+    // node_modules/.bin, le serveur LSP peut être fourni PAR le dépôt ouvert
+    // (et plus seulement installé par l'utilisateur via le PATH). DOMPurify
+    // strip <script>/on*/href:javascript: — voir ./sanitize.ts.
+    sanitizeHTML: sanitizeLspHtml,
   });
 
   try {
     client.connect(transport);
     await client.initializing;
     diag("lsp", `${langId} ready (rootUri=${workspaceUri})`);
+    setLspStatus(langId, "ready");
   } catch (err) {
-    diag("lsp", `${langId} initialize failed: ${fmtErr(err)}`);
+    const msg = fmtErr(err);
+    diag("lsp", `${langId} initialize failed: ${msg}`);
+    setLspError(langId, msg);
+    setLspStatus(langId, "error");
     transport.dispose();
+    // Défense en profondeur — tuer la session Rust en échec. lsp_init est
+    // IDEMPOTENT : laisser une session à moitié initialisée dans le registre
+    // ferait réutiliser le même process au prochain open → un 2e `initialize`
+    // qu'un serveur LSP ignore → re-timeout en boucle. Le kill garantit que la
+    // tentative suivante repart d'un process neuf, quelle que soit la cause de
+    // l'échec. (Best-effort, non bloquant.)
+    void invoke("lsp_shutdown", { langId }).catch((e) => {
+      diag("lsp", `${langId} cleanup shutdown failed: ${fmtErr(e)}`);
+    });
     return null;
   }
 
@@ -167,20 +217,10 @@ export async function getLspClient(
   return pending;
 }
 
-/**
- * Construit le fileUri à passer à `client.plugin(uri, langId)`. Combine
- * le workspaceUri (file:///F:/Dev/shugu_code) avec un path relatif
- * (src/lib/fs.ts). Encode le path relatif pour gérer espaces/accents
- * (rust-analyzer/pylsp rejettent les URI non-RFC3986).
- *
- * `encodeURI` est préféré à `encodeURIComponent` car il préserve `/`
- * (séparateur de path) ; on encode juste les espaces, `?`, `#`, accents.
- */
-export function fileUriForPath(workspaceUri: string, relativePath: string): string {
-  const ws = workspaceUri.replace(/\/+$/, "");
-  const rel = encodeURI(relativePath.replace(/^\/+/, ""));
-  return `${ws}/${rel}`;
-}
+// fileUriForPath est défini dans ./uri (avec son inverse relativePathFromUri,
+// utilisé par ShuguWorkspace). Ré-exporté ici pour ne pas casser les call sites
+// existants (CodeMirrorEditor importe fileUriForPath depuis ./client).
+export { fileUriForPath } from "./uri";
 
 /**
  * Cleanup interne d'un client cached. Appelle disconnect() ET dispose le
@@ -204,6 +244,9 @@ function clearClient(langId: string, reason: string): void {
   }
   cached.transport.dispose();
   clients.delete(langId);
+  // Lot B §4 — le serveur a crashé (EOF/erreur framing) : état "error" visible
+  // (l'indicateur propose de relancer en rouvrant le fichier).
+  setLspStatus(langId, "error");
 }
 
 /**

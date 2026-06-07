@@ -30,6 +30,7 @@ import {
 import { db } from "@/lib/db";
 import { getInstalledIds, getModelPath } from "@/lib/modelBundle";
 import { parseThinkingMode, serializeThinkingMode, type ThinkingMode } from "@/lib/thinkingHeuristic";
+import { McpServersSection } from "@/features/mcp/McpServersSection";
 
 // Storage key for the persisted list of user-added custom providers. JSON-encoded
 // array of ConnCardData rows (display metadata only — secrets/configs live in
@@ -67,6 +68,7 @@ export function ConnectionsView() {
   const tabs = [
     { v: "models",    l: "AI Providers" },
     { v: "tools",     l: "Dev tools" },
+    { v: "mcp",       l: "Serveurs MCP" },
     { v: "image",     l: "Image services" },
     { v: "storage",   l: "Storage" },
   ];
@@ -103,6 +105,10 @@ export function ConnectionsView() {
       ]},
       { id: "groq", name: "Groq", meta: "Fast LPU inference", logo: "G", color: "#f55036", fields: [
         { label: "API key", key: "apiKey", placeholder: "gsk_…", secret: true },
+      ]},
+      { id: "minimax", name: "MiniMax", meta: "OpenAI-compat · texte (vidéo/voix via MCP)", logo: "M", color: "#ff4d4f", fields: [
+        { label: "API key", key: "apiKey", placeholder: "…", secret: true },
+        { label: "Modèle par défaut", key: "defaultModel", placeholder: "MiniMax-M2.1 (requis si la liste auto échoue)", secret: false },
       ]},
       // Codex = the user's ChatGPT subscription via the local `codex` CLI
       // (shell-out, no API key). Rendered by a dedicated <CodexCard/> (status +
@@ -174,6 +180,7 @@ export function ConnectionsView() {
             )}
           </div>
           {tab === "models" && <RoutingSection />}
+          {tab === "mcp" && <McpServersSection />}
         </div>
       </div>
       {adding && <AddProviderModal onClose={() => setAdding(false)} onAdd={async (c: ConnCardData) => {
@@ -1271,21 +1278,29 @@ function RoutingSection() {
   const { data: models } = useDiscoveredModels();
   const [chatModel, setChatModel] = useState<string>("");
   const [orchModel, setOrchModel] = useState<string>("");
+  const [advisorModel, setAdvisorModel] = useState<string>("");
   const [override, setOverride] = useState<string>("");
+  // Reviewer automatique sur tâches complexes (S1 livrable + S2 plan). Défaut ON :
+  // l'utilisateur l'a demandé, et le gate complexité+tier empêche de tirer sur le trivial.
+  const [supervise, setSupervise] = useState<boolean>(true);
   const [savingState, setSavingState] = useState<"idle" | "saving" | "saved">("idle");
 
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const [c, o, ov] = await Promise.all([
+      const [c, o, adv, ov, sv] = await Promise.all([
         db.settings.get("routing.chatModel"),
         db.settings.get("routing.orchestratorModel"),
+        db.settings.get("routing.advisorModel"),
         db.settings.get("routing.delegateOverride"),
+        db.settings.get("routing.superviseComplex"),
       ]);
       if (cancelled) return;
       setChatModel(c ?? "");
       setOrchModel(o ?? "");
+      setAdvisorModel(adv ?? "");
       setOverride(ov ?? "");
+      setSupervise(sv == null ? true : sv === "true");
     })();
     return () => { cancelled = true; };
   }, []);
@@ -1295,7 +1310,9 @@ function RoutingSection() {
     try {
       await db.settings.set("routing.chatModel", chatModel);
       await db.settings.set("routing.orchestratorModel", orchModel);
+      await db.settings.set("routing.advisorModel", advisorModel);
       await db.settings.set("routing.delegateOverride", override);
+      await db.settings.set("routing.superviseComplex", supervise ? "true" : "false");
       setSavingState("saved");
       window.setTimeout(() => setSavingState("idle"), 1500);
     } catch (err) {
@@ -1371,6 +1388,34 @@ function RoutingSection() {
         </div>
 
         <div className="conn-field">
+          <label>Modèle de l'advisor (reviewer/skills)</label>
+          <div className="input">
+            <select
+              value={advisorModel}
+              onChange={(e) => setAdvisorModel(e.currentTarget.value)}
+              style={{ width: "100%", background: "transparent", border: "none", color: "inherit", fontFamily: "inherit", fontSize: "inherit" }}
+            >
+              <option value="">— Choisir un modèle —</option>
+              {orchModels.length === 0 && (
+                <option value="" disabled>
+                  (aucun provider non-llamacpp configuré — ajoute Anthropic, OpenCode, ou un Custom)
+                </option>
+              )}
+              {orchModels.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.providerLabel} · {m.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div style={{ fontSize: 11, color: "var(--on-surface-muted)", marginTop: 4 }}>
+            Le modèle FORT qui critique et distille les skills. Prends ton meilleur.
+            Prend la priorité sur le modèle épinglé dans le fichier <code>reviewer-gpt.md</code>.
+            Laisse vide pour utiliser le modèle du reviewer par défaut.
+          </div>
+        </div>
+
+        <div className="conn-field">
           <label>Override</label>
           <div className="input">
             <select
@@ -1382,6 +1427,25 @@ function RoutingSection() {
               <option value="always-delegate">Always delegate (orchestrator pour chaque message)</option>
               <option value="never-delegate">Never delegate (chat model seul)</option>
             </select>
+          </div>
+        </div>
+
+        <div className="conn-field">
+          <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+            <input
+              type="checkbox"
+              checked={supervise}
+              onChange={(e) => setSupervise(e.currentTarget.checked)}
+            />
+            Reviewer automatique sur les tâches complexes
+          </label>
+          <div style={{ fontSize: 11, color: "var(--on-surface-muted)", marginTop: 4 }}>
+            Un agent reviewer relit le <b>plan</b> (avant exécution) et le <b>livrable</b>{" "}
+            (après) des tâches jugées complexes — seuil adapté au modèle (plus bas pour un
+            petit modèle, qui en a le plus besoin). La revue est stockée en local.{" "}
+            ⚠ Coût : jusqu'à 3 appels LLM supplémentaires par tâche complexe (plan, revue
+            du plan, revue du livrable), facturés via la clé du reviewer
+            {" "}(par défaut <code>reviewer-gpt</code> → OpenAI). Max 2 supervisions en parallèle.
           </div>
         </div>
 

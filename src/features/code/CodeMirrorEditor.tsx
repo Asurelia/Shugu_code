@@ -1,7 +1,7 @@
 // Shugu Forge — CodeMirror 6 React host (ESM imports, no CDN, no window globals).
 // Replaces the proto's window.mountCodeMirror bootstrap.
 
-import { useEffect, useMemo, useRef, forwardRef, useImperativeHandle } from "react";
+import { useEffect, useMemo, useRef, useState, forwardRef, useImperativeHandle } from "react";
 import { Compartment, EditorState, type Extension } from "@codemirror/state";
 import {
   EditorView,
@@ -41,11 +41,15 @@ import { diag } from "@/lib/diag";
 import { bracketPairColors } from "./extensions/bracketPairColors";
 import { snippetCompletionSource } from "./snippets/loader";
 import { getLspClient, isLspSupported, fileUriForPath, fmtErr } from "./lsp/client";
+import { clickToDefinition } from "./lsp/clickToDefinition";
+import { LSPPlugin } from "@codemirror/lsp-client";
+import { LspContextMenu, type LspMenuState } from "./LspContextMenu";
 import { gitDiffCompartment, buildGitDecorations } from "./git-decorations";
 import { blameCompartment, buildBlameGutter } from "./blame-decorations";
 import { aiEditCompartment, aiEditStreamAnnotation } from "./ai-edit/unifiedDiffExtension";
 import { ghostTextExtension } from "./autocomplete/ghostText";
 import { fimCompartment, buildFimTrigger } from "./autocomplete/fimTrigger";
+import { setEditorSelection } from "@/features/chat/editorSelectionStore";
 import type { GitBlameLine } from "@/lib/types";
 
 /**
@@ -171,8 +175,17 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
 }>(function CodeMirrorEditor({ value, onChange, path, language = "typescript", wordWrap = false, stickyScroll = false, minimap = false, gitHeadOriginal = null, gitDecorations = true, blame = null, gitBlameEnabled = false, tabAutocomplete = false }, ref) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
+  // §3c — état du menu clic-droit LSP (null = fermé).
+  const [lspMenu, setLspMenu] = useState<LspMenuState | null>(null);
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
+  // LOT A (ressenti curseur) — ref qui suit toujours la prop `path` courante.
+  // Même mécanique que onChangeRef : l'updateListener est créé une seule fois au
+  // mount (deps [langExt]) et NE re-monte PAS quand on passe de `a.ts` à `b.ts`
+  // (même langage → même langExt). Capturer `path` directement dans la closure
+  // donnerait une valeur PÉRIMÉE ; on lit donc pathRef.current au moment du publish.
+  const pathRef = useRef(path);
+  pathRef.current = path;
   // LOT 2 — Doc version counter, incrémenté à chaque docChanged via le
   // updateListener. Lu par OutlinePanel/Breadcrumbs via getDocVersion().
   const docVersionRef = useRef(0);
@@ -233,6 +246,27 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
         const isAiStream = u.transactions.some((tr) => tr.annotation(aiEditStreamAnnotation));
         if (!isAiStream && onChangeRef.current) {
           onChangeRef.current(u.state.doc.toString());
+        }
+      }
+
+      // LOT A (ressenti curseur) — publie la sélection courante vers
+      // editorSelectionStore (lu par le chip du composer, même hors /code).
+      // On publie quand la sélection bouge (selectionSet) OU quand le doc change
+      // sous une sélection (docChanged → les offsets/texte ont pu bouger).
+      // pathRef.current (pas `path`) car la closure de l'updateListener est
+      // figée au mount et `path` y serait périmé sur changement de fichier
+      // même-langage.
+      if (u.selectionSet || u.docChanged) {
+        const sel = u.state.selection.main;
+        if (sel.empty) {
+          setEditorSelection(null);
+        } else {
+          setEditorSelection({
+            path: pathRef.current ?? "",
+            text: u.state.sliceDoc(sel.from, sel.to),
+            startLine: u.state.doc.lineAt(sel.from).number,
+            endLine: u.state.doc.lineAt(sel.to).number,
+          });
         }
       }
     });
@@ -382,7 +416,19 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
     });
     const view = new EditorView({ state, parent: hostRef.current });
     viewRef.current = view;
+    // §3c — clic-droit : si un LSP est attaché, ouvrir le menu LSP dédié (sinon
+    // laisser le menu natif du navigateur). On place le curseur sous la souris
+    // pour que les commandes (def/refs/rename) agissent sur le bon symbole.
+    const onCtx = (e: MouseEvent) => {
+      if (!LSPPlugin.get(view)) return;
+      e.preventDefault();
+      const pos = view.posAtCoords({ x: e.clientX, y: e.clientY });
+      if (pos != null) view.dispatch({ selection: { anchor: pos } });
+      setLspMenu({ x: e.clientX, y: e.clientY, view });
+    };
+    view.dom.addEventListener("contextmenu", onCtx);
     return () => {
+      view.dom.removeEventListener("contextmenu", onCtx);
       view.destroy();
       viewRef.current = null;
     };
@@ -497,7 +543,12 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
       const fileUri = fileUriForPath(result.workspaceUri, path);
       try {
         view.dispatch({
-          effects: lspCompartment.reconfigure(result.client.plugin(fileUri, langId)),
+          effects: lspCompartment.reconfigure([
+            result.client.plugin(fileUri, langId),
+            // §3a — Ctrl/Cmd+Clic = Aller à la définition (monté avec le plugin
+            // donc actif seulement quand un LSP est attaché).
+            clickToDefinition(),
+          ]),
         });
         diag("lsp", `attached plugin for ${fileUri}`);
       } catch (err) {
@@ -511,5 +562,10 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
     };
   }, [path, language, lspCompartment]);
 
-  return <div ref={hostRef} className="cm-host" />;
+  return (
+    <>
+      <div ref={hostRef} className="cm-host" />
+      <LspContextMenu state={lspMenu} onClose={() => setLspMenu(null)} />
+    </>
+  );
 });

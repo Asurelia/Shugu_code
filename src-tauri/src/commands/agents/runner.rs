@@ -71,8 +71,12 @@ const MAX_ITERATIONS_EXEC: u32 = 24;
 ///     to the LLM as the user-side of the next turn. OpenAI uses
 ///     `role: "tool"` per result; Anthropic packs all results into a
 ///     single `role: "user"` message with `content: [tool_result, ...]`.
+// `pub(crate)` (was `pub(super)`) so the chat tool loop in `commands::chat`
+// reuses the SAME multi-turn history shape + provider builders instead of
+// duplicating them (Lot A — Task 9/11, cleanup-on-replace / no-dup policy).
+// The variant fields must be `pub` too so `chat.rs` can construct them.
 #[allow(dead_code)] // variants used in match arms but rustc sees only construction
-pub(super) enum AgentMessage {
+pub(crate) enum AgentMessage {
     Text { role: String, content: String },
     AssistantWithTools { content: String, tool_calls: Vec<ToolCall> },
     ToolResults(Vec<ToolResult>),
@@ -87,7 +91,7 @@ pub(super) enum AgentMessage {
 /// each carrying its `tool_call_id`). Lot 3 — now the active builder for the
 /// openai/custom agent path via `call_openai_compat_structured`, replacing the
 /// former text projection.
-fn build_openai_messages(history: &[AgentMessage]) -> Vec<serde_json::Value> {
+pub(crate) fn build_openai_messages(history: &[AgentMessage]) -> Vec<serde_json::Value> {
     let mut out: Vec<serde_json::Value> = Vec::new();
     for msg in history {
         match msg {
@@ -162,7 +166,9 @@ fn push_coalesced(out: &mut Vec<serde_json::Value>, role: &str, blocks: Vec<serd
 /// coalesced (the loop appends a system-nudge user message right after a
 /// tool_results user message; Anthropic rejects two consecutive user turns).
 /// Lot 3 — replaces the former JSON-in-text projection.
-fn build_anthropic_native(history: &[AgentMessage]) -> (Vec<serde_json::Value>, Option<String>) {
+pub(crate) fn build_anthropic_native(
+    history: &[AgentMessage],
+) -> (Vec<serde_json::Value>, Option<String>) {
     let mut system_parts: Vec<String> = Vec::new();
     let mut out: Vec<serde_json::Value> = Vec::new();
 
@@ -236,7 +242,7 @@ fn build_anthropic_native(history: &[AgentMessage]) -> (Vec<serde_json::Value>, 
 /// is open — the dispatcher then returns an "is_error: true" ToolResult
 /// for every call this iteration so the model sees the situation and
 /// can ask the user to open a workspace.
-pub(super) fn get_workspace_root(app: &AppHandle) -> Option<PathBuf> {
+pub(crate) fn get_workspace_root(app: &AppHandle) -> Option<PathBuf> {
     let state = app.state::<Mutex<Option<PathBuf>>>();
     let guard = state.lock().ok()?;
     guard.clone()
@@ -491,12 +497,71 @@ pub(super) async fn tool_use_loop(
         );
     }
 
+    // S3 — Closed-loop lesson injection: retrieve validated past-run reviews
+    // for tasks semantically similar to this one and prepend them to context.
+    // Injected AFTER skills (position 2) so both blocks ride behind the system
+    // prompt without displacing each other. Degrades silently on any error.
+    let task_text: String = history
+        .iter()
+        .find_map(|m| match m {
+            AgentMessage::Text { role: r, content } if r.as_str() == "user" => {
+                Some(content.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_default();
+    let (lessons_block, lessons_count) =
+        super::lessons::lessons_prompt_block(app, role, &task_text);
+    if !lessons_block.is_empty() {
+        // Insérer AVANT le message user (comme le bloc skills) : un message
+        // role="system" placé APRÈS un message user est rejeté par Anthropic.
+        let pos = history.len().min(1);
+        history.insert(
+            pos,
+            AgentMessage::Text {
+                role: "system".to_string(),
+                content: lessons_block,
+            },
+        );
+        let _ = persist_and_emit(
+            app,
+            &AgentEvent::LessonsInjected {
+                agent_id: agent_id.to_string(),
+                role: role.to_string(),
+                count: lessons_count,
+            },
+        );
+    }
+
     // Env-verified skill gate: `run_command` writes its exit code here; the
     // `skill_save` tool refuses unless the LAST run was exit 0. A skill is thus
     // only ever born from a test the REAL environment confirmed — never an LLM
     // opinion. Sentinel i64::MIN = "no command run yet" (so chat, which can't
     // exec, never saves a skill). Shared (Arc) into each parallel tool task.
     let last_exec_exit = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN));
+
+    // Lot C — MCP : assemble the tools manifest ONCE per run (not per iteration).
+    // `enabled_tools_json` does real I/O — it connects to each ENABLED MCP server
+    // and lists its tools — so we pay that cost a single time. The merged array is
+    // `native tools (tools_json_*) ++ MCP tools (enabled servers)`, rendered for
+    // THIS protocol. With no enabled server, `enabled_tools_json` returns `[]` and
+    // the array is byte-identical to the native default — the no-MCP path is
+    // unchanged. `None` is threaded for the `ollama` branch (which ignores tools).
+    let agent_tools: Option<serde_json::Value> = if protocol == "ollama" {
+        None
+    } else {
+        let mut arr = if protocol == "anthropic" {
+            super::tools::tools_json_anthropic()
+        } else {
+            super::tools::tools_json_openai()
+        };
+        let mgr = app.state::<crate::commands::mcp::McpManager>();
+        let mcp_tools = crate::commands::mcp::enabled_tools_json(app, &mgr, protocol).await;
+        if let Some(a) = arr.as_array_mut() {
+            a.extend(mcp_tools);
+        }
+        Some(arr)
+    };
 
     while iteration < budget {
         metrics.iterations = iteration + 1;
@@ -523,7 +588,7 @@ pub(super) async fn tool_use_loop(
 
         // ── 1. Call the LLM with the current history + tools manifest ──
         let (turn, reasoning) =
-            call_agent_llm_with_tools(app, client, protocol, base_url, model, history, api_key, chat_template_kwargs, agent_id).await?;
+            call_agent_llm_with_tools(app, client, protocol, base_url, model, history, api_key, chat_template_kwargs, agent_id, &agent_tools).await?;
 
         // ── 2. Persist Message event for this assistant turn ───────────
         let _ = persist_and_emit(
@@ -596,12 +661,81 @@ pub(super) async fn tool_use_loop(
             );
         }
 
-        // ── 5. Resolve workspace + execute tools in parallel ───────────
+        // ── 5. Resolve workspace + execute tools ───────────────────────
         let workspace_root = workspace_override
             .as_ref()
             .cloned()
             .or_else(|| get_workspace_root(app));
-        let results: Vec<ToolResult> = if let Some(root) = workspace_root {
+
+        // Lot C — MCP routing. MCP tools (`mcp__server__tool`) are executed via
+        // `mcp::mcp_execute`, which is ASYNC and CANNOT run inside the sync
+        // `spawn_blocking` closure used for the native fs tools. So when at least
+        // ONE call this round is an MCP tool, we drop to a SEQUENTIAL path that
+        // handles both kinds in their original order (the order matters: OpenAI
+        // pairs each result to its `tool_call_id`, Anthropic batches them but all
+        // ids must be present). Simplicity over parallelism here — the plan
+        // explicitly blesses sequential-when-any-MCP. MCP tools act OUTSIDE the
+        // workspace, so they run even when no workspace is open (routed BEFORE the
+        // workspace-root gate). When NO call is MCP, the original parallel block
+        // runs VERBATIM → the no-MCP hot path (and its tests) is unchanged.
+        let any_mcp = turn
+            .tool_calls
+            .iter()
+            .any(|tc| tc.name.starts_with("mcp__"));
+
+        let results: Vec<ToolResult> = if any_mcp {
+            let mgr = app.state::<crate::commands::mcp::McpManager>();
+            let mut acc: Vec<ToolResult> = Vec::with_capacity(turn.tool_calls.len());
+            for tc in &turn.tool_calls {
+                if tc.name.starts_with("mcp__") {
+                    // MCP tool: async dispatch, no workspace needed. Parse args
+                    // like the native path (runner.rs ToolCall events) — bad/empty
+                    // args become `{}` so the call stays well-formed.
+                    let args: serde_json::Value =
+                        serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
+                    let (content, is_error) =
+                        crate::commands::mcp::mcp_execute(app, &mgr, &tc.name, &args).await;
+                    acc.push(ToolResult {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        is_error,
+                        content,
+                    });
+                } else if let Some(root) = workspace_root.as_ref() {
+                    // Native fs tool: sync dispatch on a blocking thread, same as
+                    // the parallel path but awaited one at a time.
+                    let tc_clone = tc.clone();
+                    let fallback_id = tc_clone.id.clone();
+                    let fallback_name = tc_clone.name.clone();
+                    let root_clone = Arc::new(root.clone());
+                    let app_clone = app.clone();
+                    let role_clone = role.to_string();
+                    let last_exec_clone = last_exec_exit.clone();
+                    let mounts_clone = exec_ro_mounts.clone();
+                    let r = tokio::task::spawn_blocking(move || {
+                        execute_tool(&tc_clone, &root_clone, allow_exec, &app_clone, &role_clone, &last_exec_clone, &mounts_clone)
+                    })
+                    .await
+                    .unwrap_or_else(|join_err| ToolResult {
+                        id: fallback_id,
+                        name: fallback_name,
+                        is_error: true,
+                        content: format!("tool execution panicked: {join_err}"),
+                    });
+                    acc.push(r);
+                } else {
+                    // Native tool but no workspace open — same clean error as the
+                    // parallel else-branch below.
+                    acc.push(ToolResult {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        is_error: true,
+                        content: "no workspace open".to_string(),
+                    });
+                }
+            }
+            acc
+        } else if let Some(root) = workspace_root {
             let root_arc = Arc::new(root);
             let futures = turn.tool_calls.iter().map(|tc| {
                 let tc_clone = tc.clone();
@@ -711,6 +845,7 @@ pub(super) async fn tool_use_loop(
                         agent_id: agent_id.to_string(),
                         role: role.to_string(),
                         name,
+                        source: "agent".to_string(),
                     },
                 );
             }
@@ -754,6 +889,12 @@ async fn call_agent_llm_with_tools(
     api_key: &str,
     chat_template_kwargs: &Option<serde_json::Value>,
     agent_id: &str,
+    // Lot C — merged tools manifest (native ++ enabled MCP) for THIS protocol,
+    // assembled once per run by the caller. `None` only for the `ollama` branch
+    // (which ignores tools). Passed through to the structured helpers, replacing
+    // the former hard-coded `tools: None` (= native-default) so MCP tools reach
+    // the model's request body.
+    tools: &Option<serde_json::Value>,
 ) -> Result<(AssistantTurn, String), String> {
     // Live streaming restauré post-migration TanStack (2026-05-17).
     //
@@ -812,6 +953,7 @@ async fn call_agent_llm_with_tools(
             chat::call_anthropic_structured(
                 client, base_url, model, messages, system, api_key,
                 /* with_tools */ true,
+                /* tools (native ++ enabled MCP) */ tools.clone(),
                 /* abort */ None,
                 &mut on_chunk,
             )
@@ -830,6 +972,7 @@ async fn call_agent_llm_with_tools(
                 protocol,
                 chat_template_kwargs,
                 /* with_tools */ true,
+                /* tools (native ++ enabled MCP) */ tools.clone(),
                 /* abort */ None,
                 &mut on_chunk,
             )
@@ -1004,6 +1147,10 @@ fn record_outcome(
                     now_ms(),
                 ],
             );
+            // S3 — la promotion `validated=1` se fait côté TS au moment où la
+            // review est créée (superviseDeliverable lit `transcript.agent.status`).
+            // Elle ne peut PAS se faire ici : la review n'existe pas encore à ce
+            // point (produite après ce run par un reviewer asynchrone).
         }
     }
 }

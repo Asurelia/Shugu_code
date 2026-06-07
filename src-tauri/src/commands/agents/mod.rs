@@ -84,13 +84,20 @@ mod mirror;
 /// per-role, compounding learning.
 pub(crate) mod skills;
 
+/// S3 — Closed-loop lesson injection. At the start of each run, retrieves the
+/// most relevant validated past reviews via semantic search and injects them
+/// into the agent's context so past mistakes compound into future improvements.
+mod lessons;
+
 // Re-export the crate-visible items from `tools` so `chat.rs` can reach
 // them via `crate::commands::agents::*` without poking into the private
 // submodule path. The streaming helpers in `chat.rs` consume:
 //   - `ToolCall` as the shape held in `AssistantTurn.tool_calls`
 //   - `ToolCallAccumulator` for the OpenAI streaming-fragment assembly
 //   - `tools_json_*` for injecting the `tools` body field on agent calls
-pub(crate) use tools::{tools_json_anthropic, tools_json_openai, ToolCall, ToolCallAccumulator};
+pub(crate) use tools::{
+    tools_json_anthropic, tools_json_openai, ToolCall, ToolCallAccumulator, ToolResult,
+};
 
 // ────────────────────────────────────────────────────────────────────────
 // Constants
@@ -259,10 +266,25 @@ pub enum AgentEvent {
     /// real environment VERIFIED (its last `run_command` test exited 0). Emitted
     /// by the tool loop so the main chat UI shows an inline "🎓 appris : <name>"
     /// badge. Replaces the retired `HarnessEvolved` (prompt-rewrite Refiner).
+    ///
+    /// `source` — who created the skill: `"agent"` (via the `skill_save` tool
+    /// after a passing test) or `"advisor"` (via the `skill_save_advisor` Tauri
+    /// command, written by the external reviewer model). Serialised camelCase.
     SkillLearned {
         agent_id: String,
         role: String,
         name: String,
+        /// `"agent"` | `"advisor"` — serialised camelCase via rename_all_fields.
+        source: String,
+    },
+    /// S3 — Closed-loop lesson injection. Emitted when validated past-run lessons
+    /// are retrieved via semantic search and injected into the agent's context.
+    /// The `count` field reports how many lessons were actually injected so the
+    /// UI can show a brief "📚 N leçon(s) injectée(s)" badge.
+    LessonsInjected {
+        agent_id: String,
+        role: String,
+        count: usize,
     },
     /// Grounded Run produced a unified diff (mirror vs baseline) and tried to
     /// auto-apply it to the live project. `applied` reports whether the write
@@ -290,6 +312,7 @@ impl AgentEvent {
             AgentEvent::Complete { .. } => "complete",
             AgentEvent::Error { .. } => "error",
             AgentEvent::SkillLearned { .. } => "skillLearned",
+            AgentEvent::LessonsInjected { .. } => "lessonsInjected",
             AgentEvent::Diff { .. } => "diff",
         }
     }
@@ -306,6 +329,7 @@ impl AgentEvent {
             | AgentEvent::Complete { agent_id, .. }
             | AgentEvent::Error { agent_id, .. }
             | AgentEvent::SkillLearned { agent_id, .. }
+            | AgentEvent::LessonsInjected { agent_id, .. }
             | AgentEvent::Diff { agent_id, .. } => agent_id,
         }
     }
@@ -550,12 +574,20 @@ pub async fn agent_spawn(
     // role/model par ses valeurs. Le body devient le `system_prompt_override`
     // — le runner accepte déjà ce levier ([runner.rs] system_prompt_override).
     // Sinon : comportement historique (role brut, seed_prompt par défaut).
+    //
+    // ⚠ CONTRAT : on ne résout ici QUE `role` + `model` (nom nu). Le provider du
+    // modèle épinglé (protocol / base_url / api_key) reste la responsabilité de
+    // l'appelant TS (handleDelegate → resolveProvider + loadProviderConfig). Un
+    // futur appelant qui passerait `agent_def_path` SANS résoudre le provider en
+    // amont enverrait le bon model mais les mauvais protocol/clé.
     let system_prompt_override: Option<String> = match args.agent_def_path.as_deref() {
         Some(p) if !p.is_empty() => {
             let def = crate::commands::agent_defs::load_def(p)?;
             args.role = def.base_role;
             if let Some(m) = def.model {
-                args.model = m;
+                // Strip the "provider/" prefix — the API body needs the bare model name
+                // (mirrors resolveProvider() on the TS side, e.g. "openai/gpt-4o" → "gpt-4o").
+                args.model = m.split_once('/').map(|(_, n)| n.to_string()).unwrap_or(m);
             }
             Some(def.body)
         }
@@ -673,9 +705,13 @@ pub async fn agent_spawn(
             design_context_for_task,
             abort_token,
             None,  // workspace_override — chat works on the real open workspace
-            false, // allow_exec — chat never executes; only the Atelier does
+            false, // allow_exec — DÉSACTIVÉ tant que l'isolation OS (compte sandbox
+                   // restreint + ACL + pare-feu, modèle Codex) n'est pas construite.
+                   // Le denylist `is_irreparable` seul ne tient pas (contournable via
+                   // `&&`/sous-shell) — revue sécurité 2026-06-07. On ne donne les
+                   // pleins pouvoirs d'exécution QU'UNE FOIS la cage OS en place.
             system_prompt_override_for_task, // None ⇒ seed_prompt ; Some ⇒ .md custom
-            Vec::new(), // exec_ro_mounts — chat never execs
+            Vec::new(), // exec_ro_mounts — chat n'a pas de mounts supplémentaires
         )
         .await;
     });

@@ -209,19 +209,19 @@ pub fn vec_index(
     Ok(())
 }
 
-/// Return the `k` nearest vectors in `vec_<collection>` to `query`.
-///
-/// Results are ordered by ascending distance (closest first).
-#[tauri::command]
-pub fn vec_search(
-    app: tauri::AppHandle,
-    collection: String,
-    query: String,
+/// Internal kNN search — reusable across crates without going through the
+/// Tauri command boundary. Validates `collection`, embeds `query`, executes
+/// the kNN SQL, and returns the ordered hits. Returns `Err` (never panics)
+/// on any failure so callers can degrade gracefully.
+pub(crate) fn vec_search_internal(
+    app: &tauri::AppHandle,
+    collection: &str,
+    query: &str,
     k: u32,
 ) -> Result<Vec<VecHit>, String> {
-    validate_collection(&collection)?;
-    let blob = serialize_f32_vec(&embed(&query)?);
-    let guard = get_conn(&app)?.lock().map_err(|e| format!("lock: {e}"))?;
+    validate_collection(collection)?;
+    let blob = serialize_f32_vec(&embed(query)?);
+    let guard = get_conn(app)?.lock().map_err(|e| format!("lock: {e}"))?;
     let sql = format!(
         "SELECT id, distance FROM vec_{collection} \
          WHERE embedding MATCH ?1 AND k = ?2 \
@@ -241,6 +241,19 @@ pub fn vec_search(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("vec_search row: {e}"))?;
     Ok(hits)
+}
+
+/// Return the `k` nearest vectors in `vec_<collection>` to `query`.
+///
+/// Results are ordered by ascending distance (closest first).
+#[tauri::command]
+pub fn vec_search(
+    app: tauri::AppHandle,
+    collection: String,
+    query: String,
+    k: u32,
+) -> Result<Vec<VecHit>, String> {
+    vec_search_internal(&app, &collection, &query, k)
 }
 
 /// Delete the entry identified by `id` from `vec_<collection>`.

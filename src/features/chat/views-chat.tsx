@@ -17,12 +17,17 @@ import { Icon } from "@/components/components";
 import { invoke } from "@/lib/tauri";
 import { useChatStream } from "./useChatStream";
 import { useMessages, sendChatMessage, useActiveModel } from "./chat-sync";
+import { useEditorSelection } from "./editorSelectionStore";
+import { useChatToolActivity } from "./chatToolActivityStore";
+import { ChatWritesCard } from "./ChatWritesCard";
+import { db } from "@/lib/db";
 import { ModelPicker } from "@/features/panels/panels";
 import { resolveImageProvider } from "@/lib/imageProviders";
 import { revealAgent } from "@/lib/agents";
 import { useAgentDefs } from "@/features/agents/agentDefsQueries";
 import { useMessageDisplay } from "./useMessageDisplay";
 import { useShell } from "@/routes/shell-context";
+import { detectBlockPath } from "@/lib/markdown";
 import { CodeMirrorEditor } from "@/features/code/CodeMirrorEditor";
 import { GitDiffView } from "@/features/code/DiffView";
 import { ContextBubble } from "@/features/context-cards/ContextBubble";
@@ -30,6 +35,8 @@ import { useGitBranches } from "@/features/git/queries";
 import { useWorkspaceChanges } from "@/features/git/useWorkspaceChanges";
 import { fsGetWorkspaceRoot } from "@/lib/fs";
 import { fsKeys } from "@/features/fs/keys";
+import { CommentTray } from "@/features/cockpit/CommentTray";
+import { getComments, clearComments } from "@/features/cockpit/commentStore";
 import type { Message, MessageAction } from "@/lib/types";
 
 type ImageResult = {
@@ -63,10 +70,16 @@ export function ChatView({
   activeConv,
   model: modelProp,
   onOpenSnippet,
+  disableSplit,
 }: {
   activeConv: string;
   model?: string;
   onOpenSnippet?: (code: string, lang: string) => void;
+  /** When true, suppress the in-chat split editor (used by the cockpit where
+   *  the right panel IS the editor surface). Opening a file calls openFile()
+   *  without ever setting splitFile. The /chat route (flag OFF) leaves this
+   *  false so split behavior is unchanged there. */
+  disableSplit?: boolean;
 }) {
   const [input, setInput] = useState("");
   const [typing, setTyping] = useState(false);
@@ -79,14 +92,35 @@ export function ChatView({
   const chatStream = useChatStream(activeConv);
   const { data: messages } = useMessages(activeConv);
   const [model, setModel] = useActiveModel(modelProp);
+  // Lot A — Task 12 : libellés des tool-calls du tour en cours (« 🔍 a lu … »,
+  // « ✏️ a écrit … »), accumulés par le listener root et rendus dans le bloc de
+  // streaming ci-dessous. Vidé à la fin du tour (done delta).
+  const toolActivity = useChatToolActivity(activeConv);
 
   const navigate = useNavigate();
-  const { openFile, fileContents, setFileContents, editorPrefs, compareFile, setCompareFile } = useShell();
+  const { activeFile, openFile, fileContents, setFileContents, editorPrefs, compareFile, setCompareFile, applyCodeToFile } = useShell();
 
   // Phase 2 — Chat→Editor handoff. When a file is opened from an action card,
   // we reveal an in-chat split (chat left, CodeMirror right) instead of
   // leaving the chat view. `splitFile` null = no split.
   const [splitFile, setSplitFile] = useState<string | null>(null);
+
+  // Lot A — contexte éditeur auto. Le composer du MAIN IDE a accès à l'éditeur
+  // (activeFile + fileContents via useShell) ; il joint donc automatiquement le
+  // fichier actif (+ la sélection courante) au message envoyé. La mascotte
+  // (FloatChat) n'a pas de ShellContext réel → elle ne passe jamais editorCtx.
+  //
+  // `selection` est publiée par CodeMirrorEditor (editorSelectionStore). Le chip
+  // ci-dessous montre ce qui sera envoyé et permet de le retirer pour un tour.
+  // `ctxDropped` est remis à false après chaque envoi (le contexte se réactive
+  // au tour suivant). Le toggle `chat.autoEditorContext` (défaut ON) le coupe.
+  const selection = useEditorSelection();
+  const [ctxDropped, setCtxDropped] = useState(false);
+  const { data: autoCtxOn = true } = useQuery({
+    queryKey: ["settings", "chat.autoEditorContext"],
+    queryFn: async () => (await db.settings.get("chat.autoEditorContext")) !== "false",
+    staleTime: 30_000,
+  });
 
   // Real context chips: current git branch + workspace folder name.
   const { data: branches } = useGitBranches();
@@ -180,6 +214,30 @@ export function ChatView({
       }
     }
     if (!text && !pendingImage) return; // slash sans contenu : no-op
+
+    // Lot A — contexte éditeur auto (main IDE uniquement). On joint le fichier
+    // actif (+ sélection courante si elle le concerne) sauf si le toggle est
+    // OFF ou que l'utilisateur a retiré le chip pour ce tour. La déduplication
+    // avec les @-mentions est gérée côté sendChatMessage (chat-sync.ts).
+    let editorCtx: Parameters<typeof sendChatMessage>[5] | undefined;
+    if (autoCtxOn && !ctxDropped && activeFile && fileContents[activeFile]) {
+      const sel =
+        selection && selection.path === activeFile && selection.text.trim()
+          ? { text: selection.text, startLine: selection.startLine, endLine: selection.endLine }
+          : undefined;
+      editorCtx = { path: activeFile, content: fileContents[activeFile].text, selection: sel };
+    }
+
+    // C2.4 — inline comments from the Révision diff. Read at send time (so any
+    // note added after the last keystroke is captured). Passed as an optional
+    // 7th param to sendChatMessage, which injects them EPHEMERALLY into the
+    // API payload only (same pattern as editorCtx — never written to SQLite,
+    // never shown in the user bubble). Passing undefined when empty → no-op,
+    // identical code path to today. clearComments() only after success so the
+    // queue is preserved if sendChatMessage throws (user can retry).
+    const pendingComments = getComments();
+    const commentsArg = pendingComments.length > 0 ? pendingComments : undefined;
+
     setInput("");
     const imageToSend = pendingImage;
     setPendingImage(null);
@@ -192,12 +250,29 @@ export function ChatView({
         model,
         imageToSend ?? undefined,
         agentDefPath,
+        editorCtx,
+        commentsArg,
       );
+      // Clear ONLY after dispatch succeeds.
+      if (commentsArg) clearComments();
     } finally {
       setTyping(false);
       chatStream.stop();
+      setCtxDropped(false); // le contexte se réactive au tour suivant
     }
-  }, [input, pendingImage, model, activeConv, chatStream, enabledAgents]);
+  }, [
+    input,
+    pendingImage,
+    model,
+    activeConv,
+    chatStream,
+    enabledAgents,
+    autoCtxOn,
+    ctxDropped,
+    activeFile,
+    fileContents,
+    selection,
+  ]);
 
   const onKey = (e: React.KeyboardEvent) => {
     if (slashOpen) {
@@ -235,13 +310,15 @@ export function ChatView({
   // Open a workspace file from an action card → reveal the in-chat split
   // (chat left, editor right), staying in the chat view. `openFile` loads the
   // content into the shared fileContents store first.
+  // When `disableSplit` is true (cockpit), skip the split reveal so the file
+  // only lands in the right-panel Éditeur surface (openFile alone is enough).
   const handleOpenFile = useCallback((path: string) => {
     setCompareFile(null); // opening a file for editing supersedes any open diff
     void (async () => {
       await openFile(path);
-      setSplitFile(path);
+      if (!disableSplit) setSplitFile(path);
     })();
-  }, [openFile, setCompareFile]);
+  }, [openFile, setCompareFile, disableSplit]);
 
   const closeSplit = useCallback(() => setSplitFile(null), []);
   const openFullEditor = useCallback(() => {
@@ -281,6 +358,10 @@ export function ChatView({
 
   const composer = (
     <>
+      {/* C2.4 — pending inline comments tray. Returns null when empty (no-comments
+          path unchanged). Visible only when the user has queued notes from the
+          Révision diff, independently of the cockpit flag. */}
+      <CommentTray />
       <div className="cx-composer" style={{ position: "relative" }}>
         {slashOpen && (
           <div
@@ -417,6 +498,39 @@ export function ChatView({
         </div>
       </div>
       <div className="cx-ctx-row">
+        {/* Lot A — chip contexte éditeur retirable. Montre le fichier actif (+
+            sélection) qui sera joint au prochain message. Le × le retire pour
+            ce tour (réactivé après envoi). Réutilise .cx-chip (charte glass). */}
+        {autoCtxOn && !ctxDropped && activeFile && (
+          <span className="cx-chip ctx-editor" title="Contexte envoyé au modèle — cliquez × pour ne pas l'envoyer">
+            <span aria-hidden>📄</span>
+            <span className="name">{basename(activeFile)}</span>
+            {selection?.path === activeFile && selection.text.trim() && (
+              <span className="sel" title="Sélection courante incluse">
+                ⊿ sélection ({selection.endLine - selection.startLine + 1} l.)
+              </span>
+            )}
+            <button
+              type="button"
+              className="ctx-x"
+              title="Ne pas envoyer ce contexte"
+              onClick={() => setCtxDropped(true)}
+              style={{
+                background: "none",
+                border: "none",
+                cursor: "pointer",
+                color: "inherit",
+                opacity: 0.6,
+                padding: 0,
+                marginLeft: 2,
+                lineHeight: 1,
+                font: "inherit",
+              }}
+            >
+              ×
+            </button>
+          </span>
+        )}
         <button className="cx-chip status" title="Accès au système de fichiers (Tauri)">
           <span className="dot" />
           Accès complet
@@ -471,6 +585,8 @@ export function ChatView({
                   isLatestAgent={m.id === latestAgentId}
                   onOpenFile={handleOpenFile}
                   onOpenSnippet={onOpenSnippet}
+                  activeFile={activeFile}
+                  onApply={(code, lang, target) => void applyCodeToFile(code, lang, target)}
                 />
               ))}
               {typing && (
@@ -481,12 +597,29 @@ export function ChatView({
                     <span className="sep">·</span>
                     <span className="ts">en train de travailler…</span>
                   </div>
+                  {/* Lot A — Task 12 : activité des outils du tour en cours. Une
+                      ligne discrète par tool-call (« 🔍 a lu … », « ✏️ a écrit … »),
+                      au-dessus du contenu/reasoning. Vidée à la fin du tour. */}
+                  {toolActivity.length > 0 && (
+                    <div className="cx-tool-activity">
+                      {toolActivity.map((label, i) => (
+                        <div key={i} className="cx-tool-line">
+                          {label}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   {chatStream.streaming && (chatStream.partial || chatStream.partialReasoning) ? (
                     <div className="cx-body">
                       {chatStream.partialReasoning && (
                         <ThinkBlock open text={chatStream.partialReasoning} />
                       )}
                       {chatStream.partial && <p>{chatStream.partial}</p>}
+                    </div>
+                  ) : toolActivity.length > 0 ? (
+                    <div className="cx-working">
+                      <span className="ring" />
+                      utilisation des outils · {model}
                     </div>
                   ) : (
                     <div className="cx-working">
@@ -510,6 +643,9 @@ export function ChatView({
   );
 
   if (!splitFile && !compareFile) return chatMain;
+  // In the cockpit (disableSplit), never render the in-chat split — the right
+  // panel is the editor surface. Return chatMain only.
+  if (disableSplit) return chatMain;
 
   // Phase 2 — handoff split: chat on the left, the opened file on the right.
   // The right pane shows a read-only git diff (working tree vs HEAD) when a
@@ -532,8 +668,8 @@ export function ChatView({
               <span className="sep">·</span>
               <span className="path">{splitFile}</span>
               <span style={{ flex: 1 }} />
-              <button className="lgb lgb-sm" onClick={openFullEditor} title="Ouvrir en plein écran">
-                <Icon name="code" size={11} /> Plein écran
+              <button className="lgb lgb-sm" onClick={openFullEditor} aria-label="Ouvrir en plein écran" title="Ouvrir en plein écran">
+                <Icon name="code" size={13} />
               </button>
               <button className="split-close" onClick={closeSplit} title="Fermer le split">
                 <Icon name="x" size={12} />
@@ -556,6 +692,102 @@ export function ChatView({
   );
 }
 
+// ─── Review feedback widget (👍/👎) — exported for ChatPanel ─
+//
+// Rendered only on messages that are review outputs (body starts with
+// "🔎 Revue", viaAgent=true, agentId set). Clicking a button writes
+// validated=1 or validated=0 to agent_reviews via the reviewerId.
+// Local state tracks which button is selected for this render cycle;
+// no re-fetch needed — the DB write is the source of truth.
+export function ReviewFeedback({ reviewerId }: { reviewerId: string }) {
+  // null = état inconnu ; 1 = retenue (👍 / auto-validée) ; 0 = exclue (👎 / auto-exclue)
+  const [vote, setVote] = useState<1 | 0 | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  // Reflète l'état VALIDÉ actuel de la review (auto par R3, ou un vote précédent),
+  // pour que l'utilisateur voie si elle est déjà retenue/exclue avant de voter.
+  useEffect(() => {
+    let cancelled = false;
+    void db.reviews
+      .getValidatedByReviewer(reviewerId)
+      .then((v) => { if (!cancelled && v !== null) setVote(v === 1 ? 1 : 0); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [reviewerId]);
+
+  const handleVote = async (value: 1 | 0) => {
+    if (saving) return;
+    setSaving(true);
+    try {
+      await db.reviews.setValidatedByReviewer(reviewerId, value);
+      setVote(value);
+    } catch (err) {
+      console.warn("[ReviewFeedback] setValidatedByReviewer failed:", err);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        marginTop: 6,
+        fontSize: 11,
+        color: "var(--on-surface-muted)",
+        fontFamily: "var(--font-mono)",
+      }}
+    >
+      <span>Cette revue était utile ?</span>
+      <button
+        type="button"
+        title="Utile — sera réinjectée comme leçon"
+        disabled={saving}
+        onClick={() => void handleVote(1)}
+        style={{
+          background: vote === 1 ? "rgba(34,197,94,0.18)" : "transparent",
+          border: vote === 1 ? "1px solid rgba(34,197,94,0.45)" : "1px solid rgba(255,255,255,0.1)",
+          borderRadius: 5,
+          cursor: saving ? "default" : "pointer",
+          padding: "2px 7px",
+          fontSize: 13,
+          lineHeight: 1,
+          opacity: saving ? 0.5 : 1,
+          transition: "background 0.15s, border-color 0.15s",
+        }}
+      >
+        👍
+      </button>
+      <button
+        type="button"
+        title="Pas utile — sera exclue de l'apprentissage"
+        disabled={saving}
+        onClick={() => void handleVote(0)}
+        style={{
+          background: vote === 0 ? "rgba(239,68,68,0.18)" : "transparent",
+          border: vote === 0 ? "1px solid rgba(239,68,68,0.45)" : "1px solid rgba(255,255,255,0.1)",
+          borderRadius: 5,
+          cursor: saving ? "default" : "pointer",
+          padding: "2px 7px",
+          fontSize: 13,
+          lineHeight: 1,
+          opacity: saving ? 0.5 : 1,
+          transition: "background 0.15s, border-color 0.15s",
+        }}
+      >
+        👎
+      </button>
+      {vote !== null && (
+        <span style={{ fontSize: 10, opacity: 0.7 }}>
+          {vote === 1 ? "✓ retenue (leçon)" : "✗ exclue de l'apprentissage"}
+        </span>
+      )}
+    </div>
+  );
+}
+
 // ─── Per-message renderer ───────────────────────────────────
 function CxMessage({
   m,
@@ -563,12 +795,18 @@ function CxMessage({
   isLatestAgent,
   onOpenFile,
   onOpenSnippet,
+  activeFile,
+  onApply,
 }: {
   m: Message;
   model: string;
   isLatestAgent: boolean;
   onOpenFile: (path: string) => void;
   onOpenSnippet?: (code: string, lang: string) => void;
+  /** Lot A (Task 8) — active editor file: the Apply fallback target. */
+  activeFile?: string | null;
+  /** Lot A (Task 8) — apply a code block to a file (diff accept/reject). */
+  onApply?: (code: string, lang: string, target: string) => void;
 }) {
   const { displayBody, liveReasoning, isStreamingAgent, imageDataUrl } = useMessageDisplay(m);
 
@@ -618,21 +856,31 @@ function CxMessage({
                 lang={m.code.lang}
                 text={m.code.text}
                 onOpen={onOpenSnippet ? () => onOpenSnippet(m.code!.text, m.code!.lang) : undefined}
+                activeFile={activeFile}
+                onApply={onApply}
               />
             )}
             {m.action && <ActionCard action={m.action} onOpenFile={onOpenFile} />}
             {isLatestAgent && !m.action && <WorkspaceDiffCard onOpenFile={onOpenFile} />}
           </>
         )}
+        {/* Lot C3 — Carte d'opération in-chat : "✏️ N fichier(s) modifié(s)"
+            avec liste dépliable des fichiers + diff par fichier + bouton Annuler ↺.
+            Retourne null quand il n'y a pas d'écritures pour ce message. */}
+        <ChatWritesCard messageId={String(m.id)} onOpenFile={onOpenFile} />
         <div className="cx-react">
           <button title="Copier" onClick={() => copyText(displayBody || m.body || m.text || "")}>
             <Icon name="copy" size={12} />
           </button>
         </div>
+        {m.viaAgent && m.agentId && m.body?.startsWith("🔎 Revue (") && (
+          <ReviewFeedback reviewerId={m.agentId} />
+        )}
       </div>
     </div>
   );
 }
+
 
 function copyText(text: string) {
   if (text && typeof navigator !== "undefined" && navigator.clipboard) {
@@ -745,12 +993,26 @@ export function CodeBlock({
   lang,
   text,
   onOpen,
+  activeFile,
+  onApply,
 }: {
   lang: string;
   text: string;
   onOpen?: () => void;
+  /** Lot A (Task 8) — active editor file: the Apply fallback target when the
+   *  block declares no path of its own. */
+  activeFile?: string | null;
+  /** Lot A (Task 8) — apply this block to a file with inline diff (no LLM). */
+  onApply?: (code: string, lang: string, target: string) => void;
 }) {
   const [preview, setPreview] = useState(false);
+  // Lot A (Task 8) — résolution de la cible d'apply. On regarde d'abord un
+  // chemin déclaré DANS le bloc (commentaire de 1ʳᵉ ligne `// src/x.ts` — le
+  // seul indice qui survit à la persistance SQLite, l'info-string `lang path`
+  // ayant déjà été consommée en `lang` au parse). À défaut, on retombe sur le
+  // fichier actif de l'éditeur. null ⇒ rien à cibler → bouton désactivé.
+  const applyTarget = detectBlockPath(text) ?? activeFile ?? null;
+  const canApply = !!onApply && !!applyTarget;
   // HTML blocks get a live "Aperçu" — the payoff of activating a design
   // system (Design view → "Utiliser dans le chat") is SEEING the generated
   // UI. Rendered via srcdoc in a sandboxed iframe (no network, no
@@ -770,6 +1032,29 @@ export function CodeBlock({
             </button>
           )}
           <button className="cx-tool" title="Copier" onClick={() => copyText(text)}><Icon name="copy" size={12} /></button>
+          {/* Lot A (Task 8) — bouton « Appliquer » : pose une ApplyRequest sur la
+              cible résolue → diff inline accept/reject, ZÉRO appel LLM. Le title
+              est porté par le <span> englobant : un <button disabled> n'émet pas
+              de tooltip natif dans WebView2, donc sans ce wrap le message d'aide
+              (« ouvre un fichier… ») resterait invisible justement quand on en a
+              besoin. */}
+          <span
+            style={{ display: "inline-flex" }}
+            title={
+              canApply
+                ? `Appliquer à ${applyTarget} (diff à accepter / refuser)`
+                : "Ouvre un fichier ou précise un chemin (```ts src/foo.ts)"
+            }
+          >
+            <button
+              className="cx-tool"
+              onClick={canApply ? () => onApply!(text, lang, applyTarget!) : undefined}
+              disabled={!canApply}
+              style={canApply ? { color: "var(--secondary)" } : undefined}
+            >
+              <Icon name="check" size={12} />
+            </button>
+          </span>
           <button
             className="cx-tool"
             title="Ouvrir dans l'éditeur"
