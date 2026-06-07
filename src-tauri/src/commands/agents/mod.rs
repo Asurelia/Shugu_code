@@ -557,7 +557,9 @@ pub async fn agent_spawn(
             let def = crate::commands::agent_defs::load_def(p)?;
             args.role = def.base_role;
             if let Some(m) = def.model {
-                args.model = m;
+                // Strip the "provider/" prefix — the API body needs the bare model name
+                // (mirrors resolveProvider() on the TS side, e.g. "openai/gpt-4o" → "gpt-4o").
+                args.model = m.split_once('/').map(|(_, n)| n.to_string()).unwrap_or(m);
             }
             Some(def.body)
         }

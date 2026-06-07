@@ -106,6 +106,10 @@ export function ConnectionsView() {
       { id: "groq", name: "Groq", meta: "Fast LPU inference", logo: "G", color: "#f55036", fields: [
         { label: "API key", key: "apiKey", placeholder: "gsk_…", secret: true },
       ]},
+      { id: "minimax", name: "MiniMax", meta: "OpenAI-compat · texte (vidéo/voix via MCP)", logo: "M", color: "#ff4d4f", fields: [
+        { label: "API key", key: "apiKey", placeholder: "…", secret: true },
+        { label: "Modèle par défaut", key: "defaultModel", placeholder: "MiniMax-M2.1 (requis si la liste auto échoue)", secret: false },
+      ]},
       // Codex = the user's ChatGPT subscription via the local `codex` CLI
       // (shell-out, no API key). Rendered by a dedicated <CodexCard/> (status +
       // usage panel) instead of the generic key-field ConnCard.

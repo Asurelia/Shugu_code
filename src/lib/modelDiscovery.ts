@@ -206,6 +206,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   llamacpp:  "llama.cpp",
   mistral:   "Mistral",
   groq:      "Groq",
+  minimax:   "MiniMax",
   codex:     "OpenAI Codex",
 };
 
@@ -425,10 +426,25 @@ export async function discoverAllModels(): Promise<DiscoveryResult> {
       return;
     }
 
+    // Un "Modèle par défaut" stocké permet à un provider dont le listing
+    // /v1/models est absent (ex. MiniMax) de tout de même exposer UN modèle
+    // utilisable. Chargé ici pour que les branches catch/empty ci-dessous
+    // puissent y retomber au lieu de laisser le provider sans modèle (ce qui
+    // le masquerait entièrement du picker).
+    const defaultModel = (await getConfig(id, "defaultModel"))?.trim() || "";
+
+    const pushFallbackModel = (softError?: string): void => {
+      result.models.push({
+        id:            `${id}/${defaultModel}`,
+        providerId:    id,
+        providerLabel: cfg.providerLabel,
+        modelId:       defaultModel,
+        label:         defaultModel,
+      });
+      if (softError) result.errors[id] = softError;
+    };
+
     try {
-      // Built-in Anthropic doesn't carry a baseUrl in its stored config (the
-      // registry default lives in PROVIDER_REGISTRY) — fall back to the
-      // canonical host the Rust side expects.
       const baseForProbe =
         cfg.protocol === "anthropic" && !cfg.baseUrl
           ? "https://api.anthropic.com"
@@ -438,6 +454,13 @@ export async function discoverAllModels(): Promise<DiscoveryResult> {
         return;
       }
       const ids = await probeProviderModels(cfg.protocol, baseForProbe, cfg.apiKey);
+
+      if (ids.length === 0 && defaultModel) {
+        // Endpoint joignable mais ne liste rien (ou n'implémente pas le listing)
+        // — on utilise le modèle par défaut pour garder le provider utilisable.
+        pushFallbackModel();
+        return;
+      }
 
       for (const modelId of ids) {
         result.models.push({
@@ -449,6 +472,13 @@ export async function discoverAllModels(): Promise<DiscoveryResult> {
         });
       }
     } catch (err) {
+      if (defaultModel) {
+        // /v1/models a échoué (404 sur les providers sans endpoint de listing,
+        // etc.). On n'abandonne pas le provider : on expose son modèle par
+        // défaut + une note douce.
+        pushFallbackModel(`liste auto indisponible — modèle « ${defaultModel} » utilisé (${String(err)})`);
+        return;
+      }
       result.errors[id] = String(err);
     }
   }));

@@ -33,6 +33,7 @@ export const PROVIDER_REGISTRY: Record<string, ProviderDescriptor> = {
   llamacpp:  { protocol: "openai",    baseUrl: "http://localhost:8090" },
   mistral:   { protocol: "openai",    baseUrl: "https://api.mistral.ai" },
   groq:      { protocol: "openai",    baseUrl: "https://api.groq.com/openai" },
+  minimax:   { protocol: "openai",    baseUrl: "https://api.minimax.io" },
   // Codex CLI (shell-out, subscription auth). No HTTP baseUrl — the Rust codex
   // arm spawns the local `codex` binary and ignores baseUrl/apiKey entirely.
   codex:     { protocol: "codex",     baseUrl: "" },

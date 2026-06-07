@@ -39,6 +39,7 @@ import { fireMoodReaction } from "@/features/mascot/moodReactionStore";
 import { parseThinkingMode, resolveThinking } from "@/lib/thinkingHeuristic";
 import { resolveRoute, parseDelegateOverride } from "@/lib/routingHeuristic";
 import { spawnAgent, awaitAgentComplete } from "@/lib/agents";
+import { readAgentDef } from "@/lib/agentDefs";
 import { getActiveDesignSystem, buildDesignSystemPrompt } from "@/features/design/activeDesignSystem";
 import { queryClient } from "@/lib/queryClient";
 import { diag } from "@/lib/diag";
@@ -696,7 +697,65 @@ async function handleDelegate(
     return;
   }
 
-  const { model: realModel, protocol, baseUrl, apiKey } = orch;
+  // Résolution finale : protocol / baseUrl / apiKey / model.
+  // Par défaut = provider de l'orchestrateur global. Mais si l'agent custom
+  // (.md) épingle son propre model (ex. `openai/gpt-4o`), on re-résout
+  // depuis CE model : sinon le spawn enverrait le nom complet "openai/gpt-4o"
+  // verbatim à l'API (HTTP 404), et utiliserait les credentials de l'orchestrateur
+  // même si le provider diffère.
+  let realModel = orch.model;
+  let protocol  = orch.protocol;
+  let baseUrl   = orch.baseUrl;
+  let apiKey    = orch.apiKey;
+
+  if (agentDefPath) {
+    try {
+      const def = await readAgentDef(agentDefPath);
+      if (def.model) {
+        // Même logique que resolveOrchestrator : resolveProvider + loadProviderConfig.
+        const {
+          providerId: defProviderId,
+          protocol: defDefaultProto,
+          baseUrl: defDefaultBase,
+          model: defRealModel,
+        } = resolveProvider(def.model);
+
+        const defEnabled = await getProviderEnabled(defProviderId);
+        if (defEnabled !== "true") {
+          await appendMessage(convId, {
+            id: newMessageId("e"),
+            role: "ai",
+            body: `⚠ L'agent "${def.name}" utilise le provider "${defProviderId}" qui n'est pas activé. Ouvre Settings → Connections, configure-le et clique Save.`,
+            ts: nowHHMM(),
+          });
+          return;
+        }
+
+        const defCfg = await loadProviderConfig(defProviderId);
+        let defProto: Protocol = defDefaultProto;
+        if (defDefaultProto === "custom") {
+          const stored = await getConfig(defProviderId, "protocol");
+          if (
+            stored === "anthropic" ||
+            stored === "openai" ||
+            stored === "ollama" ||
+            stored === "custom"
+          ) {
+            defProto = stored;
+          }
+        }
+
+        realModel = defRealModel;
+        protocol  = defProto;
+        baseUrl   = defCfg.baseUrl && defCfg.baseUrl !== "" ? defCfg.baseUrl : defDefaultBase;
+        apiKey    = defCfg.apiKey && defCfg.apiKey !== "" ? defCfg.apiKey : undefined;
+      }
+    } catch (err) {
+      // readAgentDef a échoué (fichier absent, frontmatter cassé…) — on continue
+      // avec les credentials de l'orchestrateur global plutôt que de bloquer.
+      console.warn("[chat-sync] handleDelegate: readAgentDef failed, falling back to orchestrator config", err);
+    }
+  }
 
   // Spawn the agent FIRST. We need the agentId to attach to the placeholder
   // so the reconciler (on mount) can match an orphan placeholder back to
