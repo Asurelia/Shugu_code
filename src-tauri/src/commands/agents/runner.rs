@@ -845,6 +845,7 @@ pub(super) async fn tool_use_loop(
                         agent_id: agent_id.to_string(),
                         role: role.to_string(),
                         name,
+                        source: "agent".to_string(),
                     },
                 );
             }

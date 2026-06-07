@@ -17,6 +17,8 @@ import { db }                  from "@/lib/db";
 import type { ReviewRow }      from "@/lib/db";
 import { vecIndex }            from "@/lib/vector";
 import type { Message }        from "@/lib/types";
+import { invoke }              from "@/lib/tauri";
+import { invalidateSkills }    from "@/features/agents/skillsQueries";
 
 // ────────────────────────────────────────────────────────────────────────────
 // Concurrency cap
@@ -220,6 +222,16 @@ export interface ReviewerArgs {
  * used by handleDelegate in chat-sync.ts (lines 711-752).
  */
 export async function resolveReviewerArgs(): Promise<ReviewerArgs | null> {
+  // 0. Read the user-configured advisor model (routing.advisorModel). When set,
+  //    it overrides the model pinned in the reviewer .md (but we still need the
+  //    reviewer def for agentDefPath + baseRole).
+  let advisorModelSetting: string | null = null;
+  try {
+    advisorModelSetting = await db.settings.get("routing.advisorModel");
+  } catch {
+    // non-critical — fall through to reviewer.model
+  }
+
   // 1. List all agent defs and pick the reviewer.
   let defs;
   try {
@@ -238,19 +250,26 @@ export async function resolveReviewerArgs(): Promise<ReviewerArgs | null> {
     return null;
   }
 
-  // If the def has no pinned model, there is nothing to resolve.
-  if (!reviewer.model) {
-    console.warn("[supervisors] reviewer agent has no model pinned — skip");
+  // Effective model: advisorModel setting (if non-empty) takes priority over
+  // the reviewer .md pinned model. Fallback = reviewer.model (current behaviour).
+  const effectiveModel =
+    advisorModelSetting && advisorModelSetting.trim() !== ""
+      ? advisorModelSetting.trim()
+      : reviewer.model;
+
+  // If neither source gives us a model, there is nothing to resolve.
+  if (!effectiveModel) {
+    console.warn("[supervisors] reviewer agent has no model pinned and routing.advisorModel is unset — skip");
     return null;
   }
 
-  // 2. Resolve provider from the pinned model.
+  // 2. Resolve provider from the effective model.
   const {
     providerId,
     protocol: defDefaultProto,
     baseUrl: defDefaultBase,
     model: realModel,
-  } = resolveProvider(reviewer.model);
+  } = resolveProvider(effectiveModel);
 
   // 3. Check provider is enabled.
   let enabled: string | null;
@@ -520,7 +539,17 @@ export async function superviseDeliverable(args: {
       `**Consigne** : Ne lis PAS d'autres fichiers — le diff ci-dessus te suffit.\n` +
       `Donne une revue structurée (points positifs, points à améliorer, risques) ` +
       `et conclus avec un verdict sur une ligne séparée :\n\n` +
-      `**APPROUVÉ** | **BLOQUÉ** | **À CORRIGER**`;
+      `**APPROUVÉ** | **BLOQUÉ** | **À CORRIGER**\n\n` +
+      `---\n\n` +
+      `**Distillation de compétence (obligatoire)** : après ton verdict, termine TOUJOURS ` +
+      "par un bloc JSON (même si le run est mediocre — renvoie `{}` dans ce cas) :\n\n" +
+      "```json\n" +
+      '{ "skill_name": "...", "when_to_use": "...", "body": "..." }\n' +
+      "```\n\n" +
+      "`skill_name` : nom court et réutilisable de la leçon (ex : \"Toujours vérifier X avant Y\").\n" +
+      "`when_to_use` : quand appliquer ce skill (1 phrase).\n" +
+      "`body` : la leçon concrète, en Markdown, ≤ 200 mots.\n" +
+      "Si aucune leçon réutilisable ne se dégage, renvoie exactement `{}`.";
 
     // 5. Spawn the reviewer agent.
     const reviewerId = await spawnAgent({
@@ -538,8 +567,14 @@ export async function superviseDeliverable(args: {
     const [waitPromise] = awaitAgentComplete(reviewerId, { timeoutMs: 90_000 });
     const { output } = await waitPromise;
 
-    // 7. Parse the verdict from the reviewer's output.
-    const verdict = parseVerdict(output);
+    // 7. Parse the verdict from the reviewer's output. Strip JSON code blocks
+    //    first — the distillation block appended at the end of the prompt can
+    //    contain words like "bloqué" or "à corriger" in the skill body, which
+    //    would corrupt the verdict (parseVerdict uses lastIndexOf).
+    const verdictSource = output
+      .replace(/```json[\s\S]*?```/g, "")   // blocs json fermés
+      .replace(/```json[\s\S]*$/g, "");      // bloc json non fermé (LLM tronqué) → jusqu'à la fin
+    const verdict = parseVerdict(verdictSource);
 
     // R3 — validation renforcée. Le run reviewé compte comme un SUCCÈS objectif
     // (→ leçon fiable, réinjectable en S3) seulement s'il s'est terminé proprement
@@ -607,6 +642,52 @@ export async function superviseDeliverable(args: {
       agentId:  reviewerId,
     };
     await appendMessage(convId, reviewMsg);
+
+    // 11. Skill distillation — advisor gate: only when the run was objectively
+    //     successful (R3). Parse the LAST ```json…``` block from the reviewer's
+    //     output, validate non-empty skill_name + body, then persist via
+    //     skill_save_advisor. Any parse/network/validation error is silently
+    //     swallowed — this step must never block the review flow.
+    // Ne distille un skill QUE si le run est un succès objectif (R3) ET que
+    // l'advisor a APPROUVÉ — on ne fige pas en leçon le travail d'un run que le
+    // reviewer a jugé à corriger/bloqué (revue sécurité m3).
+    if (runSucceeded && verdict === "APPROUVÉ") {
+      try {
+        // Extract the last ```json ... ``` block.
+        const jsonBlocks = [...output.matchAll(/```json\s*([\s\S]*?)```/g)];
+        const lastBlock  = jsonBlocks.at(-1);
+        if (lastBlock) {
+          const raw = lastBlock[1].trim();
+          // Narrow the parsed value — avoid `any`.
+          const parsed: unknown = JSON.parse(raw);
+          if (
+            parsed !== null &&
+            typeof parsed === "object" &&
+            !Array.isArray(parsed)
+          ) {
+            const rec = parsed as Record<string, unknown>;
+            const skill_name  = rec["skill_name"];
+            const when_to_use = rec["when_to_use"];
+            const body        = rec["body"];
+
+            if (
+              typeof skill_name  === "string" && skill_name.trim()  !== "" &&
+              typeof body        === "string" && body.trim()         !== ""
+            ) {
+              await invoke<void>("skill_save_advisor", {
+                role:       transcript.agent.role,
+                name:       skill_name.trim(),
+                whenToUse:  typeof when_to_use === "string" ? when_to_use.trim() : "",
+                body:       body.trim(),
+              });
+              invalidateSkills(transcript.agent.role);
+            }
+          }
+        }
+      } catch {
+        // Silently ignore — distillation is best-effort enrichment.
+      }
+    }
 
   } catch (err) {
     // The supervisor MUST NOT propagate errors — log and return silently.

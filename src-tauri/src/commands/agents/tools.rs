@@ -577,7 +577,7 @@ fn dispatch_inner(
             if name.trim().is_empty() || body.trim().is_empty() {
                 return Err("skill_save needs a non-empty name and body".to_string());
             }
-            super::skills::save_skill(app, role, name, when_to_use, body)?;
+            super::skills::save_skill(app, role, name, when_to_use, body, "agent")?;
             Ok(format!(
                 "skill '{name}' saved for role '{role}' — it will load automatically in future runs"
             ))

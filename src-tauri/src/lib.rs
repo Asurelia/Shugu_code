@@ -377,6 +377,16 @@ CREATE INDEX IF NOT EXISTS idx_agent_reviews_ts    ON agent_reviews(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_reviews_kind  ON agent_reviews(kind);
 ";
 
+// V14 — traçage de la source d'un skill (agent ou advisor).
+//
+// `created_by` distingue les skills sauvés par l'agent lui-même via le tool
+// `skill_save` ('agent') de ceux créés par la commande Tauri `skill_save_advisor`
+// ('advisor'). DEFAULT 'agent' = rétro-compat : tous les skills existants
+// (sauvés avant V14) restent attribués à 'agent', ce qui est correct.
+const MIGRATION_V14: &str = "
+ALTER TABLE agent_skills ADD COLUMN created_by TEXT NOT NULL DEFAULT 'agent';
+";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = vec![
@@ -456,6 +466,12 @@ pub fn run() {
             version: 13,
             description: "agent_reviews store",
             sql: MIGRATION_V13,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 14,
+            description: "agent_skills_created_by",
+            sql: MIGRATION_V14,
             kind: MigrationKind::Up,
         },
     ];
@@ -689,6 +705,7 @@ pub fn run() {
             // Skill library (Voyager / Hermes) — learned reusable skills.
             commands::agents::skills::skills_list,
             commands::agents::skills::skills_clear,
+            commands::agents::skills::skill_save_advisor,
             // Codex CLI bridge — auth status + real usage tracking (ChatGPT subscription).
             commands::codex::codex_auth_status,
             commands::codex::codex_login,

@@ -1278,6 +1278,7 @@ function RoutingSection() {
   const { data: models } = useDiscoveredModels();
   const [chatModel, setChatModel] = useState<string>("");
   const [orchModel, setOrchModel] = useState<string>("");
+  const [advisorModel, setAdvisorModel] = useState<string>("");
   const [override, setOverride] = useState<string>("");
   // Reviewer automatique sur tâches complexes (S1 livrable + S2 plan). Défaut ON :
   // l'utilisateur l'a demandé, et le gate complexité+tier empêche de tirer sur le trivial.
@@ -1287,15 +1288,17 @@ function RoutingSection() {
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const [c, o, ov, sv] = await Promise.all([
+      const [c, o, adv, ov, sv] = await Promise.all([
         db.settings.get("routing.chatModel"),
         db.settings.get("routing.orchestratorModel"),
+        db.settings.get("routing.advisorModel"),
         db.settings.get("routing.delegateOverride"),
         db.settings.get("routing.superviseComplex"),
       ]);
       if (cancelled) return;
       setChatModel(c ?? "");
       setOrchModel(o ?? "");
+      setAdvisorModel(adv ?? "");
       setOverride(ov ?? "");
       setSupervise(sv == null ? true : sv === "true");
     })();
@@ -1307,6 +1310,7 @@ function RoutingSection() {
     try {
       await db.settings.set("routing.chatModel", chatModel);
       await db.settings.set("routing.orchestratorModel", orchModel);
+      await db.settings.set("routing.advisorModel", advisorModel);
       await db.settings.set("routing.delegateOverride", override);
       await db.settings.set("routing.superviseComplex", supervise ? "true" : "false");
       setSavingState("saved");
@@ -1380,6 +1384,34 @@ function RoutingSection() {
             <code>http://localhost:PORT/zen/v1</code> ), OpenAI Codex (CLI shell-out — Phase 2).
             Les modèles llamacpp sont exclus — le serveur local ne charge qu'un
             modèle à la fois.
+          </div>
+        </div>
+
+        <div className="conn-field">
+          <label>Modèle de l'advisor (reviewer/skills)</label>
+          <div className="input">
+            <select
+              value={advisorModel}
+              onChange={(e) => setAdvisorModel(e.currentTarget.value)}
+              style={{ width: "100%", background: "transparent", border: "none", color: "inherit", fontFamily: "inherit", fontSize: "inherit" }}
+            >
+              <option value="">— Choisir un modèle —</option>
+              {orchModels.length === 0 && (
+                <option value="" disabled>
+                  (aucun provider non-llamacpp configuré — ajoute Anthropic, OpenCode, ou un Custom)
+                </option>
+              )}
+              {orchModels.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.providerLabel} · {m.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div style={{ fontSize: 11, color: "var(--on-surface-muted)", marginTop: 4 }}>
+            Le modèle FORT qui critique et distille les skills. Prends ton meilleur.
+            Prend la priorité sur le modèle épinglé dans le fichier <code>reviewer-gpt.md</code>.
+            Laisse vide pour utiliser le modèle du reviewer par défaut.
           </div>
         </div>
 

@@ -266,10 +266,16 @@ pub enum AgentEvent {
     /// real environment VERIFIED (its last `run_command` test exited 0). Emitted
     /// by the tool loop so the main chat UI shows an inline "🎓 appris : <name>"
     /// badge. Replaces the retired `HarnessEvolved` (prompt-rewrite Refiner).
+    ///
+    /// `source` — who created the skill: `"agent"` (via the `skill_save` tool
+    /// after a passing test) or `"advisor"` (via the `skill_save_advisor` Tauri
+    /// command, written by the external reviewer model). Serialised camelCase.
     SkillLearned {
         agent_id: String,
         role: String,
         name: String,
+        /// `"agent"` | `"advisor"` — serialised camelCase via rename_all_fields.
+        source: String,
     },
     /// S3 — Closed-loop lesson injection. Emitted when validated past-run lessons
     /// are retrieved via semantic search and injected into the agent's context.
@@ -699,9 +705,13 @@ pub async fn agent_spawn(
             design_context_for_task,
             abort_token,
             None,  // workspace_override — chat works on the real open workspace
-            false, // allow_exec — chat never executes; only the Atelier does
+            false, // allow_exec — DÉSACTIVÉ tant que l'isolation OS (compte sandbox
+                   // restreint + ACL + pare-feu, modèle Codex) n'est pas construite.
+                   // Le denylist `is_irreparable` seul ne tient pas (contournable via
+                   // `&&`/sous-shell) — revue sécurité 2026-06-07. On ne donne les
+                   // pleins pouvoirs d'exécution QU'UNE FOIS la cage OS en place.
             system_prompt_override_for_task, // None ⇒ seed_prompt ; Some ⇒ .md custom
-            Vec::new(), // exec_ro_mounts — chat never execs
+            Vec::new(), // exec_ro_mounts — chat n'a pas de mounts supplémentaires
         )
         .await;
     });

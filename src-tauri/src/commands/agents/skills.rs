@@ -21,29 +21,39 @@ pub struct SkillRow {
     pub when_to_use: String,
     pub body: String,
     pub created_at: i64,
+    /// Source (V14) : "agent" (tool skill_save pendant un run) ou "advisor"
+    /// (distillé par l'advisor via skill_save_advisor). Affiché en badge.
+    pub created_by: String,
 }
 
 /// Persist (or refine) a skill for `role`. Returns a String error so the
 /// `skill_save` tool surfaces it to the agent without crashing the run.
+///
+/// `created_by` — source identifier stored in the `created_by` column
+/// (V14): `"agent"` for skills saved via the `skill_save` tool during a
+/// normal run, `"advisor"` for skills created by the `skill_save_advisor`
+/// Tauri command (written by the external advisor, no exec-gate required).
 pub(super) fn save_skill(
     app: &AppHandle,
     role: &str,
     name: &str,
     when_to_use: &str,
     body: &str,
+    created_by: &str,
 ) -> Result<(), String> {
     let conn_mutex = get_conn(app)?;
     let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
     conn.execute(
-        "INSERT OR REPLACE INTO agent_skills (id, role, name, when_to_use, body, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT OR REPLACE INTO agent_skills (id, role, name, when_to_use, body, created_at, created_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             format!("{role}:{name}"),
             role,
             name,
             when_to_use,
             body,
-            now_ms()
+            now_ms(),
+            created_by,
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -60,7 +70,7 @@ pub(super) fn load_skills(app: &AppHandle, role: &str) -> Vec<SkillRow> {
         return Vec::new();
     };
     let Ok(mut stmt) = conn.prepare(
-        "SELECT name, when_to_use, body, created_at FROM agent_skills
+        "SELECT name, when_to_use, body, created_at, created_by FROM agent_skills
          WHERE role = ?1 ORDER BY created_at DESC",
     ) else {
         return Vec::new();
@@ -71,6 +81,7 @@ pub(super) fn load_skills(app: &AppHandle, role: &str) -> Vec<SkillRow> {
             when_to_use: r.get(1)?,
             body: r.get(2)?,
             created_at: r.get(3)?,
+            created_by: r.get(4)?,
         })
     });
     match rows {
@@ -116,5 +127,49 @@ pub async fn skills_clear(app: AppHandle, role: String) -> Result<(), String> {
     let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM agent_skills WHERE role = ?1", params![role])
         .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Create or refine a skill on behalf of the **advisor** (the external reviewer
+/// model that synthesises lessons across runs). Unlike the in-agent `skill_save`
+/// tool, this command:
+///   - does NOT require a prior passing `run_command` (the advisor reviews
+///     completed runs, so exec-verification has already happened implicitly).
+///   - stores `created_by = "advisor"` so the UI / analytics can distinguish
+///     advisor-injected skills from agent-discovered skills.
+///   - emits `AgentEvent::SkillLearned { source: "advisor" }` on the
+///     `"agent://lifecycle"` channel so the chat UI can surface a badge.
+///
+/// The event uses `agent_id = "advisor"` (a sentinel, not a real UUID) since
+/// advisor skills are not tied to a specific agent run. The event will NOT
+/// appear in any individual agent's transcript pane (expected by design).
+#[tauri::command]
+pub async fn skill_save_advisor(
+    app: AppHandle,
+    role: String,
+    name: String,
+    when_to_use: String,
+    body: String,
+) -> Result<(), String> {
+    if name.trim().is_empty() || body.trim().is_empty() {
+        return Err("skill_save_advisor needs a non-empty name and body".to_string());
+    }
+    // M4 (revue sécurité) — un skill body est INJECTÉ verbatim dans le system
+    // prompt des runs futurs (skills_prompt_block). On borne donc les tailles :
+    // un body géant = bloat de contexte + surface d'injection plus large.
+    // Troncature en scalaires Unicode (texte FR multi-octet, pas de panic).
+    let name_capped: String = name.trim().chars().take(120).collect();
+    let when_capped: String = when_to_use.trim().chars().take(300).collect();
+    let body_capped: String = body.trim().chars().take(2000).collect();
+    save_skill(&app, &role, &name_capped, &when_capped, &body_capped, "advisor")?;
+    let _ = super::persist_and_emit(
+        &app,
+        &super::AgentEvent::SkillLearned {
+            agent_id: "advisor".to_string(),
+            role: role.clone(),
+            name: name_capped.clone(),
+            source: "advisor".to_string(),
+        },
+    );
     Ok(())
 }
