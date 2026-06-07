@@ -541,6 +541,43 @@ export async function superviseDeliverable(args: {
     // 7. Parse the verdict from the reviewer's output.
     const verdict = parseVerdict(output);
 
+    // R3 — validation renforcée. Le run reviewé compte comme un SUCCÈS objectif
+    // (→ leçon fiable, réinjectable en S3) seulement s'il s'est terminé proprement
+    // (status complete), SANS erreur d'outil (distress 0), et — si le run a exécuté
+    // des commandes de vérif — sans `run_command` en échec (exit ≠ 0).
+    const runHadFailedExec = (events: AgentEventRow[]): boolean => {
+      const execIds = new Set<string>();
+      for (const ev of events) {
+        if (ev.kind !== "toolCall") continue;
+        try {
+          const p = JSON.parse(ev.payload) as { tool?: string; toolCallId?: string };
+          if (p.tool === "run_command" && p.toolCallId) execIds.add(p.toolCallId);
+        } catch { /* payload illisible — ignore */ }
+      }
+      if (execIds.size === 0) return false;
+      for (const ev of events) {
+        if (ev.kind !== "toolResult") continue;
+        try {
+          const p = JSON.parse(ev.payload) as { toolCallId?: string; result?: unknown; error?: string };
+          if (!p.toolCallId || !execIds.has(p.toolCallId)) continue;
+          if (p.error) return true; // l'outil lui-même a échoué
+          const resStr = typeof p.result === "string" ? p.result : JSON.stringify(p.result ?? "");
+          // run_command préfixe son résultat par "[exit {code}]" ou "[TIMED OUT …]"
+          // (tools.rs:546-554). Le timeout est un ÉCHEC. Le préfixe entre crochets
+          // est en tête → first-match fiable (le stdout ne masque pas le vrai code,
+          // et c'est robuste si `result` est JSON-wrappé).
+          if (resStr.includes("[TIMED OUT")) return true;
+          const m = resStr.match(/\[exit\s+(-?\d+)\]/);
+          if (m && m[1] !== "0") return true;
+        } catch { /* ignore */ }
+      }
+      return false;
+    };
+    const runSucceeded =
+      transcript.agent.status === "complete" &&
+      distress === 0 &&
+      !runHadFailedExec(transcript.events);
+
     // 8. Persist the review row.
     const reviewRow: ReviewRow = {
       id:          `rev_${reviewerId}`,
@@ -548,10 +585,10 @@ export async function superviseDeliverable(args: {
       reviewer_id: reviewerId,
       kind:        "deliverable",
       verdict,
-      // S3 — validée immédiatement si le run reviewé s'est terminé avec succès.
-      // La promotion ne PEUT PAS se faire au record_outcome Rust : la review
-      // n'existe pas encore à ce moment-là (elle est créée ici, après le run).
-      validated:   transcript.agent.status === "complete" ? 1 : 0,
+      // S3 — validée immédiatement si le run reviewé est un succès objectif
+      // (cf. runSucceeded R3). La promotion ne PEUT PAS se faire au record_outcome
+      // Rust : la review n'existe pas encore à ce moment-là.
+      validated:   runSucceeded ? 1 : 0,
       body:        output,
       ts:          Date.now(),
     };

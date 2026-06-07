@@ -54,13 +54,14 @@ pub(super) fn lessons_prompt_block(
         }
     };
 
-    let mut lessons: Vec<(String, String)> = Vec::new(); // (verdict, body)
-    for hit in &hits {
-        if lessons.len() >= 3 {
-            break;
-        }
-        // reviewer_id is the bare UUID stored in vec_patterns; the review PK is
-        // "rev_<uuid>" but the column reviewer_id matches the vec id directly.
+    // Collect ALL validated deliverable reviews among the hits (keeping their
+    // semantic rank), then prioritise ACTIONABLE verdicts before taking the top
+    // 3: a BLOQUÉ / À CORRIGER review teaches more than an APPROUVÉ one. Semantic
+    // relevance (rank) breaks ties within a priority bucket.
+    // reviewer_id is the bare UUID stored in vec_patterns; agent_reviews.reviewer_id
+    // matches the vec id directly (PK is "rev_<uuid>", not used for the join).
+    let mut candidates: Vec<(u8, usize, String, String)> = Vec::new(); // (prio, rank, verdict, body)
+    for (rank, hit) in hits.iter().enumerate() {
         let result: rusqlite::Result<(String, String)> = conn.query_row(
             "SELECT body, verdict FROM agent_reviews \
               WHERE reviewer_id = ?1 AND kind = 'deliverable' AND validated = 1",
@@ -68,12 +69,21 @@ pub(super) fn lessons_prompt_block(
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         );
         if let Ok((body, verdict)) = result {
+            let prio = match verdict.as_str() {
+                "BLOQUÉ" => 0u8,
+                "À CORRIGER" => 1,
+                "APPROUVÉ" => 2,
+                _ => 3,
+            };
             // Truncate at 600 Unicode scalar values, not bytes (French text has
             // multi-byte chars — byte-indexing would panic mid-character).
             let truncated: String = body.chars().take(600).collect();
-            lessons.push((verdict, truncated));
+            candidates.push((prio, rank, verdict, truncated));
         }
     }
+    candidates.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let lessons: Vec<(String, String)> =
+        candidates.into_iter().take(3).map(|(_, _, v, b)| (v, b)).collect();
 
     if lessons.is_empty() {
         return (String::new(), 0);

@@ -692,6 +692,89 @@ export function ChatView({
   );
 }
 
+// ─── Review feedback widget (👍/👎) — exported for ChatPanel ─
+//
+// Rendered only on messages that are review outputs (body starts with
+// "🔎 Revue", viaAgent=true, agentId set). Clicking a button writes
+// validated=1 or validated=0 to agent_reviews via the reviewerId.
+// Local state tracks which button is selected for this render cycle;
+// no re-fetch needed — the DB write is the source of truth.
+export function ReviewFeedback({ reviewerId }: { reviewerId: string }) {
+  // null = not yet voted; 1 = thumbs-up; 0 = thumbs-down
+  const [vote, setVote] = useState<1 | 0 | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const handleVote = async (value: 1 | 0) => {
+    if (saving) return;
+    setSaving(true);
+    try {
+      await db.reviews.setValidatedByReviewer(reviewerId, value);
+      setVote(value);
+    } catch (err) {
+      console.warn("[ReviewFeedback] setValidatedByReviewer failed:", err);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        marginTop: 6,
+        fontSize: 11,
+        color: "var(--on-surface-muted)",
+        fontFamily: "var(--font-mono)",
+      }}
+    >
+      <span>Cette revue était utile ?</span>
+      <button
+        type="button"
+        title="Utile — sera réinjectée comme leçon"
+        disabled={saving}
+        onClick={() => void handleVote(1)}
+        style={{
+          background: vote === 1 ? "rgba(34,197,94,0.18)" : "transparent",
+          border: vote === 1 ? "1px solid rgba(34,197,94,0.45)" : "1px solid rgba(255,255,255,0.1)",
+          borderRadius: 5,
+          cursor: saving ? "default" : "pointer",
+          padding: "2px 7px",
+          fontSize: 13,
+          lineHeight: 1,
+          opacity: saving ? 0.5 : 1,
+          transition: "background 0.15s, border-color 0.15s",
+        }}
+      >
+        👍
+      </button>
+      <button
+        type="button"
+        title="Pas utile — sera exclue de l'apprentissage"
+        disabled={saving}
+        onClick={() => void handleVote(0)}
+        style={{
+          background: vote === 0 ? "rgba(239,68,68,0.18)" : "transparent",
+          border: vote === 0 ? "1px solid rgba(239,68,68,0.45)" : "1px solid rgba(255,255,255,0.1)",
+          borderRadius: 5,
+          cursor: saving ? "default" : "pointer",
+          padding: "2px 7px",
+          fontSize: 13,
+          lineHeight: 1,
+          opacity: saving ? 0.5 : 1,
+          transition: "background 0.15s, border-color 0.15s",
+        }}
+      >
+        👎
+      </button>
+      {vote !== null && (
+        <span style={{ fontSize: 10, opacity: 0.7 }}>✓ pris en compte</span>
+      )}
+    </div>
+  );
+}
+
 // ─── Per-message renderer ───────────────────────────────────
 function CxMessage({
   m,
@@ -777,6 +860,9 @@ function CxMessage({
             <Icon name="copy" size={12} />
           </button>
         </div>
+        {m.viaAgent && m.agentId && m.body?.startsWith("🔎 Revue (") && (
+          <ReviewFeedback reviewerId={m.agentId} />
+        )}
       </div>
     </div>
   );

@@ -650,6 +650,14 @@ const reviews = {
       [limit]
     ) as Promise<ReviewRow[]>;
   },
+
+  async setValidatedByReviewer(reviewerId: string, validated: number): Promise<void> {
+    const db = await getDb();
+    await db.execute(
+      "UPDATE agent_reviews SET validated = $1 WHERE reviewer_id = $2",
+      [validated, reviewerId]
+    );
+  },
 };
 
 // ---------------------------------------------------------------------------

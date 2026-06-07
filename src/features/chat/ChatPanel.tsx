@@ -38,6 +38,7 @@ import { setChatUnread } from "@/features/chat/chatUnread";
 import { bumpInteract } from "@/features/mascot/idleStore";
 import { MascotToolbar } from "@/features/mascot/MascotToolbar";
 import { useMessageDisplay } from "./useMessageDisplay";
+import { ReviewFeedback } from "./views-chat";
 import type { Message } from "@/lib/types";
 
 // Surface ctx → route plein écran du main IDE (bouton ⤢ de l'en-tête de carte).
@@ -214,7 +215,12 @@ function MascotMessage({ m, onEdit, onDelete, onRegenerate }: MascotMessageProps
           style={{ maxWidth: "100%", maxHeight: 160, borderRadius: 4, display: "block", marginTop: 2 }}
         />
       ) : (
-        <span style={{ whiteSpace: "pre-wrap" }}>{displayBody}</span>
+        <>
+          <span style={{ whiteSpace: "pre-wrap" }}>{displayBody}</span>
+          {m.viaAgent && m.agentId && m.body?.startsWith("🔎 Revue (") && (
+            <ReviewFeedback reviewerId={m.agentId} />
+          )}
+        </>
       )}
 
       {/* Per-message action bar — visible on hover, hidden during editing */}
