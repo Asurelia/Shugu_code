@@ -1279,20 +1279,25 @@ function RoutingSection() {
   const [chatModel, setChatModel] = useState<string>("");
   const [orchModel, setOrchModel] = useState<string>("");
   const [override, setOverride] = useState<string>("");
+  // Reviewer automatique sur tâches complexes (S1 livrable + S2 plan). Défaut ON :
+  // l'utilisateur l'a demandé, et le gate complexité+tier empêche de tirer sur le trivial.
+  const [supervise, setSupervise] = useState<boolean>(true);
   const [savingState, setSavingState] = useState<"idle" | "saving" | "saved">("idle");
 
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const [c, o, ov] = await Promise.all([
+      const [c, o, ov, sv] = await Promise.all([
         db.settings.get("routing.chatModel"),
         db.settings.get("routing.orchestratorModel"),
         db.settings.get("routing.delegateOverride"),
+        db.settings.get("routing.superviseComplex"),
       ]);
       if (cancelled) return;
       setChatModel(c ?? "");
       setOrchModel(o ?? "");
       setOverride(ov ?? "");
+      setSupervise(sv == null ? true : sv === "true");
     })();
     return () => { cancelled = true; };
   }, []);
@@ -1303,6 +1308,7 @@ function RoutingSection() {
       await db.settings.set("routing.chatModel", chatModel);
       await db.settings.set("routing.orchestratorModel", orchModel);
       await db.settings.set("routing.delegateOverride", override);
+      await db.settings.set("routing.superviseComplex", supervise ? "true" : "false");
       setSavingState("saved");
       window.setTimeout(() => setSavingState("idle"), 1500);
     } catch (err) {
@@ -1389,6 +1395,25 @@ function RoutingSection() {
               <option value="always-delegate">Always delegate (orchestrator pour chaque message)</option>
               <option value="never-delegate">Never delegate (chat model seul)</option>
             </select>
+          </div>
+        </div>
+
+        <div className="conn-field">
+          <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+            <input
+              type="checkbox"
+              checked={supervise}
+              onChange={(e) => setSupervise(e.currentTarget.checked)}
+            />
+            Reviewer automatique sur les tâches complexes
+          </label>
+          <div style={{ fontSize: 11, color: "var(--on-surface-muted)", marginTop: 4 }}>
+            Un agent reviewer relit le <b>plan</b> (avant exécution) et le <b>livrable</b>{" "}
+            (après) des tâches jugées complexes — seuil adapté au modèle (plus bas pour un
+            petit modèle, qui en a le plus besoin). La revue est stockée en local.{" "}
+            ⚠ Coût : jusqu'à 3 appels LLM supplémentaires par tâche complexe (plan, revue
+            du plan, revue du livrable), facturés via la clé du reviewer
+            {" "}(par défaut <code>reviewer-gpt</code> → OpenAI). Max 2 supervisions en parallèle.
           </div>
         </div>
 

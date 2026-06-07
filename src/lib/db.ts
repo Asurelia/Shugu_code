@@ -112,6 +112,17 @@ export interface SettingRow {
   updated_at: number;
 }
 
+export interface ReviewRow {
+  id: string;
+  agent_id: string;
+  reviewer_id: string;
+  kind: "deliverable" | "plan" | "plan-review";
+  verdict: "APPROUVÉ" | "BLOQUÉ" | "À CORRIGER" | "unknown";
+  validated: number; // 0|1
+  body: string;
+  ts: number;
+}
+
 // ---------------------------------------------------------------------------
 // Shape mappers: UI <-> Row
 // The UI shape used by ChatSidebar/SEED_CONVOS differs from the DDL row.
@@ -609,6 +620,39 @@ const settings = {
 };
 
 // ---------------------------------------------------------------------------
+// reviews  (V13 migration — agent_reviews)
+// ---------------------------------------------------------------------------
+
+const reviews = {
+  async save(row: ReviewRow): Promise<void> {
+    const db = await getDb();
+    await db.execute(
+      `INSERT OR REPLACE INTO agent_reviews
+         (id, agent_id, reviewer_id, kind, verdict, validated, body, ts)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [row.id, row.agent_id, row.reviewer_id, row.kind, row.verdict,
+       row.validated, row.body, row.ts]
+    );
+  },
+
+  async getByAgent(agentId: string): Promise<ReviewRow[]> {
+    const db = await getDb();
+    return db.select(
+      "SELECT * FROM agent_reviews WHERE agent_id = $1 ORDER BY ts DESC",
+      [agentId]
+    ) as Promise<ReviewRow[]>;
+  },
+
+  async recent(limit: number): Promise<ReviewRow[]> {
+    const db = await getDb();
+    return db.select(
+      "SELECT * FROM agent_reviews ORDER BY ts DESC LIMIT $1",
+      [limit]
+    ) as Promise<ReviewRow[]>;
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Public repository facade
 // ---------------------------------------------------------------------------
 
@@ -620,6 +664,7 @@ export const db = {
   jobs,
   logs,
   settings,
+  reviews,
 
   /**
    * Wipe all user-generated data from the local SQLite database.

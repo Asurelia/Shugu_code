@@ -37,9 +37,10 @@ import { parseMentions, resolveMentions, buildMentionContext } from "./mentions"
 import { resolveCodeContext, buildCodeContext } from "./codeContext";
 import { fireMoodReaction } from "@/features/mascot/moodReactionStore";
 import { parseThinkingMode, resolveThinking } from "@/lib/thinkingHeuristic";
-import { resolveRoute, parseDelegateOverride } from "@/lib/routingHeuristic";
+import { resolveRoute, parseDelegateOverride, classifyComplexity } from "@/lib/routingHeuristic";
 import { spawnAgent, awaitAgentComplete } from "@/lib/agents";
 import { readAgentDef } from "@/lib/agentDefs";
+import { superviseDeliverable, supervisePlan } from "@/lib/supervisors";
 import { getActiveDesignSystem, buildDesignSystemPrompt } from "@/features/design/activeDesignSystem";
 import { queryClient } from "@/lib/queryClient";
 import { diag } from "@/lib/diag";
@@ -765,6 +766,39 @@ async function handleDelegate(
     }
   }
 
+  // ── S2 + S1 shared gate ────────────────────────────────────────────────────
+  // Compute ONCE whether supervision is active for this invocation. Used by
+  // both S2 (pre-execution plan review) and S1 (post-execution deliverable
+  // review). Factored out here to avoid duplicating the db.settings read.
+  const superviseRaw = await db.settings.get("routing.superviseComplex");
+  const superviseOn = superviseRaw == null ? true : superviseRaw === "true";
+  const isReviewerInvocation = !!agentDefPath && /reviewer|planner/i.test(agentDefPath);
+  const wantSupervise =
+    superviseOn &&
+    !isReviewerInvocation &&
+    classifyComplexity(task, realModel) === "complex";
+
+  // ── S2 — plan review before execution ──────────────────────────────────────
+  // If supervision is active, spawn the orchestrator in "plan-only" mode, have
+  // the reviewer evaluate the plan, and optionally augment the task with the
+  // reviewer's concerns (advisory — never blocks execution).
+  let execTask = task;
+  if (wantSupervise) {
+    try {
+      const planResult = await supervisePlan({
+        convId,
+        task,
+        orch: { model: realModel, protocol, baseUrl, apiKey },
+      });
+      if (planResult) {
+        execTask = planResult.augmentedTask;
+      }
+    } catch (s2Err) {
+      console.warn("[chat-sync] S2 supervisePlan gate failed:", s2Err);
+      // execTask stays as `task` — proceed normally.
+    }
+  }
+
   // Spawn the agent FIRST. We need the agentId to attach to the placeholder
   // so the reconciler (on mount) can match an orphan placeholder back to
   // its (possibly already-completed) agent. Without this link, an orphan
@@ -774,7 +808,7 @@ async function handleDelegate(
   try {
     agentId = await spawnAgent({
       role: "orchestrator",
-      task,
+      task: execTask,
       model: realModel,
       conversationId: convId,
       protocol,
@@ -879,6 +913,22 @@ async function handleDelegate(
       viaAgent: true,
       agentId,
     });
+
+    // ── S1 — review automatique du livrable ────────────────────────────────
+    // Sur une tâche jugée complexe POUR LE MODÈLE qui a exécuté (seuil bas pour
+    // un petit modèle, haut pour un fort), on chaîne un reviewer qui relit la
+    // sortie de l'orchestrateur et la persiste en DB. Fire-and-forget :
+    // l'utilisateur n'est pas bloqué, la review-card arrive quand elle est
+    // prête. Jamais déclenché sur une invocation explicite du reviewer
+    // (anti-récursion via agentDefPath). Gated par routing.superviseComplex
+    // (défaut ON — l'utilisateur l'a demandé ; le gate complexité empêche de
+    // tirer sur le trivial).
+    // `wantSupervise` is computed once above (shared with S2) — no re-read.
+    // The review always uses the ORIGINAL `task` as the reference, not
+    // `execTask` (which may carry the S2 warning injection).
+    if (wantSupervise) {
+      void superviseDeliverable({ convId, agentId, task });
+    }
   } catch (err) {
     // The JS listener gave up (timeout, window thrash, etc.) — but the
     // Rust agent may have completed anyway. Do ONE last SQLite check

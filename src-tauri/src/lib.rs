@@ -351,6 +351,32 @@ CREATE TABLE IF NOT EXISTS codex_limit_events (
 CREATE INDEX IF NOT EXISTS idx_codex_limit_ts ON codex_limit_events(ts);
 ";
 
+// V13 — revues produites par un agent reviewer (agent_reviews).
+//
+// `agent_reviews` stocke une revue par (reviewer_id, agent_id, kind). Le
+// champ `kind` distingue le type de livrable revu : 'deliverable' (sortie
+// finale de l'agent), 'plan' (plan soumis avant exécution) ou 'plan-review'
+// (méta-revue d'un plan déjà revu). `verdict` est le résultat textuel de la
+// revue ('APPROUVÉ' | 'BLOQUÉ' | 'À CORRIGER' | 'unknown') ; `validated` est
+// le booléen SQLite (0/1) indiquant si la revue a été acceptée par le pipeline.
+// `body` contient le texte complet de la revue (feedback, justification).
+// INSERT OR REPLACE sur `id` permet de ré-émettre une revue (idempotent).
+const MIGRATION_V13: &str = "
+CREATE TABLE IF NOT EXISTS agent_reviews (
+  id          TEXT    PRIMARY KEY,
+  agent_id    TEXT    NOT NULL,
+  reviewer_id TEXT    NOT NULL,
+  kind        TEXT    NOT NULL DEFAULT 'deliverable',
+  verdict     TEXT    NOT NULL DEFAULT 'unknown',
+  validated   INTEGER NOT NULL DEFAULT 0,
+  body        TEXT    NOT NULL DEFAULT '',
+  ts          INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_reviews_agent ON agent_reviews(agent_id);
+CREATE INDEX IF NOT EXISTS idx_agent_reviews_ts    ON agent_reviews(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_reviews_kind  ON agent_reviews(kind);
+";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = vec![
@@ -424,6 +450,12 @@ pub fn run() {
             version: 12,
             description: "codex_usage_tracking",
             sql: MIGRATION_V12,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 13,
+            description: "agent_reviews store",
+            sql: MIGRATION_V13,
             kind: MigrationKind::Up,
         },
     ];
