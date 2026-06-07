@@ -266,6 +266,7 @@ export function TranscriptDrawer({
   // skills the env-verified gate accepted. An "atelier" run is detected by the
   // presence of run_command tool calls (chat agents never execute).
   const skillEvents = events.filter((e) => e.kind === "skillLearned");
+  const lessonEvents = events.filter((e) => e.kind === "lessonsInjected");
   const runCalls = events.filter((e) => e.kind === "toolCall" && e.tool === "run_command");
   // Both Atelier and Grounded execute via run_command, so the "real-env tests"
   // view applies to either. The browser-preview iframe is Atelier-ONLY; the
@@ -500,6 +501,31 @@ export function TranscriptDrawer({
                 }}
               >
                 🎓 appris : {e.name}
+              </span>
+            ) : null,
+          )}
+        </div>
+      )}
+
+      {/* S3 — leçons de runs passés réinjectées dans le contexte de ce run */}
+      {lessonEvents.length > 0 && (
+        <div style={{ marginTop: 10, display: "flex", flexWrap: "wrap", gap: 6 }}>
+          {lessonEvents.map((e, i) =>
+            e.kind === "lessonsInjected" ? (
+              <span
+                key={i}
+                title="Leçons validées (runs passés réussis, similaires à cette tâche) réinjectées dans le contexte — boucle d'apprentissage S3"
+                style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  padding: "3px 8px",
+                  borderRadius: 99,
+                  background: "rgba(124, 58, 237, 0.15)",
+                  color: "var(--primary, #7c3aed)",
+                  border: "1px solid rgba(124, 58, 237, 0.35)",
+                }}
+              >
+                📚 {e.count} leçon{e.count > 1 ? "s" : ""} réinjectée{e.count > 1 ? "s" : ""}
               </span>
             ) : null,
           )}

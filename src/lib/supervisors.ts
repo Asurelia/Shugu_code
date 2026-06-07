@@ -548,7 +548,10 @@ export async function superviseDeliverable(args: {
       reviewer_id: reviewerId,
       kind:        "deliverable",
       verdict,
-      validated:   0,
+      // S3 — validée immédiatement si le run reviewé s'est terminé avec succès.
+      // La promotion ne PEUT PAS se faire au record_outcome Rust : la review
+      // n'existe pas encore à ce moment-là (elle est créée ici, après le run).
+      validated:   transcript.agent.status === "complete" ? 1 : 0,
       body:        output,
       ts:          Date.now(),
     };

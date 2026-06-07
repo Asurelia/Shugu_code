@@ -497,6 +497,42 @@ pub(super) async fn tool_use_loop(
         );
     }
 
+    // S3 — Closed-loop lesson injection: retrieve validated past-run reviews
+    // for tasks semantically similar to this one and prepend them to context.
+    // Injected AFTER skills (position 2) so both blocks ride behind the system
+    // prompt without displacing each other. Degrades silently on any error.
+    let task_text: String = history
+        .iter()
+        .find_map(|m| match m {
+            AgentMessage::Text { role: r, content } if r.as_str() == "user" => {
+                Some(content.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_default();
+    let (lessons_block, lessons_count) =
+        super::lessons::lessons_prompt_block(app, role, &task_text);
+    if !lessons_block.is_empty() {
+        // Insérer AVANT le message user (comme le bloc skills) : un message
+        // role="system" placé APRÈS un message user est rejeté par Anthropic.
+        let pos = history.len().min(1);
+        history.insert(
+            pos,
+            AgentMessage::Text {
+                role: "system".to_string(),
+                content: lessons_block,
+            },
+        );
+        let _ = persist_and_emit(
+            app,
+            &AgentEvent::LessonsInjected {
+                agent_id: agent_id.to_string(),
+                role: role.to_string(),
+                count: lessons_count,
+            },
+        );
+    }
+
     // Env-verified skill gate: `run_command` writes its exit code here; the
     // `skill_save` tool refuses unless the LAST run was exit 0. A skill is thus
     // only ever born from a test the REAL environment confirmed — never an LLM
@@ -1110,6 +1146,10 @@ fn record_outcome(
                     now_ms(),
                 ],
             );
+            // S3 — la promotion `validated=1` se fait côté TS au moment où la
+            // review est créée (superviseDeliverable lit `transcript.agent.status`).
+            // Elle ne peut PAS se faire ici : la review n'existe pas encore à ce
+            // point (produite après ce run par un reviewer asynchrone).
         }
     }
 }

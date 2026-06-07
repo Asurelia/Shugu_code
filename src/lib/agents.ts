@@ -31,6 +31,7 @@ export type AgentEventKind =
   | "complete"
   | "error"
   | "skillLearned"
+  | "lessonsInjected"
   | "diff";
 
 // ────────────────────────────────────────────────────────────────────
@@ -125,6 +126,15 @@ export type AgentEvent =
       /** Name of the reusable skill the agent just saved — VERIFIED by a real
        * passing test (the env gate). The chat UI shows an inline "🎓 appris" badge. */
       name: string;
+    }
+  | {
+      kind: "lessonsInjected";
+      agentId: string;
+      role: string;
+      /** Number of validated past-review lessons re-injected into this run's
+       * context at start (S3 closed loop). The Agents panel shows a
+       * "📚 N leçons réinjectées" badge. */
+      count: number;
     }
   | {
       kind: "diff";

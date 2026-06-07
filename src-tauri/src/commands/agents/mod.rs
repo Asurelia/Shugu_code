@@ -84,6 +84,11 @@ mod mirror;
 /// per-role, compounding learning.
 pub(crate) mod skills;
 
+/// S3 — Closed-loop lesson injection. At the start of each run, retrieves the
+/// most relevant validated past reviews via semantic search and injects them
+/// into the agent's context so past mistakes compound into future improvements.
+mod lessons;
+
 // Re-export the crate-visible items from `tools` so `chat.rs` can reach
 // them via `crate::commands::agents::*` without poking into the private
 // submodule path. The streaming helpers in `chat.rs` consume:
@@ -266,6 +271,15 @@ pub enum AgentEvent {
         role: String,
         name: String,
     },
+    /// S3 — Closed-loop lesson injection. Emitted when validated past-run lessons
+    /// are retrieved via semantic search and injected into the agent's context.
+    /// The `count` field reports how many lessons were actually injected so the
+    /// UI can show a brief "📚 N leçon(s) injectée(s)" badge.
+    LessonsInjected {
+        agent_id: String,
+        role: String,
+        count: usize,
+    },
     /// Grounded Run produced a unified diff (mirror vs baseline) and tried to
     /// auto-apply it to the live project. `applied` reports whether the write
     /// succeeded; `apply_error` carries the reason when it didn't. The patch is
@@ -292,6 +306,7 @@ impl AgentEvent {
             AgentEvent::Complete { .. } => "complete",
             AgentEvent::Error { .. } => "error",
             AgentEvent::SkillLearned { .. } => "skillLearned",
+            AgentEvent::LessonsInjected { .. } => "lessonsInjected",
             AgentEvent::Diff { .. } => "diff",
         }
     }
@@ -308,6 +323,7 @@ impl AgentEvent {
             | AgentEvent::Complete { agent_id, .. }
             | AgentEvent::Error { agent_id, .. }
             | AgentEvent::SkillLearned { agent_id, .. }
+            | AgentEvent::LessonsInjected { agent_id, .. }
             | AgentEvent::Diff { agent_id, .. } => agent_id,
         }
     }
