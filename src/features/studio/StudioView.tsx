@@ -25,6 +25,7 @@ import { useAgentTranscript } from "@/features/agents/queries";
 import { fsGetWorkspaceRoot } from "@/lib/fs";
 import { useShell } from "@/routes/shell-context";
 import { buildGenerationContext } from "./generationContext";
+import { useStudioBrandBoard } from "./brandBoard";
 import { useStudioDraft, setStudioDraft } from "./studioDraft";
 import {
   studioProjectUpsertAuto,
@@ -55,6 +56,7 @@ export function StudioView() {
   const active = useActiveDesignSystem();
   const skills = useDesignSkills().data ?? [];
   const draft = useStudioDraft();
+  const brandBoard = useStudioBrandBoard();
   const turns = useStudioChat();
 
   const [reloadKey, setReloadKey] = useState(0);
@@ -65,7 +67,20 @@ export function StudioView() {
   // The "start a new project" intent lives in studioDraft (survives sub-tab nav).
   const [splitFile, setSplitFile] = useState<string | null>(null);
   const [rightCollapsed, setRightCollapsed] = useState(false);
-  const { openFile, fileContents, setFileContents, editorPrefs } = useShell();
+  const { openFile, fileContents, setFileContents, editorPrefs, generations } = useShell();
+  const brandAssets = useMemo(
+    () =>
+      brandBoard.pinnedAssetIds
+        .map((id) => generations.find((g: any) => String(g.id) === id))
+        .filter(Boolean)
+        .map((g: any) => ({
+          prompt: g.prompt,
+          model: g.model,
+          ratio: g.ratio,
+          resultUrl: g.resultUrl ?? null,
+        })),
+    [brandBoard.pinnedAssetIds, generations],
+  );
 
   // A project already exists on disk when the preview has an index.html — the
   // durable source of truth. In-memory `turns` reset on app reload but the
@@ -145,6 +160,12 @@ export function StudioView() {
       skills,
       discovery: draft.discovery,
       direction: active ? null : draft.direction, // system XOR direction
+      brand: {
+        audience: brandBoard.audience,
+        voice: brandBoard.voice,
+        notes: brandBoard.notes,
+        assets: brandAssets,
+      },
       brief: draft.brief.trim() || userText,
     });
     // Dedicated Studio conversation id (per session), minted lazily so each

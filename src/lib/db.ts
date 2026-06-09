@@ -181,7 +181,7 @@ export function toGenerationRow(g: Generation): GenerationRow {
   return {
     id: String(g.id),
     prompt: g.prompt,
-    negative: null,
+    negative: g.negative ?? null,
     ratio: g.ratio ?? null,
     model: g.model ?? null,
     seed: g.seed ?? null,
@@ -189,8 +189,8 @@ export function toGenerationRow(g: Generation): GenerationRow {
     guidance: g.guidance ?? null,
     style: g.style ?? null,
     hue: g.hue ?? null,
-    status: null,
-    result_url: null,
+    status: g.status ?? null,
+    result_url: g.resultUrl ?? null,
     ts: Number(g.ts) || Date.now(),
   };
 }

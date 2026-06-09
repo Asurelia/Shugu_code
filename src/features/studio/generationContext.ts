@@ -67,6 +67,20 @@ export interface Direction {
   fonts: DirectionFonts;
 }
 
+export interface BrandAssetReference {
+  prompt?: string;
+  model?: string;
+  ratio?: string;
+  resultUrl?: string | null;
+}
+
+export interface BrandContext {
+  audience?: string;
+  voice?: string;
+  notes?: string;
+  assets?: BrandAssetReference[];
+}
+
 export interface GenerationContextInput {
   /** Active design system, or null when the user chose a direction instead. */
   system: ActiveDesignSystem | null;
@@ -75,6 +89,8 @@ export interface GenerationContextInput {
   discovery: DiscoveryAnswers;
   /** Chosen colour direction — applied ONLY when no system is active. */
   direction: Direction | null;
+  /** Persistent Studio brand board (audience, voice, notes, pinned image refs). */
+  brand?: BrandContext | null;
   /** The brief; used only to rank skills by relevance when over budget. */
   brief: string;
 }
@@ -140,6 +156,33 @@ function discoveryBlock(a: DiscoveryAnswers): string {
     .join("\n");
 }
 
+function compactText(value: string | null | undefined, max = 180): string {
+  const clean = (value ?? "").trim().replace(/\s+/g, " ");
+  return clean.length <= max ? clean : `${clean.slice(0, max - 3)}...`;
+}
+
+function brandBlock(brand: BrandContext | null | undefined): string {
+  if (!brand) return "";
+  const lines: string[] = [];
+  const audience = compactText(brand.audience, 240);
+  const voice = compactText(brand.voice, 240);
+  const notes = compactText(brand.notes, 600);
+  const assets = (brand.assets ?? []).filter((asset) => compactText(asset.prompt).length > 0).slice(0, 8);
+
+  if (audience) lines.push(`- Audience: ${audience}`);
+  if (voice) lines.push(`- Voice: ${voice}`);
+  if (notes) lines.push(`- Notes: ${notes}`);
+  if (assets.length > 0) {
+    lines.push("- Visual references pinned by the user:");
+    for (const [index, asset] of assets.entries()) {
+      const meta = [asset.model, asset.ratio].filter(Boolean).join(", ");
+      lines.push(`  ${index + 1}. ${compactText(asset.prompt)}${meta ? ` (${meta})` : ""}`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
 /** Term-overlap score of a skill against the brief (cheap, deterministic). */
 function scoreSkill(skill: DesignSkillMeta, terms: string[]): number {
   const hay = `${skill.name} ${skill.description} ${skill.category}`.toLowerCase();
@@ -197,7 +240,7 @@ export function buildGenerationContext(
   input: GenerationContextInput,
   maxChars = DEFAULT_MAX,
 ): string {
-  const { system, skills, discovery, direction, brief } = input;
+  const { system, skills, discovery, direction, brand, brief } = input;
   const parts: string[] = [];
 
   // 1. Brand source — design system XOR colour direction.
@@ -207,11 +250,15 @@ export function buildGenerationContext(
     parts.push(`## COLOUR DIRECTION\n${directionBlock(direction)}`);
   }
 
-  // 2. Discovery (only non-empty dimensions).
+  // 2. Studio brand board (persistent product/brand memory).
+  const brandGuidance = brandBlock(brand);
+  if (brandGuidance) parts.push(`## BRAND WORKSPACE\n${brandGuidance}`);
+
+  // 3. Discovery (only non-empty dimensions).
   const disc = discoveryBlock(discovery);
   if (disc) parts.push(`## USER PREFERENCES (discovery)\n${disc}`);
 
-  // 3. Skill catalogue for agent self-selection (fills remaining budget).
+  // 4. Skill catalogue for agent self-selection (fills remaining budget).
   if (skills.length > 0) {
     const used = parts.join("\n\n").length;
     const skillBudget = maxChars - used - 400; // reserve room for the header

@@ -11,6 +11,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { queryClient } from "@/lib/queryClient";
+import { db } from "@/lib/db";
 
 export interface ActiveDesignSystem {
   id: string;
@@ -22,13 +23,50 @@ export interface ActiveDesignSystem {
 }
 
 const KEY = ["design", "active-system"] as const;
+const STORAGE_KEY = "design.active-system.v1";
+
+function readBrowserCache(): ActiveDesignSystem | null {
+  if (typeof localStorage === "undefined") return null;
+  const raw = localStorage.getItem(STORAGE_KEY);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as ActiveDesignSystem | null;
+    if (!parsed || !parsed.id || !parsed.name) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writeBrowserCache(ds: ActiveDesignSystem | null): void {
+  if (typeof localStorage === "undefined") return;
+  try {
+    if (ds) localStorage.setItem(STORAGE_KEY, JSON.stringify(ds));
+    else localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    // Non-fatal: SQLite persistence below is the durable copy.
+  }
+}
+
+async function loadActiveDesignSystem(): Promise<ActiveDesignSystem | null> {
+  const raw = await db.settings.get(STORAGE_KEY).catch(() => null);
+  if (!raw) return readBrowserCache();
+  try {
+    const parsed = JSON.parse(raw) as ActiveDesignSystem | null;
+    if (!parsed || !parsed.id || !parsed.name) return null;
+    writeBrowserCache(parsed);
+    return parsed;
+  } catch {
+    return readBrowserCache();
+  }
+}
 
 /** Reactive read — components re-render when the active system changes. */
 export function useActiveDesignSystem(): ActiveDesignSystem | null {
   return (
     useQuery<ActiveDesignSystem | null>({
       queryKey: KEY,
-      queryFn: () => null, // value is only ever written via setActiveDesignSystem
+      queryFn: loadActiveDesignSystem,
       staleTime: Infinity,
       gcTime: Infinity,
     }).data ?? null
@@ -37,11 +75,15 @@ export function useActiveDesignSystem(): ActiveDesignSystem | null {
 
 /** Imperative read — for sendChatMessage (outside React render). */
 export function getActiveDesignSystem(): ActiveDesignSystem | null {
-  return queryClient.getQueryData<ActiveDesignSystem | null>(KEY) ?? null;
+  return queryClient.getQueryData<ActiveDesignSystem | null>(KEY) ?? readBrowserCache();
 }
 
 export function setActiveDesignSystem(ds: ActiveDesignSystem | null): void {
   queryClient.setQueryData<ActiveDesignSystem | null>(KEY, ds);
+  writeBrowserCache(ds);
+  void db.settings
+    .set(STORAGE_KEY, ds ? JSON.stringify(ds) : "")
+    .catch((err) => console.warn("[design] persist active system failed:", err));
 }
 
 /**

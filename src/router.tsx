@@ -23,6 +23,7 @@ const LazyInspirationRoute = lazy(() => import("./routes/design"));        // ca
 const LazyStudioShell      = lazy(() => import("./routes/studio"));        // unified Studio shell (sub-tabs + Outlet)
 const LazyStudioCreate     = lazy(() => import("./routes/studio.create")); // /studio index → the assistant
 const LazyStudioProjects   = lazy(() => import("./routes/studio.projects")); // /studio/projects → saved-projects grid
+const LazyStudioBrand      = lazy(() => import("./routes/studio.brand")); // /studio/brand → brand workspace
 const LazyAgentsRoute      = lazy(() => import("./routes/agents"));
 const LazyGalleryRoute     = lazy(() => import("./routes/gallery"));
 const LazySettingsRoute    = lazy(() => import("./routes/settings"));
@@ -96,6 +97,12 @@ const studioProjectsRoute = createRoute({
   path: "projects",
   component: () => <LazyStudioProjects />,
 });
+// /studio/brand → brand workspace (design base + notes + image refs)
+const studioBrandRoute = createRoute({
+  getParentRoute: () => studioRoute,
+  path: "brand",
+  component: () => <LazyStudioBrand />,
+});
 // /studio/inspiration → the catalogue (systems as a starting base)
 const studioInspirationRoute = createRoute({
   getParentRoute: () => studioRoute,
@@ -153,7 +160,7 @@ const routeTree = rootRoute.addChildren([
   gitRoute,
   imageRoute,
   designRedirectRoute,
-  studioRoute.addChildren([studioCreateRoute, studioProjectsRoute, studioInspirationRoute]),
+  studioRoute.addChildren([studioCreateRoute, studioProjectsRoute, studioBrandRoute, studioInspirationRoute]),
   agentsRoute,
   galleryRoute,
   settingsIndexRoute,

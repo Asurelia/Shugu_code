@@ -530,6 +530,9 @@ export function RootLayout() {
           steps: r.steps ?? undefined,
           guidance: r.guidance ?? undefined,
           style: r.style ?? undefined,
+          negative: r.negative ?? undefined,
+          status: r.status ?? undefined,
+          resultUrl: r.result_url ?? undefined,
         })));
       }
     })();

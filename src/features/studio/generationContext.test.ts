@@ -4,7 +4,7 @@
 // discovery omission of empty dimensions, and the skill-catalogue budget cap.
 
 import { describe, it, expect } from "vitest";
-import { buildGenerationContext, type DiscoveryAnswers, type Direction } from "./generationContext";
+import { buildGenerationContext, type BrandContext, type DiscoveryAnswers, type Direction } from "./generationContext";
 import type { ActiveDesignSystem } from "@/features/design/activeDesignSystem";
 import type { DesignSkillMeta } from "@/features/design/queries";
 
@@ -26,6 +26,20 @@ const DIRECTION: Direction = {
 };
 
 const EMPTY_DISCOVERY: DiscoveryAnswers = {};
+
+const BRAND: BrandContext = {
+  audience: "Développeurs indépendants qui veulent piloter un IDE agentique local.",
+  voice: "Calme, précis, un peu complice.",
+  notes: "La mascotte doit agir comme présence utile, pas comme décoration isolée.",
+  assets: [
+    {
+      prompt: "small luminous companion mascot beside a desktop code editor",
+      model: "minimax/image-01",
+      ratio: "1:1",
+      resultUrl: "C:/tmp/mascot.png",
+    },
+  ],
+};
 
 function mkSkills(n: number, descLen = 1): DesignSkillMeta[] {
   return Array.from({ length: n }, (_, i) => ({
@@ -88,6 +102,35 @@ describe("buildGenerationContext", () => {
     expect(out).toContain("Palette: Sombre");
     expect(out).toContain("Mood: Luxe");
     expect(out).not.toContain("Layout:");
+  });
+
+  it("includes persistent brand guidance and pinned visual references", () => {
+    const out = buildGenerationContext({
+      system: null,
+      skills: [],
+      discovery: EMPTY_DISCOVERY,
+      direction: DIRECTION,
+      brand: BRAND,
+      brief: "an app shell",
+    });
+    expect(out).toContain("## BRAND WORKSPACE");
+    expect(out).toContain("Audience: Développeurs indépendants");
+    expect(out).toContain("Voice: Calme, précis");
+    expect(out).toContain("Visual references pinned by the user");
+    expect(out).toContain("small luminous companion mascot");
+    expect(out).toContain("minimax/image-01");
+  });
+
+  it("omits the brand section when the brand board is empty", () => {
+    const out = buildGenerationContext({
+      system: null,
+      skills: [],
+      discovery: EMPTY_DISCOVERY,
+      direction: null,
+      brand: { audience: "", voice: "", notes: "", assets: [] },
+      brief: "",
+    });
+    expect(out).toBe("");
   });
 
   it("lists the whole skill catalogue when it fits the budget", () => {

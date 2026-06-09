@@ -83,6 +83,52 @@
 }
 .design-search-clear:hover { color: var(--on-surface); background: rgba(255, 255, 255, 0.1); }
 
+.design-active-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, rgba(224, 142, 254, 0.14), rgba(129, 236, 255, 0.06));
+  border: 1px solid rgba(224, 142, 254, 0.28);
+}
+.design-active-card-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.design-active-card-main > div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.design-active-card-main strong {
+  color: var(--on-surface);
+  font-family: var(--font-display);
+  font-size: 12.5px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.design-active-card-main span {
+  color: var(--on-surface-muted);
+  font-size: 10.5px;
+}
+.design-active-clear {
+  flex-shrink: 0;
+  border: 1px solid rgba(255,255,255,0.1);
+  background: rgba(255,255,255,0.04);
+  color: var(--on-surface-variant);
+  border-radius: 8px;
+  padding: 5px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.design-active-clear:hover { color: var(--on-surface); border-color: rgba(224, 142, 254, 0.36); }
+
 /* List */
 .design-list {
   flex: 1;

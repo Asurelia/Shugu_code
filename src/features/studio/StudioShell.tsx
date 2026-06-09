@@ -6,17 +6,21 @@
 // live preview). Both are real sub-routes under /studio, sharing this chrome
 // via a nested <Outlet/>:
 //   /studio              → Créer   (the assistant)
+//   /studio/brand        → Marque  (brand direction + image references)
 //   /studio/inspiration  → Inspiration (the catalogue, systems-only)
 
 import { Outlet, useNavigate, useRouterState } from "@tanstack/react-router";
 import { Icon } from "@/components/components";
+import { useActiveDesignSystem } from "@/features/design/activeDesignSystem";
 
 export function StudioShell() {
   const navigate = useNavigate();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const onProjects = pathname.startsWith("/studio/projects");
+  const onBrand = pathname.startsWith("/studio/brand");
   const onInspiration = pathname.startsWith("/studio/inspiration");
-  const onCreate = !onProjects && !onInspiration;
+  const onCreate = !onProjects && !onBrand && !onInspiration;
+  const activeDesign = useActiveDesignSystem();
 
   return (
     <div className="studio-root">
@@ -38,6 +42,14 @@ export function StudioShell() {
           <Icon name="folder" size={13} /> Projets
         </button>
         <button
+          className={"studio-subtab" + (onBrand ? " is-active" : "")}
+          onClick={() => navigate({ to: "/studio/brand" })}
+          role="tab"
+          aria-selected={onBrand}
+        >
+          <Icon name="image" size={13} /> Marque
+        </button>
+        <button
           className={"studio-subtab" + (onInspiration ? " is-active" : "")}
           onClick={() => navigate({ to: "/studio/inspiration" })}
           role="tab"
@@ -45,6 +57,17 @@ export function StudioShell() {
         >
           <Icon name="palette" size={13} /> Inspiration
         </button>
+        <span style={{ flex: 1 }} />
+        {activeDesign && (
+          <button
+            className="studio-active-base"
+            onClick={() => navigate({ to: "/studio/inspiration" })}
+            title="Voir la base de design active"
+          >
+            <Icon name="check" size={12} />
+            <span>{activeDesign.name}</span>
+          </button>
+        )}
       </div>
       <div className="studio-outlet">
         <Outlet />

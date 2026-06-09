@@ -24,6 +24,8 @@ import { GitDiffStats } from "@/features/git/components/GitDiffStats";
 import { DiffView as CompareDiffView } from "./DiffView";
 import { InlineEditWidget } from "./ai-edit/InlineEditWidget";
 import { useApplyRunner } from "./ai-edit/applyController";
+import { fallbackGradient, formatGenerationTime, imageDisplaySrc, copyText as copyImageText } from "@/features/image/imageAssets";
+import { togglePinnedAsset, useStudioBrandBoard } from "@/features/studio/brandBoard";
 
 // ─── Code view (editor + tabs + statusbar) ──────────────────
 export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, fileContents, setFileContents, editorViewRef, embedded }: any) {
@@ -322,31 +324,72 @@ export function DiffView({ original, modified }: { original: string; modified: s
 
 // ─── Gallery view ───────────────────────────────────────────
 export function GalleryView({ generations }: any) {
+  const brandBoard = useStudioBrandBoard();
+  const copyPrompt = (prompt: string) => {
+    copyImageText(prompt);
+    pushToast("Prompt image copie", "success", 2200);
+  };
+  const copyPath = (path?: string | null) => {
+    copyImageText(path ?? "");
+    pushToast(path ? "Chemin image copie" : "Aucun fichier image", path ? "success" : "info", 2200);
+  };
+
   return (
     <div className="gallery-shell scroll">
       <div className="gallery-head">
         <div>
-          <div style={{fontFamily:"var(--font-display)", fontSize:14, fontWeight:700}}>All generations · {generations.length} images</div>
-          <div style={{fontSize:12, color:"var(--on-surface-variant)", marginTop:4}}>Tout est cached localement. Re-clic = ré-injecter dans le prompt.</div>
+          <div style={{fontFamily:"var(--font-display)", fontSize:14, fontWeight:700}}>Image assets · {generations.length} generations</div>
+          <div style={{fontSize:12, color:"var(--on-surface-variant)", marginTop:4}}>Fichiers locaux, prompts, seeds et providers — la galerie devient la memoire creative.</div>
         </div>
         <div style={{display:"flex", gap:6}}>
           <span className="chip">grid</span>
-          <button className="lgb lgb-sm"><Icon name="download" size={12}/> Export all</button>
+          <span className="chip tertiary">{generations.filter((g: any) => g.resultUrl).length} files</span>
         </div>
       </div>
-      <div className="gallery-grid">
-        {generations.map((g: any) => (
-          <div key={g.id} className="gallery-card" style={{
-            background: `radial-gradient(circle at 30% 30%, hsl(${g.hue} 80% 70%) 0%, transparent 50%), radial-gradient(circle at 70% 70%, hsl(${(g.hue+60)%360} 80% 60%) 0%, transparent 50%), radial-gradient(circle at 60% 30%, hsl(${(g.hue+120)%360} 80% 60%) 0%, transparent 55%), linear-gradient(135deg, #2a1437 0%, #0d0d18 100%)`
-          }}>
-            <div className="img"></div>
-            <div className="meta">
-              <span style={{flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>{g.prompt}</span>
-              <span style={{flexShrink:0}}>{g.ratio}</span>
-            </div>
-          </div>
-        ))}
-      </div>
+      {generations.length === 0 ? (
+        <div className="gallery-empty">
+          <Icon name="gallery" size={30} />
+          <div>Aucune generation image pour le moment.</div>
+          <span>Les images produites dans l'atelier Image apparaitront ici avec leur prompt et leur fichier local.</span>
+        </div>
+      ) : (
+        <div className="gallery-grid">
+          {generations.map((g: any) => {
+            const src = imageDisplaySrc(g.resultUrl);
+            const id = String(g.id);
+            const pinned = brandBoard.pinnedAssetIds.includes(id);
+            return (
+              <div key={g.id} className="gallery-card" style={{ background: src ? undefined : fallbackGradient(g.hue ?? 250) }}>
+                {src ? <img className="img-real" src={src} alt={g.prompt} /> : <div className="img"></div>}
+                <div className="gallery-card-top">
+                  <span>{g.model ?? "unknown"}</span>
+                  <span>{pinned ? "brand ref" : (g.status ?? (src ? "done" : "no file"))}</span>
+                </div>
+                <div className="meta">
+                  <span style={{flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>{g.prompt}</span>
+                  <span style={{flexShrink:0}}>{g.ratio}</span>
+                </div>
+                <div className="gallery-actions">
+                  <button className="lgb lgb-sm" onClick={() => copyPrompt(g.prompt)}><Icon name="copy" size={11}/> Prompt</button>
+                  <button className="lgb lgb-sm" onClick={() => copyPath(g.resultUrl)}><Icon name="download" size={11}/> Path</button>
+                  <button
+                    className="lgb lgb-sm"
+                    disabled={!g.resultUrl}
+                    onClick={() => {
+                      togglePinnedAsset(id);
+                      pushToast(pinned ? "Reference marque retiree" : "Reference marque ajoutee", "success", 2200);
+                    }}
+                  ><Icon name="image" size={11}/> {pinned ? "Unpin" : "Brand"}</button>
+                </div>
+                <div className="gallery-card-foot">
+                  <span>seed {g.seed ?? "auto"}</span>
+                  <span>{formatGenerationTime(g.ts)}</span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
