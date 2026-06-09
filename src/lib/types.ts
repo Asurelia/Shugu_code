@@ -64,14 +64,17 @@ export interface Conversation {
 export interface Generation {
   id: number | string;
   prompt: string;
+  negative?: string | null;
   ratio: string;
   hue: number;
-  ts: string;
+  ts: string | number;
   model?: string;
   seed?: number;
   steps?: number;
   guidance?: number;
   style?: string;
+  status?: string | null;
+  resultUrl?: string | null;
 }
 
 export interface FileNode {

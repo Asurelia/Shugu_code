@@ -22,7 +22,6 @@ import { useChatToolActivity } from "./chatToolActivityStore";
 import { ChatWritesCard } from "./ChatWritesCard";
 import { db } from "@/lib/db";
 import { ModelPicker } from "@/features/panels/panels";
-import { resolveImageProvider } from "@/lib/imageProviders";
 import { revealAgent } from "@/lib/agents";
 import { useAgentDefs } from "@/features/agents/agentDefsQueries";
 import { useMessageDisplay } from "./useMessageDisplay";
@@ -31,6 +30,7 @@ import { detectBlockPath } from "@/lib/markdown";
 import { CodeMirrorEditor } from "@/features/code/CodeMirrorEditor";
 import { GitDiffView } from "@/features/code/DiffView";
 import { ContextBubble } from "@/features/context-cards/ContextBubble";
+import { loadProviderConfig } from "@/lib/credentials";
 import { useGitBranches } from "@/features/git/queries";
 import { useWorkspaceChanges } from "@/features/git/useWorkspaceChanges";
 import { fsGetWorkspaceRoot } from "@/lib/fs";
@@ -38,6 +38,10 @@ import { fsKeys } from "@/features/fs/keys";
 import { CommentTray } from "@/features/cockpit/CommentTray";
 import { getComments, clearComments } from "@/features/cockpit/commentStore";
 import type { Message, MessageAction } from "@/lib/types";
+import { IMAGE_MODEL_PRESETS, resolveImageProvider } from "@/lib/imageProviders";
+import { fallbackGradient, formatGenerationTime, imageDisplaySrc, ratioToCss, copyText as copyImageText } from "@/features/image/imageAssets";
+import { pushToast } from "@/components/toast";
+import { togglePinnedAsset, useStudioBrandBoard } from "@/features/studio/brandBoard";
 
 type ImageResult = {
   id: number | string;
@@ -49,8 +53,9 @@ type ImageResult = {
   guidance: number;
   style: string;
   hue: number;
-  ts: string;
+  ts: string | number;
   status?: string;
+  negative?: string | null;
   resultUrl?: string | null;
 };
 
@@ -1089,55 +1094,81 @@ export function CodeBlock({
 
 // ─── Image view (dedicated) — unchanged data wiring ─────────
 export function ImageView({ generations, setGenerations }: any) {
-  const [prompt, setPrompt] = useState("celestial veil over a quiet ocean at dusk, soft purples and cyan, painterly");
+  const [prompt, setPrompt] = useState("interface companion mascot in a quiet desktop IDE, luminous glass, precise product illustration");
   const [negative, setNegative] = useState("");
   const [ratio, setRatio] = useState("1:1");
   const [seed, setSeed] = useState(8204);
   const [steps, setSteps] = useState(28);
   const [guidance, setGuidance] = useState(7.5);
-  const [model, setModel] = useState("flux.1-veil");
+  const [model, setModel] = useState(IMAGE_MODEL_PRESETS[0]?.id ?? "comfyui/v1-5-pruned-emaonly.safetensors");
   const [styleKey, setStyleKey] = useState("painterly");
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [current, setCurrent] = useState<any>(null);
+  const brandBoard = useStudioBrandBoard();
 
   const ratios = ["1:1", "4:3", "3:4", "16:9", "9:16"];
-  const styles = ["painterly", "cinematic", "vector", "anime", "photo", "3d"];
+  const styles = ["product", "cinematic", "vector", "anime", "photo", "3d"];
+  const currentSrc = imageDisplaySrc(current?.resultUrl);
+  const currentPinned = current ? brandBoard.pinnedAssetIds.includes(String(current.id)) : false;
 
-  const generate = async () => {
+  const generate = async (override?: Partial<{ prompt: string; seed: number }>) => {
+    const nextPrompt = override?.prompt ?? prompt;
+    const nextSeed = override?.seed ?? seed;
     setBusy(true);
     setCurrent(null);
+    setError(null);
     try {
-      const { protocol, baseUrl, model: realModel } = resolveImageProvider(model);
+      const resolved = resolveImageProvider(model);
+      const config = await loadProviderConfig(resolved.providerId).catch(() => null);
+      const configuredBaseUrl = config?.baseUrl?.trim() || config?.endpoint?.trim();
+      const apiKey = config?.apiKey?.trim() || undefined;
       const raw = await invoke<any>("image_generate", {
-        prompt, negative, ratio, model: realModel, protocol, baseUrl,
-        seed, steps, guidance, style: styleKey,
+        args: {
+          prompt: nextPrompt,
+          negative,
+          ratio,
+          model: resolved.model,
+          protocol: resolved.protocol,
+          baseUrl: configuredBaseUrl || resolved.baseUrl,
+          apiKey,
+          seed: nextSeed, steps, guidance, style: styleKey,
+        },
       });
-      const derivedHue = [...prompt].reduce((a, c) => a + c.charCodeAt(0), 0) % 360;
+      const derivedHue = [...nextPrompt].reduce((a, c) => a + c.charCodeAt(0), 0) % 360;
       const normalized: ImageResult = {
         id:        raw.id       ?? Date.now(),
-        prompt,
+        prompt:    nextPrompt,
+        negative,
         ratio,
         model,
-        seed,
+        seed:      nextSeed,
         steps,
         guidance,
         style:     styleKey,
         hue:       typeof raw.hue === "number" ? raw.hue : derivedHue,
-        ts:        raw.ts       ?? nowTime(),
+        ts:        raw.ts       ?? Date.now(),
         status:    raw.status,
         resultUrl: raw.resultUrl ?? null,
       };
       setCurrent(normalized);
       setGenerations((g: any[]) => [normalized, ...g]);
+      if (!normalized.resultUrl) {
+        pushToast(`Image: ${normalized.status ?? "aucun fichier reçu"}`, "info", 4500);
+      }
       setBusy(false);
-    } catch {
+    } catch (err) {
+      setError(String(err));
+      pushToast("Generation image echouee", "error", 5000);
       setBusy(false);
     }
   };
 
-  const bg = current
-    ? `radial-gradient(circle at 30% 30%, hsl(${current.hue} 80% 70%) 0%, transparent 50%), radial-gradient(circle at 70% 70%, hsl(${(current.hue+60)%360} 80% 60%) 0%, transparent 50%), radial-gradient(circle at 60% 30%, hsl(${(current.hue+120)%360} 80% 60%) 0%, transparent 55%), linear-gradient(135deg, #2a1437 0%, #0d0d18 100%)`
-    : undefined;
+  const makeVariation = () => {
+    const nextSeed = Math.floor(Math.random() * 100000);
+    setSeed(nextSeed);
+    void generate({ seed: nextSeed });
+  };
 
   return (
     <div className="image-shell">
@@ -1152,13 +1183,32 @@ export function ImageView({ generations, setGenerations }: any) {
             </div>
           )}
           {!busy && current && (
-            <div className="preview">
-              <div className="img-content" style={{background: bg}}></div>
+            <div className="preview" style={{ aspectRatio: ratioToCss(current.ratio) }}>
+              {currentSrc ? (
+                <img className="img-real" src={currentSrc} alt={current.prompt} />
+              ) : (
+                <div className="img-content" style={{background: fallbackGradient(current.hue)}} />
+              )}
+              {!currentSrc && <div className="img-fallback-note">{current.status ?? "En attente du fichier image"}</div>}
               <div className="img-grain"></div>
-              <div style={{position:"absolute", left:14, bottom:14, right:14, display:"flex", gap:8}}>
-                <button className="lgb lgb-sm"><Icon name="download" size={12}/> Save</button>
-                <button className="lgb lgb-sm"><Icon name="sparkle" size={12}/> Variations</button>
-                <button className="lgb lgb-sm"><Icon name="copy" size={12}/> Copy prompt</button>
+              <div style={{position:"absolute", left:14, bottom:14, right:14, display:"flex", gap:8, flexWrap:"wrap"}}>
+                <button
+                  className="lgb lgb-sm"
+                  onClick={() => {
+                    copyImageText(current.resultUrl ?? "");
+                    pushToast(current.resultUrl ? "Chemin image copie" : "Aucun fichier image a copier", current.resultUrl ? "success" : "info", 2500);
+                  }}
+                ><Icon name="download" size={12}/> Path</button>
+                <button className="lgb lgb-sm" onClick={makeVariation}><Icon name="sparkle" size={12}/> Variations</button>
+                <button className="lgb lgb-sm" onClick={() => { copyImageText(current.prompt); pushToast("Prompt copie", "success", 2200); }}><Icon name="copy" size={12}/> Copy prompt</button>
+                <button
+                  className="lgb lgb-sm"
+                  disabled={!current.resultUrl}
+                  onClick={() => {
+                    togglePinnedAsset(String(current.id));
+                    pushToast(currentPinned ? "Reference marque retiree" : "Reference marque ajoutee", "success", 2400);
+                  }}
+                ><Icon name="image" size={12}/> {currentPinned ? "Unpin" : "Brand ref"}</button>
                 <span style={{flex:1}}></span>
                 <span className="chip" style={{background:"rgba(0,0,0,0.5)"}}>seed {current.seed}</span>
               </div>
@@ -1175,6 +1225,7 @@ export function ImageView({ generations, setGenerations }: any) {
           <span className="chip">{model}</span>
           <span className="chip tertiary">{ratio}</span>
           <span className="chip" style={{textTransform:"none"}}>{styleKey}</span>
+          {current?.status && <span className="chip">{current.status}</span>}
           <span style={{flex:1}}></span>
           <span style={{fontSize:11, fontFamily:"var(--font-mono)", color:"var(--on-surface-muted)"}}>{generations.length} in this session</span>
         </div>
@@ -1186,7 +1237,8 @@ export function ImageView({ generations, setGenerations }: any) {
           <textarea value={prompt} onChange={e => setPrompt(e.target.value)} placeholder="A dreamy aurora over still water…"/>
           <div className="label-row"><span className="l">Negative</span></div>
           <textarea value={negative} onChange={e => setNegative(e.target.value)} placeholder="blurry, watermark…" style={{minHeight:54}}/>
-          <button className="lgb lgb-primary lgb-lg" style={{width:"100%", marginTop:14}} onClick={generate} disabled={busy}>
+          {error && <div className="image-error">{error}</div>}
+          <button className="lgb lgb-primary lgb-lg" style={{width:"100%", marginTop:14}} onClick={() => void generate()} disabled={busy || !prompt.trim()}>
             <Icon name="sparkle" size={14}/> {busy ? "Generating…" : "Generate"}
           </button>
         </div>
@@ -1210,11 +1262,20 @@ export function ImageView({ generations, setGenerations }: any) {
         <div className="panel">
           <div className="panel-title">Sampling</div>
           <div className="label-row"><span className="l">Model</span><span className="v">{model}</span></div>
-          <div className="ratio-row" style={{flexDirection:"column", gap:6}}>
-            {["flux.1-veil", "sdxl-celestial", "shugu-lcm-fast"].map(m => (
-              <button key={m} className={"ratio-btn" + (m === model ? " on" : "")} style={{textAlign:"left", padding:"8px 12px"}} onClick={() => setModel(m)}>{m}</button>
+          <div className="image-model-list">
+            {IMAGE_MODEL_PRESETS.map(m => (
+              <button key={m.id} className={"image-model-btn" + (m.id === model ? " on" : "")} onClick={() => setModel(m.id)}>
+                <span>{m.label}</span>
+                <small>{m.provider} · {m.meta}</small>
+              </button>
             ))}
           </div>
+          <input
+            className="image-model-custom"
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+            placeholder="provider/model ou comfyui/checkpoint.safetensors"
+          />
           <div className="label-row"><span className="l">Steps</span><span className="v">{steps}</span></div>
           <input type="range" min={4} max={50} value={steps} onChange={e => setSteps(+e.target.value)} className="slider"/>
           <div className="label-row"><span className="l">Guidance</span><span className="v">{guidance.toFixed(1)}</span></div>
@@ -1222,6 +1283,28 @@ export function ImageView({ generations, setGenerations }: any) {
           <div className="label-row"><span className="l">Seed</span><span className="v">{seed}</span></div>
           <input type="range" min={0} max={99999} value={seed} onChange={e => setSeed(+e.target.value)} className="slider"/>
         </div>
+
+        {generations.length > 0 && (
+          <div className="panel">
+            <div className="panel-title">Recent</div>
+            <div className="image-recent-list">
+              {generations.slice(0, 5).map((g: any) => {
+                const src = imageDisplaySrc(g.resultUrl);
+                return (
+                  <button key={g.id} className="image-recent-item" onClick={() => setCurrent(g)}>
+                    <span className="image-recent-thumb" style={{ background: src ? undefined : fallbackGradient(g.hue ?? 250) }}>
+                      {src && <img src={src} alt="" />}
+                    </span>
+                    <span className="image-recent-meta">
+                      <strong>{g.prompt}</strong>
+                      <small>{g.model ?? "model"} · {formatGenerationTime(g.ts)}</small>
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

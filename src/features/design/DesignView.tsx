@@ -335,7 +335,7 @@ export function DesignView() {
       <aside className="design-browser">
         <div className="design-browser-head">
           <Icon name="palette" size={14} />
-          <span>Systèmes de design</span>
+          <span>Inspiration systems</span>
           <span className="design-tab-count">{systems.data?.length ?? 0}</span>
         </div>
 
@@ -354,6 +354,21 @@ export function DesignView() {
             </button>
           )}
         </div>
+
+        {active && (
+          <div className="design-active-card">
+            <div className="design-active-card-main">
+              <Icon name="check" size={13} />
+              <div>
+                <strong>{active.name}</strong>
+                <span>Base persistée pour Studio</span>
+              </div>
+            </div>
+            <button className="design-active-clear" onClick={() => setActiveDesignSystem(null)}>
+              Retirer
+            </button>
+          </div>
+        )}
 
         <div className="design-list scroll">
           {systems.isLoading && (

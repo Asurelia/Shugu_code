@@ -134,14 +134,28 @@ export function ConnectionsView() {
       ]},
     ],
     image: [
+      { id: "comfyui", name: "ComfyUI Local", meta: "Workflow local text-to-image", logo: "C", color: "#7ee787", fields: [
+        { label: "Endpoint", key: "baseUrl", placeholder: "http://127.0.0.1:8188", secret: false },
+      ]},
+      { id: "openai", name: "OpenAI Images", meta: "GPT Image generation & editing", logo: "O", color: "#10a37f", fields: [
+        { label: "API key", key: "apiKey", placeholder: "sk-…", secret: true },
+        { label: "Endpoint", key: "baseUrl", placeholder: "https://api.openai.com", secret: false },
+      ]},
+      { id: "minimax", name: "MiniMax Image", meta: "image-01 · references sujet", logo: "M", color: "#ff4d4f", fields: [
+        { label: "API key", key: "apiKey", placeholder: "…", secret: true },
+        { label: "Endpoint", key: "baseUrl", placeholder: "https://api.minimax.io", secret: false },
+      ]},
       { id: "replicate", name: "Replicate", meta: "flux.1, sdxl, hosted models", logo: "R", color: "#fff", fields: [
         { label: "API token", key: "apiKey", placeholder: "r8_…", secret: true },
+        { label: "Endpoint", key: "baseUrl", placeholder: "https://api.replicate.com", secret: false },
       ]},
       { id: "stability", name: "Stability AI", meta: "SDXL turbo, SD3", logo: "S", color: "#9b51e0", fields: [
         { label: "Key", key: "apiKey", placeholder: "sk-…", secret: true },
+        { label: "Endpoint", key: "baseUrl", placeholder: "https://api.stability.ai", secret: false },
       ]},
-      { id: "modal", name: "Modal", meta: "Custom inference functions", logo: "M", color: "#7ee787", fields: [
-        { label: "Token", key: "apiKey", placeholder: "…", secret: true },
+      { id: "custom", name: "Custom Image Endpoint", meta: "OpenAI-compatible /v1/images", logo: "X", color: "#d8b4fe", fields: [
+        { label: "API key", key: "apiKey", placeholder: "optional", secret: true },
+        { label: "Endpoint", key: "baseUrl", placeholder: "https://host.example.com", secret: false },
       ]},
     ],
     storage: [
