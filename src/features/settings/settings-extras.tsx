@@ -548,17 +548,17 @@ export function SegRow({ value, onChange, options }: any) {
 }
 
 /**
- * Lot Cockpit-1 — toggle du flag `ui.cockpit` (défaut OFF).
- * Active la disposition « cockpit » (chat + IDE en surfaces) sur la vue Chat.
- * Pattern identique à ChatToolsRow MAIS défaut OFF : ON seulement si "true".
+ * Lot Cockpit-1 — toggle du flag `ui.cockpit` (défaut ON depuis le
+ * 2026-06-10). Active la disposition « cockpit » (chat + IDE en surfaces) sur
+ * la vue Chat ; désactiver ramène l'ancien shell mono-pane.
  */
 function CockpitRow() {
-  const [on, setOn] = useState(false); // défaut OFF (nouvelle feature)
+  const [on, setOn] = useState(true); // défaut ON (absent = ON)
 
   useEffect(() => {
     let alive = true;
     void db.settings.get("ui.cockpit").then((v) => {
-      if (alive) setOn(v === "true"); // ON uniquement si "true"
+      if (alive) setOn(v !== "false"); // OFF uniquement si "false"
     });
     return () => { alive = false; };
   }, []);
@@ -573,8 +573,8 @@ function CockpitRow() {
 
   return (
     <SettingRow
-      label="Cockpit (chat + IDE) — expérimental"
-      desc="Affiche la vue Chat comme un cockpit : chat à gauche, éditeur/révision en panneau droit redimensionnable."
+      label="Cockpit (chat + IDE)"
+      desc="Affiche la vue Chat comme un cockpit : chat à gauche, éditeur/révision en panneau droit redimensionnable. Désactiver ramène la vue chat simple."
     >
       <Switch on={on} onChange={change} />
     </SettingRow>
