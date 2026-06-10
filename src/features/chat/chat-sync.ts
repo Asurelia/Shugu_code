@@ -36,6 +36,7 @@ import { parseAiReply } from "@/lib/markdown";
 import { parseMentions, resolveMentions, buildMentionContext } from "./mentions";
 import { resolveCodeContext, buildCodeContext } from "./codeContext";
 import { fireMoodReaction } from "@/features/mascot/moodReactionStore";
+import { SHUGU_PERSONA_PROMPT, personaEnabled } from "@/features/chat/persona";
 import { parseThinkingMode, resolveThinking } from "@/lib/thinkingHeuristic";
 import { resolveRoute, parseDelegateOverride, classifyComplexity } from "@/lib/routingHeuristic";
 import { spawnAgent, awaitAgentComplete } from "@/lib/agents";
@@ -484,6 +485,15 @@ export async function sendChatMessage(
   const activeDs = getActiveDesignSystem();
   if (activeDs && (activeDs.designMd.trim() || activeDs.tokensCss.trim())) {
     apiMessages.unshift({ role: "system", content: buildDesignSystemPrompt(activeDs) });
+  }
+
+  // Persona Shugu (lot 2026-06-10) — la voix de la mascotte dans TOUTES les
+  // conversations (pipeline partagé main + mascotte). Unshift APRÈS le
+  // design-system pour finir en position 0 : l'identité d'abord, le contexte
+  // ensuite. INVOKE-ONLY comme le design-system (jamais persisté). Toggle
+  // Réglages → chat.persona (absent = ON).
+  if (await personaEnabled()) {
+    apiMessages.unshift({ role: "system", content: SHUGU_PERSONA_PROMPT });
   }
 
   // Capture the reasoning trace for persistence. The streaming UI hooks

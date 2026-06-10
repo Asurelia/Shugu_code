@@ -385,6 +385,11 @@ export function InterfaceSettings() {
             label="Le chat peut modifier les fichiers"
             desc="Autorise le chat à écrire / éditer des fichiers. Chaque tour reste réversible via « Annuler les modifications de ce message »."
           />
+          <ChatToolsRow
+            settingKey="chat.persona"
+            label="Personnalité de Shugu"
+            desc="Le chat répond avec la voix de Shugu (chaleureuse, directe, honnête) au lieu du ton neutre du modèle. S'applique à toutes les conversations."
+          />
           <CockpitRow />
         </div>
 
@@ -508,7 +513,7 @@ function ChatToolsRow({
   label,
   desc,
 }: {
-  settingKey: "chat.readTools" | "chat.writeTools";
+  settingKey: "chat.readTools" | "chat.writeTools" | "chat.persona";
   label: string;
   desc: string;
 }) {
