@@ -58,6 +58,7 @@ void (async () => {
 })();
 import { FloatShell } from "@/features/floating/FloatShell";
 import { ChibiWithMood } from "@/features/mascot/ChibiWithMood";
+import { SpeechBubble } from "@/features/mascot/SpeechBubble";
 import { ChatPanel } from "@/features/chat/ChatPanel";
 import { ThemeBootstrap } from "@/lib/ThemeBootstrap";
 import { useChatEvents } from "@/features/chat/useEvents";
@@ -534,7 +535,14 @@ function MascotApp() {
     <>
       <ThemeBootstrap />
       <FloatShell
-        anchor={<ChibiWithMood />}
+        anchor={
+          // position:relative pour ancrer la bulle de parole au-dessus de la
+          // chibi (la bulle est .float-bubble → whitelistée click-through).
+          <div style={{ position: "relative" }}>
+            <SpeechBubble />
+            <ChibiWithMood />
+          </div>
+        }
         disableInternalDrag
         freezePos
         forceSide={forcedSide ?? undefined}

@@ -16,7 +16,9 @@ export type MoodEvent =
   | "edit-accept"
   | "edit-reject"
   | "edit-error"
-  | "chat-error";
+  | "chat-error"
+  | "skill-learned"
+  | "lessons-injected";
 
 export interface MoodReaction {
   mood: ChibiMood;
@@ -33,6 +35,10 @@ const REACTIONS: Record<MoodEvent, MoodReaction> = {
   "edit-reject": { mood: "neutral", ttlMs: 1500 },
   "edit-error": { mood: "cry", ttlMs: 4000 },
   "chat-error": { mood: "cry", ttlMs: 4000 },
+  // Lot mascotte-avatar — elle est FIÈRE d'apprendre (skill vérifié par un
+  // test qui passe) et contente d'appliquer ses leçons passées.
+  "skill-learned": { mood: "joy", ttlMs: 4500 },
+  "lessons-injected": { mood: "smile", ttlMs: 2500 },
 };
 
 /** Réaction associée à un événement (pure, table figée). */

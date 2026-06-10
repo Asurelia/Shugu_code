@@ -25,6 +25,7 @@ import type { AgentEvent, AgentRow } from "@/lib/agents";
 import type { ParsedAgentTranscript } from "./queries";
 import { agentKeys } from "./keys";
 import { fireMoodReaction } from "@/features/mascot/moodReactionStore";
+import { sayMascot, truncateSpeech } from "@/features/mascot/speechStore";
 
 export function useAgentEvents(): void {
   const qc = useQueryClient();
@@ -148,11 +149,46 @@ export function useAgentEvents(): void {
           // en mémoire avec les deltas, et un refetch wiperait le stream.
           if (event.kind === "spawn" || event.kind === "complete" || event.kind === "error") {
             void qc.invalidateQueries({ queryKey: agentKeys.lists() });
-            // Lot 6 — la mascotte réagit aux transitions d'agent (humeur
-            // transitoire). Fire per-window (chaque webview a son store).
-            if (event.kind === "spawn") fireMoodReaction("agent-start");
-            else if (event.kind === "complete") fireMoodReaction("agent-complete");
-            else fireMoodReaction("agent-error");
+            // Lot 6 + mascotte-avatar (2026-06-10) — la mascotte INCARNE le
+            // travail des agents : humeur transitoire ET bulle de parole.
+            // Fire per-window (chaque webview a son store) ; seule la fenêtre
+            // mascotte rend la bulle.
+            if (event.kind === "spawn") {
+              fireMoodReaction("agent-start");
+              sayMascot(`Je m'y mets : ${truncateSpeech(event.task, 70)}`, {
+                tone: "info",
+                ttlMs: 5000,
+                agentId: event.agentId,
+              });
+            } else if (event.kind === "complete") {
+              fireMoodReaction("agent-complete");
+              sayMascot("✅ Terminé ! Clique pour voir le résultat.", {
+                tone: "success",
+                ttlMs: 8000,
+                agentId: event.agentId,
+              });
+            } else {
+              fireMoodReaction("agent-error");
+              sayMascot(`❌ Raté : ${truncateSpeech(event.error, 70)}`, {
+                tone: "error",
+                ttlMs: 8000,
+                agentId: event.agentId,
+              });
+            }
+          } else if (event.kind === "skillLearned") {
+            // Elle apprend (skill vérifié par un test qui passe) → fierté.
+            fireMoodReaction("skill-learned");
+            sayMascot(`🎓 J'ai appris : ${truncateSpeech(event.name, 50)}`, {
+              tone: "proud",
+              ttlMs: 6000,
+              agentId: event.agentId,
+            });
+          } else if (event.kind === "lessonsInjected" && event.count > 0) {
+            fireMoodReaction("lessons-injected");
+            sayMascot(
+              `📚 J'applique ${event.count} leçon${event.count > 1 ? "s" : ""} déjà apprise${event.count > 1 ? "s" : ""}.`,
+              { tone: "proud", ttlMs: 4000, agentId: event.agentId },
+            );
           }
         });
         diag("agent-events", `LISTEN ATTACHED cancelled=${cancelled}`);
