@@ -701,7 +701,6 @@ pub fn run() {
             commands::agents::agent_atelier_run,
             commands::agents::agent_exec_preflight,
             commands::agents::agent_grounded_run,
-            commands::agents::agent_reverse_patch,
             // Skill library (Voyager / Hermes) — learned reusable skills.
             commands::agents::skills::skills_list,
             commands::agents::skills::skills_clear,

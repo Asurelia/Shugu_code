@@ -21,7 +21,14 @@ import { diag } from "@/lib/diag";
 // ────────────────────────────────────────────────────────────────────
 
 export type AgentStatus = "pending" | "running" | "complete" | "error" | "killed";
-export type AgentRole = "mascot" | "orchestrator" | "coder" | "researcher" | "tester";
+export type AgentRole =
+  | "mascot"
+  | "orchestrator"
+  | "coder"
+  | "researcher"
+  | "tester"
+  | "atelier"
+  | "grounded";
 export type AgentEventKind =
   | "spawn"
   | "message"
@@ -31,8 +38,7 @@ export type AgentEventKind =
   | "complete"
   | "error"
   | "skillLearned"
-  | "lessonsInjected"
-  | "diff";
+  | "lessonsInjected";
 
 // ────────────────────────────────────────────────────────────────────
 // DB row shapes (mirror Rust AgentRow / AgentEventRow)
@@ -138,16 +144,6 @@ export type AgentEvent =
        * context at start (S3 closed loop). The Agents panel shows a
        * "📚 N leçons réinjectées" badge. */
       count: number;
-    }
-  | {
-      kind: "diff";
-      agentId: string;
-      /** Unified diff (mirror vs baseline) of everything the Grounded Run changed. */
-      patch: string;
-      /** Whether the patch was auto-applied to the live project. */
-      applied: boolean;
-      /** Reason the auto-apply failed (only set when `applied` is false). */
-      applyError?: string;
     };
 
 // ────────────────────────────────────────────────────────────────────
@@ -350,12 +346,12 @@ export async function skillsClear(role: string): Promise<void> {
 
 // ── Atelier (env-grounded build → test → learn loop) — mirrors agent_atelier_run ──
 
-/** Launch an Atelier run: a `coder` agent builds a small web UI on a DISPOSABLE
- *  mirror, drives it with a real browser (Playwright in the Docker sandbox),
- *  iterates on real failures, and saves a skill once its test passes (exit 0).
- *  Returns the agent id — stream it in the SAME transcript UI as any agent.
- *  Provider routing mirrors `spawnAgent`: the key is resolved by the caller from
- *  the keychain (never cleartext at rest). */
+/** Launch an Atelier run: an `atelier` agent builds a small web UI in a THROWAWAY
+ *  creation dir, drives it with a real browser (Playwright, exec directe sur la
+ *  machine), iterates on real failures, and saves a skill once its test passes
+ *  (exit 0). Returns the agent id — stream it in the SAME transcript UI as any
+ *  agent. Provider routing mirrors `spawnAgent`: the key is resolved by the
+ *  caller from the keychain (never cleartext at rest). */
 export async function atelierRun(args: {
   task: string;
   model: string;
@@ -367,28 +363,32 @@ export async function atelierRun(args: {
   return invoke<string>("agent_atelier_run", { args });
 }
 
-// ── Grounded Run (exec on a disposable mirror of the REAL project) ──
+// ── Grounded Run (exec DIRECTE sur le vrai projet — le filet est git) ──
 
-/** Exec-sandbox capability report (mirror of Rust `ExecCapability`). Drives the
- *  enabled/disabled state of the "Grounded Run" button + its reason tooltip. */
+/** Git-safety-net report (mirror of Rust `ExecCapability`). Execution is always
+ *  available (exec directe, pivot 2026-06-10) — this drives the NON-blocking
+ *  warning shown before an agent run when the net is missing or partial. */
 export interface ExecCapability {
-  dockerAvailable: boolean;
-  imagePresent: boolean;
-  /** Actionable reason when exec is unusable; absent when everything is ready. */
-  reason?: string;
+  /** A workspace is open — execution can target it. */
+  ready: boolean;
+  /** The workspace is a git repository (the safety net exists). */
+  gitRepo: boolean;
+  /** Uncommitted changes present — the net only protects what's committed. */
+  hasUncommitted: boolean;
+  /** Human-readable, non-blocking warning; absent when the net is solid. */
+  warning?: string;
 }
 
-/** Probe whether the exec sandbox is usable right now (Docker daemon + image).
- *  Rejects if the IPC itself is unreachable; the caller treats that as
- *  "sandbox unavailable" and disables the button. */
+/** Probe the git safety net for the open workspace. Rejects if the IPC itself
+ *  is unreachable; the caller treats that as "unknown" and shows no warning. */
 export async function execPreflight(): Promise<ExecCapability> {
   return invoke<ExecCapability>("agent_exec_preflight");
 }
 
-/** Launch a Grounded Run: a `grounded` agent works on a DISPOSABLE mirror of the
- *  user's REAL project with execution enabled, runs the project's checks, and
- *  iterates on real failures. When it ends, the diff is auto-applied to the live
- *  project (reversible via [`reversePatch`]) and emitted as a `diff` event.
+/** Launch a Grounded Run: a `grounded` agent works DIRECTLY on the user's real
+ *  project with execution enabled, runs the project's checks, and iterates on
+ *  real failures. Changes land on the live tree as they happen — follow and
+ *  revert them in the Git panel (the git watcher refreshes it live).
  *  Provider routing mirrors `spawnAgent` (key resolved from the keychain). */
 export async function groundedRun(args: {
   task: string;
@@ -401,10 +401,4 @@ export async function groundedRun(args: {
   testCommand?: string;
 }): Promise<string> {
   return invoke<string>("agent_grounded_run", { args });
-}
-
-/** Reverse a Grounded Run's auto-applied patch ("Annuler ce run"). Writes ONLY
- *  to the live workspace, behind the user's explicit click. */
-export async function reversePatch(patch: string): Promise<void> {
-  return invoke<void>("agent_reverse_patch", { patch });
 }

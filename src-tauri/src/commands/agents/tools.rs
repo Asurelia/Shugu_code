@@ -228,12 +228,11 @@ fn agent_tools() -> &'static [ToolDef] {
             },
             ToolDef {
                 name: "run_command",
-                description: "Run a shell command in a SANDBOXED, network-isolated container with the \
-                              workspace mounted (e.g. `node --test`, `node script.mjs`). Returns the \
+                description: "Run a shell command directly in the workspace, with the machine's real \
+                              toolchain (node, pnpm, npm, cargo, git…) and network access. Returns the \
                               REAL exit code + stdout + stderr — use it to actually RUN your code/tests, \
-                              see what fails, and fix it before finishing. No network access; available \
-                              only on the measurement bench (a disposable copy), disabled on the live \
-                              project.",
+                              see what fails, and fix it before finishing. The user's git history is the \
+                              safety net: stay surgical, never run destructive commands outside the task.",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -398,13 +397,11 @@ impl ToolCallAccumulator {
 pub(super) fn execute_tool(
     call: &ToolCall,
     workspace_root: &Path,
-    allow_exec: bool,
     app: &AppHandle,
     role: &str,
     last_exec_exit: &AtomicI64,
-    exec_ro_mounts: &[(String, String)],
 ) -> ToolResult {
-    match dispatch_inner(call, workspace_root, allow_exec, app, role, last_exec_exit, exec_ro_mounts) {
+    match dispatch_inner(call, workspace_root, app, role, last_exec_exit) {
         Ok(content) => ToolResult {
             id: call.id.clone(),
             name: call.name.clone(),
@@ -423,11 +420,9 @@ pub(super) fn execute_tool(
 fn dispatch_inner(
     call: &ToolCall,
     root: &Path,
-    allow_exec: bool,
     app: &AppHandle,
     role: &str,
     last_exec_exit: &AtomicI64,
-    exec_ro_mounts: &[(String, String)],
 ) -> Result<String, String> {
     let args: serde_json::Value = serde_json::from_str(&call.arguments)
         .map_err(|e| format!("argument parse error: {e}"))?;
@@ -519,18 +514,14 @@ fn dispatch_inner(
             Ok(format!("edited {path} ({bytes} bytes written)"))
         }
         "run_command" => {
-            // Safety gate: execution runs arbitrary code, which a path-guard can't
-            // contain. Only the bench (workspace = disposable copy) sets allow_exec.
-            if !allow_exec {
-                return Err("run_command is disabled here (safety): execution runs only on the \
-                            measurement bench's disposable copy, never the live project"
-                    .to_string());
-            }
+            // Exec directe sur la machine (pivot 2026-06-10) : le filet de
+            // sécurité est git (l'utilisateur suit/annule les changements dans
+            // l'onglet Git), plus aucun verrou allow_exec ni sandbox Docker.
             let command = args["command"]
                 .as_str()
                 .ok_or_else(|| "missing required field: command".to_string())?;
             let timeout_secs = args["timeoutSecs"].as_u64().unwrap_or(60).clamp(1, 300);
-            let res = super::sandbox::run_in_sandbox(root, command, timeout_secs, exec_ro_mounts);
+            let res = super::exec::run_command_direct(root, command, timeout_secs);
             // Record the exit code for the skill gate: `skill_save` only persists
             // when the LAST run_command exited 0 (env-verified success). Timeout
             // (sentinel -2) and infra failure (-1) both block saving a skill.
@@ -539,10 +530,9 @@ fn dispatch_inner(
                 Ordering::Relaxed,
             );
             // ALWAYS Ok: a non-zero exit (failing test) is DATA the agent must see
-            // and react to, not a tool error — and a docker-unavailable result must
-            // NOT count as a tool_error (that would drive evolution on an infra
-            // problem, exactly the canonicalize-bug trap). The agent reads the
-            // full picture and decides.
+            // and react to, not a tool error — an infra failure must NOT count as
+            // a tool_error (that would drive evolution on an infra problem). The
+            // agent reads the full picture and decides.
             let status = if res.timed_out {
                 format!("TIMED OUT after {timeout_secs}s")
             } else {
@@ -557,7 +547,7 @@ fn dispatch_inner(
             // Env-verified gate: a skill is only worth keeping if the real
             // environment just CONFIRMED the approach works — i.e. the last
             // `run_command` exited 0. This is Voyager's "critic", replaced by
-            // ground truth. Refuse otherwise (incl. chat, which never execs).
+            // ground truth. Refuse otherwise.
             let last = last_exec_exit.load(Ordering::Relaxed);
             if last != 0 {
                 let seen = if last == i64::MIN { "aucun".to_string() } else { last.to_string() };
