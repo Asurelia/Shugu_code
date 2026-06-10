@@ -58,6 +58,13 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
   // Reset the ref when the active file changes to avoid cross-tab false positives.
   const prevDirtyRef = useRef<boolean | undefined>(undefined);
   const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Lot statusbar (2026-06-10) — position du curseur, écrite IMPÉRATIVEMENT
+  // dans le span (pas de setState : un re-render de CodeView par mouvement de
+  // curseur réveillerait les freezes WebView2 historiques).
+  const cursorSpanRef = useRef<HTMLSpanElement | null>(null);
+  const onCursor = useCallback((ln: number, col: number) => {
+    if (cursorSpanRef.current) cursorSpanRef.current.textContent = `Ln ${ln}, Col ${col}`;
+  }, []);
 
   // embedded mode — outline bubble state (default closed).
   const [outlineBubbleOpen, setOutlineBubbleOpen] = useState(false);
@@ -147,6 +154,7 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
                 path={activeFile}
                 value={fileContents[activeFile].text}
                 onChange={onChange}
+                onCursor={onCursor}
                 wordWrap={editorPrefs.wordWrap}
                 stickyScroll={editorPrefs.stickyScroll}
                 minimap={embedded ? false : editorPrefs.minimap}
@@ -213,9 +221,10 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
                 ? <span className="item" style={{color:"var(--success)"}}>Saved ✓</span>
                 : <span className="item">{activeDirty ? "● unsaved" : "saved"}</span>
             )}
-            <span className="item"><Icon name="shield" size={11}/> Sandbox · trusted</span>
-            <span className="item">Ln 24, Col 18</span>
-            <span className="item" style={{color:"var(--tertiary)"}}>● connected</span>
+            {/* Lot statusbar — vraie position du curseur (maj impérative via
+                onCursor ; les anciens items « Sandbox · trusted » / « connected »
+                étaient des placeholders de maquette, retirés). */}
+            <span className="item" ref={cursorSpanRef}>Ln 1, Col 1</span>
           </div>
         )}
       </div>

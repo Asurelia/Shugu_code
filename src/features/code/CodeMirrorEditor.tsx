@@ -146,6 +146,11 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
   onChange?: (v: string) => void;
   /** Full file path (used to pick the language extension). */
   path?: string;
+  /** Lot statusbar (2026-06-10) — position du curseur (1-based). Appelé sur
+   *  selectionSet/docChanged ; le consommateur DOIT rester impératif (écrire
+   *  dans un ref DOM, pas un setState) — un re-render par mouvement de
+   *  curseur réveillerait les freezes WebView2 historiques. */
+  onCursor?: (line: number, col: number) => void;
   /** LOT 1 — enable line wrapping. Default: false. Reconfigured via Compartment
    *  on change — does NOT re-mount the editor (cursor/scroll preserved). */
   wordWrap?: boolean;
@@ -170,7 +175,7 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
    *  trigger is mounted via `fimCompartment` only when true → no requests when
    *  off. Reconfigured on change (no editor re-mount). */
   tabAutocomplete?: boolean;
-}>(function CodeMirrorEditor({ value, onChange, path, wordWrap = false, stickyScroll = false, minimap = false, gitHeadOriginal = null, gitDecorations = true, blame = null, gitBlameEnabled = false, tabAutocomplete = false }, ref) {
+}>(function CodeMirrorEditor({ value, onChange, path, onCursor, wordWrap = false, stickyScroll = false, minimap = false, gitHeadOriginal = null, gitDecorations = true, blame = null, gitBlameEnabled = false, tabAutocomplete = false }, ref) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
   // §3c — état du menu clic-droit LSP (null = fermé).
@@ -184,6 +189,10 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
   // donnerait une valeur PÉRIMÉE ; on lit donc pathRef.current au moment du publish.
   const pathRef = useRef(path);
   pathRef.current = path;
+  // Lot statusbar — même mécanique ref que onChangeRef : l'updateListener est
+  // figé au mount, on lit la prop fraîche au moment du publish.
+  const onCursorRef = useRef(onCursor);
+  onCursorRef.current = onCursor;
   // LOT 2 — Doc version counter, incrémenté à chaque docChanged via le
   // updateListener. Lu par OutlinePanel/Breadcrumbs via getDocVersion().
   const docVersionRef = useRef(0);
@@ -257,6 +266,12 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
       // même-langage.
       if (u.selectionSet || u.docChanged) {
         const sel = u.state.selection.main;
+        // Lot statusbar — publie Ln/Col (1-based) vers le consommateur
+        // impératif (views-code écrit dans un ref DOM, zéro re-render).
+        if (onCursorRef.current) {
+          const headLine = u.state.doc.lineAt(sel.head);
+          onCursorRef.current(headLine.number, sel.head - headLine.from + 1);
+        }
         if (sel.empty) {
           setEditorSelection(null);
         } else {
