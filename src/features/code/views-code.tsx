@@ -147,7 +147,6 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
                 path={activeFile}
                 value={fileContents[activeFile].text}
                 onChange={onChange}
-                language={fileContents[activeFile].lang}
                 wordWrap={editorPrefs.wordWrap}
                 stickyScroll={editorPrefs.stickyScroll}
                 minimap={embedded ? false : editorPrefs.minimap}
@@ -267,7 +266,7 @@ export function FilesView({ activeFile, fileContents }: any) {
       <div className="ide-body">
         {showDiff
           ? <DiffView original={f.original || f.text} modified={f.text}/>
-          : <div className="ide-editor"><CodeMirrorEditor key={activeFile} path={activeFile} value={f.text} language={f.lang}/></div>}
+          : <div className="ide-editor"><CodeMirrorEditor key={activeFile} path={activeFile} value={f.text}/></div>}
         <div className="statusbar">
           <span className="item branch">main</span>
           <span className="item">{f.dirty ? "● unsaved" : "saved"}</span>

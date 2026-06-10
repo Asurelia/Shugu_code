@@ -354,8 +354,8 @@ pub struct SpawnArgs {
 }
 
 /// Arguments for an Atelier run (env-grounded build→test→learn loop). Mirrors the
-/// provider routing of `SpawnArgs`, but role is fixed to "coder" and the run
-/// happens on a disposable mirror with execution enabled.
+/// provider routing of `SpawnArgs`, but role is fixed to "atelier" and the run
+/// happens in a throwaway creation dir (empty temp dir, exec directe).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AtelierArgs {
@@ -367,9 +367,10 @@ pub struct AtelierArgs {
     pub chat_template_kwargs: Option<serde_json::Value>,
 }
 
-/// Arguments for a Grounded Run — exec on a disposable mirror of the user's
-/// REAL project. Mirrors `AtelierArgs` provider routing, plus an optional
-/// verification command the agent must run after each change.
+/// Arguments for a Grounded Run — exec DIRECTLY on the user's real project
+/// (pivot 2026-06-10, le filet est git). Mirrors `AtelierArgs` provider
+/// routing, plus an optional verification command the agent must run after
+/// each change.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroundedArgs {

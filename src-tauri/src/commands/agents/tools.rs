@@ -465,7 +465,7 @@ fn dispatch_inner(
                 .as_str()
                 .ok_or_else(|| "missing required field: query".to_string())?;
             // Reuse the workspace grep engine, but anchored at the AGENT's root
-            // (the bench's sandbox copy when overridden) — never the global state.
+            // (the Atelier's creation dir when overridden) — never the global state.
             let opts = crate::commands::grep::GrepOpts {
                 case_sensitive: args["case_sensitive"].as_bool().unwrap_or(false),
                 regex: args["regex"].as_bool().unwrap_or(false),

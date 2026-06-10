@@ -144,10 +144,8 @@ export interface CodeMirrorEditorHandle {
 export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
   value: string;
   onChange?: (v: string) => void;
-  /** Full file path (used to pick the language extension). Fallback: typescript. */
+  /** Full file path (used to pick the language extension). */
   path?: string;
-  /** @deprecated Pass `path` instead — kept for callers not yet sending a path. */
-  language?: string;
   /** LOT 1 — enable line wrapping. Default: false. Reconfigured via Compartment
    *  on change — does NOT re-mount the editor (cursor/scroll preserved). */
   wordWrap?: boolean;
@@ -172,7 +170,7 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
    *  trigger is mounted via `fimCompartment` only when true → no requests when
    *  off. Reconfigured on change (no editor re-mount). */
   tabAutocomplete?: boolean;
-}>(function CodeMirrorEditor({ value, onChange, path, language = "typescript", wordWrap = false, stickyScroll = false, minimap = false, gitHeadOriginal = null, gitDecorations = true, blame = null, gitBlameEnabled = false, tabAutocomplete = false }, ref) {
+}>(function CodeMirrorEditor({ value, onChange, path, wordWrap = false, stickyScroll = false, minimap = false, gitHeadOriginal = null, gitDecorations = true, blame = null, gitBlameEnabled = false, tabAutocomplete = false }, ref) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
   // §3c — état du menu clic-droit LSP (null = fermé).
@@ -208,13 +206,14 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
   //     successifs et le reconfigure dispatch toujours sur le bon slot.
   const lspCompartment = useMemo(() => new Compartment(), []);
 
-  // Re-compute language extension only when path (or legacy language) changes.
+  // Re-compute language extension only when path changes (le prop legacy
+  // `language` a été retiré 2026-06-10 — tous les callers passent `path`).
   // LOT 1: delegates to the central langExtensionFor mapper (languages.ts).
-  // Deps [path, language] unchanged — wordWrap must NOT be a dep here, as that
-  // would trigger a full editor re-mount on toggle (destroying cursor/scroll).
+  // wordWrap must NOT be a dep here, as that would trigger a full editor
+  // re-mount on toggle (destroying cursor/scroll).
   const langExt = useMemo(
-    () => langExtensionFor(path ? langFromPath(path) : (language ?? "")),
-    [path, language],
+    () => langExtensionFor(path ? langFromPath(path) : ""),
+    [path],
   );
 
   // Expose getView(), openSearch(), getDocVersion(), getPath() to parent refs.
@@ -271,13 +270,9 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
       }
     });
 
-    // Compute le langId (string) pour snippets + keywords seed.
-    // Priorité : path → langFromPath (16 mappings) ; sinon prop language
-    // (legacy, dépréciée mais toujours acceptée) ; sinon "typescript" par
-    // défaut. NE PAS hardcoder "typescript" quand le caller a passé un
-    // language explicite, sinon snippets/keywords ne matchent pas la
-    // syntaxe (bug repéré par reviewer LOT 1).
-    const langId = path ? langFromPath(path) : language;
+    // Compute le langId (string) pour snippets + keywords seed —
+    // path → langFromPath (16 mappings) ; sans path, pas de seed spécifique.
+    const langId = path ? langFromPath(path) : "";
     const keywordSeed = KEYWORDS_FOR_LANG[langId] ?? [];
 
     const state = EditorState.create({
@@ -532,7 +527,7 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
   // de fichier pendant la connexion LSP).
   useEffect(() => {
     if (!path) return;
-    const langId = path ? langFromPath(path) : language;
+    const langId = langFromPath(path);
     if (!isLspSupported(langId)) return;
     let cancelled = false;
     void (async () => {
@@ -560,7 +555,7 @@ export const CodeMirrorEditor = forwardRef<CodeMirrorEditorHandle, {
     return () => {
       cancelled = true;
     };
-  }, [path, language, lspCompartment]);
+  }, [path, lspCompartment]);
 
   return (
     <>

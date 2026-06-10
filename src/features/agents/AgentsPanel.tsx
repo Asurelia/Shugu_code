@@ -97,7 +97,7 @@ const ATELIER_UI_ENABLED = false;
 // Preset for the "Démo : to-do list" button — a small but genuinely interactive
 // app the agent must build AND verify by driving a real browser.
 const ATELIER_TODO_PRESET =
-  "Construis une petite to-do list web : un champ texte + un bouton « Ajouter » qui ajoute la saisie comme nouvel item dans une liste (<ul>) ; chaque item a un bouton « Supprimer » qui le retire ; cliquer sur le texte d'un item le marque comme fait (une classe CSS qui barre le texte). Puis écris un test Playwright en CommonJS (require('playwright'), chromium.launch({ args: ['--no-sandbox'] }), page sur file:///work/index.html) qui : ajoute deux items, en supprime un, marque l'autre comme fait, et vérifie le DOM à chaque étape (process.exit(1) si un check échoue). Lance le test avec run_command et corrige jusqu'à exit 0, puis sauve le skill.";
+  "Construis une petite to-do list web : un champ texte + un bouton « Ajouter » qui ajoute la saisie comme nouvel item dans une liste (<ul>) ; chaque item a un bouton « Supprimer » qui le retire ; cliquer sur le texte d'un item le marque comme fait (une classe CSS qui barre le texte). Puis écris un test Playwright en CommonJS (require('playwright'), chromium.launch(), URL file:// absolue construite depuis process.cwd()) qui : ajoute deux items, en supprime un, marque l'autre comme fait, et vérifie le DOM à chaque étape (process.exit(1) si un check échoue). Lance le test avec run_command et corrige jusqu'à exit 0, puis sauve le skill.";
 
 // Tick utility — force un re-render périodique tant que `active=true`.
 // Cas d'usage : faire que `fmtAge()` (qui lit `Date.now()`) tick en live
@@ -810,10 +810,10 @@ export function AgentsPanel() {
             marginBottom: 8,
           }}
         >
-          L'agent construit une UI web sur une copie jetable, la <b>teste pour de vrai</b> dans
-          un navigateur (Playwright en sandbox), corrige sur l'échec réel, et ne garde un{" "}
-          <b>skill vérifié</b> qu'une fois le test au vert. La boucle, l'app et le skill
-          s'affichent dans le transcript.
+          L'agent construit une UI web dans un dossier de création jetable, la{" "}
+          <b>teste pour de vrai</b> dans un navigateur (Playwright), corrige sur l'échec réel,
+          et ne garde un <b>skill vérifié</b> qu'une fois le test au vert. La boucle, l'app et
+          le skill s'affichent dans le transcript.
         </div>
         <textarea
           value={atelierTask}
