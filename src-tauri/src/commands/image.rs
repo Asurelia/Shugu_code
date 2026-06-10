@@ -843,7 +843,9 @@ pub async fn image_generate(app: AppHandle, args: ImageGenerateArgs) -> Result<I
     let _ = &args.style;
 
     let fid = fallback_id();
-    let client = reqwest::Client::new();
+    // Deadline totale 300 s (lot timeouts) : la génération + le download de
+    // l'asset peuvent être lents, mais un provider muet ne pend plus l'UI.
+    let client = crate::commands::chat::request_client(300)?;
     let protocol = args.protocol.as_str();
     let api_key = resolve_image_key(protocol, &args.api_key);
 

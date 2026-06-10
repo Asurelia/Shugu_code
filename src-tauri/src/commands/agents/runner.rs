@@ -334,7 +334,15 @@ pub(super) async fn run_agent_task(
         },
     ];
 
-    let client = reqwest::Client::new();
+    // Client borné (lot timeouts) : connect 15 s + 300 s de silence max entre
+    // deux chunks — un provider mort ne pend plus l'agent indéfiniment.
+    let client = match chat::streaming_client() {
+        Ok(c) => c,
+        Err(e) => {
+            finish_error(&app, &state, &agent_id, &e);
+            return;
+        }
+    };
 
     // Whole loop racing the abort token. Inside, the multi-turn loop
     // body (`tool_use_loop`) calls the LLM, executes tools, appends to

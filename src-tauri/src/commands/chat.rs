@@ -146,6 +146,33 @@ struct ChatDelta {
 ///     with a clear HTTP 401 — surfacing that as the visible error is better
 ///     UX than a pre-emptive "no API key" before we've even tried.
 ///
+/// Clients HTTP partagés (lot timeouts 2026-06-10) — avant ça, chaque site
+/// faisait `reqwest::Client::new()` SANS timeout : un provider qui ne répond
+/// plus pendait indéfiniment (chat, FIM, runner d'agents, images).
+///
+/// `streaming_client` — pour les appels LLM en streaming (SSE/NDJSON) : connect
+/// borné + `read_timeout` = silence max entre DEUX chunks, PAS une durée totale
+/// (une longue réponse reste vivante tant qu'elle émet). 300 s couvre le
+/// prompt-processing lent d'un llama.cpp CPU sur gros contexte tout en
+/// décoinçant un pair mort.
+pub(crate) fn streaming_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| format!("http client: {e}"))
+}
+
+/// `request_client` — pour les appels one-shot (JSON, pas de stream) : deadline
+/// TOTALE dure en plus du connect borné.
+pub(crate) fn request_client(total_secs: u64) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(total_secs))
+        .build()
+        .map_err(|e| format!("http client: {e}"))
+}
+
 /// Anthropic always needs `x-api-key` to be set, so we still hard-fail there.
 pub(crate) fn resolve_key(protocol: &str, api_key: &Option<String>) -> Result<String, String> {
     if let Some(k) = api_key {
@@ -1014,7 +1041,7 @@ pub async fn chat_send(
         return Err("messages array is empty".into());
     }
 
-    let client = reqwest::Client::new();
+    let client = streaming_client()?;
     let protocol_str = protocol.as_str();
 
     // Register an abort flag for this conversation (if we have an ID).
@@ -1221,7 +1248,8 @@ pub async fn fim_complete(
         body["stop"] = serde_json::json!(s);
     }
 
-    let client = reqwest::Client::new();
+    // FIM = complétion inline : au-delà de 60 s le ghost text n'a plus de sens.
+    let client = request_client(60)?;
     let mut req = client
         .post(&url)
         .header("content-type", "application/json")
