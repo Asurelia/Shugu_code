@@ -566,7 +566,26 @@ export function RootLayout() {
   // workspace walk → catastrophic freeze (observed 2026-05-17).
   useEffect(() => {
     const t = setTimeout(() => { void indexWorkspace(); }, 5000);
-    return () => clearTimeout(t);
+    // Ré-index quand l'utilisateur OUVRE UN AUTRE dossier sans relancer l'app
+    // (Rust émet `workspace://changed` depuis fs_open_folder). Le hash de la
+    // liste de fichiers change → nouveau stamp TTL → vraie ré-indexation ;
+    // sur le même workspace, le TTL 24 h + le guard in-flight rendent l'appel
+    // no-op. Petit délai pour laisser le file tree se recharger d'abord.
+    let unlisten: (() => void) | null = null;
+    void (async () => {
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
+        unlisten = await listen("workspace://changed", () => {
+          setTimeout(() => { void indexWorkspace(); }, 3000);
+        });
+      } catch (err) {
+        console.warn("[RootLayout] workspace://changed listen failed:", err);
+      }
+    })();
+    return () => {
+      clearTimeout(t);
+      unlisten?.();
+    };
   }, []);
 
   // Restore the previously open tabs + active file from SQLite.

@@ -458,11 +458,12 @@ export async function sendChatMessage(
     }
   }
 
-  // Suite Lot 4 — auto-RAG (OPT-IN via db.settings "rag.autoCodeContext").
-  // Injecte des extraits de code sémantiquement proches de la question. Désactivé
-  // par défaut : consomme des tokens et la pertinence dépend de la qualité de
-  // l'index/embedding (réglage runtime). Indépendant des @-mentions explicites.
-  if ((await db.settings.get("rag.autoCodeContext")) === "true") {
+  // Auto-RAG (db.settings "rag.autoCodeContext", absent = ON depuis le
+  // 2026-06-10 — même pattern que chat.readTools). Injecte des extraits de code
+  // sémantiquement proches de la question ; se désactive dans Réglages → Éditeur.
+  // Indépendant des @-mentions explicites. Dégrade en silence si l'index est
+  // vide (resolveCodeContext → []).
+  if ((await db.settings.get("rag.autoCodeContext")) !== "false") {
     const codeCtx = buildCodeContext(await resolveCodeContext(trimmed, 5));
     if (codeCtx) {
       const lastUserIdx = apiMessages.map((m) => m.role).lastIndexOf("user");

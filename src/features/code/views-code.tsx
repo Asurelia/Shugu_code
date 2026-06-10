@@ -513,13 +513,14 @@ export function SettingsImage() {
 
 // Suite Lot 4 — toggle auto-RAG (stocké dans db.settings, pas dans editorPrefs
 // car c'est une préférence de chat, pas d'éditeur). Self-contained : charge au
-// mount, persiste au changement.
+// mount, persiste au changement. Absent = ON (défaut depuis le 2026-06-10),
+// même convention que chat.readTools — la lecture côté chat-sync est `!== "false"`.
 function AutoRagToggle() {
-  const [on, setOn] = useState(false);
+  const [on, setOn] = useState(true);
   useEffect(() => {
     let alive = true;
     void db.settings.get("rag.autoCodeContext").then((v) => {
-      if (alive) setOn(v === "true");
+      if (alive) setOn(v !== "false");
     });
     return () => {
       alive = false;
@@ -532,7 +533,7 @@ function AutoRagToggle() {
   return (
     <SettingRow
       label="Auto-contexte code (RAG)"
-      desc="EXPÉRIMENTAL : injecte automatiquement dans le chat des extraits de code du workspace sémantiquement proches de ta question. Nécessite l'indexation (automatique) ; la pertinence dépend du modèle d'embedding. Indépendant des @-mentions explicites."
+      desc="Injecte automatiquement dans le chat des extraits de code du workspace sémantiquement proches de ta question (activé par défaut). L'indexation est automatique ; la pertinence dépend du modèle d'embedding. Indépendant des @-mentions explicites."
     >
       <Switch on={on} onChange={toggle} />
     </SettingRow>
