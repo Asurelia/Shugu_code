@@ -363,6 +363,45 @@ fn build_subtree(root: &Path, start: &Path, entries: Vec<walkdir::DirEntry>) -> 
 // Tauri commands
 // ---------------------------------------------------------------------------
 
+/// Shared tail of `fs_open_folder` / `fs_set_workspace_root` : canonicalize,
+/// store in managed state, persist to settings, rewire both watchers, and
+/// broadcast `workspace://changed` so anything anchored to the OLD root can
+/// react — notably the integrated terminal, which respawns its PTY in the new
+/// directory (VS Code behaviour). These two commands are the ONLY runtime
+/// mutations of `root_state` (Studio's openProject writes to .shugu-forge/
+/// preview without touching it), so this single emit covers every switch.
+fn apply_workspace_root(
+    app: &tauri::AppHandle,
+    root_state: &tauri::State<'_, Mutex<Option<PathBuf>>>,
+    watcher_ctl: &tauri::State<'_, crate::commands::watcher::WatcherCtl>,
+    git_watcher_ctl: &tauri::State<'_, crate::commands::git_watcher::WatcherCtl>,
+    raw_path: &Path,
+) -> Result<String, String> {
+    let canonical = std::fs::canonicalize(raw_path)
+        .map_err(|e| format!("canonicalize workspace: {e}"))?;
+
+    // Store in managed state.
+    let display = canonical.to_string_lossy().to_string();
+    {
+        let mut guard = root_state
+            .lock()
+            .map_err(|e| format!("workspace state lock: {e}"))?;
+        *guard = Some(canonical.clone());
+    }
+
+    // Persist to settings table (best-effort — don't fail the command on DB error).
+    let _ = persist_workspace_root(app, &canonical);
+
+    // Notify both watchers of the new root (best-effort — never fail the command).
+    let _ = watcher_ctl.0.send(canonical.clone());
+    let _ = git_watcher_ctl.0.send(canonical);
+
+    // Payload is the display path (forward-slash, no `\\?\`) for the frontend.
+    let _ = app.emit("workspace://changed", display.replace('\\', "/"));
+
+    Ok(display)
+}
+
 /// Open a native folder picker and set the workspace root.
 ///
 /// Returns the chosen folder's absolute path, or `null` if the user cancelled.
@@ -384,34 +423,26 @@ pub fn fs_open_folder(
         .into_path()
         .map_err(|e| format!("invalid path from dialog: {e}"))?;
 
-    let canonical = std::fs::canonicalize(&raw_path)
-        .map_err(|e| format!("canonicalize workspace: {e}"))?;
+    apply_workspace_root(&app, &root_state, &watcher_ctl, &git_watcher_ctl, &raw_path).map(Some)
+}
 
-    // Store in managed state.
-    let display = canonical.to_string_lossy().to_string();
-    {
-        let mut guard = root_state
-            .lock()
-            .map_err(|e| format!("workspace state lock: {e}"))?;
-        *guard = Some(canonical.clone());
+/// Set the workspace root from a KNOWN absolute path — the « projets récents »
+/// path (lot 2026-06-10) : pas de dialog, même canonicalize/persist/watchers/
+/// broadcast que `fs_open_folder`. Rejette un chemin qui n'est pas un dossier
+/// existant pour qu'une entrée récente périmée échoue avec un message propre.
+#[tauri::command]
+pub fn fs_set_workspace_root(
+    app: tauri::AppHandle,
+    root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
+    watcher_ctl: tauri::State<'_, crate::commands::watcher::WatcherCtl>,
+    git_watcher_ctl: tauri::State<'_, crate::commands::git_watcher::WatcherCtl>,
+    path: String,
+) -> Result<String, String> {
+    let raw = PathBuf::from(&path);
+    if !raw.is_dir() {
+        return Err(format!("dossier introuvable : {path}"));
     }
-
-    // Persist to settings table (best-effort — don't fail the command on DB error).
-    let _ = persist_workspace_root(&app, &canonical);
-
-    // Notify both watchers of the new root (best-effort — never fail the command).
-    let _ = watcher_ctl.0.send(canonical.clone());
-    let _ = git_watcher_ctl.0.send(canonical.clone());
-
-    // Broadcast the workspace change so anything anchored to the OLD root can
-    // react — notably the integrated terminal, which respawns its PTY in the
-    // new directory (VS Code behaviour). `fs_open_folder` is the ONLY runtime
-    // mutation of `root_state` (Studio's openProject writes to .shugu-forge/
-    // preview without touching it), so this single emit covers every switch.
-    // Payload is the display path (forward-slash, no `\\?\`) for the frontend.
-    let _ = app.emit("workspace://changed", display.replace('\\', "/"));
-
-    Ok(Some(display))
+    apply_workspace_root(&app, &root_state, &watcher_ctl, &git_watcher_ctl, &raw)
 }
 
 /// List the IMMEDIATE children of one directory (lazy tree loading).

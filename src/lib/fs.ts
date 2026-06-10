@@ -142,6 +142,13 @@ export async function fsOpenFolder(): Promise<string | null> {
   return invoke<string | null>("fs_open_folder");
 }
 
+/** Set the workspace root from a KNOWN absolute path (projets récents — lot
+ *  2026-06-10). Pas de dialog ; mêmes effets que fsOpenFolder (state, persist,
+ *  watchers, workspace://changed). Rejette si le dossier n'existe plus. */
+export async function fsSetWorkspaceRoot(path: string): Promise<string> {
+  return invoke<string>("fs_set_workspace_root", { path });
+}
+
 /**
  * Returns the current workspace root as an absolute, forward-slash path,
  * or null when no workspace is open.

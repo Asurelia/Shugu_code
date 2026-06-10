@@ -45,7 +45,13 @@ import type { DockState, FileNode, Generation } from "@/lib/types";
 import { db, seedIfEmpty, toGenerationRow } from "@/lib/db";
 import { useActiveConv, createConversation, sendChatMessage } from "@/features/chat/chat-sync";
 import { loadOpenFiles, saveOpenFiles } from "@/lib/ide-state";
-import { fsReadFile, fsWriteFile, fsCreateDir, fsCreateFile, langToExt } from "@/lib/fs";
+import { fsReadFile, fsWriteFile, fsCreateDir, fsCreateFile, langToExt, fsSetWorkspaceRoot, fsGetWorkspaceRoot } from "@/lib/fs";
+import { RecentWorkspacesPalette } from "@/features/fs/RecentWorkspacesPalette";
+import {
+  recordRecentWorkspace,
+  removeRecentWorkspace,
+} from "@/features/fs/recentWorkspaces";
+import { pushToast } from "@/components/toast";
 import { invalidateFileTree } from "@/features/fs/queries";
 import { useFsEvents } from "@/features/fs/useEvents";
 import { useGitEvents } from "@/features/git/useEvents";
@@ -342,6 +348,8 @@ export function RootLayout() {
   // Lot stubs-palette (2026-06-10) — Quick Open (Cmd+P) + Regenerate (Cmd+R).
   const [quickOpenOpen, setQuickOpenOpen] = useState(false);
   const regenerateLast = useRegenerateLast();
+  // Lot projets-récents — picker « Open Recent Folder… » (palette).
+  const [recentOpen, setRecentOpen] = useState(false);
 
   // Chat state — activeConvo is cross-window synchronised via chat-sync's
   // useActiveConv hook (localStorage + Tauri event). Messages no longer
@@ -569,6 +577,38 @@ export function RootLayout() {
   // first openFile), each one invalidating the file tree query, each
   // invalidation re-running this effect, each re-run spawning a parallel
   // workspace walk → catastrophic freeze (observed 2026-05-17).
+  // Lot projets-récents — le root restauré au boot entre dans l'historique
+  // (la liste se peuple donc sans action utilisateur), et la bascule depuis
+  // le picker refait le même cleanup que la commande open-folder.
+  useEffect(() => {
+    void fsGetWorkspaceRoot()
+      .then((r) => { if (r) void recordRecentWorkspace(r); })
+      .catch(() => {});
+  }, []);
+  const openRecentWorkspace = useCallback((path: string) => {
+    void (async () => {
+      try {
+        const { disconnectAllClients } = await import("@/features/code/lsp/client");
+        await disconnectAllClients();
+      } catch (err) {
+        console.warn("[recent] LSP disconnect failed:", err);
+      }
+      try {
+        const display = await fsSetWorkspaceRoot(path);
+        await recordRecentWorkspace(display);
+        invalidateFileTree();
+        setOpenFiles([]);
+        setActiveFile(null);
+        setFileContents({});
+        pushToast(`Projet ouvert : ${display.replace(/\\/g, "/").split("/").pop()}`, "success", 3000);
+      } catch (err) {
+        // Dossier supprimé/déplacé : message clair + purge de l'entrée morte.
+        pushToast(String(err), "error", 5000);
+        void removeRecentWorkspace(path);
+      }
+    })();
+  }, [invalidateFileTree, setOpenFiles, setActiveFile, setFileContents]);
+
   useEffect(() => {
     const t = setTimeout(() => { void indexWorkspace(); }, 5000);
     // Ré-index quand l'utilisateur OUVRE UN AUTRE dossier sans relancer l'app
@@ -981,6 +1021,8 @@ export function RootLayout() {
     // Lot stubs-palette (2026-06-10) — Quick Open (Cmd+P) + Regenerate (Cmd+R)
     setQuickOpenOpen,
     regenerateLast,
+    // Lot projets-récents
+    setRecentOpen,
   }), [
     navigateTo, view, setPaletteOpen,
     sideCollapsed, setSideCollapsed,
@@ -1292,6 +1334,13 @@ export function RootLayout() {
             void openFile(path);
             navigate({ to: "/code" });
           }}
+        />
+
+        {/* Lot projets-récents — picker « Open Recent Folder… » (palette). */}
+        <RecentWorkspacesPalette
+          open={recentOpen}
+          onClose={() => setRecentOpen(false)}
+          onPick={openRecentWorkspace}
         />
 
         {/* LOT 2 — Find-in-files workspace panel (ripgrep backend).

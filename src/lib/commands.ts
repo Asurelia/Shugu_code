@@ -3,6 +3,7 @@
 // Pass 1: flat COMMANDS array with default keybindings, categories, run/when predicates.
 
 import { fsOpenFolder, fsGetWorkspaceRoot } from "@/lib/fs";
+import { recordRecentWorkspace } from "@/features/fs/recentWorkspaces";
 import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
 import { openSearchPanel } from "@codemirror/search";
 import type { EditorView } from "@codemirror/view";
@@ -113,6 +114,8 @@ export interface CommandContext {
   /** Régénère le dernier message assistant de la conversation active
    *  (Cmd+R). Retourne false quand il n'y a rien à régénérer. */
   regenerateLast?: () => Promise<boolean>;
+  /** Ouvre/ferme le picker « projets récents » — câblé par RootLayout. */
+  setRecentOpen?: (open: boolean) => void;
 }
 
 // ─── Command interface ─────────────────────────────────────────
@@ -349,6 +352,8 @@ export const COMMANDS: Command[] = [
     run: async (ctx) => {
       const root = await fsOpenFolder();
       if (!root) return;
+      // Lot projets-récents — alimente l'historique (best-effort, fire-and-forget).
+      void recordRecentWorkspace(root);
       // LOT 3 — Disconnect tous les LSP clients AVANT le refetch tree :
       // leur workspaceUri pointe sur l'ancien dossier, les requêtes
       // go-to-def / find-refs y resteraient ancrées. Le prochain ouvrir
@@ -369,6 +374,16 @@ export const COMMANDS: Command[] = [
       ctx.setActiveFile(null);
       ctx.setFileContents({});
     },
+  },
+  {
+    // Lot projets-récents (2026-06-10) — picker des 8 derniers workspaces.
+    id: "open-recent-folder",
+    title: "Open Recent Folder…",
+    category: "File",
+    icon: "folderTree",
+    description: "projets récents",
+    when: (ctx) => !!ctx.setRecentOpen,
+    run: (ctx) => ctx.setRecentOpen?.(true),
   },
 
   // ── View ─────────────────────────────────────────────────

@@ -658,6 +658,7 @@ pub fn run() {
             commands::llama::llama_autostart,
             commands::llama::llama_backend_info,
             commands::fs::fs_open_folder,
+            commands::fs::fs_set_workspace_root,
             commands::fs::fs_read_dir,
             commands::fs::fs_read_dir_shallow,
             commands::fs::fs_read_dir_scoped,
