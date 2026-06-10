@@ -51,6 +51,8 @@ import { useFsEvents } from "@/features/fs/useEvents";
 import { useGitEvents } from "@/features/git/useEvents";
 import { useRefreshOpenFiles } from "@/features/fs/useRefreshOpenFiles";
 import { indexWorkspace } from "@/features/fs/workspaceIndexer";
+import { QuickOpenPalette } from "@/features/code/QuickOpenPalette";
+import { useRegenerateLast } from "@/features/chat/mutations";
 import { AgentsPanel } from "@/features/agents/AgentsPanel";
 import { useAgentEvents } from "@/features/agents/useEvents";
 import { setSelectedAgentId, useAgentsRailDisplay } from "@/features/agents/queries";
@@ -337,6 +339,9 @@ export function RootLayout() {
 
   const [tweaks, setTweak] = useTweaks(TWEAK_DEFAULTS);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  // Lot stubs-palette (2026-06-10) — Quick Open (Cmd+P) + Regenerate (Cmd+R).
+  const [quickOpenOpen, setQuickOpenOpen] = useState(false);
+  const regenerateLast = useRegenerateLast();
 
   // Chat state — activeConvo is cross-window synchronised via chat-sync's
   // useActiveConv hook (localStorage + Tauri event). Messages no longer
@@ -973,6 +978,9 @@ export function RootLayout() {
     // LOT 3 — compare mode
     compareFile,
     setCompareFile,
+    // Lot stubs-palette (2026-06-10) — Quick Open (Cmd+P) + Regenerate (Cmd+R)
+    setQuickOpenOpen,
+    regenerateLast,
   }), [
     navigateTo, view, setPaletteOpen,
     sideCollapsed, setSideCollapsed,
@@ -995,6 +1003,8 @@ export function RootLayout() {
     setEditorPref,
     // LOT 3 — compare mode
     compareFile, setCompareFile,
+    // Lot stubs-palette
+    regenerateLast,
   ]);
 
   // Global keybinding dispatcher — replaces the hardcoded Cmd+K useEffect.
@@ -1270,6 +1280,18 @@ export function RootLayout() {
           open={paletteOpen}
           onClose={() => setPaletteOpen(false)}
           ctx={cmdCtx}
+        />
+
+        {/* Lot stubs-palette — Quick Open (Cmd+P) : fuzzy picker sur le
+            workspace, ouvre dans l'éditeur via le même chemin que
+            app://open-file (openFile + navigate /code). */}
+        <QuickOpenPalette
+          open={quickOpenOpen}
+          onClose={() => setQuickOpenOpen(false)}
+          onOpen={(path) => {
+            void openFile(path);
+            navigate({ to: "/code" });
+          }}
         />
 
         {/* LOT 2 — Find-in-files workspace panel (ripgrep backend).

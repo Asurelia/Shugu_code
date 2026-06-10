@@ -1170,6 +1170,36 @@ export function ImageView({ generations, setGenerations }: any) {
     void generate({ seed: nextSeed });
   };
 
+  // Lot stubs-palette (2026-06-10) — les commandes palette (Cmd+Enter /
+  // Cmd+Shift+V / Cmd+S sur /image) pilotent les fonctions internes de cette
+  // vue via des CustomEvents window-locaux. Ré-abonné à chaque render (cleanup
+  // systématique) pour capturer les états frais sans tableau de deps fragile.
+  useEffect(() => {
+    const onGen = () => {
+      if (!busy && prompt.trim()) void generate();
+    };
+    const onVar = () => {
+      if (!busy && current) makeVariation();
+    };
+    const onPin = () => {
+      if (!current?.resultUrl) return;
+      togglePinnedAsset(String(current.id));
+      pushToast(
+        currentPinned ? "Reference marque retiree" : "Reference marque ajoutee",
+        "success",
+        2400,
+      );
+    };
+    window.addEventListener("shugu:image-generate", onGen);
+    window.addEventListener("shugu:image-variation", onVar);
+    window.addEventListener("shugu:image-save", onPin);
+    return () => {
+      window.removeEventListener("shugu:image-generate", onGen);
+      window.removeEventListener("shugu:image-variation", onVar);
+      window.removeEventListener("shugu:image-save", onPin);
+    };
+  });
+
   return (
     <div className="image-shell">
       <div className="image-canvas">
