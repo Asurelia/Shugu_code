@@ -128,6 +128,88 @@
 }
 .cx-think .body { margin-top: 6px; font-style: italic; color: var(--on-surface-muted); white-space: pre-wrap; }
 
+/* ── Live agent activity timeline ──────────────────────────────────────────
+   Rendu dans la bulle de l'orchestrateur : « Travaille… » + chrono + journal
+   des actions (lit / écrit / exécute) en temps réel. Repliable. */
+.cx-agent-activity {
+  margin: 4px 0 12px;
+  border: 1px solid rgba(124,58,237,0.22);
+  background: rgba(124,58,237,0.045);
+  border-radius: 8px;
+  overflow: hidden;
+  font-size: 12px;
+}
+.cx-agent-activity > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 11px;
+  color: var(--on-surface-muted);
+  font-family: var(--font-mono);
+  user-select: none;
+}
+.cx-agent-activity > summary::-webkit-details-marker { display: none; }
+.cx-agent-activity > summary .dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--on-surface-muted); flex: none;
+}
+.cx-agent-activity > summary .dot.live {
+  background: var(--primary, #7c3aed);
+  box-shadow: 0 0 0 0 rgba(124,58,237,0.6);
+  animation: cx-act-pulse 1.4s ease-out infinite;
+}
+@keyframes cx-act-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(124,58,237,0.55); }
+  70%  { box-shadow: 0 0 0 7px rgba(124,58,237,0); }
+  100% { box-shadow: 0 0 0 0 rgba(124,58,237,0); }
+}
+.cx-agent-activity > summary .hl {
+  color: var(--on-surface);
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+.cx-agent-activity > summary .el,
+.cx-agent-activity > summary .ct {
+  font-size: 10.5px;
+  color: var(--on-surface-muted);
+  font-variant-numeric: tabular-nums;
+}
+.cx-agent-activity > summary .ct { margin-left: auto; }
+.cx-agent-activity ul {
+  margin: 0;
+  padding: 2px 0 6px;
+  list-style: none;
+  border-top: 1px solid rgba(124,58,237,0.14);
+}
+.cx-agent-activity li.act {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  padding: 3px 12px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.cx-agent-activity li.act .ic { flex: none; }
+.cx-agent-activity li.act .lb { color: var(--on-surface); flex: none; }
+.cx-agent-activity li.act .dt {
+  color: var(--on-surface-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1 1 auto;
+  direction: rtl;          /* tronque par la GAUCHE : la fin du path/cmd reste lisible */
+  text-align: left;
+}
+.cx-agent-activity li.act .st { flex: none; margin-left: auto; opacity: 0.8; }
+.cx-agent-activity li.act.error .lb,
+.cx-agent-activity li.act.error .st { color: var(--accent-red, #e05252); }
+.cx-agent-activity li.act.error .st { opacity: 1; }
+.cx-agent-activity li.act.running .st { color: var(--primary, #7c3aed); }
+
 /* Inline code chip — JetBrains Mono pill, monospace */
 .cx-code-inline {
   font-family: var(--font-mono);
