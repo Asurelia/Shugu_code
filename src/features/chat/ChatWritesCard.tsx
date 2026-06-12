@@ -12,7 +12,7 @@
 
 import React, { useState, useCallback } from "react";
 import { invoke } from "@/lib/tauri";
-import { useChatWrites, setChatWrites } from "./chatWritesStore";
+import { useChatWrites, setChatWrites, markAgentWritesReverted, isAgentWritesReverted } from "./chatWritesStore";
 import type { ChatWriteRecord } from "./chatWritesStore";
 import { useGitDiff } from "@/features/git/queries";
 import { useIsGitRepo } from "@/features/git/queries";
@@ -225,7 +225,9 @@ export function ChatWritesCard({ messageId, onOpenFile, records: propRecords }: 
   const [dismissed, setDismissed] = useState(false);
 
   // Return null when there are no records (same condition as the old button).
-  if (dismissed || records.length === 0) return null;
+  // En mode agent, isAgentWritesReverted persiste l'annulation au-delà du
+  // remount (le transcript garde les events write) — cf. revue fraîche.
+  if (dismissed || (propRecords != null && isAgentWritesReverted(messageId)) || records.length === 0) return null;
 
   const n = records.length;
 
@@ -239,10 +241,15 @@ export function ChatWritesCard({ messageId, onOpenFile, records: propRecords }: 
     void (async () => {
       try {
         await invoke("chat_revert_writes", { records });
-        // Mode agent : pas d'entrée store → on masque localement. Mode chat : on
-        // vide le store (persiste au remount).
-        if (propRecords) setDismissed(true);
-        else setChatWrites(messageId, []);
+        // Mode agent : pas d'entrée store → on masque localement ET on mémorise
+        // l'annulation (session) pour ne pas réafficher au remount. Mode chat :
+        // on vide le store (persiste au remount).
+        if (propRecords) {
+          markAgentWritesReverted(messageId);
+          setDismissed(true);
+        } else {
+          setChatWrites(messageId, []);
+        }
         try {
           const mod = await import("@tauri-apps/api/event");
           await mod.emit("workspace://changed", {});

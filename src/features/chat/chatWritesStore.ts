@@ -47,6 +47,20 @@ export function getChatWrites(messageId: string): ChatWriteRecord[] {
   return map?.[messageId] ?? [];
 }
 
+// ── Annulations d'écritures d'AGENT (mode transcript) ──────────────────────
+// En mode agent, la carte est alimentée par le transcript (events `write`), qui
+// garde ses records même après un undo → sans mémoire, la carte réapparaîtrait
+// en revenant sur la conversation. On note les messages déjà annulés (niveau
+// session ; après un redémarrage les fichiers sont déjà restaurés, donc inutile
+// de persister). Le store chat-direct, lui, vide simplement son entrée.
+const revertedAgentMessages = new Set<string>();
+export function markAgentWritesReverted(messageId: string): void {
+  revertedAgentMessages.add(messageId);
+}
+export function isAgentWritesReverted(messageId: string): boolean {
+  return revertedAgentMessages.has(messageId);
+}
+
 /** Hook réactif (pour le bouton Annuler sous un message). */
 export function useChatWrites(messageId: string): ChatWriteRecord[] {
   const { data } = useQuery<WritesMap>({

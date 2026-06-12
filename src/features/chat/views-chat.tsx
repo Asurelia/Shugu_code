@@ -894,7 +894,13 @@ function AgentActivity({
   if (!running && items.length === 0) return null;
 
   const elapsed = startedAt != null ? fmtElapsed((finishedAt ?? Date.now()) - startedAt) : "";
-  const headLabel = running ? "Travaille…" : status === "error" ? "Échec" : "Terminé";
+  // `killed` (clic Stop local) : on dit « Arrêté », pas « Échec » — l'agent n'a
+  // pas planté, l'utilisateur l'a stoppé (le statut backend devient error/killed).
+  const headLabel = running
+    ? (killed ? "Arrêt…" : "Travaille…")
+    : killed ? "Arrêté"
+    : status === "error" ? "Échec"
+    : "Terminé";
 
   return (
     <details className={"cx-agent-activity" + (running ? " running" : "")} open={running}>
@@ -932,7 +938,7 @@ function AgentActivity({
       )}
       {!running && elapsed && (
         <div className="foot">
-          {status === "error" ? "✗ Échec" : "✓ Terminé"} · {elapsed}
+          {killed ? "⏹ Arrêté" : status === "error" ? "✗ Échec" : "✓ Terminé"} · {elapsed}
         </div>
       )}
     </details>
