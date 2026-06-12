@@ -817,6 +817,17 @@ async function handleDelegate(
   // reviewer's concerns (advisory — never blocks execution).
   let execTask = task;
   if (wantSupervise && supervisorAvailable) {
+    // Indicateur transitoire pendant la phase plan (S2). Sans lui, il y a un
+    // trou mort entre le message user et l'apparition du « 📋 Plan » : le
+    // planner tourne 10-90 s en silence et l'utilisateur croit que rien ne se
+    // passe. Soft-deleté dès que S2 rend la main (le 📋 Plan prend le relais).
+    const planningId = newMessageId("a");
+    await appendMessage(convId, {
+      id: planningId,
+      role: "ai",
+      body: "🧭 Planification…",
+      ts: nowHHMM(),
+    });
     try {
       const planResult = await supervisePlan({
         convId,
@@ -829,6 +840,14 @@ async function handleDelegate(
     } catch (s2Err) {
       console.warn("[chat-sync] S2 supervisePlan gate failed:", s2Err);
       // execTask stays as `task` — proceed normally.
+    } finally {
+      try {
+        await db.messages.softDelete(planningId);
+        const mod = await import("@tauri-apps/api/event");
+        await mod.emit(EVT_MESSAGES, { conversationId: convId });
+      } catch (rmErr) {
+        console.warn("[chat-sync] planning indicator cleanup failed:", rmErr);
+      }
     }
   }
 

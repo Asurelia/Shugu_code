@@ -39,6 +39,15 @@ export interface AgentActivityItem {
   detail: string;
   /** running = pas encore de résultat ; ok = réussi ; error = échec/exit≠0. */
   status: "running" | "ok" | "error";
+  /** Sortie de l'outil (stdout d'une commande, contenu lu…), tronquée. Présent
+   *  seulement quand le toolResult est arrivé. Permet de déplier « pourquoi ✗ ». */
+  result?: string;
+}
+
+/** Une étape du plan de l'orchestrateur (tool `todo_write`). */
+export interface AgentPlanStep {
+  text: string;
+  status: "pending" | "in_progress" | "completed";
 }
 
 export interface MessageDisplay {
@@ -61,6 +70,9 @@ export interface MessageDisplay {
   finishedAt?: number | null;
   /** Journal d'activité ordonné (appels d'outils + issue). Vide hors run agent. */
   activity: AgentActivityItem[];
+  /** Plan vivant de l'orchestrateur (dernier `todo_write`), undefined s'il n'en
+   *  a pas posé. La checklist se met à jour à chaque nouvel appel todo_write. */
+  plan?: AgentPlanStep[];
   /** Populated when the message is an image attachment (m.image === true and
    *  body starts with "data:"). Renderers should show an <img> tag instead of
    *  interpreting displayBody as text. */
@@ -116,6 +128,20 @@ function describeToolCall(tool: string, args: unknown): { icon: string; label: s
   return { icon: "🔧", label: tool, detail: clip(firstString(a, ["path", "file_path", "command", "query", "input"])) };
 }
 
+/** Sortie d'un toolResult en texte (stdout, contenu lu, message d'erreur).
+ *  result est `unknown` — string directe, sinon error, sinon JSON. Aligné sur
+ *  AgentsPanel. Tronqué pour ne pas gonfler le DOM (les gros reads/outputs). */
+const RESULT_CAP = 2000;
+function extractResultString(ev: Extract<AgentEvent, { kind: "toolResult" }>): string {
+  let s: string;
+  if (typeof ev.result === "string") s = ev.result;
+  else if (typeof ev.error === "string" && ev.error.trim() !== "") s = ev.error;
+  else {
+    try { s = JSON.stringify(ev.result ?? ""); } catch { s = String(ev.result ?? ""); }
+  }
+  return s.length > RESULT_CAP ? s.slice(0, RESULT_CAP) + "\n…(tronqué)" : s;
+}
+
 /** Un toolResult run_command préfixe son stdout par "[exit N]" / "[TIMED OUT …]"
  *  (tools.rs). On considère exit≠0 et timeout comme des échecs. */
 function resultIsError(ev: Extract<AgentEvent, { kind: "toolResult" }>): boolean {
@@ -127,6 +153,21 @@ function resultIsError(ev: Extract<AgentEvent, { kind: "toolResult" }>): boolean
   if (resStr.includes("[TIMED OUT")) return true;
   const m = resStr.match(/\[exit\s+(-?\d+)\]/);
   return m ? m[1] !== "0" : false;
+}
+
+/** Parse les `todos` d'un appel `todo_write` en étapes de plan typées. */
+function parsePlan(args: unknown): AgentPlanStep[] | undefined {
+  const todos = asRecord(args)["todos"];
+  if (!Array.isArray(todos)) return undefined;
+  const steps: AgentPlanStep[] = [];
+  for (const t of todos) {
+    const r = asRecord(t);
+    const text = typeof r["text"] === "string" ? r["text"].trim() : "";
+    const raw = typeof r["status"] === "string" ? r["status"] : "pending";
+    const status = raw === "in_progress" || raw === "completed" ? raw : "pending";
+    if (text) steps.push({ text, status });
+  }
+  return steps.length ? steps : undefined;
 }
 
 /**
@@ -146,18 +187,29 @@ export function useMessageDisplay(m: Message): MessageDisplay {
   let liveContent = "";
   let liveReasoning = "";
   const activity: AgentActivityItem[] = [];
+  let plan: AgentPlanStep[] | undefined;
 
   if (isAgentRun && transcript) {
-    // 1er passage : indexer l'issue de chaque appel par toolCallId.
+    // 1er passage : indexer issue (ok/error) + sortie texte de chaque appel.
     const errorByCall = new Map<string, boolean>();
+    const resultByCall = new Map<string, string>();
     for (const ev of transcript.events) {
-      if (ev.kind === "toolResult") errorByCall.set(ev.toolCallId, resultIsError(ev));
+      if (ev.kind === "toolResult") {
+        errorByCall.set(ev.toolCallId, resultIsError(ev));
+        resultByCall.set(ev.toolCallId, extractResultString(ev));
+      }
     }
-    // 2e passage (ordre chronologique) : deltas live + journal d'outils.
+    // 2e passage (ordre chronologique) : deltas live + journal d'outils + plan.
     for (const ev of transcript.events) {
       if (ev.kind === "delta" && ev.deltaKind === "content") liveContent += ev.chunk;
       else if (ev.kind === "delta" && ev.deltaKind === "reasoning") liveReasoning += ev.chunk;
       else if (ev.kind === "toolCall") {
+        // `todo_write` n'est PAS une action de la timeline : c'est le plan.
+        // Le dernier appel gagne (il remplace la liste — cf. description du tool).
+        if (ev.tool === "todo_write") {
+          plan = parsePlan(ev.args) ?? plan;
+          continue;
+        }
         const d = describeToolCall(ev.tool, ev.args);
         const seen = errorByCall.has(ev.toolCallId);
         activity.push({
@@ -166,6 +218,7 @@ export function useMessageDisplay(m: Message): MessageDisplay {
           label: d.label,
           detail: d.detail,
           status: !seen ? "running" : errorByCall.get(ev.toolCallId) ? "error" : "ok",
+          result: resultByCall.get(ev.toolCallId),
         });
       }
     }
@@ -195,6 +248,7 @@ export function useMessageDisplay(m: Message): MessageDisplay {
     startedAt: transcript?.agent.createdAt,
     finishedAt: transcript?.agent.finishedAt,
     activity,
+    plan,
     imageDataUrl,
   };
 }

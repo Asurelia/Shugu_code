@@ -22,9 +22,9 @@ import { useChatToolActivity } from "./chatToolActivityStore";
 import { ChatWritesCard } from "./ChatWritesCard";
 import { db } from "@/lib/db";
 import { ModelPicker } from "@/features/panels/panels";
-import { revealAgent, type AgentStatus } from "@/lib/agents";
+import { revealAgent, killAgent, type AgentStatus } from "@/lib/agents";
 import { useAgentDefs } from "@/features/agents/agentDefsQueries";
-import { useMessageDisplay, type AgentActivityItem } from "./useMessageDisplay";
+import { useMessageDisplay, type AgentActivityItem, type AgentPlanStep } from "./useMessageDisplay";
 import { useShell } from "@/routes/shell-context";
 import { detectBlockPath } from "@/lib/markdown";
 import { CodeMirrorEditor } from "@/features/code/CodeMirrorEditor";
@@ -810,16 +810,72 @@ function fmtElapsed(ms: number): string {
   return r ? `${m}m ${r}s` : `${m}m`;
 }
 
+// Plan vivant de l'orchestrateur (tool `todo_write`) — checklist qui se coche au
+// fil de l'exécution. N'apparaît que si l'agent a réellement posé un plan
+// (graceful : pas de plan → pas de bloc). Glyphes : ☐ à faire, ◐ en cours
+// (pulsé), ☑ fait.
+function AgentPlan({ steps }: { steps: AgentPlanStep[] }) {
+  const done = steps.filter((s) => s.status === "completed").length;
+  return (
+    <details className="cx-agent-plan" open>
+      <summary>
+        <span className="hl">Plan</span>
+        <span className="ct">{done}/{steps.length}</span>
+      </summary>
+      <ul>
+        {steps.map((s, i) => (
+          <li key={i} className={"pstep " + s.status}>
+            <span className="box">
+              {s.status === "completed" ? "☑" : s.status === "in_progress" ? "◐" : "☐"}
+            </span>
+            <span className="txt">{s.text}</span>
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+}
+
+// Une ligne de la timeline. Quand l'outil a renvoyé une sortie (`result`), la
+// ligne devient dépliable (clic → <pre> de la sortie : stdout/exit d'une
+// commande, contenu lu, message d'erreur). Sinon c'est une ligne simple.
+function ActivityRow({ it }: { it: AgentActivityItem }) {
+  const head = (
+    <>
+      <span className="ic">{it.icon}</span>
+      <span className="lb">{it.label}</span>
+      {it.detail && <span className="dt" title={it.detail}>{it.detail}</span>}
+      <span className="st">
+        {it.status === "running" ? "…" : it.status === "error" ? "✗" : "✓"}
+      </span>
+    </>
+  );
+  if (!it.result) {
+    return <li className={"act " + it.status}>{head}</li>;
+  }
+  return (
+    <li className={"act has-out " + it.status}>
+      <details>
+        <summary>{head}</summary>
+        <pre className="out">{it.result}</pre>
+      </details>
+    </li>
+  );
+}
+
 function AgentActivity({
   items,
   status,
   startedAt,
   finishedAt,
+  agentId,
 }: {
   items: AgentActivityItem[];
   status?: AgentStatus;
   startedAt?: number;
   finishedAt?: number | null;
+  /** Pour le bouton Stop (kill l'agent en cours). */
+  agentId?: string;
 }) {
   const running = status === "running" || status === "pending";
 
@@ -832,6 +888,8 @@ function AgentActivity({
     const id = setInterval(() => forceTick((n) => n + 1), 1000);
     return () => clearInterval(id);
   }, [running]);
+
+  const [killed, setKilled] = useState(false);
 
   if (!running && items.length === 0) return null;
 
@@ -847,20 +905,35 @@ function AgentActivity({
         {items.length > 0 && (
           <span className="ct">{items.length} action{items.length > 1 ? "s" : ""}</span>
         )}
+        {running && agentId && (
+          <button
+            type="button"
+            className="stop"
+            title="Arrêter l'agent"
+            disabled={killed}
+            // stopPropagation : ne pas replier le <details> en cliquant Stop.
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setKilled(true);
+              void killAgent(agentId).catch(() => setKilled(false));
+            }}
+          >
+            {killed ? "Arrêt…" : "✕ Stop"}
+          </button>
+        )}
       </summary>
       {items.length > 0 && (
         <ul>
           {items.map((it) => (
-            <li key={it.key} className={"act " + it.status}>
-              <span className="ic">{it.icon}</span>
-              <span className="lb">{it.label}</span>
-              {it.detail && <span className="dt" title={it.detail}>{it.detail}</span>}
-              <span className="st">
-                {it.status === "running" ? "…" : it.status === "error" ? "✗" : "✓"}
-              </span>
-            </li>
+            <ActivityRow key={it.key} it={it} />
           ))}
         </ul>
+      )}
+      {!running && elapsed && (
+        <div className="foot">
+          {status === "error" ? "✗ Échec" : "✓ Terminé"} · {elapsed}
+        </div>
       )}
     </details>
   );
@@ -895,6 +968,7 @@ function CxMessage({
     agentRole,
     agentStatus,
     activity,
+    plan,
     startedAt,
     finishedAt,
   } = useMessageDisplay(m);
@@ -942,8 +1016,15 @@ function CxMessage({
       {isStreamingAgent && liveReasoning && !m.reasoning && <ThinkBlock open text={liveReasoning} />}
       {m.reasoning && <ThinkBlock text={m.reasoning} label={`Thinking (${m.reasoning.length} chars)`} />}
 
+      {showActivity && plan && plan.length > 0 && <AgentPlan steps={plan} />}
       {showActivity && (
-        <AgentActivity items={activity} status={agentStatus} startedAt={startedAt} finishedAt={finishedAt} />
+        <AgentActivity
+          items={activity}
+          status={agentStatus}
+          startedAt={startedAt}
+          finishedAt={finishedAt}
+          agentId={m.agentId}
+        />
       )}
 
       <div className="cx-body">

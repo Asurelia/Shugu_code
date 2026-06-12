@@ -210,6 +210,75 @@
 .cx-agent-activity li.act.error .st { opacity: 1; }
 .cx-agent-activity li.act.running .st { color: var(--primary, #7c3aed); }
 
+/* Lignes avec sortie dépliable (#2) : le <li> devient un conteneur, et c'est le
+   <summary> du <details> imbriqué qui porte la rangée flex (les sélecteurs
+   descendants .ic/.lb/.dt/.st ci-dessus s'y appliquent aussi). */
+.cx-agent-activity li.act.has-out { display: block; padding: 0; }
+.cx-agent-activity li.act.has-out > details > summary {
+  display: flex; align-items: baseline; gap: 7px;
+  padding: 3px 12px; cursor: pointer; list-style: none;
+}
+.cx-agent-activity li.act.has-out > details > summary::-webkit-details-marker { display: none; }
+.cx-agent-activity li.act.has-out > details[open] > summary { background: rgba(124,58,237,0.06); }
+.cx-agent-activity li.act .out {
+  margin: 0; padding: 6px 12px 8px 30px;
+  font-family: var(--font-mono); font-size: 10.5px; line-height: 1.45;
+  color: var(--on-surface-muted);
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 220px; overflow: auto;
+  background: rgba(10,10,18,0.5);
+  border-top: 1px solid rgba(124,58,237,0.1);
+}
+
+/* Bouton Stop (#4) — kill l'agent en cours, dans l'en-tête de la timeline. */
+.cx-agent-activity > summary .stop {
+  margin-left: auto;
+  font-family: var(--font-mono); font-size: 10px;
+  padding: 2px 8px; border-radius: 999px;
+  background: rgba(224,82,82,0.14);
+  color: var(--accent-red, #e05252);
+  border: 1px solid rgba(224,82,82,0.4);
+  cursor: pointer;
+}
+.cx-agent-activity > summary .stop:hover { background: rgba(224,82,82,0.24); }
+.cx-agent-activity > summary .stop:disabled { opacity: 0.55; cursor: default; }
+
+/* Footer durée (#5) — au statut terminal. */
+.cx-agent-activity .foot {
+  padding: 5px 12px;
+  font-family: var(--font-mono); font-size: 10.5px;
+  color: var(--on-surface-muted);
+  border-top: 1px solid rgba(124,58,237,0.12);
+}
+
+/* ── Plan vivant (#3) — checklist `todo_write` qui se coche à l'exécution. ── */
+.cx-agent-plan {
+  margin: 4px 0 8px;
+  border: 1px solid rgba(124,58,237,0.18);
+  background: rgba(124,58,237,0.03);
+  border-radius: 8px; overflow: hidden; font-size: 12px;
+}
+.cx-agent-plan > summary {
+  cursor: pointer; list-style: none; display: flex; align-items: center; gap: 8px;
+  padding: 7px 11px; font-family: var(--font-mono); color: var(--on-surface-muted);
+  user-select: none;
+}
+.cx-agent-plan > summary::-webkit-details-marker { display: none; }
+.cx-agent-plan > summary .hl { color: var(--on-surface); font-weight: 600; letter-spacing: 0.3px; }
+.cx-agent-plan > summary .ct { margin-left: auto; font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.cx-agent-plan ul { margin: 0; padding: 2px 0 6px; list-style: none; border-top: 1px solid rgba(124,58,237,0.12); }
+.cx-agent-plan li.pstep {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 3px 12px; font-size: 12px; line-height: 1.5;
+}
+.cx-agent-plan li.pstep .box { flex: none; font-family: var(--font-mono); color: var(--on-surface-muted); }
+.cx-agent-plan li.pstep .txt { color: var(--on-surface); }
+.cx-agent-plan li.pstep.completed .box { color: #5dd4a8; }
+.cx-agent-plan li.pstep.completed .txt { color: var(--on-surface-muted); text-decoration: line-through; }
+.cx-agent-plan li.pstep.in_progress .box { color: var(--primary, #7c3aed); animation: cx-plan-pulse 1.2s ease-in-out infinite; }
+.cx-agent-plan li.pstep.in_progress .txt { color: var(--on-surface); font-weight: 600; }
+@keyframes cx-plan-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
 /* Inline code chip — JetBrains Mono pill, monospace */
 .cx-code-inline {
   font-family: var(--font-mono);
