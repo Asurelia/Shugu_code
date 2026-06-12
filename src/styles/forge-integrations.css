@@ -486,6 +486,10 @@
   grid-template-columns: repeat(3, 1fr);
   gap: 8px;
   padding: 12px;
+  /* Enfant d'un flex column borné (max-height du shell) : flex+min-height
+     rendent le scroll effectif si des tuiles s'ajoutent un jour. */
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   animation: mascot-pop 150ms ease-out;
 }

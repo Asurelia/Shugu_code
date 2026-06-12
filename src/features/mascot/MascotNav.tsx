@@ -48,25 +48,29 @@ export function MascotTabBar({ tab, onSelect, onNewConvo, agentsCount, cardsCoun
   // toujours où il est dans la hiérarchie (barre → hub → carte).
   const activeId = isCardTab(tab) ? "hub" : tab;
   return (
-    <div className="mascot-tabbar" role="tablist" aria-label="Navigation mascotte">
-      {TABS.map((t) => {
-        const on = activeId === t.id;
-        const count = t.id === "agents" ? agentsCount : t.id === "hub" ? cardsCount : 0;
-        return (
-          <button
-            key={t.id}
-            type="button"
-            role="tab"
-            aria-selected={on}
-            className={"mascot-tab" + (on ? " on" : "")}
-            onClick={() => onSelect(t.id)}
-          >
-            <Icon name={t.icon} size={13} />
-            <span>{t.label}</span>
-            {count > 0 && <span className="mascot-tab-badge">{count}</span>}
-          </button>
-        );
-      })}
+    <div className="mascot-tabbar">
+      {/* Le tablist ARIA ne contient QUE des role="tab" ; le bouton « + » vit
+          à côté (display: contents → même rangée flex). */}
+      <div className="mascot-tablist" role="tablist" aria-label="Navigation mascotte">
+        {TABS.map((t) => {
+          const on = activeId === t.id;
+          const count = t.id === "agents" ? agentsCount : t.id === "hub" ? cardsCount : 0;
+          return (
+            <button
+              key={t.id}
+              type="button"
+              role="tab"
+              aria-selected={on}
+              className={"mascot-tab" + (on ? " on" : "")}
+              onClick={() => onSelect(t.id)}
+            >
+              <Icon name={t.icon} size={13} />
+              <span>{t.label}</span>
+              {count > 0 && <span className="mascot-tab-badge">{count}</span>}
+            </button>
+          );
+        })}
+      </div>
       <button
         type="button"
         className="mascot-tab mascot-tab-new"

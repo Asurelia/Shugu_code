@@ -957,6 +957,9 @@
   border-bottom: 1px solid rgba(255,255,255,0.08);
   flex: 0 0 auto;
 }
+/* Wrapper ARIA pur (tablist sans le bouton « + ») — transparent pour le
+   layout : ses enfants participent directement au flex de la tabbar. */
+.mascot-tablist { display: contents; }
 .mascot-tab {
   position: relative;
   display: inline-flex;
