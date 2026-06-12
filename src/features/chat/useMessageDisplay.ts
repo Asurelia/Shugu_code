@@ -120,7 +120,10 @@ function describeToolCall(tool: string, args: unknown): { icon: string; label: s
  *  (tools.rs). On considère exit≠0 et timeout comme des échecs. */
 function resultIsError(ev: Extract<AgentEvent, { kind: "toolResult" }>): boolean {
   if (typeof ev.error === "string" && ev.error.trim() !== "") return true;
-  const resStr = typeof ev.result === "string" ? ev.result : "";
+  // result is `unknown` — le runner peut renvoyer une string OU du JSON structuré.
+  // On stringify le cas non-string (comme supervisors.ts) pour ne pas classer en
+  // succès un résultat d'erreur encodé dans un objet.
+  const resStr = typeof ev.result === "string" ? ev.result : JSON.stringify(ev.result ?? "");
   if (resStr.includes("[TIMED OUT")) return true;
   const m = resStr.match(/\[exit\s+(-?\d+)\]/);
   return m ? m[1] !== "0" : false;
