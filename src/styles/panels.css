@@ -929,6 +929,9 @@
   bottom: calc(100% + 10px);
   max-height: var(--history-max-height, 280px);
   display: flex;
+  /* Empilement vertical : barre d'onglets (MascotTabBar) puis contenu
+     (fil / historique / agents / hub / carte avec son en-tête). */
+  flex-direction: column;
   background: linear-gradient(180deg, rgba(20,16,38,0.78), rgba(12,10,24,0.92));
   border: 1px solid rgba(255,255,255,0.06);
   border-radius: 18px;
@@ -941,6 +944,64 @@
 @keyframes float-history-in {
   from { opacity: 0; transform: translateY(8px) scale(0.985); }
   to   { opacity: 1; transform: translateY(0)   scale(1); }
+}
+
+/* ── Barre d'onglets unifiée du panneau mascotte (Lot nav-mascotte) ──
+   Remplace le menu cascade MascotToolbar : 4 onglets persistants icône +
+   libellé, actif souligné mauve, badges live. Markup : MascotNav.tsx. */
+.mascot-tabbar {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 4px 8px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+  flex: 0 0 auto;
+}
+.mascot-tab {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 34px;
+  padding: 0 10px;
+  background: transparent;
+  border: 0;
+  border-radius: 8px 8px 0 0;
+  color: var(--on-surface-muted);
+  font-family: var(--font-display, var(--font-body));
+  font-size: 11px;
+  cursor: pointer;
+  transition: color 180ms ease, background 180ms ease;
+}
+.mascot-tab:hover { color: var(--on-surface); background: rgba(255,255,255,0.05); }
+.mascot-tab.on { color: var(--primary, #e08efe); }
+.mascot-tab.on::after {
+  content: "";
+  position: absolute;
+  left: 8px; right: 8px; bottom: 0;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--primary, #e08efe);
+}
+.mascot-tab-badge {
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 7px;
+  background: var(--primary, #e08efe);
+  color: #1a0f33;
+  font-size: 8px;
+  font-weight: 800;
+  line-height: 14px;
+  text-align: center;
+  font-family: var(--font-mono);
+}
+.mascot-tab-new {
+  margin-left: auto;
+  width: 30px;
+  padding: 0;
+  justify-content: center;
+  border-radius: 8px;
 }
 .float-history {
   flex: 1;
@@ -1463,28 +1524,7 @@
   border-radius: 999px;
 }
 
-/* ── Chibi tabs strip (between feed and composer) ──
-   Tabs sit inside their own bubble that visually attaches to the
-   composer below: rounded top, flat bottom, slight overlap so the
-   two shapes read as a single grouped surface. */
-.float-tabs {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 14px;
-  padding: 5px 16px 8px;
-  margin: 0 auto -6px;
-  width: fit-content;
-  background: rgba(20,16,38,0.72);
-  border: 1px solid rgba(255,255,255,0.08);
-  border-bottom: 0;
-  backdrop-filter: blur(18px) saturate(160%);
-  border-radius: 14px 14px 0 0;
-  position: relative;
-  z-index: 0;
-  box-shadow: 0 -2px 12px -8px rgba(0,0,0,0.4);
-}
-/* Lift the composer slightly so its shadow doesn't cut the tabs bubble */
+/* Lift the composer slightly so its shadow doesn't cut the float-panel edge */
 .float-panel.cstyle-pill .float-composer,
 .float-panel.cstyle-glow .float-composer,
 .float-panel.cstyle-frame .float-composer,
@@ -1492,46 +1532,6 @@
   position: relative;
   z-index: 1;
 }
-
-.float-tab {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
-  width: 24px;
-  height: 24px;
-  padding: 0;
-  background: transparent;
-  border: 0;
-  border-radius: 6px;
-  color: var(--on-surface-muted);
-  cursor: pointer;
-  transition: color 140ms ease, background 140ms ease;
-  flex-shrink: 0;
-  position: relative;
-}
-.float-tab span:not(.float-tab-count) { display: none; }
-.float-tab:hover {
-  color: var(--on-surface);
-  background: rgba(255,255,255,0.05);
-}
-.float-tab.on { color: var(--primary); }
-.float-tab.new { color: var(--on-surface-muted); }
-.float-tab.new:hover { color: var(--primary); }
-.float-tab svg { flex-shrink: 0; }
-.float-tab-count {
-  position: absolute;
-  top: 0;
-  right: -2px;
-  font-family: var(--font-mono);
-  font-size: 8px;
-  font-weight: 700;
-  color: var(--on-surface-muted);
-  background: transparent;
-  padding: 0;
-  line-height: 1;
-}
-.float-tab.on .float-tab-count { color: var(--primary); }
 
 /* History list view (replaces feed when tab=history) */
 .float-history-list {
