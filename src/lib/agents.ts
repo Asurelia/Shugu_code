@@ -38,7 +38,8 @@ export type AgentEventKind =
   | "complete"
   | "error"
   | "skillLearned"
-  | "lessonsInjected";
+  | "lessonsInjected"
+  | "write";
 
 // ────────────────────────────────────────────────────────────────────
 // DB row shapes (mirror Rust AgentRow / AgentEventRow)
@@ -144,6 +145,15 @@ export type AgentEvent =
        * context at start (S3 closed loop). The Agents panel shows a
        * "📚 N leçons réinjectées" badge. */
       count: number;
+    }
+  | {
+      kind: "write";
+      agentId: string;
+      /** Workspace-relative path the agent wrote (fs_write_file / fs_edit). */
+      path: string;
+      /** Pre-write content for diff + undo. Undefined/absent = file was CREATED
+       *  this run (the chat's "Annuler" then deletes it). */
+      before?: string;
     };
 
 // ────────────────────────────────────────────────────────────────────

@@ -696,8 +696,9 @@ pub(super) async fn tool_use_loop(
                     let app_clone = app.clone();
                     let role_clone = role.to_string();
                     let last_exec_clone = last_exec_exit.clone();
+                    let agent_id_clone = agent_id.to_string();
                     let r = tokio::task::spawn_blocking(move || {
-                        execute_tool(&tc_clone, &root_clone, &app_clone, &role_clone, &last_exec_clone)
+                        execute_tool(&tc_clone, &root_clone, &app_clone, &role_clone, &last_exec_clone, &agent_id_clone)
                     })
                     .await
                     .unwrap_or_else(|join_err| ToolResult {
@@ -735,6 +736,7 @@ pub(super) async fn tool_use_loop(
                 let app_clone = app.clone();
                 let role_clone = role.to_string();
                 let last_exec_clone = last_exec_exit.clone();
+                let agent_id_clone = agent_id.to_string();
                 async move {
                     // `spawn_blocking` because the fs ops are synchronous —
                     // running them on the async runtime thread would starve
@@ -742,7 +744,7 @@ pub(super) async fn tool_use_loop(
                     // a JoinError (panic in the closure); `execute_tool`
                     // itself never panics for normal fs failures.
                     tokio::task::spawn_blocking(move || {
-                        execute_tool(&tc_clone, &root_clone, &app_clone, &role_clone, &last_exec_clone)
+                        execute_tool(&tc_clone, &root_clone, &app_clone, &role_clone, &last_exec_clone, &agent_id_clone)
                     })
                         .await
                         .unwrap_or_else(|join_err| ToolResult {

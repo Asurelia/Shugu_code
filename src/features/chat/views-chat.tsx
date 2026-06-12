@@ -969,6 +969,7 @@ function CxMessage({
     agentStatus,
     activity,
     plan,
+    writeRecords,
     startedAt,
     finishedAt,
   } = useMessageDisplay(m);
@@ -1049,7 +1050,13 @@ function CxMessage({
         {/* Lot C3 — Carte d'opération in-chat : "✏️ N fichier(s) modifié(s)"
             avec liste dépliable des fichiers + diff par fichier + bouton Annuler ↺.
             Retourne null quand il n'y a pas d'écritures pour ce message. */}
-        <ChatWritesCard messageId={String(m.id)} onOpenFile={onOpenFile} />
+        {/* Mode AGENT : les écritures viennent du transcript (events `write`),
+            pas du store chat-direct. Sinon (chat direct) → fallback store. */}
+        <ChatWritesCard
+          messageId={String(m.id)}
+          onOpenFile={onOpenFile}
+          records={showActivity && writeRecords.length > 0 ? writeRecords : undefined}
+        />
         <div className="cx-react">
           <button title="Copier" onClick={() => copyText(displayBody || m.body || m.text || "")}>
             <Icon name="copy" size={12} />

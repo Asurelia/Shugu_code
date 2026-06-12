@@ -25,6 +25,7 @@
 
 import { useAgentTranscript } from "@/features/agents/queries";
 import type { AgentEvent, AgentStatus } from "@/lib/agents";
+import type { ChatWriteRecord } from "./chatWritesStore";
 import type { Message } from "@/lib/types";
 
 /** Une ligne du journal d'activité de l'agent — un appel d'outil + son issue. */
@@ -73,6 +74,10 @@ export interface MessageDisplay {
   /** Plan vivant de l'orchestrateur (dernier `todo_write`), undefined s'il n'en
    *  a pas posé. La checklist se met à jour à chaque nouvel appel todo_write. */
   plan?: AgentPlanStep[];
+  /** Fichiers écrits par l'agent (events `write`), dédupliqués par chemin avec le
+   *  PREMIER `before` (= état d'avant le run, pour un undo cohérent). Alimente la
+   *  carte « ✏️ N fichiers modifiés » (ChatWritesCard) + Annuler. */
+  writeRecords: ChatWriteRecord[];
   /** Populated when the message is an image attachment (m.image === true and
    *  body starts with "data:"). Renderers should show an <img> tag instead of
    *  interpreting displayBody as text. */
@@ -188,6 +193,8 @@ export function useMessageDisplay(m: Message): MessageDisplay {
   let liveReasoning = "";
   const activity: AgentActivityItem[] = [];
   let plan: AgentPlanStep[] | undefined;
+  const writeRecords: ChatWriteRecord[] = [];
+  const seenWritePaths = new Set<string>();
 
   if (isAgentRun && transcript) {
     // 1er passage : indexer issue (ok/error) + sortie texte de chaque appel.
@@ -220,6 +227,14 @@ export function useMessageDisplay(m: Message): MessageDisplay {
           status: !seen ? "running" : errorByCall.get(ev.toolCallId) ? "error" : "ok",
           result: resultByCall.get(ev.toolCallId),
         });
+      } else if (ev.kind === "write") {
+        // 1er write d'un path gagne : son `before` = état d'avant le run, donc
+        // l'undo restaure le pré-run même après plusieurs éditions (idempotent
+        // par path, comme record_before côté chat).
+        if (!seenWritePaths.has(ev.path)) {
+          seenWritePaths.add(ev.path);
+          writeRecords.push({ path: ev.path, before: ev.before ?? null });
+        }
       }
     }
   }
@@ -249,6 +264,7 @@ export function useMessageDisplay(m: Message): MessageDisplay {
     finishedAt: transcript?.agent.finishedAt,
     activity,
     plan,
+    writeRecords,
     imageDataUrl,
   };
 }

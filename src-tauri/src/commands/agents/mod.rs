@@ -286,6 +286,17 @@ pub enum AgentEvent {
         role: String,
         count: usize,
     },
+    /// A file write performed by the agent (fs_write_file / fs_edit). Carries the
+    /// PRE-write content (`before`) so the chat can show a diff vs HEAD and offer
+    /// an "Annuler" that restores it — exactly like the chat-direct path's
+    /// `chat://writes`. `before == None` means the file was created this run.
+    /// Persisted to `agent_events` so the diff/undo survive a reload.
+    Write {
+        agent_id: String,
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+    },
 }
 
 impl AgentEvent {
@@ -302,6 +313,7 @@ impl AgentEvent {
             AgentEvent::Error { .. } => "error",
             AgentEvent::SkillLearned { .. } => "skillLearned",
             AgentEvent::LessonsInjected { .. } => "lessonsInjected",
+            AgentEvent::Write { .. } => "write",
         }
     }
 
@@ -317,7 +329,8 @@ impl AgentEvent {
             | AgentEvent::Complete { agent_id, .. }
             | AgentEvent::Error { agent_id, .. }
             | AgentEvent::SkillLearned { agent_id, .. }
-            | AgentEvent::LessonsInjected { agent_id, .. } => agent_id,
+            | AgentEvent::LessonsInjected { agent_id, .. }
+            | AgentEvent::Write { agent_id, .. } => agent_id,
         }
     }
 }

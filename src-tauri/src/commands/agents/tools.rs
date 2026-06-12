@@ -400,8 +400,9 @@ pub(super) fn execute_tool(
     app: &AppHandle,
     role: &str,
     last_exec_exit: &AtomicI64,
+    agent_id: &str,
 ) -> ToolResult {
-    match dispatch_inner(call, workspace_root, app, role, last_exec_exit) {
+    match dispatch_inner(call, workspace_root, app, role, last_exec_exit, agent_id) {
         Ok(content) => ToolResult {
             id: call.id.clone(),
             name: call.name.clone(),
@@ -423,6 +424,7 @@ fn dispatch_inner(
     app: &AppHandle,
     role: &str,
     last_exec_exit: &AtomicI64,
+    agent_id: &str,
 ) -> Result<String, String> {
     let args: serde_json::Value = serde_json::from_str(&call.arguments)
         .map_err(|e| format!("argument parse error: {e}"))?;
@@ -446,7 +448,19 @@ fn dispatch_inner(
             let content = args["content"]
                 .as_str()
                 .ok_or_else(|| "missing required field: content".to_string())?;
+            // Capture l'état AVANT l'écriture (None si le fichier n'existait pas →
+            // créé ce tour). Émis comme event `Write` après un write réussi pour
+            // alimenter la carte diff+Annuler du chat (cf. chat_tools::record_before).
+            let before = crate::commands::fs::read_file_inner(root, path, None).ok();
             let bytes = crate::commands::fs::write_file_inner(root, path, content)?;
+            let _ = super::persist_and_emit(
+                app,
+                &super::AgentEvent::Write {
+                    agent_id: agent_id.to_string(),
+                    path: path.to_string(),
+                    before,
+                },
+            );
             Ok(format!("wrote {bytes} bytes to {path}"))
         }
         "fs_list_dir" => {
@@ -511,6 +525,16 @@ fn dispatch_inner(
             }
             let updated = content.replacen(old, new, 1);
             let bytes = crate::commands::fs::write_file_inner(root, path, &updated)?;
+            // `content` est l'état d'avant l'édition (le fichier existait forcément
+            // — old_string a matché). Émis comme `before` pour le diff+Annuler.
+            let _ = super::persist_and_emit(
+                app,
+                &super::AgentEvent::Write {
+                    agent_id: agent_id.to_string(),
+                    path: path.to_string(),
+                    before: Some(content),
+                },
+            );
             Ok(format!("edited {path} ({bytes} bytes written)"))
         }
         "run_command" => {
