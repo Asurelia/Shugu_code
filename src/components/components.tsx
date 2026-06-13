@@ -36,6 +36,7 @@ export function Icon({ name, size = 18, className = "" }: { name: string; size?:
     case "sparkle":return p(<><path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M5.6 18.4l2.8-2.8M15.6 8.4l2.8-2.8"/></>);
     case "attach": return p(<><path d="m21 11-8.6 8.6a5 5 0 0 1-7-7L14 4a3.5 3.5 0 0 1 5 5l-8.5 8.5a2 2 0 0 1-2.8-2.8L16 6.5"/></>);
     case "mic":    return p(<><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/></>);
+    case "camera": return p(<><path d="M14.5 4h-5L7.5 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3.5L14.5 4Z"/><circle cx="12" cy="13" r="3.5"/></>);
     case "play":   return p(<><path d="m6 4 14 8L6 20Z"/></>);
     case "pause":  return p(<><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></>);
     case "stop":   return p(<><rect x="5" y="5" width="14" height="14" rx="2"/></>);

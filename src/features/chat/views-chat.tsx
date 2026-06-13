@@ -19,6 +19,7 @@ import { useChatStream } from "./useChatStream";
 import { useMessages, sendChatMessage, useActiveModel } from "./chat-sync";
 import { useEditorSelection } from "./editorSelectionStore";
 import { useChatToolActivity } from "./chatToolActivityStore";
+import { CaptureButton } from "./CaptureButton";
 import { ChatWritesCard } from "./ChatWritesCard";
 import { db } from "@/lib/db";
 import { ModelPicker } from "@/features/panels/panels";
@@ -477,6 +478,8 @@ export function ChatView({
           <button className="cx-tool" title="Joindre une image" onClick={() => fileInputRef.current?.click()}>
             <Icon name="attach" size={15} />
           </button>
+          {/* 📷 capture d'écran → même flux pendingImage que le paste/attach. */}
+          <CaptureButton className="cx-tool" iconSize={15} onCaptured={setPendingImage} />
           <button
             className={"cx-tool" + (mode === "image" ? " on" : "")}
             onClick={() => setMode((m) => (m === "image" ? "chat" : "image"))}

@@ -682,6 +682,8 @@ pub fn run() {
             commands::terminal::term_kill,
             commands::terminal::term_snapshot,
             commands::image::image_generate,
+            commands::capture::capture_screen,
+            commands::capture::capture_list_monitors,
             commands::models::models_list,
             commands::models::models_discover_external,
             commands::vector::vec_index,

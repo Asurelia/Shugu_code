@@ -88,6 +88,17 @@ percent-encoding = "2"
 #     (vérifié contre rmcp-1.7.0/src/transport.rs + streamable_http_client.rs).
 rmcp = { version = "1", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 
+# Lot capture d'écran (commands/capture.rs) — bouton 📷 du composer + outil
+# agent de vérification visuelle.
+#   xcap  : capture multi-moniteurs DPI-aware (successeur maintenu de la
+#           crate `screenshots`, même auteur). Capture synchrone →
+#           spawn_blocking côté command.
+#   image : resize (grand côté ≤ 1568 px) + encodage JPEG q80 avant l'envoi
+#           au modèle vision. Même lignée 0.25 que celle utilisée par xcap
+#           (les RgbaImage passent d'une crate à l'autre sans conversion).
+xcap = "0.9.6"
+image = "0.25.6"
+
 # keyring v3 has NO default features — without an explicit platform feature
 # it compiles but provides no real backend (a fall-through "sample" store
 # that silently accepts writes and reads but never persists across processes).

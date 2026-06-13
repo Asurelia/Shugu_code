@@ -37,6 +37,7 @@ import { setChatBusy, useChatBusy } from "@/features/chat/chatBusy";
 import { setChatUnread } from "@/features/chat/chatUnread";
 import { bumpInteract } from "@/features/mascot/idleStore";
 import { MascotTabBar, CardsHub, isCardTab, type MascotTab } from "@/features/mascot/MascotNav";
+import { CaptureButton } from "./CaptureButton";
 import { useMessageDisplay } from "./useMessageDisplay";
 import { ReviewFeedback } from "./views-chat";
 import type { Message } from "@/lib/types";
@@ -834,6 +835,13 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
             >
               <Icon name="attach" size={13}/>
             </button>
+            {/* 📷 capture d'écran → suit le même flux pendingImage que le
+                paste/attach : MiniMax M3 (vision) lit l'écran directement. */}
+            <CaptureButton
+              className="float-icon-btn"
+              iconSize={13}
+              onCaptured={setPendingImage}
+            />
           </div>
         </div>
       </div>
