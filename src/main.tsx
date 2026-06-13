@@ -81,6 +81,19 @@ void (async () => {
 // queryClient est maintenant un singleton importé depuis lib/queryClient
 // (réutilisé par les helpers hors-React via import direct).
 
+// Sous-clés ["chat", X] à NE PAS persister (synthétique localStorage-backed ou
+// live éphémère) — cf. dehydrateOptions ci-dessous. Les messages/conversations
+// (autres sous-clés) restent persistés.
+const VOLATILE_CHAT_STATE = new Set<string>([
+  "active-conv",
+  "active-model",
+  "codex-effort",
+  "busy",
+  "unread",
+  "stream",
+  "toolActivity",
+]);
+
 // PersistQueryClientProvider remplace QueryClientProvider :
 //   - Hydrate le cache depuis localStorage au mount (cache rehydration)
 //   - Sauvegarde les mutations dans localStorage (throttle 1s)
@@ -93,7 +106,11 @@ const inner = (
     client={queryClient}
     persistOptions={{
       persister: queryPersister,
-      buster: "v1",
+      // v2 : invalide le snapshot existant qui contenait encore
+      // ["chat","active-conv"] (etc.). shouldDehydrateQuery ne filtre QUE
+      // l'écriture, pas la restauration — sans bump, l'ancienne valeur serait
+      // rehydratée une dernière fois et la divergence persisterait un boot.
+      buster: "v2",
       // Les états AI inline sont PUREMENT éphémères et ne doivent JAMAIS être
       // persistés/rehydratés :
       //   • ["ai-edit","session"]  → rehydrater un "preview"/"streaming" périmé
@@ -102,12 +119,33 @@ const inner = (
       //     rejouerait au 1er mount /code (diff surprise / fichier disparu).
       //   • ["ai-review","dialog"] → rehydrater open:true rouvrirait le dialog
       //     de review tout seul au reload.
-      // Le reste du cache est persisté normalement.
+      //
+      // Les états SYNTHÉTIQUES/VOLATILES du chat ne doivent pas non plus être
+      // persistés ici — c'est une SECONDE source de vérité qui DIVERGE :
+      //   • ["chat","active-conv"] / ["chat","active-model"] / ["chat",
+      //     "codex-effort"] sont DÉJÀ persistés dans localStorage (KEY_ACTIVE…)
+      //     et partagés cross-window par ce biais. Si on les rehydrate AUSSI
+      //     depuis le snapshot tanstack, la fenêtre principale (qui a un
+      //     PersistQueryClientProvider) repart sur la valeur du snapshot tandis
+      //     que la mascotte (provider simple) lit localStorage → les deux
+      //     fenêtres peuvent diverger de conversation active. On les exclut donc
+      //     du snapshot : les DEUX fenêtres retombent sur loadActive()/localStorage,
+      //     source unique partagée, et restent synchronisées via chat://active-changed.
+      //   • ["chat","busy"|"unread"|"stream"|"toolActivity"] sont des états LIVE
+      //     éphémères ; rehydrater un "streaming:true" périmé afficherait une
+      //     fausse bulle « en train de travailler » au boot.
+      // Les messages et la liste de conversations RESTENT persistés (rendu
+      // instantané au boot, puis refetch SQLite).
       dehydrateOptions: {
         shouldDehydrateQuery: (q) =>
           q.queryKey[0] !== "ai-edit" &&
           q.queryKey[0] !== "ai-apply" &&
           q.queryKey[0] !== "ai-review" &&
+          !(
+            q.queryKey[0] === "chat" &&
+            typeof q.queryKey[1] === "string" &&
+            VOLATILE_CHAT_STATE.has(q.queryKey[1])
+          ) &&
           defaultShouldDehydrateQuery(q),
       },
     }}
