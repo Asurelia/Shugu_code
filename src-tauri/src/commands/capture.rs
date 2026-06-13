@@ -120,6 +120,11 @@ pub(crate) async fn capture_inner(
         let _ = w.hide();
         tokio::time::sleep(std::time::Duration::from_millis(MASCOT_HIDE_SETTLE_MS)).await;
     }
+    // Le show() s'exécute AVANT la propagation d'erreur (`result?` en bas) :
+    // la mascotte réapparaît même si la capture échoue ou si le thread
+    // bloquant panique (JoinError → Err). Seule une annulation de la future
+    // elle-même sauterait le show — impossible avec les commands Tauri 2
+    // (non annulables depuis le frontend).
     let result = tokio::task::spawn_blocking(move || capture_and_encode(monitor, max_edge))
         .await
         .map_err(|e| format!("capture task join: {e}"));

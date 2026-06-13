@@ -70,18 +70,20 @@ export function CaptureButton({ className, iconSize = 14, onCaptured }: CaptureB
   };
 
   // Raccourci fenêtre : Ctrl+Shift+S → capture du moniteur principal.
-  // `capture.mutate` est référentiellement stable (TanStack v5) — deps vides.
+  // Appelle directement `capture.mutate` (référentiellement stable en
+  // TanStack v5) — pas `trigger`, qui est recréé à chaque render et rendrait
+  // la closure du listener périmée si on l'étoffait un jour.
+  const mutateRef = capture.mutate;
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.shiftKey && (e.key === "S" || e.key === "s")) {
         e.preventDefault();
-        trigger(undefined);
+        mutateRef(undefined);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [mutateRef]);
 
   // Fermer le menu moniteurs au clic extérieur.
   useEffect(() => {
