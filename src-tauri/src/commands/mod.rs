@@ -2,6 +2,7 @@ pub mod agent_defs;
 pub mod agents;
 pub mod capture;
 pub mod chat;
+pub mod chat_minimax;
 pub mod chat_tools;
 pub mod codex;
 pub mod codex_app_server;

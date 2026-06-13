@@ -26,6 +26,7 @@ import { ModelPicker } from "@/features/panels/panels";
 import { revealAgent, killAgent, type AgentStatus } from "@/lib/agents";
 import { useAgentDefs } from "@/features/agents/agentDefsQueries";
 import { useMessageDisplay, type AgentActivityItem, type AgentPlanStep } from "./useMessageDisplay";
+import { Markdown } from "./markdownView";
 import { useShell } from "@/routes/shell-context";
 import { detectBlockPath } from "@/lib/markdown";
 import { CodeMirrorEditor } from "@/features/code/CodeMirrorEditor";
@@ -622,7 +623,7 @@ export function ChatView({
                       {chatStream.partialReasoning && (
                         <ThinkBlock open text={chatStream.partialReasoning} />
                       )}
-                      {chatStream.partial && <p>{chatStream.partial}</p>}
+                      {chatStream.partial && <Markdown text={chatStream.partial} />}
                     </div>
                   ) : toolActivity.length > 0 ? (
                     <div className="cx-working">
@@ -1050,7 +1051,7 @@ function CxMessage({
           <img src={imageDataUrl} alt="image générée" />
         ) : (
           <>
-            {displayBody && renderProse(displayBody)}
+            {displayBody && <Markdown text={displayBody} />}
             {m.code && (
               <CodeBlock
                 lang={m.code.lang}
@@ -1104,13 +1105,8 @@ function ThinkBlock({ text, open = false, label = "Thinking…" }: { text: strin
   );
 }
 
-// Render markdown prose: split on blank lines into paragraphs, render inline
-// `code` spans as Celestial-Veil code chips. No innerHTML.
-function renderProse(text: string): React.ReactNode {
-  const paras = text.split(/\n{2,}/);
-  return paras.map((para, i) => <p key={i}>{renderInlineCode(para)}</p>);
-}
-
+// Inline-code-only renderer — used for USER messages (no full markdown needed
+// there). AI bodies go through <Markdown> (markdownView.tsx). No innerHTML.
 function renderInlineCode(text: string): React.ReactNode[] {
   // Split on `inline code` spans, keeping the delimited groups.
   const parts = text.split(/(`[^`]+`)/g);

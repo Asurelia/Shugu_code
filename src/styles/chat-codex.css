@@ -113,6 +113,63 @@
 .cx-msg.ai .cx-body strong { color: var(--on-surface); font-weight: 600; }
 .cx-msg.ai .cx-body img { max-width: 100%; max-height: 300px; border-radius: 6px; display: block; margin-top: 4px; }
 
+/* ── Markdown rendu (markdownView.tsx) — titres, listes, citations, code ──── */
+.cx-msg.ai .cx-body .cx-md-h {
+  color: var(--on-surface);
+  font-weight: 600;
+  line-height: 1.3;
+  margin: 14px 0 8px;
+}
+.cx-msg.ai .cx-body .cx-md-h:first-child { margin-top: 0; }
+.cx-msg.ai .cx-body .cx-md-h1 { font-size: 18px; }
+.cx-msg.ai .cx-body .cx-md-h2 { font-size: 16px; }
+.cx-msg.ai .cx-body .cx-md-h3 { font-size: 15px; }
+.cx-msg.ai .cx-body .cx-md-h4,
+.cx-msg.ai .cx-body .cx-md-h5,
+.cx-msg.ai .cx-body .cx-md-h6 { font-size: 14px; color: var(--on-surface-variant); }
+.cx-msg.ai .cx-body .cx-md-ol { margin: 4px 0 12px; padding-left: 20px; }
+.cx-msg.ai .cx-body .cx-md-ol li,
+.cx-msg.ai .cx-body .cx-md-ul li { margin: 4px 0; }
+.cx-msg.ai .cx-body .cx-md-ul li::marker { color: var(--primary, #e08efe); }
+.cx-msg.ai .cx-body .cx-md-quote {
+  margin: 8px 0 12px;
+  padding: 4px 12px;
+  border-left: 3px solid rgba(224, 142, 254, 0.4);
+  background: rgba(224, 142, 254, 0.05);
+  color: var(--on-surface-variant);
+  white-space: pre-wrap;
+  border-radius: 0 6px 6px 0;
+}
+.cx-msg.ai .cx-body .cx-md-hr {
+  border: 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.10);
+  margin: 14px 0;
+}
+.cx-msg.ai .cx-body .cx-md-link {
+  color: var(--primary, #e08efe);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.cx-msg.ai .cx-body .cx-md-link:hover { opacity: 0.85; }
+/* Bloc de code dans le flux markdown (aperçu live + corps sans extraction). */
+.cx-msg.ai .cx-body .cx-md-pre {
+  margin: 8px 0 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(7, 7, 16, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  overflow-x: auto;
+}
+.cx-msg.ai .cx-body .cx-md-pre code {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--on-surface);
+  white-space: pre;
+  background: none;
+  padding: 0;
+}
+
 /* Reasoning / thinking trace (collapsible). Reuses the existing inline-styled
    <details> from views-chat; this class is a hook for future extraction. */
 .cx-think {

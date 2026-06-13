@@ -609,6 +609,10 @@ pub(crate) async fn call_openai_compat_structured(
 
     let mut acc = String::new();
     let mut tc_acc = ToolCallAccumulator::default();
+    // Filtre MiniMax : sépare le `delta.content` en {prose visible propre,
+    // raisonnement <think>, blocs d'outils XML}. No-op pour les providers qui
+    // n'émettent aucun de ces marqueurs (OpenAI, Claude…) → zéro régression.
+    let mut mm = crate::commands::chat_minimax::MinimaxContentFilter::new();
     let mut content_chunks = 0u32;
     let mut reasoning_chunks = 0u32;
     let mut tool_chunks = 0u32;
@@ -620,12 +624,23 @@ pub(crate) async fn call_openai_compat_structured(
         // Terminal sentinel — not JSON; just stop accumulating.
         if payload.trim() == "[DONE]" { return }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else { return };
-        // Visible answer chunk (the standard OpenAI field).
+        // Visible answer chunk (the standard OpenAI field). Routé via le filtre
+        // MiniMax : le `<think>` part en reasoning, les blocs d'outils XML sont
+        // mis de côté, et SEULE la prose visible nettoyée nourrit `acc` +
+        // le canal "content". Les fragments retenus (marge anti-coupure) sont
+        // vidés par `mm.finish()` après la boucle.
         if let Some(text) = v["choices"][0]["delta"]["content"].as_str() {
             if !text.is_empty() {
-                acc.push_str(text);
                 content_chunks += 1;
-                on_chunk("content", text);
+                let emit = mm.feed(text);
+                if !emit.visible.is_empty() {
+                    acc.push_str(&emit.visible);
+                    on_chunk("content", &emit.visible);
+                }
+                if !emit.reasoning.is_empty() {
+                    reasoning_chunks += 1;
+                    on_chunk("reasoning", &emit.reasoning);
+                }
             }
         }
         // Reasoning chunk — modern llama-server (and DeepSeek's API)
@@ -655,11 +670,32 @@ pub(crate) async fn call_openai_compat_structured(
         }
     }).await?;
 
+    // Vide la marge retenue du filtre (dernier fragment de prose/raisonnement).
+    let tail = mm.finish();
+    if !tail.visible.is_empty() {
+        acc.push_str(&tail.visible);
+        on_chunk("content", &tail.visible);
+    }
+    if !tail.reasoning.is_empty() {
+        reasoning_chunks += 1;
+        on_chunk("reasoning", &tail.reasoning);
+    }
+
     let tool_calls = tc_acc.finish();
+    // Lot 1 — outils émis en TEXTE par MiniMax (XML natif dans le content) : ils
+    // sont DÉTECTÉS et cachés du corps, mais PAS encore exécutés (Lot 2). Si le
+    // modèle n'a produit QUE des intentions d'outils (pas de prose visible), on
+    // pose une note lisible plutôt qu'un message vide.
+    let mm_tool_block_count = mm.tool_block_count();
+    if mm_tool_block_count > 0 && acc.trim().is_empty() && tool_calls.is_empty() {
+        let note = crate::commands::chat_minimax::summarize_tool_blocks(mm.tool_blocks());
+        acc.push_str(&note);
+        on_chunk("content", &note);
+    }
 
     eprintln!(
-        "[chat:{protocol}] stream complete — {content_chunks} content + {reasoning_chunks} reasoning + {tool_chunks} tool-call chunks ({} tool_calls assembled)",
-        tool_calls.len()
+        "[chat:{protocol}] stream complete — {content_chunks} content + {reasoning_chunks} reasoning + {tool_chunks} tool-call chunks ({} tool_calls assembled, {mm_tool_block_count} minimax-text blocks)",
+        tool_calls.len(),
     );
 
     Ok(AssistantTurn { content: acc, tool_calls })
