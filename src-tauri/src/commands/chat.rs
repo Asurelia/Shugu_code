@@ -683,18 +683,19 @@ pub(crate) async fn call_openai_compat_structured(
 
     let mut tool_calls = tc_acc.finish();
     // Outils émis en TEXTE par MiniMax (XML natif dans le content) → parsés en
-    // ToolCall structurés et fusionnés avec d'éventuels tool_calls natifs. La
-    // boucle d'outils du chat (et le runner agent, même chemin) les exécute
-    // ensuite normalement. Quand le toggle outils est COUPÉ, l'appelant
-    // (chemin sans boucle) pose une note via `summarize_tool_calls` plutôt que
-    // de laisser un message vide — il ignore sinon `tool_calls`.
+    // ToolCall structurés. La boucle d'outils du chat (et le runner agent, même
+    // chemin) les exécute ensuite normalement ; quand le toggle outils est
+    // COUPÉ, l'appelant (chemin sans boucle) pose une note via
+    // `summarize_tool_calls` plutôt qu'un message vide (il ignore sinon
+    // `tool_calls`).
+    //
+    // Garde anti-double-exécution : on NE parse les blocs texte QUE si le modèle
+    // n'a produit AUCUN tool_call natif (`delta.tool_calls`). Un modèle qui
+    // émettrait les deux est pathologique — on fait alors confiance au canal
+    // natif et on ignore le texte, plutôt que d'exécuter deux fois le même outil.
     let mm_tool_block_count = mm.tool_block_count();
-    if mm_tool_block_count > 0 {
-        let base = tool_calls.len();
-        tool_calls.extend(crate::commands::chat_minimax::parse_tool_blocks(
-            mm.tool_blocks(),
-            base,
-        ));
+    if mm_tool_block_count > 0 && tool_calls.is_empty() {
+        tool_calls = crate::commands::chat_minimax::parse_tool_blocks(mm.tool_blocks(), 0);
     }
 
     eprintln!(
