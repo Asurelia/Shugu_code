@@ -481,6 +481,22 @@ pub(crate) fn get_conn(app: &tauri::AppHandle) -> Result<&'static Mutex<Connecti
         eprintln!("[agents] purged {purged} legacy delta row(s) from agent_events");
     }
 
+    // Purge des miniatures de capture d'écran de plus de 7 jours : chaque
+    // event `screenshot` embarque une miniature base64 (~50-160 Ko) — sans
+    // purge, shugu.db gonflerait indéfiniment sur usage intensif. 7 jours
+    // suffisent largement à la relecture d'un run ; le JPEG plein format
+    // reste de toute façon dans app_data_dir/captures/.
+    let week_ago = now_ms() - 7 * 24 * 3600 * 1000;
+    let purged_shots = conn
+        .execute(
+            "DELETE FROM agent_events WHERE kind = 'screenshot' AND ts < ?1",
+            params![week_ago],
+        )
+        .map_err(|e| format!("purge old screenshots: {e}"))?;
+    if purged_shots > 0 {
+        eprintln!("[agents] purged {purged_shots} screenshot row(s) older than 7 days");
+    }
+
     let _ = AGENTS_CONN.set(Mutex::new(conn));
     AGENTS_CONN
         .get()
