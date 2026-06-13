@@ -60,6 +60,11 @@ use uuid::Uuid;
 // Split out so this file stays under the CLAUDE.md 500-line ceiling.
 pub(crate) mod runner;
 
+// Coalescing buffer for streaming Delta events — merges token-level chunks
+// into ~14 events/s per (agent, kind) before they hit the Tauri event bus.
+// See the module doc for the ordering contract with `persist_and_emit`.
+mod delta_buffer;
+
 // Phase 2 tools submodule. Defines the closed set of file-system tools the
 // orchestrator can call (`fs_read_file`, `fs_write_file`, `fs_list_dir`),
 // the JSON-schema renderers per provider dialect (OpenAI / Anthropic), and
@@ -516,8 +521,25 @@ pub(super) fn persist_and_emit(app: &tauri::AppHandle, event: &AgentEvent) -> Re
     // `agent_events`, which never had per-token rows; it will see the
     // assistant Message events that the runner emits at each turn boundary,
     // and those carry the full assembled content.
-    if matches!(event, AgentEvent::Delta { .. }) {
-        let emit_result = app.emit(EVENT_CHANNEL, event);
+    if let AgentEvent::Delta {
+        agent_id,
+        chunk,
+        delta_kind,
+    } = event
+    {
+        // Coalesce: most chunks just feed the buffer; one merged Delta comes
+        // out per FLUSH_INTERVAL per (agent, kind). The stream's tail is
+        // flushed by the non-delta branch below (the runner always closes a
+        // turn with Message/Complete/Error).
+        let Some(merged) = delta_buffer::push(agent_id, delta_kind, chunk) else {
+            return Ok(());
+        };
+        let merged_event = AgentEvent::Delta {
+            agent_id: agent_id.clone(),
+            chunk: merged,
+            delta_kind: delta_kind.clone(),
+        };
+        let emit_result = app.emit(EVENT_CHANNEL, &merged_event);
         if cfg!(debug_assertions) {
             let c = EMIT_DELTA_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if c == 1 || c % 50 == 0 {
@@ -530,6 +552,17 @@ pub(super) fn persist_and_emit(app: &tauri::AppHandle, event: &AgentEvent) -> Re
             }
         }
         return Ok(());
+    }
+
+    // Non-delta event: flush this agent's pending merged deltas FIRST so the
+    // frontend never sees a Message/ToolCall/Complete overtake its own text.
+    for (delta_kind, chunk) in delta_buffer::drain(event.agent_id()) {
+        let flushed = AgentEvent::Delta {
+            agent_id: event.agent_id().to_string(),
+            chunk,
+            delta_kind,
+        };
+        let _ = app.emit(EVENT_CHANNEL, &flushed);
     }
 
     let conn_mutex = get_conn(app)?;
