@@ -314,11 +314,26 @@ export async function sendChatMessage(
   // `routing.delegateOverride` ("always-delegate" / "never-delegate").
   const overrideRaw = await db.settings.get("routing.delegateOverride");
   const delegateOverride = parseDelegateOverride(overrideRaw);
-  // Si un agent custom est sélectionné, on force la délégation et on bypasse
-  // l'heuristique resolveRoute (l'utilisateur a explicitement choisi son agent).
+  // ── UNIFICATION (façon Claude Code) ───────────────────────────────────────
+  // Le chat du COCKPIT *est* l'agent : chaque message lance la boucle agent
+  // complète (TOUS les outils : run_command, todo_write, fs… ; le modèle
+  // planifie + agit + vérifie lui-même), avec le modèle actif — quel qu'il
+  // soit. Plus de routeur regex qui devine « est-ce une tâche de dev ? ».
+  // Exceptions au tout-agent :
+  //   • image jointe → le chemin agent n'est pas multimodal (chat direct vision) ;
+  //   • `never-delegate` → opt-out explicite (Réglages → Routing) ;
+  //   • la MASCOTTE → reste un chat LÉGER (compagnon) ; elle peut quand même
+  //     confier une tâche à l'app via son heuristique resolveRoute.
+  // Un agent custom (.md) force toujours la délégation.
+  const isMascot =
+    typeof window !== "undefined" &&
+    typeof window.location !== "undefined" &&
+    window.location.pathname.includes("mascot");
   const route = agentDefPath
     ? ("delegate" as const)
-    : resolveRoute(trimmed, delegateOverride);
+    : imageDataUrl || isMascot || delegateOverride === "never-delegate"
+      ? resolveRoute(trimmed, delegateOverride)
+      : ("delegate" as const);
 
   if (route === "delegate") {
     // On passe le modèle de chat actif comme orchestrateur de REPLI : si aucun
