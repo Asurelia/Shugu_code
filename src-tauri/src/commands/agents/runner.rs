@@ -84,6 +84,17 @@ pub(crate) enum AgentMessage {
 // Provider-specific message builders
 // ────────────────────────────────────────────────────────────────────
 
+/// Normalise une chaîne d'arguments d'appel d'outil en JSON d'OBJET valide.
+/// Garde la chaîne telle quelle si elle parse en objet JSON ; sinon (`""`,
+/// fragment tronqué, valeur non-objet) renvoie `"{}"`. Évite les 400 des
+/// providers stricts (MiniMax) quand on ré-injecte le tour d'appel d'outils.
+fn normalize_tool_args(arguments: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(v) if v.is_object() => arguments.to_string(),
+        _ => "{}".to_string(),
+    }
+}
+
 /// Translate `AgentMessage` history into OpenAI Chat Completions format
 /// (native `assistant.tool_calls` + one `role:"tool"` message per result,
 /// each carrying its `tool_call_id`). Lot 3 — now the active builder for the
@@ -103,7 +114,13 @@ pub(crate) fn build_openai_messages(history: &[AgentMessage]) -> Vec<serde_json:
                         serde_json::json!({
                             "id": tc.id,
                             "type": "function",
-                            "function": { "name": tc.name, "arguments": tc.arguments }
+                            // `arguments` DOIT être une chaîne JSON valide : MiniMax
+                            // (et d'autres) rejettent la requête en 400 « invalid
+                            // function arguments json string » sinon. Un appel sans
+                            // argument streame souvent `""` (ou un fragment malformé)
+                            // → on normalise vers un objet JSON valide. L'outil a de
+                            // toute façon déjà été exécuté avec ces args (ou `{}`).
+                            "function": { "name": tc.name, "arguments": normalize_tool_args(&tc.arguments) }
                         })
                     })
                     .collect();
@@ -1339,6 +1356,28 @@ mod tests {
                 }]
             })
         );
+    }
+
+    #[test]
+    fn normalize_tool_args_coerces_invalid_to_empty_object() {
+        assert_eq!(normalize_tool_args(r#"{"path":"a.ts"}"#), r#"{"path":"a.ts"}"#);
+        assert_eq!(normalize_tool_args(""), "{}"); // no-arg call → "" rejeté par MiniMax
+        assert_eq!(normalize_tool_args(r#"{"path":"trunc"#), "{}"); // streaming coupé
+        assert_eq!(normalize_tool_args("\"bare string\""), "{}"); // JSON valide mais pas objet
+        assert_eq!(normalize_tool_args("42"), "{}");
+    }
+
+    #[test]
+    fn openai_tool_calls_empty_args_become_object() {
+        // Régression 400 MiniMax : un appel d'outil sans arguments streamés (`""`)
+        // doit être ré-injecté avec `"{}"`, pas `""` (sinon « invalid function
+        // arguments json string »).
+        let h = vec![AgentMessage::AssistantWithTools {
+            content: "".into(),
+            tool_calls: vec![tc("call_function_x", "list_factions", "")],
+        }];
+        let out = build_openai_messages(&h);
+        assert_eq!(out[0]["tool_calls"][0]["function"]["arguments"], "{}");
     }
 
     #[test]
