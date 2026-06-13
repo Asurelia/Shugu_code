@@ -785,9 +785,16 @@ pub(crate) async fn call_ollama(
 //   * resolves the REAL open workspace (runner::get_workspace_root)
 // ---------------------------------------------------------------------------
 
-/// Maximum LLM round-trips in one chat tool turn. The last iteration runs WITH
-/// tools disabled so the turn always terminates with a plain-text answer.
-const CHAT_TOOL_MAX_ITERS: u32 = 8;
+/// Plafond de sécurité du nombre d'allers-retours LLM dans UN tour de chat
+/// avec outils. Volontairement haut (MiniMax M3 a 1M de contexte → de longues
+/// sessions multi-outils sont légitimes) : ce n'est PAS lui qui doit arrêter
+/// le travail normal. La terminaison réelle vient de 3 garde-fous :
+///   1. le modèle répond sans tool_call → on retourne (cas nominal) ;
+///   2. la DERNIÈRE itération force `with_tools=false` → réponse texte ;
+///   3. détection de blocage (même appel d'outil répété) → arrêt net.
+/// Le bouton Stop coupe à tout moment. Un plafond fini reste indispensable :
+/// une boucle infinie sur une API payante brûlerait le quota sans fin.
+const CHAT_TOOL_MAX_ITERS: u32 = 64;
 
 /// Short, human-readable activity label for one tool call, shown inline in the
 /// chat via a `chat://delta` of `kind:"tool"`. Pure (no I/O). Derived from the
@@ -878,6 +885,13 @@ async fn run_chat_tool_loop(
         })
         .collect();
 
+    // Détection de blocage : si le modèle répète le MÊME jeu d'appels d'outils
+    // round après round, il ne tient pas compte des résultats (cas typique du
+    // round-trip non consommé). On s'arrête alors net plutôt que d'épuiser le
+    // budget — et le quota API. Signature = noms+arguments des appels du tour.
+    let mut last_sig: Option<String> = None;
+    let mut repeat: u32 = 0;
+
     for iter in 0..CHAT_TOOL_MAX_ITERS {
         // The last allowed iteration forces a final text answer (no tools), the
         // same termination guarantee as `runner::tool_use_loop`'s last round.
@@ -951,11 +965,48 @@ async fn run_chat_tool_loop(
             other => return Err(format!("chat tool loop: unsupported protocol {other}")),
         };
 
-        // No tool calls → final answer. The content was ALREADY streamed live by
-        // `sink` above, so we DON'T re-emit it (that would double it in the
-        // chat-sync buffer). Just return the accumulated text.
-        if turn.tool_calls.is_empty() {
-            return Ok(turn.content);
+        // Réponse finale dans DEUX cas :
+        //   * pas d'appel d'outil (cas nominal) ;
+        //   * `with_tools == false` (dernière itération forcée) : on a demandé
+        //     une réponse texte, donc on NE ré-exécute PAS d'éventuels appels
+        //     d'outils que le modèle aurait quand même émis EN TEXTE (MiniMax
+        //     M3 le fait même sans champ `tools`). Sans ce second cas, la
+        //     terminaison forcée échouait → « exceeded N iterations ».
+        // Le contenu a déjà été streamé live par `sink`, on ne le ré-émet pas.
+        if turn.tool_calls.is_empty() || !with_tools {
+            let answer = if turn.content.trim().is_empty() && !turn.tool_calls.is_empty() {
+                crate::commands::chat_minimax::summarize_tool_calls(&turn.tool_calls)
+            } else {
+                turn.content
+            };
+            return Ok(answer);
+        }
+
+        // Garde anti-blocage : même signature d'appels répétée ⇒ le modèle
+        // n'avance plus (résultats non pris en compte). Arrêt avec un message
+        // clair plutôt qu'une boucle qui brûle le quota.
+        let sig = turn
+            .tool_calls
+            .iter()
+            .map(|t| format!("{}:{}", t.name, t.arguments))
+            .collect::<Vec<_>>()
+            .join("|");
+        if last_sig.as_deref() == Some(sig.as_str()) {
+            repeat += 1;
+        } else {
+            repeat = 0;
+            last_sig = Some(sig);
+        }
+        if repeat >= 2 {
+            let prefix = if turn.content.trim().is_empty() {
+                String::new()
+            } else {
+                format!("{}\n\n", turn.content.trim())
+            };
+            return Ok(format!(
+                "{prefix}⚠ Le modèle a répété le même appel d'outil sans tenir compte des résultats — \
+                 arrêt pour éviter une boucle. (Format de retour d'outils possiblement incompatible avec ce modèle.)"
+            ));
         }
 
         // Record the assistant's tool-call turn in history.
