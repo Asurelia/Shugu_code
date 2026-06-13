@@ -405,7 +405,7 @@ fn apply_workspace_root(
 /// Open a native folder picker and set the workspace root.
 ///
 /// Returns the chosen folder's absolute path, or `null` if the user cancelled.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_open_folder(
     app: tauri::AppHandle,
     root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
@@ -430,7 +430,7 @@ pub fn fs_open_folder(
 /// path (lot 2026-06-10) : pas de dialog, même canonicalize/persist/watchers/
 /// broadcast que `fs_open_folder`. Rejette un chemin qui n'est pas un dossier
 /// existant pour qu'une entrée récente périmée échoue avec un message propre.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_set_workspace_root(
     app: tauri::AppHandle,
     root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
@@ -458,7 +458,7 @@ pub fn fs_set_workspace_root(
 /// Containment: the root is canonicalized; `rel` is resolved with `safe_resolve`
 /// (rejects traversal / symlink escape). Returns `Err("no workspace open")` when
 /// no folder is open, or `Err` if `rel` is not a directory inside the root.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_read_dir_shallow(
     rel: Option<String>,
     root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
@@ -530,7 +530,7 @@ pub fn fs_read_dir_shallow(
 /// Walk the workspace root and return a recursive directory tree.
 ///
 /// Returns `Err("no workspace open")` if no folder has been opened yet.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_read_dir(
     root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
 ) -> Result<Vec<FsEntry>, String> {
@@ -585,7 +585,7 @@ pub fn fs_read_dir(
 /// so the cap that protects the file-explorer's eager whole-tree render doesn't
 /// apply. Paths are full workspace-relative (so `fs_read_file`/`openFile` still
 /// resolve). Same `is_ignored` filter + dir-first sort as `fs_read_dir`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_read_dir_scoped(
     rel: Option<String>,
     root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
@@ -657,7 +657,7 @@ pub struct FileListResult {
     pub total_seen: usize,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_list_files(
     exclude_exts: Vec<String>,
     max_files: usize,
@@ -729,7 +729,7 @@ pub fn fs_list_files(
 /// Read a workspace-relative file path and return its content as a string.
 ///
 /// Rejects binary files (null bytes in first 8 KiB) and files over 5 MiB.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_read_file(
     path: String,
     root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
@@ -765,7 +765,7 @@ pub fn fs_read_file(
 /// Write content to a workspace-relative file path (atomic via temp-file + rename).
 ///
 /// Creates intermediate directories if needed.  Rejects paths outside the workspace.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_write_file(
     path: String,
     content: String,
@@ -817,7 +817,7 @@ pub fn fs_write_file(
 /// Fails if the file already exists.  Creates intermediate parent directories.
 /// If `content` is `None` an empty file is written; otherwise the given string
 /// is written atomically (temp-file + rename — same pattern as `fs_write_file`).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_create_file(
     path: String,
     content: Option<String>,
@@ -854,7 +854,7 @@ pub fn fs_create_file(
 /// Create a directory (and all parents) at a workspace-relative path.
 ///
 /// Idempotent: succeeds if the directory already exists.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_create_dir(
     path: String,
     root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
@@ -869,7 +869,7 @@ pub fn fs_create_dir(
 /// `from` must exist; `to` must not exist (no silent overwrite).  If `to`'s
 /// parent directories are missing they are created first.  Both `from` and `to`
 /// must remain inside the workspace root.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_rename(
     from: String,
     to: String,
@@ -909,7 +909,7 @@ pub fn fs_rename(
 /// symlink whose resolved target is outside the workspace.  This means a
 /// dangling or out-of-workspace symlink cannot be deleted through this command.
 /// That is intentional; use the host OS to remove such links.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_delete(
     path: String,
     root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,

@@ -190,7 +190,7 @@ pub struct VecHit {
 ///
 /// Errors if the collection name is not in the allowlist or if the embedding
 /// model is unavailable.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn vec_index(
     app: tauri::AppHandle,
     collection: String,
@@ -246,7 +246,7 @@ pub(crate) fn vec_search_internal(
 /// Return the `k` nearest vectors in `vec_<collection>` to `query`.
 ///
 /// Results are ordered by ascending distance (closest first).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn vec_search(
     app: tauri::AppHandle,
     collection: String,
@@ -257,7 +257,7 @@ pub fn vec_search(
 }
 
 /// Delete the entry identified by `id` from `vec_<collection>`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn vec_delete(
     app: tauri::AppHandle,
     collection: String,
@@ -275,7 +275,7 @@ pub fn vec_delete(
 /// Delete ALL entries from `vec_<collection>`. Used by "réindexer le code"
 /// (Lot 4 suite) pour purger les ids whole-file stale avant un rebuild en
 /// chunks. Ne supprime pas la table, juste ses lignes.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn vec_clear(app: tauri::AppHandle, collection: String) -> Result<(), String> {
     validate_collection(&collection)?;
     let guard = get_conn(&app)?.lock().map_err(|e| format!("lock: {e}"))?;
