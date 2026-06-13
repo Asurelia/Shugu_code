@@ -681,16 +681,20 @@ pub(crate) async fn call_openai_compat_structured(
         on_chunk("reasoning", &tail.reasoning);
     }
 
-    let tool_calls = tc_acc.finish();
-    // Lot 1 — outils émis en TEXTE par MiniMax (XML natif dans le content) : ils
-    // sont DÉTECTÉS et cachés du corps, mais PAS encore exécutés (Lot 2). Si le
-    // modèle n'a produit QUE des intentions d'outils (pas de prose visible), on
-    // pose une note lisible plutôt qu'un message vide.
+    let mut tool_calls = tc_acc.finish();
+    // Outils émis en TEXTE par MiniMax (XML natif dans le content) → parsés en
+    // ToolCall structurés et fusionnés avec d'éventuels tool_calls natifs. La
+    // boucle d'outils du chat (et le runner agent, même chemin) les exécute
+    // ensuite normalement. Quand le toggle outils est COUPÉ, l'appelant
+    // (chemin sans boucle) pose une note via `summarize_tool_calls` plutôt que
+    // de laisser un message vide — il ignore sinon `tool_calls`.
     let mm_tool_block_count = mm.tool_block_count();
-    if mm_tool_block_count > 0 && acc.trim().is_empty() && tool_calls.is_empty() {
-        let note = crate::commands::chat_minimax::summarize_tool_blocks(mm.tool_blocks());
-        acc.push_str(&note);
-        on_chunk("content", &note);
+    if mm_tool_block_count > 0 {
+        let base = tool_calls.len();
+        tool_calls.extend(crate::commands::chat_minimax::parse_tool_blocks(
+            mm.tool_blocks(),
+            base,
+        ));
     }
 
     eprintln!(
@@ -1164,7 +1168,19 @@ pub async fn chat_send(
             }
             "openai" | "custom" => {
                 let key = resolve_key(protocol_str, &api_key)?;
-                call_openai_compat(&client, &base_url, &model, &messages, &key, protocol_str, &chat_template_kwargs, /* with_tools */ false, img_ref, abort_flag.clone(), &mut on_chunk).await
+                call_openai_compat(&client, &base_url, &model, &messages, &key, protocol_str, &chat_template_kwargs, /* with_tools */ false, img_ref, abort_flag.clone(), &mut on_chunk)
+                    .await
+                    .map(|mut turn| {
+                        // Outils OFF : MiniMax peut quand même émettre des appels
+                        // d'outils en texte (parsés en tool_calls), qu'on n'exécute
+                        // PAS ici. Si la prose est vide, on pose une note lisible au
+                        // lieu d'un message vide ; les tool_calls sont sinon ignorés.
+                        if turn.content.trim().is_empty() && !turn.tool_calls.is_empty() {
+                            turn.content =
+                                crate::commands::chat_minimax::summarize_tool_calls(&turn.tool_calls);
+                        }
+                        turn
+                    })
             }
             "ollama" => {
                 // Ollama vision uses a different shape (a top-level `images` field

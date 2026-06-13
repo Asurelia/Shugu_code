@@ -352,33 +352,71 @@ fn next_short_tag(s: &str) -> Option<(String, String, usize)> {
     None
 }
 
-/// Note de repli (Lot 1) quand le modèle n'a produit QUE des intentions
-/// d'outils (pas de prose). Lisible, honnête sur l'état (exécution = Lot 2).
-pub(crate) fn summarize_tool_blocks(blocks: &[String]) -> String {
-    let invokes = extract_invokes(blocks);
-    if invokes.is_empty() {
+/// Parse les blocs d'outils MiniMax (texte XML) en `ToolCall` structurés
+/// exécutables par la boucle d'outils du chat (et le runner agent). Les valeurs
+/// de paramètres sont interprétées en JSON quand c'est possible (tableaux,
+/// nombres, booléens, chaînes entre guillemets), sinon conservées en chaîne.
+/// `index_base` permet des id uniques quand on concatène plusieurs sources.
+pub(crate) fn parse_tool_blocks(
+    blocks: &[String],
+    index_base: usize,
+) -> Vec<crate::commands::agents::ToolCall> {
+    use crate::commands::agents::ToolCall;
+    extract_invokes(blocks)
+        .into_iter()
+        .enumerate()
+        .map(|(i, inv)| {
+            let mut map = serde_json::Map::new();
+            for (k, raw) in inv.params {
+                let val = serde_json::from_str::<serde_json::Value>(&raw)
+                    .unwrap_or(serde_json::Value::String(raw));
+                map.insert(k, val);
+            }
+            let arguments = serde_json::Value::Object(map).to_string();
+            ToolCall {
+                id: format!("mm_call_{}", index_base + i),
+                name: inv.name,
+                arguments,
+            }
+        })
+        .collect()
+}
+
+/// Note de repli quand le modèle a voulu des outils mais qu'ils ne sont PAS
+/// exécutés — typiquement le toggle « Accès complet » coupé (chemin sans boucle
+/// d'outils). Construite à partir des `ToolCall` déjà parsés (nom + 1er arg).
+pub(crate) fn summarize_tool_calls(
+    calls: &[crate::commands::agents::ToolCall],
+) -> String {
+    if calls.is_empty() {
         return String::new();
     }
-    let list = invokes
+    let list = calls
         .iter()
-        .map(|inv| {
-            let arg = inv
-                .params
-                .first()
-                .map(|(_, v)| v.trim_matches(['"', '[', ']'].as_ref()).to_string())
+        .map(|c| {
+            // 1er argument lisible, extrait du JSON d'arguments.
+            let arg = serde_json::from_str::<serde_json::Value>(&c.arguments)
+                .ok()
+                .and_then(|v| {
+                    v.as_object()
+                        .and_then(|o| o.values().next().cloned())
+                        .map(|x| match x {
+                            serde_json::Value::String(s) => s,
+                            other => other.to_string(),
+                        })
+                })
                 .unwrap_or_default();
             if arg.is_empty() {
-                format!("`{}`", inv.name)
+                format!("`{}`", c.name)
             } else {
-                format!("`{}({})`", inv.name, arg)
+                format!("`{}({})`", c.name, arg)
             }
         })
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "🔧 Shugu a voulu utiliser des outils : {list}.\n\n\
-         _L'exécution des outils directement dans le chat arrive très bientôt. \
-         En attendant, active « Accès complet » puis relance, ou passe par le panneau Agents._"
+        "🔧 Shugu voulait utiliser des outils : {list}.\n\n\
+         _Active « Accès complet » sous le chat puis relance ta demande pour qu'il les exécute réellement._"
     )
 }
 
@@ -567,13 +605,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_tool_blocks_builds_executable_calls() {
+        let blocks = vec![
+            "<invoke name=\"fs_list_dir\"><path>js</path></invoke>\
+             <invoke name=\"fs_search\"><parameter name=\"query\">main</parameter><parameter name=\"regex\">true</parameter></invoke>"
+                .to_string(),
+        ];
+        let calls = parse_tool_blocks(&blocks, 0);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "fs_list_dir");
+        assert_eq!(calls[0].id, "mm_call_0");
+        let a0: serde_json::Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(a0["path"], "js");
+        let a1: serde_json::Value = serde_json::from_str(&calls[1].arguments).unwrap();
+        // "true" doit être interprété en booléen JSON, pas en chaîne.
+        assert_eq!(a1["query"], "main");
+        assert_eq!(a1["regex"], true);
+    }
+
+    #[test]
     fn summarize_reads_names_and_first_arg() {
         let blocks = vec![
             "<invoke name=\"fs_list_dir\"><path>js</path></invoke>\
              <invoke name=\"fs_read_file\"><path>formicium.html</path></invoke>"
                 .to_string(),
         ];
-        let s = summarize_tool_blocks(&blocks);
+        let s = summarize_tool_calls(&parse_tool_blocks(&blocks, 0));
         assert!(s.contains("`fs_list_dir(js)`"), "{s}");
         assert!(s.contains("`fs_read_file(formicium.html)`"), "{s}");
     }
