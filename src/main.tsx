@@ -102,12 +102,28 @@ const inner = (
       //     rejouerait au 1er mount /code (diff surprise / fichier disparu).
       //   • ["ai-review","dialog"] → rehydrater open:true rouvrirait le dialog
       //     de review tout seul au reload.
+      // Les familles VOLUMINEUSES et/ou reconstructibles sont aussi exclues —
+      // elles gonflaient le blob localStorage (JSON.parse synchrone AVANT le
+      // premier render au boot) pour des données qui se refetchent en ms :
+      //   • ["agents"]        → transcripts complets (events) ; reconstruits
+      //     depuis SQLite via getAgentTranscript au premier mount.
+      //   • ["fs"] / ["git"]  → listings/status du workspace ; refetch local
+      //     instantané, et périmés dès que le disque a bougé hors-app.
+      //   • ["grep"]          → résultats de recherche, volumineux et jetables.
+      //   • ["chat","stream"] → buffer de streaming live ; rehydrater un
+      //     streaming:true périmé au boot = ghost "en cours" (bug latent).
+      //     Le reste de ["chat"] (messages, conversations) reste persisté.
       // Le reste du cache est persisté normalement.
       dehydrateOptions: {
         shouldDehydrateQuery: (q) =>
           q.queryKey[0] !== "ai-edit" &&
           q.queryKey[0] !== "ai-apply" &&
           q.queryKey[0] !== "ai-review" &&
+          q.queryKey[0] !== "agents" &&
+          q.queryKey[0] !== "fs" &&
+          q.queryKey[0] !== "git" &&
+          q.queryKey[0] !== "grep" &&
+          !(q.queryKey[0] === "chat" && q.queryKey[1] === "stream") &&
           defaultShouldDehydrateQuery(q),
       },
     }}
