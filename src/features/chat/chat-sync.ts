@@ -336,10 +336,31 @@ export async function sendChatMessage(
       : ("delegate" as const);
 
   if (route === "delegate") {
-    // On passe le modèle de chat actif comme orchestrateur de REPLI : si aucun
-    // orchestrateur dédié n'est configuré, la délégation utilise quand même ce
-    // modèle (cf. resolveOrchestrator) au lieu d'échouer avec « non configuré ».
-    await handleDelegate(convId, trimmed, agentDefPath, modelId);
+    // Enrichit la tâche déléguée avec le contexte éditeur (fichier actif +
+    // sélection) et les commentaires inline de la Révision diff — que le chemin
+    // chat-direct injecte sinon (≈ l.436-462) et que l'early-return sauterait.
+    // Sans ça, l'agent ne connaîtrait pas le fichier ouvert / la sélection /
+    // les annotations (régression revue). Reste du texte (RAG auto, persona)
+    // non injecté à dessein : l'agent explore lui-même via fs_search/fs_read.
+    let delegateTask = trimmed;
+    if (editorCtx) {
+      try {
+        const { buildEditorContext } = await import("./editorContext");
+        const ectx = buildEditorContext(editorCtx, { skipPaths: parseMentions(trimmed) });
+        if (ectx) delegateTask = `${ectx}\n\n---\n\n${delegateTask}`;
+      } catch (err) {
+        console.warn("[chat-sync] editor context for delegate failed", err);
+      }
+    }
+    if (inlineComments && inlineComments.length > 0) {
+      const block = [
+        "Commentaires inline (Révision diff) :",
+        ...inlineComments.map((c) => `- ${c.path}:${c.line} — ${c.note}   (\`${c.snippet}\`)`),
+      ].join("\n");
+      delegateTask = `${block}\n\n---\n\n${delegateTask}`;
+    }
+    // Le modèle de chat actif sert d'orchestrateur de REPLI (cf. resolveOrchestrator).
+    await handleDelegate(convId, delegateTask, agentDefPath, modelId);
     return;
   }
   // Below: chat-direct + chat-think continue the existing chat flow.
@@ -821,7 +842,14 @@ async function handleDelegate(
   const superviseRaw = await db.settings.get("routing.superviseComplex");
   const superviseOn = superviseRaw == null ? true : superviseRaw === "true";
   const isReviewerInvocation = !!agentDefPath && /reviewer|planner/i.test(agentDefPath);
-  const wantSupervise = superviseOn && !isReviewerInvocation;
+  // Pas d'advisor sur le bavardage TRIVIAL (« merci », « ok », salutation) :
+  // depuis l'unification, le cockpit délègue CHAQUE message — un remerciement
+  // ne doit ni payer une phase de plan, ni spammer le fil d'un « Advisor
+  // inactif ». resolveThinking("auto") classe déjà casual (false) vs
+  // substantiel (true) ; on ne supervise que le substantiel. Un agent custom
+  // explicite (agentDefPath) reste supervisé (intention claire).
+  const trivial = !agentDefPath && !resolveThinking("auto", task);
+  const wantSupervise = superviseOn && !isReviewerInvocation && !trivial;
 
   // Si l'advisor est demandé mais qu'aucun reviewer n'est configuré, on le DIT
   // dans le fil — sauter en silence laissait l'utilisateur croire que l'advisor
