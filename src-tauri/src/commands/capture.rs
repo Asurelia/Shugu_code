@@ -152,6 +152,94 @@ pub async fn capture_screen(
     })
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Capture pour l'outil agent (vérification visuelle — « tests réels »)
+// ────────────────────────────────────────────────────────────────────
+
+/// Miniature pour la timeline du fil — 512 px de grand côté, q70 (~50-120 Ko,
+/// persistée dans agent_events → survit au reload sans protocole asset).
+const THUMB_EDGE: u32 = 512;
+const THUMB_QUALITY: u8 = 70;
+
+/// Windows : `canonicalize()` préfixe `\\?\` — on le retire systématiquement
+/// avant de stocker/afficher un chemin (bug récurrent, cf. mémoire projet).
+fn strip_extended_prefix(p: &str) -> String {
+    p.strip_prefix(r"\\?\").unwrap_or(p).to_string()
+}
+
+fn captures_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir: {e}"))?
+        .join("captures");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create captures dir: {e}"))?;
+    Ok(dir)
+}
+
+/// Capture SYNCHRONE pour l'outil agent `capture_screen` — le dispatcher
+/// d'outils tourne déjà dans un `spawn_blocking`, donc pas d'async ici (les
+/// hide/show de fenêtre Tauri sont thread-safe, dispatchés vers le thread
+/// principal en interne). Sauve le JPEG plein format (grand côté ≤ 1568 px)
+/// dans `app_data_dir/captures/` et retourne :
+///   (chemin absolu SANS préfixe \\?\, miniature 512 px en data URL).
+/// Le chemin part dans le tool result (marqueur `SCREENSHOT_SAVED:`) ; la
+/// miniature part dans l'event `Screenshot` affiché par la timeline du fil.
+pub(crate) fn capture_for_agent_blocking(
+    app: &AppHandle,
+    agent_id: &str,
+    monitor: Option<usize>,
+    delay_ms: u64,
+) -> Result<(String, String), String> {
+    // Laisser à l'UI fraîchement lancée/rafraîchie le temps de peindre.
+    if delay_ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(5_000)));
+    }
+    let mascot = app
+        .get_webview_window("mascot")
+        .filter(|w| w.is_visible().unwrap_or(false));
+    if let Some(w) = &mascot {
+        let _ = w.hide();
+        std::thread::sleep(std::time::Duration::from_millis(MASCOT_HIDE_SETTLE_MS));
+    }
+    let result = capture_and_encode(monitor, MAX_EDGE);
+    // Ré-affichage AVANT la propagation d'erreur — la mascotte revient
+    // toujours, même si la capture a échoué.
+    if let Some(w) = &mascot {
+        let _ = w.show();
+    }
+    let (jpeg, _, _) = result?;
+
+    let dir = captures_dir(app)?;
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let safe_agent: String = agent_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    let path = dir.join(format!("{safe_agent}-{ms}.jpg"));
+    std::fs::write(&path, &jpeg).map_err(|e| format!("write screenshot: {e}"))?;
+
+    let img = image::load_from_memory(&jpeg).map_err(|e| format!("decode for thumb: {e}"))?;
+    let thumb = img.resize(THUMB_EDGE, THUMB_EDGE, image::imageops::FilterType::Triangle);
+    let thumb_rgb = image::DynamicImage::ImageRgb8(thumb.to_rgb8());
+    let mut buf = Vec::new();
+    thumb_rgb
+        .write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
+            Cursor::new(&mut buf),
+            THUMB_QUALITY,
+        ))
+        .map_err(|e| format!("encode thumb: {e}"))?;
+    let thumb_url = format!(
+        "data:image/jpeg;base64,{}",
+        general_purpose::STANDARD.encode(&buf)
+    );
+
+    Ok((strip_extended_prefix(&path.to_string_lossy()), thumb_url))
+}
+
 /// Liste les moniteurs (pour le choix dans le composer quand il y en a > 1).
 #[tauri::command]
 pub fn capture_list_monitors() -> Result<Vec<MonitorInfo>, String> {

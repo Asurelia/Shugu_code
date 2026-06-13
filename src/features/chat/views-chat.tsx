@@ -853,14 +853,22 @@ function ActivityRow({ it }: { it: AgentActivityItem }) {
       </span>
     </>
   );
-  if (!it.result) {
+  if (!it.result && !it.imageUrl) {
     return <li className={"act " + it.status}>{head}</li>;
   }
   return (
     <li className={"act has-out " + it.status}>
       <details>
         <summary>{head}</summary>
-        <pre className="out">{it.result}</pre>
+        {/* Preuve visuelle d'un capture_screen — miniature dépliable. */}
+        {it.imageUrl && (
+          <img
+            src={it.imageUrl}
+            alt="Capture d'écran prise par l'agent"
+            style={{ maxWidth: "100%", borderRadius: 6, marginTop: 6, display: "block" }}
+          />
+        )}
+        {it.result && <pre className="out">{it.result}</pre>}
       </details>
     </li>
   );

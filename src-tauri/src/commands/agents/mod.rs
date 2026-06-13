@@ -297,6 +297,17 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         before: Option<String>,
     },
+    /// Capture d'écran prise par l'agent (outil `capture_screen`) pour la
+    /// vérification visuelle (« tests réels »). `path` = JPEG plein format sur
+    /// disque (app_data_dir/captures/) ; `thumb_data_url` = miniature 512 px
+    /// affichée dans la timeline du fil. Persisté dans `agent_events` → la
+    /// miniature survit au reload sans protocole asset.
+    Screenshot {
+        agent_id: String,
+        tool_call_id: String,
+        path: String,
+        thumb_data_url: String,
+    },
 }
 
 impl AgentEvent {
@@ -314,6 +325,7 @@ impl AgentEvent {
             AgentEvent::SkillLearned { .. } => "skillLearned",
             AgentEvent::LessonsInjected { .. } => "lessonsInjected",
             AgentEvent::Write { .. } => "write",
+            AgentEvent::Screenshot { .. } => "screenshot",
         }
     }
 
@@ -330,7 +342,8 @@ impl AgentEvent {
             | AgentEvent::Error { agent_id, .. }
             | AgentEvent::SkillLearned { agent_id, .. }
             | AgentEvent::LessonsInjected { agent_id, .. }
-            | AgentEvent::Write { agent_id, .. } => agent_id,
+            | AgentEvent::Write { agent_id, .. }
+            | AgentEvent::Screenshot { agent_id, .. } => agent_id,
         }
     }
 }

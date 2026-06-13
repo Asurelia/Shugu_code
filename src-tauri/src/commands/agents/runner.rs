@@ -71,6 +71,13 @@ pub(crate) enum AgentMessage {
     Text { role: String, content: String },
     AssistantWithTools { content: String, tool_calls: Vec<ToolCall> },
     ToolResults(Vec<ToolResult>),
+    /// Screenshot de l'outil `capture_screen`, ré-injecté comme tour USER
+    /// multimodal juste après les tool results — openai-compat n'accepte pas
+    /// d'image dans un message `role:"tool"`, et côté Anthropic
+    /// `push_coalesced` fusionne légalement ce tour avec le message
+    /// tool_result précédent. `data_url` vidée par `prune_user_images`
+    /// (anti-bloat) → le builder retombe alors sur un message texte simple.
+    UserImage { text: String, data_url: String },
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -115,6 +122,20 @@ pub(crate) fn build_openai_messages(history: &[AgentMessage]) -> Vec<serde_json:
                         "role": "tool",
                         "tool_call_id": r.id,
                         "content": r.content,
+                    }));
+                }
+            }
+            AgentMessage::UserImage { text, data_url } => {
+                if data_url.is_empty() {
+                    // Image élaguée (prune_user_images) → texte simple.
+                    out.push(serde_json::json!({ "role": "user", "content": text }));
+                } else {
+                    out.push(serde_json::json!({
+                        "role": "user",
+                        "content": [
+                            { "type": "text", "text": text },
+                            { "type": "image_url", "image_url": { "url": data_url } }
+                        ]
                     }));
                 }
             }
@@ -211,6 +232,20 @@ pub(crate) fn build_anthropic_native(
                         b
                     })
                     .collect();
+                push_coalesced(&mut out, "user", blocks);
+            }
+            AgentMessage::UserImage { text, data_url } => {
+                let mut blocks = vec![serde_json::json!({ "type": "text", "text": text })];
+                // `data:image/jpeg;base64,<b64>` → bloc image natif Anthropic.
+                if let Some((media_type, b64)) = data_url
+                    .strip_prefix("data:")
+                    .and_then(|rest| rest.split_once(";base64,"))
+                {
+                    blocks.push(serde_json::json!({
+                        "type": "image",
+                        "source": { "type": "base64", "media_type": media_type, "data": b64 }
+                    }));
+                }
                 push_coalesced(&mut out, "user", blocks);
             }
         }
@@ -545,6 +580,20 @@ pub(super) async fn tool_use_loop(
         if let Some(a) = arr.as_array_mut() {
             a.extend(mcp_tools);
         }
+        // Gate vie privée : `agents.allowScreenCapture = "false"` retire
+        // l'outil de capture d'écran du manifest (défaut ON — clé absente ou
+        // toute autre valeur laisse l'outil). Advisory : le réglage gouverne
+        // ce que le modèle VOIT, pas le dispatcher.
+        if crate::commands::mcp::read_setting(app, "agents.allowScreenCapture").as_deref()
+            == Some("false")
+        {
+            if let Some(a) = arr.as_array_mut() {
+                a.retain(|t| {
+                    let name = t["name"].as_str().or_else(|| t["function"]["name"].as_str());
+                    name != Some("capture_screen")
+                });
+            }
+        }
         Some(arr)
     };
 
@@ -836,6 +885,16 @@ pub(super) async fn tool_use_loop(
             }
         }
 
+        // Vérification visuelle : un résultat `SCREENSHOT_SAVED:<path>` veut
+        // dire que l'agent vient de capturer l'écran (outil capture_screen).
+        // L'image ne peut pas voyager dans un message role:"tool" → on la
+        // ré-injecte comme tour USER multimodal juste après les tool results.
+        let screenshot_paths: Vec<String> = results
+            .iter()
+            .filter(|r| !r.is_error)
+            .filter_map(|r| r.content.strip_prefix("SCREENSHOT_SAVED:").map(str::to_string))
+            .collect();
+
         // ── 7. Append to history for the next iteration ────────────────
         history.push(AgentMessage::AssistantWithTools {
             content: turn.content,
@@ -843,12 +902,61 @@ pub(super) async fn tool_use_loop(
         });
         history.push(AgentMessage::ToolResults(results));
 
+        for path in screenshot_paths {
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    use base64::Engine as _;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    history.push(AgentMessage::UserImage {
+                        text: "[Shugu system] Screenshot captured — attached below. LOOK at it: \
+                               does the rendered UI match what you intended? State what you \
+                               observe before continuing."
+                            .to_string(),
+                        data_url: format!("data:image/jpeg;base64,{b64}"),
+                    });
+                }
+                Err(e) => {
+                    history.push(AgentMessage::Text {
+                        role: "user".to_string(),
+                        content: format!("[Shugu system] screenshot read failed ({path}): {e}"),
+                    });
+                }
+            }
+        }
+        // Anti-bloat contexte : seules les 2 dernières captures restent en
+        // image (~400-600 Ko base64 chacune) ; les plus vieilles redeviennent
+        // du texte.
+        prune_user_images(history, 2);
+
         iteration += 1;
     }
 
     Err(format!(
         "agent exceeded MAX_ITERATIONS ({MAX_ITERATIONS}) — unreachable in practice (cf. last_iteration force-return)"
     ))
+}
+
+/// Anti-bloat : vide la `data_url` des screenshots les plus anciens en ne
+/// gardant que les `keep` derniers en image. Le texte reste (avec une note de
+/// retrait) pour que le modèle sache qu'une capture a existé à ce tour.
+fn prune_user_images(history: &mut [AgentMessage], keep: usize) {
+    let idxs: Vec<usize> = history
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| match m {
+            AgentMessage::UserImage { data_url, .. } if !data_url.is_empty() => Some(i),
+            _ => None,
+        })
+        .collect();
+    if idxs.len() <= keep {
+        return;
+    }
+    for &i in &idxs[..idxs.len() - keep] {
+        if let AgentMessage::UserImage { text, data_url } = &mut history[i] {
+            data_url.clear();
+            text.push_str("\n[ancien screenshot retiré du contexte]");
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1006,7 +1114,7 @@ pub(super) const GROUNDED_PROMPT: &str = r#"You are Shugu's Grounded agent. You 
 LOOP (DeepSWE-shaped):
 1. UNDERSTAND before editing. Use fs_search and fs_read_file to locate the relevant code and read it FULLY. Never edit a file you have not read.
 2. EDIT surgically: fs_edit for changes to existing files, fs_write_file for new ones.
-3. VERIFY after every change with run_command. If a verification command was provided below, run EXACTLY that. Otherwise read package.json / Cargo.toml to find the project's own check (typecheck, test, build) and run it.
+3. VERIFY after every change with run_command. If a verification command was provided below, run EXACTLY that. Otherwise read package.json / Cargo.toml to find the project's own check (typecheck, test, build) and run it. For UI changes you can also SEE the result: after launching/refreshing the UI, call capture_screen — the screenshot comes back as an image you can actually look at, and it shows the user visual proof in the chat.
 4. READ the failure. A non-zero exit is INFORMATION, not defeat: read stderr, find the root cause, fix it, then run the check AGAIN.
 5. Declare done ONLY when the check passes (exit 0). End with a short plain-text summary of what you changed and why.
 
@@ -1345,5 +1453,82 @@ mod tests {
         }];
         let (msgs, _) = build_anthropic_native(&h);
         assert_eq!(msgs[0]["content"][0]["input"], json!({}));
+    }
+
+    // ── UserImage (vérification visuelle agent) ───────────────────────
+    #[test]
+    fn openai_user_image_multimodal_blocks() {
+        let h = vec![AgentMessage::UserImage {
+            text: "look".into(),
+            data_url: "data:image/jpeg;base64,AAAA".into(),
+        }];
+        let out = build_openai_messages(&h);
+        assert_eq!(
+            out[0],
+            json!({
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "look" },
+                    { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,AAAA" } }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn openai_user_image_pruned_becomes_text() {
+        let h = vec![AgentMessage::UserImage { text: "look".into(), data_url: "".into() }];
+        assert_eq!(
+            build_openai_messages(&h)[0],
+            json!({ "role": "user", "content": "look" })
+        );
+    }
+
+    #[test]
+    fn anthropic_user_image_coalesces_with_tool_results() {
+        // tool_result (user) puis UserImage → UN SEUL message user, blocs
+        // tool_result + text + image (Anthropic rejette 2 tours user de suite).
+        let h = vec![
+            AgentMessage::ToolResults(vec![tr("tu_1", "capture_screen", false, "SCREENSHOT_SAVED:/x.jpg")]),
+            AgentMessage::UserImage {
+                text: "look".into(),
+                data_url: "data:image/jpeg;base64,AAAA".into(),
+            },
+        ];
+        let (msgs, _) = build_anthropic_native(&h);
+        assert_eq!(msgs.len(), 1);
+        let blocks = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(
+            blocks[2],
+            json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": "image/jpeg", "data": "AAAA" }
+            })
+        );
+    }
+
+    #[test]
+    fn prune_keeps_only_last_n_images() {
+        let img = |t: &str| AgentMessage::UserImage {
+            text: t.into(),
+            data_url: "data:image/jpeg;base64,AAAA".into(),
+        };
+        let mut h = vec![img("a"), img("b"), img("c")];
+        prune_user_images(&mut h, 2);
+        let urls: Vec<bool> = h
+            .iter()
+            .map(|m| match m {
+                AgentMessage::UserImage { data_url, .. } => !data_url.is_empty(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(urls, vec![false, true, true]);
+        // Le texte du plus ancien signale le retrait.
+        if let AgentMessage::UserImage { text, .. } = &h[0] {
+            assert!(text.contains("retiré"));
+        }
     }
 }

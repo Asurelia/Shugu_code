@@ -249,6 +249,29 @@ fn agent_tools() -> &'static [ToolDef] {
                 }),
             },
             ToolDef {
+                name: "capture_screen",
+                description: "Capture the user's screen to VERIFY visually what you just built — \
+                              the screenshot comes back to you as an IMAGE in the next message, so \
+                              you can actually SEE the rendered UI (the user has the app/preview/\
+                              browser open on screen). Use it after launching or refreshing a UI \
+                              you changed, then state what you observe versus what was expected. \
+                              The screenshot also appears in the chat timeline so the user sees \
+                              the proof too.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "monitor": {
+                            "type": "integer",
+                            "description": "Monitor index (omit = primary monitor)."
+                        },
+                        "delay_ms": {
+                            "type": "integer",
+                            "description": "Wait before capturing, in ms — give the UI time to render. Default 500, max 5000."
+                        }
+                    }
+                }),
+            },
+            ToolDef {
                 name: "skill_save",
                 description: "Save a REUSABLE skill you've just figured out so future runs apply it \
                               instantly — a learned procedure, recipe, or hard-won project fact. Call \
@@ -566,6 +589,28 @@ fn dispatch_inner(
                 "[{status}]\n--- stdout ---\n{}\n--- stderr ---\n{}",
                 res.stdout, res.stderr
             ))
+        }
+        "capture_screen" => {
+            // Vérification visuelle (« tests réels ») : capture l'écran, sauve
+            // le plein format sur disque, émet l'event Screenshot (miniature
+            // pour la timeline du fil) et retourne un MARQUEUR que le runner
+            // détecte pour ré-injecter l'image en tour user multimodal
+            // (openai-compat n'accepte pas d'image dans un message role:"tool").
+            let monitor = args["monitor"].as_u64().map(|v| v as usize);
+            let delay_ms = args["delay_ms"].as_u64().unwrap_or(500);
+            let (path, thumb) = crate::commands::capture::capture_for_agent_blocking(
+                app, agent_id, monitor, delay_ms,
+            )?;
+            let _ = super::persist_and_emit(
+                app,
+                &super::AgentEvent::Screenshot {
+                    agent_id: agent_id.to_string(),
+                    tool_call_id: call.id.clone(),
+                    path: path.clone(),
+                    thumb_data_url: thumb,
+                },
+            );
+            Ok(format!("SCREENSHOT_SAVED:{path}"))
         }
         "skill_save" => {
             // Env-verified gate: a skill is only worth keeping if the real

@@ -43,6 +43,9 @@ export interface AgentActivityItem {
   /** Sortie de l'outil (stdout d'une commande, contenu lu…), tronquée. Présent
    *  seulement quand le toolResult est arrivé. Permet de déplier « pourquoi ✗ ». */
   result?: string;
+  /** Miniature (data URL) d'un screenshot pris par l'outil capture_screen —
+   *  la preuve visuelle s'affiche dépliable dans la timeline. */
+  imageUrl?: string;
 }
 
 /** Une étape du plan de l'orchestrateur (tool `todo_write`). */
@@ -123,6 +126,9 @@ function describeToolCall(tool: string, args: unknown): { icon: string; label: s
   if (t.includes("search") || t.includes("grep") || t.includes("find")) {
     return { icon: "🔎", label: "cherche", detail: clip(firstString(a, ["query", "pattern", "q", "needle", "text"])) };
   }
+  if (t.includes("screenshot") || t.includes("capture")) {
+    return { icon: "📸", label: "capture", detail: "l'écran" };
+  }
   if (t.includes("run") || t.includes("command") || t.includes("exec") || t.includes("shell") || t.includes("bash")) {
     return { icon: "⚙️", label: "exécute", detail: clip(firstString(a, ["command", "cmd", "script", "args"])) };
   }
@@ -197,13 +203,17 @@ export function useMessageDisplay(m: Message): MessageDisplay {
   const seenWritePaths = new Set<string>();
 
   if (isAgentRun && transcript) {
-    // 1er passage : indexer issue (ok/error) + sortie texte de chaque appel.
+    // 1er passage : indexer issue (ok/error) + sortie texte de chaque appel,
+    // et la miniature des screenshots (event `screenshot`, par toolCallId).
     const errorByCall = new Map<string, boolean>();
     const resultByCall = new Map<string, string>();
+    const imageByCall = new Map<string, string>();
     for (const ev of transcript.events) {
       if (ev.kind === "toolResult") {
         errorByCall.set(ev.toolCallId, resultIsError(ev));
         resultByCall.set(ev.toolCallId, extractResultString(ev));
+      } else if (ev.kind === "screenshot") {
+        imageByCall.set(ev.toolCallId, ev.thumbDataUrl);
       }
     }
     // 2e passage (ordre chronologique) : deltas live + journal d'outils + plan.
@@ -226,6 +236,7 @@ export function useMessageDisplay(m: Message): MessageDisplay {
           detail: d.detail,
           status: !seen ? "running" : errorByCall.get(ev.toolCallId) ? "error" : "ok",
           result: resultByCall.get(ev.toolCallId),
+          imageUrl: imageByCall.get(ev.toolCallId),
         });
       } else if (ev.kind === "write") {
         // 1er write d'un path gagne : son `before` = état d'avant le run, donc

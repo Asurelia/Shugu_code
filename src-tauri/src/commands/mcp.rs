@@ -155,7 +155,9 @@ pub fn remove_server(app: &AppHandle, name: &str) -> Result<(), String> {
 /// agents (`agents::get_conn`) — même fichier `shugu.db` que tauri-plugin-sql,
 /// sérialisé via WAL. `None` si la clé est absente OU si l'accès DB échoue (la
 /// lecture d'un flag ne doit jamais faire planter l'app).
-fn read_setting(app: &AppHandle, key: &str) -> Option<String> {
+/// `pub(crate)` : aussi utilisé par le runner agent pour la gate
+/// `agents.allowScreenCapture` (retrait de l'outil capture_screen du manifest).
+pub(crate) fn read_setting(app: &AppHandle, key: &str) -> Option<String> {
     let conn_mutex = crate::commands::agents::get_conn(app).ok()?;
     let conn = conn_mutex.lock().ok()?;
     conn.query_row(

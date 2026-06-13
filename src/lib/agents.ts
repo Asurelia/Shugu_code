@@ -39,7 +39,8 @@ export type AgentEventKind =
   | "error"
   | "skillLearned"
   | "lessonsInjected"
-  | "write";
+  | "write"
+  | "screenshot";
 
 // ────────────────────────────────────────────────────────────────────
 // DB row shapes (mirror Rust AgentRow / AgentEventRow)
@@ -154,6 +155,18 @@ export type AgentEvent =
       /** Pre-write content for diff + undo. Undefined/absent = file was CREATED
        *  this run (the chat's "Annuler" then deletes it). */
       before?: string;
+    }
+  | {
+      kind: "screenshot";
+      agentId: string;
+      /** toolCallId de l'appel `capture_screen` correspondant — la timeline
+       *  attache la miniature à cette ligne d'activité. */
+      toolCallId: string;
+      /** Chemin absolu du JPEG plein format (app_data_dir/captures/). */
+      path: string;
+      /** Miniature 512 px en data URL — affichée dans le fil (persistée dans
+       *  agent_events, survit au reload). */
+      thumbDataUrl: string;
     };
 
 // ────────────────────────────────────────────────────────────────────
