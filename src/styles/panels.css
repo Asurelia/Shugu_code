@@ -888,12 +888,17 @@
 .float-shell.edge-hidden-top .float-edge-tip    { top: calc(100% + 8px);   left: 50%; transform: translateX(-50%); }
 .float-shell.edge-hidden-bottom .float-edge-tip { bottom: calc(100% + 8px);left: 50%; transform: translateX(-50%); }
 
-/* Panel body — docks beside the avatar, flips with side */
+/* Panel body — docks beside the avatar, flips with side.
+   NB : la fenêtre mascotte est FIXE (1200×720, non resizable) donc le
+   max-width vaut toujours 460px aujourd'hui ; le plancher min-width est une
+   assurance si la fenêtre devient resizable — le panneau ne doit jamais
+   devenir un ruban inutilisable. */
 .float-body {
   position: absolute;
   left: 0; bottom: 0;
   width: 460px;
-  max-width: min(460px, calc(100vw - var(--avatar-size) - 80px));
+  max-width: min(460px, calc(100vw - var(--avatar-size) - 24px));
+  min-width: min(300px, calc(100vw - var(--avatar-size) - 24px));
   opacity: 1;
   transform: translate3d(calc(var(--avatar-size) + var(--gap)), var(--body-shift-y), 0) scale(var(--body-scale));
   transform-origin: left bottom;
@@ -909,7 +914,7 @@
 }
 .float-shell.compact .float-body {
   width: 360px;
-  max-width: min(360px, calc(100vw - var(--avatar-size) - 80px));
+  max-width: min(360px, calc(100vw - var(--avatar-size) - 24px));
 }
 .float-shell.closed .float-body {
   opacity: 0;
@@ -922,12 +927,14 @@
   --body-scale: 0.72;
 }
 
-/* History (conversation feed) sits above the panel */
+/* History (conversation feed) sits above the panel.
+   max-height clampé sur la hauteur fenêtre : avatar dragué près du bord
+   haut, l'historique ne doit pas sortir de la fenêtre (clipping vertical). */
 .float-history-shell {
   position: absolute;
   left: 0; right: 0;
   bottom: calc(100% + 10px);
-  max-height: var(--history-max-height, 280px);
+  max-height: min(var(--history-max-height, 280px), calc(100vh - var(--avatar-size) - 40px));
   display: flex;
   background: linear-gradient(180deg, rgba(20,16,38,0.78), rgba(12,10,24,0.92));
   border: 1px solid rgba(255,255,255,0.06);
@@ -954,6 +961,9 @@
   padding: 7px 11px;
   border-radius: 12px;
   line-height: 1.55;
+  /* Même garde que les bulles du chat principal : une URL/UUID sans espace
+     ne doit pas étirer la bulle hors du panneau. */
+  overflow-wrap: anywhere;
 }
 .float-history .fm.you {
   align-self: flex-end;

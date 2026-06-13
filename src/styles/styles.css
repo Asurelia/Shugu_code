@@ -286,11 +286,14 @@ body {
 /* Side panel — width is now controlled by the wrap, drop the fixed width */
 .side { width: auto; min-width: 0; flex: 1; }
 
-/* ── Responsive breakpoints (window resize adaptation) ────── */
+/* ── Responsive breakpoints (window resize adaptation) ──────
+   NB : plus aucune règle .float-shell/.float-body ici — FloatShell ne rend
+   QUE dans la fenêtre mascotte, fixe à 1200×720 (non resizable), où ces
+   breakpoints ne s'appliquaient jamais (code mort hérité de l'époque où le
+   chat flottant vivait dans la fenêtre principale). Les gardes de taille du
+   panneau flottant vivent dans panels.css. */
 @media (max-width: 1100px) {
   .image-controls { width: 280px; }
-  .float-shell { --avatar-size: 64px; }
-  .float-body { width: 380px; max-width: min(380px, calc(100vw - var(--avatar-size) - 60px)); }
 }
 @media (max-width: 900px) {
   .rail { width: 56px; }
@@ -311,8 +314,6 @@ body {
   .brand-name .sub { display: none; }
   .tb-search { width: 180px; font-size: 11px; }
   .tb-search > span:not(.kbd) { display: none; }
-  .float-shell { --avatar-size: 56px; }
-  .float-body { width: calc(100vw - 96px); max-width: calc(100vw - 96px); }
 }
 
 /* When the window itself is small, drop ornaments */
