@@ -729,6 +729,8 @@ pub fn fs_list_files(
 /// Read a workspace-relative file path and return its content as a string.
 ///
 /// Rejects binary files (null bytes in first 8 KiB) and files over 5 MiB.
+/// Delegates to `read_file_inner` (the agent-tools core, defined below) with
+/// no soft cap — same guards, single implementation.
 #[tauri::command(async)]
 pub fn fs_read_file(
     path: String,
@@ -740,26 +742,43 @@ pub fn fs_read_file(
             .map_err(|e| format!("workspace state lock: {e}"))?;
         guard.clone().ok_or_else(|| "no workspace open".to_string())?
     };
+    read_file_inner(&root, &path, None)
+}
 
-    let resolved = safe_resolve(&root, &path)?;
+/// One entry of `fs_read_files`. `content: None` means the file could not be
+/// read (renamed/deleted/binary/too large) — callers skip those silently,
+/// matching the per-file catch the boot restoration used to do around
+/// individual `fs_read_file` invokes.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoredFile {
+    pub path: String,
+    pub content: Option<String>,
+}
 
-    // Size check before reading.
-    let meta = std::fs::metadata(&resolved).map_err(|e| format!("stat error: {e}"))?;
-    const MAX_SIZE: u64 = 5 * 1024 * 1024; // 5 MiB
-    if meta.len() > MAX_SIZE {
-        return Err("file too large (>5 MiB)".into());
-    }
-
-    let bytes = std::fs::read(&resolved).map_err(|e| format!("read error: {e}"))?;
-
-    // Binary detection: scan first 8 KiB for null bytes.
-    let scan_len = bytes.len().min(8 * 1024);
-    if bytes[..scan_len].contains(&0u8) {
-        return Err("binary file".into());
-    }
-
-    // Decode with lossy UTF-8 (invalid sequences → U+FFFD). Preserve CRLF.
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+/// Read MANY workspace-relative files in ONE IPC round-trip.
+///
+/// Boot-time open-tabs restoration used to issue one `fs_read_file` invoke
+/// per persisted tab (N round-trips + 2 React setState per file). This batch
+/// returns everything at once; the result vec mirrors the order of `paths`.
+#[tauri::command(async)]
+pub fn fs_read_files(
+    paths: Vec<String>,
+    root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
+) -> Result<Vec<RestoredFile>, String> {
+    let root = {
+        let guard = root_state
+            .lock()
+            .map_err(|e| format!("workspace state lock: {e}"))?;
+        guard.clone().ok_or_else(|| "no workspace open".to_string())?
+    };
+    Ok(paths
+        .into_iter()
+        .map(|path| {
+            let content = read_file_inner(&root, &path, None).ok();
+            RestoredFile { path, content }
+        })
+        .collect())
 }
 
 /// Write content to a workspace-relative file path (atomic via temp-file + rename).
