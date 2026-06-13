@@ -321,7 +321,10 @@ export async function sendChatMessage(
     : resolveRoute(trimmed, delegateOverride);
 
   if (route === "delegate") {
-    await handleDelegate(convId, trimmed, agentDefPath);
+    // On passe le modèle de chat actif comme orchestrateur de REPLI : si aucun
+    // orchestrateur dédié n'est configuré, la délégation utilise quand même ce
+    // modèle (cf. resolveOrchestrator) au lieu d'échouer avec « non configuré ».
+    await handleDelegate(convId, trimmed, agentDefPath, modelId);
     return;
   }
   // Below: chat-direct + chat-think continue the existing chat flow.
@@ -644,9 +647,19 @@ export type OrchestratorResolution =
   | { kind: "no-orchestrator" }
   | { kind: "disabled"; providerId: string };
 
-export async function resolveOrchestrator(): Promise<OrchestratorResolution> {
+export async function resolveOrchestrator(fallbackModel?: string): Promise<OrchestratorResolution> {
   const orchestratorModelRaw = await db.settings.get("routing.orchestratorModel");
-  const orchestratorModel = orchestratorModelRaw && orchestratorModelRaw.trim();
+  let orchestratorModel = orchestratorModelRaw && orchestratorModelRaw.trim();
+  // Pas d'orchestrateur DÉDIÉ configuré → repli sur le modèle de chat actif
+  // (souvent déjà un modèle fort, ex. MiniMax M3). Ainsi la délégation marche
+  // « out of the box » : demander « crée un jeu » lance un vrai agent
+  // (plan + run_command + advisor) sans config préalable. L'utilisateur peut
+  // toujours épingler un orchestrateur dédié dans Réglages → Routing.
+  // Le Design Studio appelle resolveOrchestrator() SANS fallback → comportement
+  // inchangé là-bas (bannière « configure un orchestrateur » si absent).
+  if (!orchestratorModel && fallbackModel && fallbackModel.trim()) {
+    orchestratorModel = fallbackModel.trim();
+  }
   if (!orchestratorModel) return { kind: "no-orchestrator" };
 
   // Prefix the id with `openai/` if no slash so resolveProvider doesn't fall
@@ -680,8 +693,12 @@ async function handleDelegate(
   convId: string,
   task: string,
   agentDefPath?: string,
+  fallbackModel?: string,
 ): Promise<void> {
-  const orch = await resolveOrchestrator();
+  // fallbackModel = modèle de chat actif, utilisé comme orchestrateur si aucun
+  // n'est configuré (délégation « out of the box »). Un agent custom (.md)
+  // épingle son propre modèle plus bas et n'utilise donc pas ce repli.
+  const orch = await resolveOrchestrator(agentDefPath ? undefined : fallbackModel);
   if (orch.kind !== "ok") {
     if (orch.kind === "no-orchestrator") {
       await appendMessage(convId, {

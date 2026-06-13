@@ -94,6 +94,15 @@ const DELEGATE_PATTERNS: RegExp[] = [
   // READ the files first, so they're orchestrator work.
   /\b(résume?z?|summarize|summary|analyse[rz]?|analyze|examine[rz]?|étudie[rz]?|study|décri(?:s|t|vez|re)|describe|explique?z?|explain|review|revois?z?|audit)\b.{0,60}\b(fichiers?|files?|dossiers?|directory|directories|folders?|repo|repository|projets?|projects?|modules?|composants?|components?|classes?|fonctions?|functions?|code|services?|hooks?|apis?|endpoints?|routes?|features?|architecture|implementations?|implémentations?)\b/,
 
+  // High-level "build/create an ENTIRE product from scratch" — a buildable
+  // artifact (app, game, site, tool…), not a single function or file. These
+  // are THE quintessential orchestrator tasks (multi-file, multi-step, need
+  // exec + a plan), but they slipped to chat-direct before because no narrow
+  // artifact keyword (fonction/fichier/module) matched. "crée un jeu vidéo
+  // depuis zéro", "build me a todo app", "fais un site portfolio", "develop a
+  // CLI tool", "code-moi un clone de X". Build VERB + product NOUN within 40c.
+  /\b(crée?[rz]?|create|make|fais|construis?|build|développe[rz]?|develop|génère?[rz]?|generate|code(?:r|z)?|implémente[rz]?|implement|réalise[rz]?|programme[rz]?|prototype[rz]?)\b.{0,40}\b(jeux?(?:\s+vid[ée]o)?|game|app(?:lication)?|applications?|sites?|websites?|web\s?apps?|webapps?|logiciels?|softwares?|programmes?|programs?|projets?|projects?|clones?|mvp|prototypes?|protos?|landing(?:\s?pages?)?|dashboards?|tableau\s+de\s+bord|outils?|tools?|extensions?|plugins?|bots?|clis?|moteurs?|engines?|simulateur|simulator|jeu)\b/,
+
   // Multi-step intent (a sequence of actions, not a single answer)
   /\b(d'abord|first|step\s*1|étape\s*1).{0,120}\b(puis|ensuite|then|after that|et après|ensuite)\b/,
 

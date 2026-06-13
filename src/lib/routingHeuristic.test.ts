@@ -138,6 +138,34 @@ describe("resolveRoute — existing behavior unchanged", () => {
   it('delegate-pattern message → delegate (no override)', () => {
     expect(resolveRoute("crée un agent qui fait X")).toBe("delegate");
   });
+
+  // ── Builds de produit haut-niveau « depuis zéro » → delegate (le bug signalé)
+  it('crée un jeu vidéo depuis zéro → delegate', () => {
+    expect(resolveRoute("crée un jeu vidéo depuis zéro")).toBe("delegate");
+  });
+  it('build me a todo app → delegate', () => {
+    expect(resolveRoute("build me a todo app")).toBe("delegate");
+  });
+  it('fais un site portfolio → delegate', () => {
+    expect(resolveRoute("fais un site portfolio")).toBe("delegate");
+  });
+  it('develop a CLI tool → delegate', () => {
+    expect(resolveRoute("develop a small CLI tool for me")).toBe("delegate");
+  });
+  it('code-moi un clone de Tetris → delegate', () => {
+    expect(resolveRoute("code-moi un clone de Tetris")).toBe("delegate");
+  });
+  it('génère une application de gestion → delegate', () => {
+    expect(resolveRoute("génère une application de gestion de stock")).toBe("delegate");
+  });
+
+  // ── Anti-faux-positifs : une QUESTION sur un jeu ne délègue pas
+  it('question sur un jeu (pas de verbe build) → pas delegate', () => {
+    expect(resolveRoute("quel est ton jeu vidéo préféré ?")).not.toBe("delegate");
+  });
+  it('parler d\'une app sans verbe build → pas delegate', () => {
+    expect(resolveRoute("c'est quoi la meilleure app de notes ?")).not.toBe("delegate");
+  });
 });
 
 // ────────────────────────────────────────────────────────────────────
