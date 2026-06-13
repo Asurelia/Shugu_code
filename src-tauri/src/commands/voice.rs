@@ -21,7 +21,10 @@ const MAX_TTS_CHARS: usize = 600;
 fn decode_hex_or_b64(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();
     // Hex (défaut t2a_v2). Décodage manuel — pas la peine d'une crate `hex`
-    // pour 16 symboles.
+    // pour 16 symboles. AMBIGUÏTÉ assumée : une chaîne base64 composée
+    // UNIQUEMENT de [0-9a-fA-F] passerait par la branche hex — probabilité
+    // nulle en pratique pour un MP3 base64 de plusieurs Ko, et on demande
+    // explicitement `output_format: "hex"` dans le body.
     if !s.is_empty() && s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
         let bytes = s.as_bytes();
         let mut out = Vec::with_capacity(s.len() / 2);

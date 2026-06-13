@@ -20,8 +20,15 @@ const TTS_SETTING_KEY = "voice.tts";
 const TTS_VOICE_KEY = "voice.ttsVoice";
 const TTS_QUERY_KEY = ["settings", TTS_SETTING_KEY] as const;
 
-/** Un seul audio à la fois — un nouvel énoncé coupe le précédent. */
+/** Audio en cours — coupé par le toggle OFF. */
 let currentAudio: HTMLAudioElement | null = null;
+/** File SÉQUENTIELLE : deux énoncés proches (bulle « ✅ Terminé ! » + lecture
+ * de la réponse déléguée) s'ENCHAÎNENT au lieu de se couper l'un l'autre. */
+let queue: Promise<void> = Promise.resolve();
+let pendingCount = 0;
+/** Dédoublonnage : même texte demandé deux fois en < 4 s = un seul énoncé. */
+let lastText = "";
+let lastAt = 0;
 
 export async function isTtsEnabled(): Promise<boolean> {
   try {
@@ -34,11 +41,29 @@ export async function isTtsEnabled(): Promise<boolean> {
 /**
  * Fait parler la mascotte (fire-and-forget). No-op silencieux si le réglage
  * est OFF, si la clé MiniMax manque, ou hors Tauri — la voix ne doit jamais
- * casser le flux visuel existant.
+ * casser le flux visuel existant. Les énoncés sont joués en SÉQUENCE (file) ;
+ * au-delà de 2 en attente, les nouveaux sont ignorés (pas de monologue).
  */
-export async function ttsSpeak(text: string): Promise<void> {
+export function ttsSpeak(text: string): void {
   const clean = text.replace(/\s+/g, " ").trim();
   if (!clean) return;
+  const now = Date.now();
+  if (clean === lastText && now - lastAt < 4000) return;
+  lastText = clean;
+  lastAt = now;
+  if (pendingCount >= 2) return;
+  pendingCount += 1;
+  queue = queue
+    .then(() => speakNow(clean))
+    .catch(() => undefined)
+    .finally(() => {
+      pendingCount -= 1;
+    });
+}
+
+async function speakNow(clean: string): Promise<void> {
+  // Le réglage est relu au moment de JOUER : un toggle OFF pendant la file
+  // coupe aussi les énoncés en attente.
   if (!(await isTtsEnabled())) return;
   try {
     const cfg = await loadProviderConfig("minimax");
@@ -50,9 +75,13 @@ export async function ttsSpeak(text: string): Promise<void> {
       baseUrl: cfg.baseUrl || "https://api.minimax.io",
       apiKey: cfg.apiKey,
     });
-    currentAudio?.pause();
-    currentAudio = new Audio(dataUrl);
-    await currentAudio.play();
+    await new Promise<void>((resolve) => {
+      currentAudio = new Audio(dataUrl);
+      currentAudio.onended = () => resolve();
+      currentAudio.onerror = () => resolve();
+      currentAudio.onpause = () => resolve();
+      currentAudio.play().catch(() => resolve());
+    });
   } catch (err) {
     console.warn("[tts] speak failed:", err);
   }
