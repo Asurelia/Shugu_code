@@ -598,7 +598,15 @@ export function ChatView({
                   onApply={(code, lang, target) => void applyCodeToFile(code, lang, target)}
                 />
               ))}
-              {typing && (
+              {/* Bulle « en train de travailler » : visible quand CETTE fenêtre
+                  envoie (typing local) OU quand un stream est en cours POUR la
+                  conversation active, quelle que soit la fenêtre émettrice
+                  (chatStream filtre déjà par convId). Indispensable pour que le
+                  chat principal reflète EN DIRECT un prompt lancé depuis la
+                  mascotte — les deux fenêtres reçoivent le même broadcast
+                  chat://delta, mais sans cette 2e condition seul l'émetteur
+                  l'affichait. */}
+              {(typing || chatStream.streaming) && (
                 <div className="cx-msg ai">
                   <div className="cx-meta">
                     <span className="mark ai"><Icon name="sparkle" size={11} /></span>
