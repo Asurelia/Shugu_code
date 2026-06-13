@@ -37,6 +37,7 @@ import { setChatBusy, useChatBusy } from "@/features/chat/chatBusy";
 import { setChatUnread } from "@/features/chat/chatUnread";
 import { bumpInteract } from "@/features/mascot/idleStore";
 import { MascotTabBar, CardsHub, isCardTab, type MascotTab } from "@/features/mascot/MascotNav";
+import { ttsSpeak, useTtsEnabled } from "@/features/mascot/useTts";
 import { CaptureButton } from "./CaptureButton";
 import { useMessageDisplay } from "./useMessageDisplay";
 import { ReviewFeedback } from "./views-chat";
@@ -318,6 +319,8 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const busy = useChatBusy();
   const chatStream = useChatStream(activeConv);
+  // Voix de la mascotte (TTS MiniMax) — réglage voice.tts, défaut OFF.
+  const tts = useTtsEnabled();
 
   // ── B4: per-message action mutations ─────────────────────────────────────
   // Instantiated here (parent) so a single mutation instance is shared across
@@ -450,6 +453,19 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
       const newest = msgs[msgs.length - 1];
       if (newest?.role === "ai" && (mode !== "full" || edge)) {
         setChatUnread(true);
+      }
+      // Voix (lot voix bloc A) : lire la réponse AI fraîche si voice.tts est
+      // ON (ttsSpeak no-op sinon). Garde lastMsgCount > 0 : au premier mount
+      // l'historique chargé ne doit pas déclencher de lecture. Ni les
+      // placeholders agent ni les messages-image ne sont lus.
+      if (
+        lastMsgCount > 0 &&
+        newest?.role === "ai" &&
+        newest.image !== true &&
+        newest.body &&
+        newest.body !== "Orchestrateur au travail…"
+      ) {
+        void ttsSpeak(String(newest.text ?? newest.body));
       }
     }
     setLastMsgCount(msgs.length);
@@ -842,6 +858,22 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
               iconSize={13}
               onCaptured={setPendingImage}
             />
+            {/* 🔊 voix de la mascotte (TTS MiniMax) — lit la bulle et les
+                réponses. OFF par défaut ; l'état est partagé via voice.tts. */}
+            <button
+              className="float-icon-btn"
+              onClick={tts.toggle}
+              aria-pressed={tts.enabled}
+              aria-label={tts.enabled ? "Couper la voix de la mascotte" : "Activer la voix de la mascotte"}
+              title={
+                tts.enabled
+                  ? "Voix activée — la mascotte lit ses réponses (MiniMax). Cliquer pour couper."
+                  : "Voix coupée — cliquer pour que la mascotte lise ses réponses à voix haute (MiniMax)."
+              }
+              style={tts.enabled ? { color: "var(--primary, #e08efe)" } : undefined}
+            >
+              <Icon name={tts.enabled ? "speaker" : "speaker-off"} size={13} />
+            </button>
           </div>
         </div>
       </div>

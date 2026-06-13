@@ -684,6 +684,7 @@ pub fn run() {
             commands::image::image_generate,
             commands::capture::capture_screen,
             commands::capture::capture_list_monitors,
+            commands::voice::voice_tts,
             commands::models::models_list,
             commands::models::models_discover_external,
             commands::vector::vec_index,

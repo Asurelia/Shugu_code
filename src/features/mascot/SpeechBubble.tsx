@@ -9,11 +9,22 @@
 // focus), entrée 200 ms transform/opacity (ease-out), prefers-reduced-motion
 // respecté côté CSS, clic = action claire (ouvrir l'agent ou fermer).
 
+import { useEffect } from "react";
 import { revealAgent } from "@/lib/agents";
 import { useMascotSpeech, clearMascotSpeech } from "./speechStore";
+import { ttsSpeak } from "./useTts";
 
 export function SpeechBubble() {
   const speech = useMascotSpeech();
+
+  // Voix (lot voix bloc A) : chaque nouvel énoncé est aussi LU si le réglage
+  // voice.tts est ON (ttsSpeak no-op sinon). Branché ICI — composant rendu
+  // uniquement dans la fenêtre mascotte — pour que l'audio ne sorte qu'une
+  // fois même quand sayMascot est émis depuis la fenêtre main.
+  useEffect(() => {
+    if (speech) void ttsSpeak(speech.text);
+  }, [speech?.firedAt]); // eslint-disable-line react-hooks/exhaustive-deps
+
   if (!speech) return null;
 
   const onClick = () => {
