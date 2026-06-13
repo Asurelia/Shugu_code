@@ -27,9 +27,9 @@
 //! outil — donc aucune régression sur le chemin openai-compat partagé.
 
 /// Marge de fin retenue avant émission (≥ au plus long marqueur géré,
-/// `</minimax:tool_call>` = 20 octets). 24 laisse de la marge pour les jetons
-/// spéciaux. La marge est toujours vidée par `finish`.
-const HOLDBACK: usize = 24;
+/// `</minimax:tool_call>` = 20 octets). 32 laisse de la marge pour d'éventuels
+/// jetons spéciaux plus longs. La marge est toujours vidée par `finish`.
+const HOLDBACK: usize = 32;
 
 const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
@@ -242,14 +242,24 @@ pub(crate) fn extract_invokes(blocks: &[String]) -> Vec<ParsedInvoke> {
     for block in blocks {
         let mut rest = block.as_str();
         while let Some(start) = rest.find("<invoke") {
-            // name="..."
+            // Sur tout `<invoke` malformé, on AVANCE d'un cran plutôt que
+            // d'abandonner le reste du bloc (un invoke valide peut suivre).
+            let advance = start + "<invoke".len();
             let after = &rest[start..];
-            let Some(name_pos) = after.find("name=\"") else { break };
-            let name_val_start = name_pos + "name=\"".len();
-            let Some(name_end_rel) = after[name_val_start..].find('"') else { break };
-            let name = after[name_val_start..name_val_start + name_end_rel].to_string();
-            // Corps entre le '>' de l'ouverture et le </invoke> fermant.
-            let Some(open_gt) = after.find('>') else { break };
+            // Bornes : name="..." et le '>' fermant de la balise ouvrante.
+            let open_gt = match after.find('>') {
+                Some(g) => g,
+                None => break, // pas de tag complet → rien d'exploitable après
+            };
+            let open_tag = &after[..open_gt]; // "<invoke name=\"...\"" (sans le >)
+            let name = open_tag
+                .find("name=\"")
+                .map(|np| np + "name=\"".len())
+                .and_then(|s| open_tag[s..].find('"').map(|e| open_tag[s..s + e].to_string()));
+            let Some(name) = name else {
+                rest = &rest[advance..];
+                continue;
+            };
             let body_start = start + open_gt + 1;
             let body_end = match rest[body_start..].find("</invoke>") {
                 Some(e) => body_start + e,
@@ -276,6 +286,7 @@ fn extract_params(body: &str) -> Vec<(String, String)> {
         // Forme officielle : <parameter name="k">v</parameter>
         if let Some(p) = rest.find("<parameter") {
             let after = &rest[p..];
+            let mut matched = false;
             if let (Some(npos), Some(gt)) = (after.find("name=\""), after.find('>')) {
                 let kvs = npos + "name=\"".len();
                 if let Some(kve) = after[kvs..].find('"') {
@@ -284,12 +295,17 @@ fn extract_params(body: &str) -> Vec<(String, String)> {
                     if let Some(ve) = rest[vstart..].find("</parameter>") {
                         params.push((key, rest[vstart..vstart + ve].trim().to_string()));
                         rest = &rest[vstart + ve + "</parameter>".len()..];
-                        continue;
+                        matched = true;
                     }
                 }
             }
-            // Balise <parameter> malformée → on arrête proprement.
-            break;
+            if matched {
+                continue;
+            }
+            // <parameter> malformé : on l'enjambe et on poursuit (des formes
+            // courtes valides peuvent suivre) plutôt que d'abandonner.
+            rest = &rest[p + "<parameter".len()..];
+            continue;
         }
         // Forme courte : <k>v</k> (k ≠ invoke/parameter), première rencontrée.
         if let Some((key, val, end)) = next_short_tag(rest) {
@@ -520,6 +536,34 @@ mod tests {
         assert_eq!(inv.len(), 1);
         assert_eq!(inv[0].name, "search_web");
         assert_eq!(inv[0].params, vec![("query".to_string(), "rust async".to_string())]);
+    }
+
+    #[test]
+    fn malformed_invoke_without_name_is_skipped_not_abandoned() {
+        // Un <invoke> sans name= ne doit pas faire perdre l'invoke valide
+        // qui suit (ni boucler). Robustesse de revue.
+        let blocks = vec![
+            "<invoke><path>x</path></invoke>\
+             <invoke name=\"fs_read_file\"><path>ok.ts</path></invoke>"
+                .to_string(),
+        ];
+        let inv = extract_invokes(&blocks);
+        assert_eq!(inv.len(), 1);
+        assert_eq!(inv[0].name, "fs_read_file");
+        assert_eq!(inv[0].params, vec![("path".to_string(), "ok.ts".to_string())]);
+    }
+
+    #[test]
+    fn mixed_parameter_and_short_form_both_extracted() {
+        let blocks = vec![
+            "<invoke name=\"t\"><parameter name=\"a\">1</parameter><b>2</b></invoke>".to_string(),
+        ];
+        let inv = extract_invokes(&blocks);
+        assert_eq!(inv.len(), 1);
+        assert_eq!(
+            inv[0].params,
+            vec![("a".to_string(), "1".to_string()), ("b".to_string(), "2".to_string())]
+        );
     }
 
     #[test]

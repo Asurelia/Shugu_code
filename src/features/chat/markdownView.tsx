@@ -13,18 +13,26 @@
 import React from "react";
 
 // ── Inline : code `x`, lien [t](u), gras **x**/__x__, italique *x*/_x_ ──────
-// Un seul regex d'alternation, parcouru dans l'ordre ; le texte entre matches
-// passe tel quel. Le contenu gras/italique est re-rendu (nesting léger).
-const INLINE_RE =
-  /(`[^`]+`)|(\[[^\]]+\]\([^)\s]+\))|(\*\*[^*]+\*\*|__[^_]+__)|(\*[^*\n]+\*|_[^_\n]+_)/g;
+// Source du regex d'alternation. On crée une INSTANCE NEUVE à chaque appel de
+// `renderInline` (et donc à chaque appel récursif) : un regex global partagé
+// avec `.exec` serait corrompu par la récursion (le `lastIndex` de l'appel
+// interne casserait l'itération de l'appelant — ex. `**gras `code` dedans**`).
+const INLINE_SOURCE =
+  "(`[^`]+`)|(\\[[^\\]]+\\]\\([^)\\s]+\\))|(\\*\\*[^*]+\\*\\*|__[^_]+__)|(\\*[^*\\n]+\\*|_[^_\\n]+_)";
+
+/** N'autorise que des schémas d'URL sûrs pour un href. Bloque `javascript:`,
+ *  `data:`, etc. (le texte du modèle est une donnée non fiable). */
+export function safeHref(url: string): string | null {
+  return /^(https?:\/\/|mailto:)/i.test(url.trim()) ? url.trim() : null;
+}
 
 function renderInline(text: string, keyBase: string): React.ReactNode[] {
+  const re = new RegExp(INLINE_SOURCE, "g");
   const out: React.ReactNode[] = [];
   let last = 0;
   let m: RegExpExecArray | null;
-  INLINE_RE.lastIndex = 0;
   let i = 0;
-  while ((m = INLINE_RE.exec(text)) !== null) {
+  while ((m = re.exec(text)) !== null) {
     if (m.index > last) out.push(text.slice(last, m.index));
     const tok = m[0];
     const key = `${keyBase}-${i++}`;
@@ -32,14 +40,18 @@ function renderInline(text: string, keyBase: string): React.ReactNode[] {
       // `code`
       out.push(<code key={key} className="cx-code-inline">{tok.slice(1, -1)}</code>);
     } else if (m[2]) {
-      // [text](url)
+      // [text](url) — href filtré ; un schéma non sûr → texte simple (pas de lien).
       const close = tok.indexOf("](");
       const label = tok.slice(1, close);
-      const url = tok.slice(close + 2, -1);
+      const href = safeHref(tok.slice(close + 2, -1));
       out.push(
-        <a key={key} href={url} target="_blank" rel="noopener noreferrer" className="cx-md-link">
-          {label}
-        </a>,
+        href ? (
+          <a key={key} href={href} target="_blank" rel="noopener noreferrer" className="cx-md-link">
+            {label}
+          </a>
+        ) : (
+          <React.Fragment key={key}>{label}</React.Fragment>
+        ),
       );
     } else if (m[3]) {
       // **bold** / __bold__
