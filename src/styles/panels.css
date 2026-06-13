@@ -402,10 +402,14 @@
 .problem-row .loc { color: var(--on-surface-muted); }
 .problem-row .msg { color: var(--on-surface); margin-top: 2px; }
 
-/* ── Custom right-click context menu ────────────────────────── */
+/* ── Custom right-click context menu ──────────────────────────
+   max-width clampé au viewport ; PAS d'overflow-y ici — les sous-menus
+   flyout (.ctx-submenu, left:100%) sortent du menu racine et seraient
+   clippés. Le positionnement JS (Math.max/Math.min) garantit le on-screen. */
 .ctx-menu {
   position: fixed;
   min-width: 240px;
+  max-width: min(320px, calc(100vw - 16px));
   background: linear-gradient(180deg, rgba(20,16,38,0.92), rgba(14,12,28,0.95));
   border: 1px solid rgba(255,255,255,0.08);
   border-radius: 12px;
@@ -474,6 +478,14 @@
   top: -6px; left: 100%;
   margin-left: 4px;
   min-width: 220px;
+}
+/* Près du bord droit (classe posée par ContextMenu.tsx quand la place
+   manque), le sous-menu s'ouvre à GAUCHE du menu racine. */
+.ctx-menu.flip .ctx-submenu {
+  left: auto;
+  right: 100%;
+  margin-left: 0;
+  margin-right: 4px;
 }
 
 /* Selection annotation banner */
