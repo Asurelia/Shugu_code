@@ -159,12 +159,47 @@ describe("resolveRoute — existing behavior unchanged", () => {
     expect(resolveRoute("génère une application de gestion de stock")).toBe("delegate");
   });
 
-  // ── Anti-faux-positifs : une QUESTION sur un jeu ne délègue pas
+  // ── Anti-faux-positifs (confirmés par revue adverse) ───────────────────────
+  // 1. NOM sans verbe build
   it('question sur un jeu (pas de verbe build) → pas delegate', () => {
     expect(resolveRoute("quel est ton jeu vidéo préféré ?")).not.toBe("delegate");
   });
   it('parler d\'une app sans verbe build → pas delegate', () => {
     expect(resolveRoute("c'est quoi la meilleure app de notes ?")).not.toBe("delegate");
+  });
+  // 2. Partitif « des/les » après le verbe (pas un déterminant de création)
+  it('« j\'adore coder des jeux » → pas delegate (partitif)', () => {
+    expect(resolveRoute("j'adore coder des jeux")).not.toBe("delegate");
+  });
+  it('« tu sais coder des jeux ? » → pas delegate', () => {
+    expect(resolveRoute("tu sais coder des jeux ?")).not.toBe("delegate");
+  });
+  // 3. Collocations idiomatiques make/fais (pas de déterminant juste après)
+  it('« make sure the app works » → pas delegate', () => {
+    expect(resolveRoute("make sure the app works")).not.toBe("delegate");
+  });
+  it('« fais comme tu veux avec ce projet » → pas delegate', () => {
+    expect(resolveRoute("fais comme tu veux avec ce projet")).not.toBe("delegate");
+  });
+  it('« fais attention au projet » → pas delegate', () => {
+    expect(resolveRoute("fais attention au projet")).not.toBe("delegate");
+  });
+  // 4. Aspiration / musing / question (garde NON_COMMAND)
+  it('« créer un jeu c\'est compliqué non ? » → pas delegate', () => {
+    expect(resolveRoute("créer un jeu c'est compliqué non ?")).not.toBe("delegate");
+  });
+  it('« je voudrais créer une app un jour » → pas delegate (un jour)', () => {
+    expect(resolveRoute("je voudrais créer une app un jour")).not.toBe("delegate");
+  });
+  it('« je rêve de développer mon propre jeu » → pas delegate', () => {
+    expect(resolveRoute("je rêve de développer mon propre jeu")).not.toBe("delegate");
+  });
+  it('« comment créer un jeu vidéo ? » → pas delegate (question how-to)', () => {
+    expect(resolveRoute("comment créer un jeu vidéo ?")).not.toBe("delegate");
+  });
+  // 5. Mais une demande POLIE reste une commande → delegate
+  it('« peux-tu me coder un clone de Tetris ? » → delegate (commande polie)', () => {
+    expect(resolveRoute("peux-tu me coder un clone de Tetris ?")).toBe("delegate");
   });
 });
 

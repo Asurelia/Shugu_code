@@ -94,21 +94,34 @@ const DELEGATE_PATTERNS: RegExp[] = [
   // READ the files first, so they're orchestrator work.
   /\b(résume?z?|summarize|summary|analyse[rz]?|analyze|examine[rz]?|étudie[rz]?|study|décri(?:s|t|vez|re)|describe|explique?z?|explain|review|revois?z?|audit)\b.{0,60}\b(fichiers?|files?|dossiers?|directory|directories|folders?|repo|repository|projets?|projects?|modules?|composants?|components?|classes?|fonctions?|functions?|code|services?|hooks?|apis?|endpoints?|routes?|features?|architecture|implementations?|implémentations?)\b/,
 
-  // High-level "build/create an ENTIRE product from scratch" — a buildable
-  // artifact (app, game, site, tool…), not a single function or file. These
-  // are THE quintessential orchestrator tasks (multi-file, multi-step, need
-  // exec + a plan), but they slipped to chat-direct before because no narrow
-  // artifact keyword (fonction/fichier/module) matched. "crée un jeu vidéo
-  // depuis zéro", "build me a todo app", "fais un site portfolio", "develop a
-  // CLI tool", "code-moi un clone de X". Build VERB + product NOUN within 40c.
-  /\b(crée?[rz]?|create|make|fais|construis?|build|développe[rz]?|develop|génère?[rz]?|generate|code(?:r|z)?|implémente[rz]?|implement|réalise[rz]?|programme[rz]?|prototype[rz]?)\b.{0,40}\b(jeux?(?:\s+vid[ée]o)?|game|app(?:lication)?|applications?|sites?|websites?|web\s?apps?|webapps?|logiciels?|softwares?|programmes?|programs?|projets?|projects?|clones?|mvp|prototypes?|protos?|landing(?:\s?pages?)?|dashboards?|tableau\s+de\s+bord|outils?|tools?|extensions?|plugins?|bots?|clis?|moteurs?|engines?|simulateur|simulator|jeu)\b/,
-
   // Multi-step intent (a sequence of actions, not a single answer)
   /\b(d'abord|first|step\s*1|étape\s*1).{0,120}\b(puis|ensuite|then|after that|et après|ensuite)\b/,
 
   // Web search request
   /\b(cherche|search|google|recherche)\b.{0,20}\b(sur (le |l')?(internet|web)|online)\b/,
 ];
+
+// High-level "build/create an ENTIRE product from scratch" — a buildable
+// artifact (app, game, site, tool…), not a single function or file. THE
+// quintessential orchestrator task (multi-file, multi-step, exec + plan), mais
+// elle tombait en chat-direct car aucun mot d'artefact étroit (fonction/fichier/
+// module) ne matchait. « crée un jeu vidéo depuis zéro », « build me a todo
+// app », « fais un site portfolio », « develop a CLI tool », « code-moi un
+// clone de X ».
+//
+// Précision (revue adverse) : on EXIGE un DÉTERMINANT SINGULIER de création
+// (un/une/a/the/ce/mon…) juste après le verbe (option « moi/me/nous » entre les
+// deux) — ce qui distingue « crée UN jeu » d'un usage partitif/idiomatique
+// non-build : « coder DES jeux », « make SURE the app », « fais COMME tu veux ».
+const BUILD_PRODUCT_RE =
+  /\b(?:crée?[rz]?|create|make|fais|construis?|build|développe[rz]?|develop|génère?[rz]?|generate|code(?:r|z)?|implémente[rz]?|implement|réalise[rz]?|programme[rz]?|prototype[rz]?)(?:[\s-]+(?:moi|me|nous|us))?\s+(?:un|une|a|an|the|ce|cet|cette|mon|ma|mes|ton|ta|tes|son|sa|ses|notre|nos|votre|vos|my|your|our|his|her|their)\s+.{0,30}?\b(?:jeux?(?:\s+vid[ée]o)?|game|app(?:lication)?|applications?|sites?|websites?|web\s?apps?|webapps?|logiciels?|softwares?|programmes?|programs?|projets?|projects?|clones?|mvp|prototypes?|protos?|landing(?:\s?pages?)?|dashboards?|tableau\s+de\s+bord|outils?|tools?|extensions?|plugins?|bots?|clis?|moteurs?|engines?|simulateur|simulator)\b/;
+
+// Garde « pas une commande » : marqueurs clairs d'aspiration / de question /
+// de discussion qui transforment une phrase « build » en simple bavardage. On
+// ne supprime QUE les formes non-ambiguës ; on laisse passer les questions
+// polies qui SONT des commandes (« peux-tu me coder un jeu ? »).
+const NON_COMMAND_RE =
+  /^(?:comment|pourquoi|est-ce qu|qu'est-ce|c'est quoi|quels?|quelles?)\b|\bje r[êe]ve\b|\bun jour\b|\bce serait\b|c'est (?:compliqu|dur|difficile|facile|impossible|long)|\bnon\s*\?\s*$/;
 
 // ────────────────────────────────────────────────────────────────────
 // Public API
@@ -132,6 +145,10 @@ export function resolveRoute(text: string, override?: DelegateOverride): Route {
   if (override !== "never-delegate") {
     // Try the delegate patterns. First match wins.
     if (DELEGATE_PATTERNS.some((re) => re.test(lower))) {
+      return "delegate";
+    }
+    // Build-a-product : délègue SAUF si c'est une question/aspiration (garde).
+    if (BUILD_PRODUCT_RE.test(lower) && !NON_COMMAND_RE.test(lower)) {
       return "delegate";
     }
   }
