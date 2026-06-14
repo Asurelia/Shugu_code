@@ -841,14 +841,14 @@ async function handleDelegate(
   const superviseRaw = await db.settings.get("routing.superviseComplex");
   const superviseOn = superviseRaw === "true";
   const isReviewerInvocation = !!agentDefPath && /reviewer|planner/i.test(agentDefPath);
-  // Pas d'advisor sur le bavardage TRIVIAL (« merci », « ok », salutation) :
-  // depuis l'unification, le cockpit délègue CHAQUE message — un remerciement
-  // ne doit ni payer une phase de plan, ni spammer le fil d'un « Advisor
-  // inactif ». resolveThinking("auto") classe déjà casual (false) vs
-  // substantiel (true) ; on ne supervise que le substantiel. Un agent custom
-  // explicite (agentDefPath) reste supervisé (intention claire).
-  const trivial = !agentDefPath && !resolveThinking("auto", task);
-  const wantSupervise = superviseOn && !isReviewerInvocation && !trivial;
+  // Si l'advisor EST activé : on ne supervise pas le bavardage trivial (« merci »,
+  // salutation) — resolveThinking("auto") classe casual (false) vs substantiel
+  // (true) ; un agent custom explicite reste supervisé. L'ordre des `&&` court-
+  // circuite resolveThinking quand l'advisor est OFF (défaut) → zéro calcul inutile.
+  const wantSupervise =
+    superviseOn &&
+    !isReviewerInvocation &&
+    (!!agentDefPath || resolveThinking("auto", task));
 
   // Si l'advisor est demandé mais qu'aucun reviewer n'est configuré, on le DIT
   // dans le fil — sauter en silence laissait l'utilisateur croire que l'advisor
