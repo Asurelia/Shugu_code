@@ -657,11 +657,7 @@ export function ChatView({
           History/Bell/Settings); the panel floats here when opened. Mounted for
           the whole chat view incl. the empty state; chatMain isn't rendered
           during the handoff split, so that case is already excluded. */}
-      <ContextBubble
-        convId={activeConv}
-        onOpenFile={handleOpenFile}
-        editor={{ openFiles, activeFile, fileContents }}
-      />
+      <ContextBubble convId={activeConv} />
     </div>
   );
 

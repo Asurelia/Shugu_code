@@ -4,12 +4,32 @@
 // the user has opened; "+" lists the ones not yet open.
 import { useState } from "react";
 import { Icon } from "@/components/components";
+import { useShell } from "@/routes/shell-context";
 import { SurfaceHost } from "./SurfaceHost";
 import { SURFACE_MENU } from "./surfaces";
 import { closeSurface, openSurface, setActiveSurface, setBottomDockOpen, setRightPanelOpen, useCockpitLayout } from "./layoutStore";
+import { ContextTiles } from "@/features/context-cards/ContextTiles";
+import { useOpenTiles } from "@/features/context-cards/tilesStore";
 
-export function RightPanel() {
+export function RightPanel({ convId }: { convId: string }) {
+  const shell = useShell();
+  const openTiles = useOpenTiles();
   const layout = useCockpitLayout();
+
+  // Mode TUILES : dès qu'une tuile est ouverte (via le menu « Contexte »), le
+  // panneau droit devient la grille redimensionnable de tuiles. Sinon, la
+  // surface classique (éditeur / révision…) ci-dessous.
+  if (openTiles.length > 0) {
+    return (
+      <div className="cockpit-right" style={{ display: "flex", flexDirection: "column", height: "100%", minWidth: 0 }}>
+        <ContextTiles
+          convId={convId}
+          onOpenFile={(p) => { void shell.openFile(p); }}
+          editor={{ openFiles: shell.openFiles, activeFile: shell.activeFile, fileContents: shell.fileContents }}
+        />
+      </div>
+    );
+  }
   const { openedSurfaces, activeSurface } = layout;
   const [menuOpen, setMenuOpen] = useState(false);
 

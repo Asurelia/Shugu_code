@@ -71,14 +71,7 @@
   border: 1px solid rgba(224,142,254,0.3);
 }
 
-/* ── Window-manager work area ─────────────────────────────────
-   Calque plein-cadre qui héberge le menu-lanceur + les fenêtres flottantes.
-   pointer-events:none pour laisser passer les clics vers le chat ; chaque
-   bulle réactive les events. */
-.ctx-wm { position: absolute; inset: 0; z-index: 20; pointer-events: none; }
-.ctx-wm > .ctx-bubble { pointer-events: auto; }
-
-/* ── Open bubble ──────────────────────────────────────────── */
+/* ── Open bubble (menu-lanceur Contexte) ──────────────────── */
 .ctx-bubble {
   position: absolute; top: 14px; right: 18px; z-index: 20;
   width: 408px; max-width: calc(100% - 36px);
@@ -100,13 +93,6 @@
 }
 /* Menu-lanceur compact, ancré en haut à droite. */
 .ctx-bubble.is-menu { width: 264px; }
-
-/* Fenêtres flottantes : LARGEUR = inline (drag de la poignée droite),
-   HAUTEUR = preset via le bouton (mini / demi / plein). Position = inline. */
-.ctx-bubble.ctx-win { top: auto; right: auto; max-height: none; }
-.ctx-win.size-mini  { height: 360px; }
-.ctx-win.size-demi  { height: min(58vh, calc(100% - 24px)); }
-.ctx-win.size-plein { height: calc(100% - 24px); }
 .ctx-bubble-head {
   display: flex; align-items: center; gap: 6px;
   padding: 8px 8px 8px 10px;
@@ -122,14 +108,6 @@
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .ctx-bubble-title svg { color: var(--primary); flex-shrink: 0; }
-/* "‹" back-to-menu button (card view). */
-.ctx-back {
-  width: 26px; height: 26px; flex-shrink: 0;
-  display: inline-flex; align-items: center; justify-content: center;
-  border-radius: 8px; border: 0; cursor: pointer;
-  background: transparent; color: var(--on-surface-variant);
-}
-.ctx-back:hover { background: rgba(255,255,255,0.06); color: var(--primary); }
 .ctx-bubble-close {
   width: 26px; height: 26px; flex-shrink: 0;
   display: inline-flex; align-items: center; justify-content: center;
@@ -154,14 +132,6 @@
   background: transparent; border: 1px solid transparent; cursor: pointer;
   text-align: left; transition: all 130ms ease;
 }
-/* Bouton taille (mini/demi/plein) dans l'en-tête d'une carte. */
-.ctx-size {
-  flex-shrink: 0; height: 22px; padding: 0 8px; border-radius: 7px; cursor: pointer;
-  font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.08em;
-  color: var(--on-surface-variant);
-  background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08);
-}
-.ctx-size:hover { color: var(--primary); border-color: rgba(224,142,254,0.28); }
 .ctx-launch-item:hover {
   background: rgba(224,142,254,0.08);
   border-color: rgba(224,142,254,0.20);
@@ -184,20 +154,6 @@
   width: 7px; height: 7px; flex-shrink: 0; border-radius: 50%;
   background: var(--primary); box-shadow: 0 0 0 3px rgba(224,142,254,0.18);
 }
-
-/* ── Fenêtre flottante : en-tête déplaçable + poignée de largeur ──── */
-.ctx-win-head { cursor: move; user-select: none; touch-action: none; }
-.ctx-win-head .ctx-bubble-title { cursor: move; }
-.ctx-win-resize {
-  position: absolute; top: 8px; bottom: 8px; right: 0; width: 8px;
-  cursor: ew-resize; touch-action: none; z-index: 2;
-}
-.ctx-win-resize::after {
-  content: ""; position: absolute; top: 50%; right: 2px; transform: translateY(-50%);
-  width: 3px; height: 30px; border-radius: 2px; background: rgba(255,255,255,0.12);
-  transition: background 130ms ease;
-}
-.ctx-win-resize:hover::after { background: var(--primary); }
 
 /* overflow-y:auto (with default overflow-x) clips both axes, so the rounded
    bottom corners are honored even though the parent .ctx-bubble is now
@@ -634,8 +590,43 @@
 .ctx-diff .dl.del { background: rgba(255,106,138,0.08); color: #ffb0c0; }
 .ctx-diff .dl.hunk { color: var(--tertiary); background: rgba(129,236,255,0.06); }
 
+/* ── Tuiles du panneau droit (ContextTiles, façon Claude Code) ──── */
+.ctx-tiles { width: 100%; height: 100%; }
+.ctx-tiles-col { height: 100%; }
+.ctx-tile {
+  display: flex; flex-direction: column; height: 100%; min-height: 0; overflow: hidden;
+  background: var(--surface-container-low, #12121e);
+}
+.ctx-tile-head {
+  display: flex; align-items: center; gap: 6px; flex-shrink: 0;
+  padding: 5px 6px 5px 9px;
+  border-bottom: 1px solid rgba(255,255,255,0.07);
+  background: var(--surface-container, #16162a);
+}
+.ctx-tile-title {
+  flex: 1; min-width: 0; display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--font-display); font-weight: 600; font-size: 11px;
+  color: var(--on-surface); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ctx-tile-title svg { color: var(--primary); flex-shrink: 0; }
+.ctx-tile-close {
+  width: 20px; height: 20px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 5px; border: 0; cursor: pointer; background: transparent; color: var(--on-surface-muted);
+}
+.ctx-tile-close:hover { background: rgba(255,255,255,0.07); color: var(--on-surface); }
+.ctx-tile-body { flex: 1; min-height: 0; overflow: auto; padding: 10px; }
+.ctx-tile-body.flush { padding: 0; }
+.ctx-tile-files { height: 100%; overflow: auto; }
+.ctx-tiles-empty {
+  flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 12px; padding: 32px 22px; text-align: center; color: var(--on-surface-muted);
+}
+.ctx-tiles-empty svg { opacity: 0.7; }
+.ctx-tiles-empty p { margin: 0; font-size: 12.5px; line-height: 1.55; max-width: 280px; }
+
 @media (max-width: 900px) {
-  .ctx-bubble, .ctx-bubble.is-menu, .ctx-bubble.size-mini, .ctx-bubble.size-demi { width: calc(100% - 36px); }
+  .ctx-bubble, .ctx-bubble.is-menu { width: calc(100% - 36px); }
 }
 
 /* ── Conversations sidebar — vector search bar (VEC2) ──────────

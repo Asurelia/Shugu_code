@@ -230,7 +230,7 @@ export function CockpitShell({ activeConv }: { activeConv: string }) {
               onCollapse={() => setRightPanelOpen(false)}
               onExpand={() => setRightPanelOpen(true)}
             >
-              <RightPanel />
+              <RightPanel convId={activeConv} />
             </Panel>
           </PanelGroup>
         </Panel>
