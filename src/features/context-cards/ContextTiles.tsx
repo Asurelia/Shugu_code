@@ -87,25 +87,27 @@ function Tile({
 }) {
   const meta = tileMeta(id);
   return (
-    <div className="ctx-tile">
-      <div className="ctx-tile-head">
-        <span className="ctx-tile-title">
-          <Icon name={meta.icon} size={12} /> {meta.label}
-        </span>
-        <button className="ctx-tile-close" onClick={() => closeTile(id)} title="Fermer la tuile">
-          <Icon name="x" size={12} />
-        </button>
-      </div>
-      <div className={"ctx-tile-body" + (id === "terminal" || id === "files" ? " flush" : "")}>
-        {id === "terminal" ? (
-          <DockTerminal tabId="ctx-tile-terminal" name="Terminal" />
-        ) : id === "files" ? (
-          <div className="ctx-tile-files">
-            <SideFiles active={editor.activeFile ?? null} onPick={(p: string) => onOpenFile(p)} />
-          </div>
-        ) : (
-          <ContextCard tab={id} convId={convId} onOpenFile={onOpenFile} editor={editor} />
-        )}
+    <div className="ctx-tile-slot">
+      <div className="ctx-tile">
+        <div className="ctx-tile-head">
+          <span className="ctx-tile-title">
+            <Icon name={meta.icon} size={12} /> {meta.label}
+          </span>
+          <button className="ctx-tile-close" onClick={() => closeTile(id)} title="Fermer la tuile">
+            <Icon name="x" size={12} />
+          </button>
+        </div>
+        <div className={"ctx-tile-body" + (id === "terminal" || id === "files" ? " flush" : "")}>
+          {id === "terminal" ? (
+            <DockTerminal tabId="ctx-tile-terminal" name="Terminal" />
+          ) : id === "files" ? (
+            <div className="ctx-tile-files">
+              <SideFiles active={editor.activeFile ?? null} onPick={(p: string) => onOpenFile(p)} />
+            </div>
+          ) : (
+            <ContextCard tab={id} convId={convId} onOpenFile={onOpenFile} editor={editor} />
+          )}
+        </div>
       </div>
     </div>
   );
