@@ -24,6 +24,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { listen } from "@/lib/tauri";
 import type { AgentEvent } from "@/lib/agents";
 import { chatKeys } from "./keys";
+import { KEY_CHAT_MODE } from "./chat-sync";
 
 const EVT_MESSAGES = "chat://messages-changed";
 const EVT_ACTIVE = "chat://active-changed";
@@ -128,6 +129,11 @@ export function useChatEvents(): void {
           const m = payload?.mode;
           if (m === "chat" || m === "plan" || m === "agent") {
             qc.setQueryData<string>(chatKeys.chatMode(), m);
+            // Écrit AUSSI le localStorage de CETTE fenêtre : `getActiveChatMode()`
+            // (chemin d'envoi, hors React) lit la clé en direct — sans ça, un
+            // changement de mode fait dans l'autre fenêtre laisserait celle-ci
+            // avec une valeur périmée et appliquerait le mauvais mode.
+            try { localStorage.setItem(KEY_CHAT_MODE, m); } catch { /* quota */ }
           }
         });
         unlistens.push(un);

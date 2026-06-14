@@ -59,7 +59,10 @@ const EVT_CHAT_MODE    = "chat://chat-mode-changed";
 const KEY_ACTIVE       = "shugu.chat.activeConv.v1";
 const KEY_ACTIVE_MODEL = "shugu.chat.activeModel.v1";
 const KEY_CODEX_EFFORT = "shugu.chat.codexEffort.v1";
-const KEY_CHAT_MODE    = "shugu.chat.mode.v1";
+// Exporté : le listener cross-fenêtre (useEvents) doit ÉCRIRE cette clé sur la
+// fenêtre réceptrice — sinon `getActiveChatMode()` (lu en direct dans le chemin
+// d'envoi) verrait une valeur périmée après un changement de mode fait ailleurs.
+export const KEY_CHAT_MODE = "shugu.chat.mode.v1";
 
 // Fallback when no model has ever been chosen. We default to llama.cpp local
 // because (a) it doesn't need an API key, (b) it's the smoke-test target, and

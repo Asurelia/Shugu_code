@@ -46,10 +46,14 @@ use crate::commands::chat::{self, AssistantTurn, ChatMessage};
 /// "exceeded MAX_ITERATIONS" sans output.
 const MAX_ITERATIONS: u32 = 24;
 
-/// Native tools that MUTATE the project — removed from the manifest AND refused
-/// by the dispatcher in plan mode (read-only). MCP tools are not classified.
+/// Native tools that MUTATE persistent state — removed from the manifest AND
+/// refused by the dispatcher in plan mode (read-only). Includes `skill_save`
+/// (writes to the shared skills DB → affects all future runs ; de-facto already
+/// neutralised in plan mode since it requires a prior exit-0 `run_command`, but
+/// we block it explicitly so plan mode never persists anything). MCP tools are
+/// not classified (namespaced `mcp__…`, mutation unknown — see manifest filter).
 fn is_write_tool(name: &str) -> bool {
-    matches!(name, "fs_write_file" | "fs_edit" | "run_command")
+    matches!(name, "fs_write_file" | "fs_edit" | "run_command" | "skill_save")
 }
 
 /// Returned to the model if it invokes a write tool while in plan mode
