@@ -18,6 +18,7 @@ pub mod lsp;
 pub mod mcp;
 pub mod model_bundle;
 pub mod preview;
+pub mod search;
 pub mod studio;
 pub mod terminal;
 pub mod image;

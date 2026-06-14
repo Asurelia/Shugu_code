@@ -30,6 +30,75 @@ import {
 // stash each row's outcome here as the user tests servers independently.
 type TestResult = { tools: McpToolInfo[] } | { error: string };
 
+// Pré-remplissage du formulaire « Ajouter un serveur ». Tous les presets du
+// catalogue sont en `npx` (Node, présent sur la machine — pas de dépendance
+// Python/uv), pour qu'un clic « just works ».
+type Preset = {
+  id: string;
+  name: string;
+  label: string;
+  desc: string;
+  command: string;
+  args: string;
+  env?: string; // lignes KEY=VALUE à compléter par l'utilisateur
+  envNote?: string;
+};
+
+// Catalogue restreint de serveurs MCP utiles et fiables. L'objectif est qu'un
+// utilisateur non-technique branche un outil externe sans connaître la commande.
+const RECOMMENDED: Preset[] = [
+  {
+    id: "filesystem",
+    name: "filesystem",
+    label: "Fichiers",
+    desc: "Lire et parcourir des fichiers d'un dossier (au-delà du workspace).",
+    command: "npx",
+    args: "-y @modelcontextprotocol/server-filesystem .",
+  },
+  {
+    id: "memory",
+    name: "memory",
+    label: "Mémoire",
+    desc: "Mémoire persistante (graphe de connaissances) entre les sessions.",
+    command: "npx",
+    args: "-y @modelcontextprotocol/server-memory",
+  },
+  {
+    id: "sequential-thinking",
+    name: "sequential-thinking",
+    label: "Raisonnement",
+    desc: "Outil de réflexion structurée étape par étape pour les tâches complexes.",
+    command: "npx",
+    args: "-y @modelcontextprotocol/server-sequential-thinking",
+  },
+  {
+    id: "context7",
+    name: "context7",
+    label: "Docs de libs",
+    desc: "Documentation à jour de n'importe quelle librairie/framework (Context7).",
+    command: "npx",
+    args: "-y @upstash/context7-mcp",
+  },
+  {
+    id: "playwright",
+    name: "playwright",
+    label: "Navigateur",
+    desc: "Pilote un vrai navigateur : naviguer, cliquer, remplir, capturer (Playwright).",
+    command: "npx",
+    args: "-y @playwright/mcp@latest",
+  },
+  {
+    id: "github",
+    name: "github",
+    label: "GitHub",
+    desc: "Repos, pull requests, issues. Nécessite un jeton GitHub.",
+    command: "npx",
+    args: "-y @modelcontextprotocol/server-github",
+    env: "GITHUB_PERSONAL_ACCESS_TOKEN=",
+    envNote: "Colle ton jeton GitHub (Settings → Developer settings → Personal access tokens) après le =.",
+  },
+];
+
 export function McpServersSection() {
   const { data: servers, isLoading, error } = useMcpServers();
   const toggle = useMcpToggle();
@@ -37,6 +106,8 @@ export function McpServersSection() {
   const remove = useMcpRemove();
 
   const [adding, setAdding] = useState(false);
+  // Pré-remplissage du formulaire depuis le catalogue 1-clic (null = vierge).
+  const [preset, setPreset] = useState<Preset | null>(null);
   // Which server is currently being probed (drives the "Test…" button label).
   const [testingName, setTestingName] = useState<string | null>(null);
   // Per-server probe results (tools or error).
@@ -91,16 +162,44 @@ export function McpServersSection() {
       </p>
 
       <div className="conn-actions" style={{ marginTop: 12 }}>
-        <button className="lgb lgb-sm lgb-primary" onClick={() => setAdding((v) => !v)}>
+        <button
+          className="lgb lgb-sm lgb-primary"
+          onClick={() => { setPreset(null); setAdding((v) => !v); }}
+        >
           <Icon name={adding ? "x" : "plus"} size={12} />
           {adding ? " Annuler" : " Ajouter un serveur"}
         </button>
       </div>
 
+      {/* Catalogue 1-clic — pré-remplit le formulaire avec un serveur connu, pour
+          que l'utilisateur n'ait pas à connaître la commande exacte. Masqué
+          pendant l'édition pour ne pas encombrer. */}
+      {!adding && (
+        <div style={{ marginTop: 14 }}>
+          <div className="sub" style={{ marginBottom: 8 }}>
+            Ajout rapide — clique un outil pour pré-remplir le formulaire :
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            {RECOMMENDED.map((p) => (
+              <button
+                key={p.id}
+                className="lgb lgb-sm"
+                title={p.desc}
+                onClick={() => { setPreset(p); setAdding(true); }}
+              >
+                <Icon name="plus" size={11} /> {p.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {adding && (
         <AddServerForm
-          onClose={() => setAdding(false)}
-          onAdded={() => setAdding(false)}
+          key={preset?.id ?? "blank"}
+          preset={preset}
+          onClose={() => { setAdding(false); setPreset(null); }}
+          onAdded={() => { setAdding(false); setPreset(null); }}
         />
       )}
 
@@ -324,16 +423,19 @@ function TransportBadge({ transport }: { transport: string }) {
 
 // ─── Add-server inline form ──────────────────────────────────────────────────
 
-function AddServerForm({ onClose, onAdded }: { onClose: () => void; onAdded: () => void }) {
+function AddServerForm({ preset, onClose, onAdded }: { preset?: Preset | null; onClose: () => void; onAdded: () => void }) {
   const add = useMcpAdd();
-  const [name, setName] = useState("");
+  // Initialise depuis le preset du catalogue (tous en stdio). Le composant est
+  // `key`-é par preset.id côté parent → remonté à chaque choix, donc ces valeurs
+  // initiales reflètent bien le prest sélectionné.
+  const [name, setName] = useState(preset?.name ?? "");
   const [kind, setKind] = useState<"stdio" | "http">("stdio");
   // stdio fields
-  const [command, setCommand] = useState("");
-  const [argsLine, setArgsLine] = useState("");
+  const [command, setCommand] = useState(preset?.command ?? "");
+  const [argsLine, setArgsLine] = useState(preset?.args ?? "");
   // env entered as "KEY=VALUE" lines (one per line). Written in clear text into
   // .mcp.json in v1 — surfaced with a visible warning below (keychain later).
-  const [envLines, setEnvLines] = useState("");
+  const [envLines, setEnvLines] = useState(preset?.env ?? "");
   // http fields
   const [url, setUrl] = useState("");
   // scope
@@ -442,6 +544,19 @@ function AddServerForm({ onClose, onAdded }: { onClose: () => void; onAdded: () 
               />
             </div>
           </div>
+          {preset?.envNote && (
+            <div style={{
+              padding: "6px 10px",
+              borderRadius: 6,
+              background: "rgba(124, 58, 237, 0.10)",
+              border: "1px solid rgba(124, 58, 237, 0.30)",
+              fontSize: 11,
+              color: "var(--on-surface)",
+              lineHeight: 1.4,
+            }}>
+              💡 {preset.envNote}
+            </div>
+          )}
           {hasEnv && (
             <div style={{
               padding: "6px 10px",

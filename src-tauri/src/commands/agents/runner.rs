@@ -53,7 +53,10 @@ const MAX_ITERATIONS: u32 = 24;
 /// we block it explicitly so plan mode never persists anything). MCP tools are
 /// not classified (namespaced `mcp__…`, mutation unknown — see manifest filter).
 fn is_write_tool(name: &str) -> bool {
-    matches!(name, "fs_write_file" | "fs_edit" | "run_command" | "skill_save")
+    matches!(
+        name,
+        "fs_write_file" | "fs_edit" | "fs_delete" | "fs_move" | "run_command" | "skill_save"
+    )
 }
 
 /// Returned to the model if it invokes a write tool while in plan mode
@@ -179,111 +182,12 @@ fn load_conversation_history(app: &AppHandle, conversation_id: &str, limit: u32)
     history
 }
 
-// ────────────────────────────────────────────────────────────────────
-// web_search — best-effort, keyless (DuckDuckGo HTML). Async : utilise le
-// client reqwest déjà construit pour le streaming. Fragile par nature (parsing
-// HTML) → dégrade en message clair, jamais en panique.
-// ────────────────────────────────────────────────────────────────────
-
-async fn web_search_ddg(client: &reqwest::Client, query: &str, max: usize) -> (String, bool) {
-    let resp = client
-        .get("https://html.duckduckgo.com/html/")
-        .query(&[("q", query)])
-        .header(
-            reqwest::header::USER_AGENT,
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        )
-        // Deadline PROPRE à cette requête (le client est celui du streaming SSE,
-        // tolérant 300 s de silence — inadapté à un simple GET). Une réponse DDG
-        // qui pend ne gèle donc plus l'agent que 15 s.
-        .timeout(std::time::Duration::from_secs(15))
-        .send()
-        .await;
-    let html = match resp {
-        Ok(r) => match r.text().await {
-            Ok(t) => t,
-            Err(e) => return (format!("web_search: failed to read response: {e}"), true),
-        },
-        Err(e) => return (format!("web_search: request failed ({e}). Check connectivity."), true),
-    };
-    let results = parse_ddg_results(&html, max);
-    if results.is_empty() {
-        return (
-            format!(
-                "web_search: no results parsed for «{query}» (DuckDuckGo may have blocked the request \
-                 or changed its HTML). You can fetch a specific URL with run_command, e.g. `curl -sL <url>`."
-            ),
-            false,
-        );
-    }
-    (format!("Web results for «{query}»:\n\n{results}"), false)
-}
-
-/// Parse la page HTML DuckDuckGo : un résultat = un `result__a` (href + titre)
-/// suivi d'un `result__snippet`. Décode le lien de redirection `/l/?uddg=…`.
-/// Renvoie une liste numérotée, ou "" si rien n'a pu être extrait.
-fn parse_ddg_results(html: &str, max: usize) -> String {
-    use regex::Regex;
-    let link_re = Regex::new(r#"(?s)<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#).ok();
-    let snippet_re = Regex::new(r#"(?s)<a[^>]*class="result__snippet"[^>]*>(.*?)</a>"#).ok();
-    let (link_re, snippet_re) = match (link_re, snippet_re) {
-        (Some(a), Some(b)) => (a, b),
-        _ => return String::new(),
-    };
-    let links: Vec<(String, String)> = link_re
-        .captures_iter(html)
-        .take(max)
-        .map(|c| (decode_ddg_url(&c[1]), strip_html(&c[2])))
-        .collect();
-    let snippets: Vec<String> = snippet_re
-        .captures_iter(html)
-        .take(max)
-        .map(|c| strip_html(&c[1]))
-        .collect();
-    let mut out = String::new();
-    for (i, (url, title)) in links.iter().enumerate() {
-        let title = if title.is_empty() { "(untitled)" } else { title.as_str() };
-        out.push_str(&format!("{}. {}\n   {}\n", i + 1, title, url));
-        if let Some(snip) = snippets.get(i) {
-            if !snip.is_empty() {
-                out.push_str(&format!("   {snip}\n"));
-            }
-        }
-        out.push('\n');
-    }
-    out.trim_end().to_string()
-}
-
-/// Décode l'URL réelle depuis un lien de redirection DDG `…/l/?uddg=<enc>&…`.
-fn decode_ddg_url(href: &str) -> String {
-    if let Some(idx) = href.find("uddg=") {
-        let rest = &href[idx + 5..];
-        let enc = rest.split('&').next().unwrap_or(rest);
-        if let Ok(dec) = percent_encoding::percent_decode_str(enc).decode_utf8() {
-            return dec.into_owned();
-        }
-    }
-    // Normalise un href protocole-relatif "//host/…" → "https://host/…".
-    href.strip_prefix("//").map(|s| format!("https://{s}")).unwrap_or_else(|| href.to_string())
-}
-
-/// Retire les balises HTML + décode quelques entités courantes (best-effort).
-fn strip_html(s: &str) -> String {
-    use regex::Regex;
-    let no_tags = Regex::new(r"<[^>]+>")
-        .map(|re| re.replace_all(s, "").into_owned())
-        .unwrap_or_else(|_| s.to_string());
-    no_tags
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#x27;", "'")
-        .replace("&#39;", "'")
-        .replace("&nbsp;", " ")
-        .trim()
-        .to_string()
-}
+// web_search / web_fetch vivent désormais dans `commands::search` (moteur
+// hybride Brave/Tavily + repli DuckDuckGo durci, et récupération de page). Le
+// fork async du dispatch (plus bas) route `web_search` et `web_fetch` vers ce
+// module via le client reqwest du streaming. Migré ici pour dédupliquer la
+// logique réseau et la rendre réutilisable par le chat-direct.
+use crate::commands::search;
 
 // ────────────────────────────────────────────────────────────────────
 // Internal conversation history shape
@@ -882,6 +786,26 @@ pub(super) async fn tool_use_loop(
                 });
             }
         }
+        // Recherche NATIVE du provider : si le réglage `search.preferNative` est
+        // ON (défaut) et que le modèle a sa propre recherche serveur, on
+        // REMPLACE notre `web_search` client par l'outil serveur du provider —
+        // le modèle exécute la recherche lui-même (résultats frais + citations).
+        // On GARDE `web_fetch` client pour lire les pages (hybride sûr). Le
+        // parseur SSE abandonne déjà en silence les blocs serveur, donc aucun
+        // changement de parsing. Gate conservateur (cf. search.rs) → jamais de
+        // 400 sur un modèle incapable ; sinon notre recherche client reste.
+        let prefer_native = crate::commands::mcp::read_setting(app, "search.preferNative")
+            .as_deref()
+            != Some("false");
+        if prefer_native
+            && protocol == "anthropic"
+            && search::model_supports_native_search("anthropic", &model)
+        {
+            if let Some(a) = arr.as_array_mut() {
+                a.retain(|t| t["name"].as_str() != Some("web_search"));
+                a.extend(search::anthropic_server_web_tools());
+            }
+        }
         Some(arr)
     };
 
@@ -1008,15 +932,20 @@ pub(super) async fn tool_use_loop(
         let any_async = turn
             .tool_calls
             .iter()
-            .any(|tc| tc.name.starts_with("mcp__") || tc.name == "web_search" || tc.name == "advisor");
+            .any(|tc| {
+                tc.name.starts_with("mcp__")
+                    || tc.name == "web_search"
+                    || tc.name == "web_fetch"
+                    || tc.name == "advisor"
+            });
 
         let results: Vec<ToolResult> = if any_async {
             let mgr = app.state::<crate::commands::mcp::McpManager>();
             let mut acc: Vec<ToolResult> = Vec::with_capacity(turn.tool_calls.len());
             for tc in &turn.tool_calls {
                 if tc.name == "web_search" {
-                    // Recherche web async via le client reqwest (best-effort DDG).
-                    // Read-only → disponible aussi en mode Plan.
+                    // Recherche web async via le client reqwest (Brave/Tavily si
+                    // clé, sinon DuckDuckGo durci). Read-only → dispo en Plan.
                     let args: serde_json::Value =
                         serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
                     let query = args["query"].as_str().unwrap_or("").trim();
@@ -1024,7 +953,25 @@ pub(super) async fn tool_use_loop(
                     let (content, is_error) = if query.is_empty() {
                         ("web_search: missing required field: query".to_string(), true)
                     } else {
-                        web_search_ddg(client, query, max).await
+                        search::web_search(client, query, max).await
+                    };
+                    acc.push(ToolResult {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        is_error,
+                        content,
+                    });
+                } else if tc.name == "web_fetch" {
+                    // Récupération de page async (HTML→texte). Read-only → Plan OK.
+                    let args: serde_json::Value =
+                        serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
+                    let url = args["url"].as_str().unwrap_or("").trim();
+                    let max_chars =
+                        args["max_chars"].as_u64().unwrap_or(48_000).clamp(500, 200_000) as usize;
+                    let (content, is_error) = if url.is_empty() {
+                        ("web_fetch: missing required field: url".to_string(), true)
+                    } else {
+                        search::web_fetch(client, url, max_chars).await
                     };
                     acc.push(ToolResult {
                         id: tc.id.clone(),

@@ -67,6 +67,7 @@ export function ConnectionsView() {
   };
   const tabs = [
     { v: "models",    l: "AI Providers" },
+    { v: "search",    l: "Recherche web" },
     { v: "tools",     l: "Dev tools" },
     { v: "mcp",       l: "Serveurs MCP" },
     { v: "image",     l: "Image services" },
@@ -114,6 +115,17 @@ export function ConnectionsView() {
       // (shell-out, no API key). Rendered by a dedicated <CodexCard/> (status +
       // usage panel) instead of the generic key-field ConnCard.
       { id: "codex", name: "OpenAI Codex", meta: "Abonnement ChatGPT (CLI)", logo: "C", color: "#10a37f", fields: [] },
+    ],
+    search: [
+      // Les clés vont dans le keychain sous `provider.brave.apiKey` /
+      // `provider.tavily.apiKey` — exactement ce que `commands::search` lit côté
+      // Rust pour la cascade web_search (Brave → Tavily → DuckDuckGo sans clé).
+      { id: "brave", name: "Brave Search", meta: "Recherche web fiable · 2000 requêtes/mois gratuites", logo: "B", color: "#fb542b", fields: [
+        { label: "API key", key: "apiKey", placeholder: "BSA…", secret: true },
+      ]},
+      { id: "tavily", name: "Tavily", meta: "Recherche optimisée pour l'IA (renvoie aussi le contenu)", logo: "T", color: "#3b82f6", fields: [
+        { label: "API key", key: "apiKey", placeholder: "tvly-…", secret: true },
+      ]},
     ],
     tools: [
       { id: "github", name: "GitHub", meta: "Repos, PRs, issues", logo: "G", color: "#24292f", fields: [
@@ -194,6 +206,11 @@ export function ConnectionsView() {
             )}
           </div>
           {tab === "models" && <RoutingSection />}
+          {tab === "search" && (
+            <p className="sub" style={{ marginTop: 14 }}>
+              Sans clé, la recherche web de l'agent fonctionne quand même (DuckDuckGo, best-effort) — mais elle peut être bloquée ou vide. Ajoute une clé <b>Brave</b> ou <b>Tavily</b> pour des résultats fiables. Une seule suffit ; Brave est essayé en premier, puis Tavily, puis DuckDuckGo. Les modèles dotés de leur propre recherche (Claude, GPT…) l'utilisent directement.
+            </p>
+          )}
           {tab === "mcp" && <McpServersSection />}
         </div>
       </div>

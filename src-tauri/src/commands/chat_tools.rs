@@ -74,6 +74,26 @@ fn tool_defs(write_enabled: bool) -> Vec<(&'static str, &'static str, Value)> {
             "Recherche ripgrep dans le workspace (cap 80).",
             json!({"type":"object","properties":{"query":{"type":"string"},"regex":{"type":"boolean"},"case_sensitive":{"type":"boolean"}},"required":["query"]}),
         ),
+        // Outils de RECHERCHE en lecture seule — toujours présents (indépendants
+        // de write_enabled). Le chat peut chercher le web, lire une page, et
+        // chercher dans le code par sens. Le dispatch (async) vit dans
+        // chat::run_chat_tool_loop, PAS dans execute_chat_tool (sync) : ces trois
+        // outils ne font pas d'écriture et ne passent jamais par le journal.
+        (
+            "web_search",
+            "Cherche sur le web public et renvoie les meilleurs résultats (titre, URL, extrait). Pour toute info récente, doc de lib, message d'erreur, ou ce qui n'est pas dans le projet local.",
+            json!({"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer"}},"required":["query"]}),
+        ),
+        (
+            "web_fetch",
+            "Récupère une page web (ou un texte/JSON) et renvoie son contenu lisible (HTML nettoyé). À utiliser APRÈS web_search pour vraiment lire un résultat, ou sur une URL fournie. http/https uniquement.",
+            json!({"type":"object","properties":{"url":{"type":"string"},"max_chars":{"type":"integer"}},"required":["url"]}),
+        ),
+        (
+            "code_search",
+            "Recherche SÉMANTIQUE dans l'index vectoriel du projet (embeddings). Renvoie les emplacements de code les plus pertinents pour une requête en langage naturel — plus malin que fs_search quand on ne connaît pas l'identifiant exact. Vide si l'index n'est pas construit.",
+            json!({"type":"object","properties":{"query":{"type":"string"},"k":{"type":"integer"}},"required":["query"]}),
+        ),
     ];
     if write_enabled {
         v.push((
