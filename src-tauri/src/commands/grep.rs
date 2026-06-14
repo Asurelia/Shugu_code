@@ -97,8 +97,8 @@ pub async fn fs_grep_workspace(
 ) -> Result<Vec<GrepMatch>, String> {
     // Snapshot du workspace root — clone hors du Mutex (pas de lock pendant la
     // recherche). Le cœur est factorisé dans `grep_inner` pour être réutilisé
-    // tel quel par l'outil agent `fs_search` (qui passe un root sandbox, pas le
-    // state).
+    // tel quel par l'outil agent `fs_search` (qui passe le root de l'agent —
+    // workspace réel ou dossier de création Atelier — pas le state).
     let workspace_root: Option<PathBuf> = {
         let state = app.state::<Mutex<Option<PathBuf>>>();
         let guard = state.lock().map_err(|e| format!("workspace lock: {e}"))?;
@@ -114,7 +114,7 @@ pub async fn fs_grep_workspace(
 
 /// Cœur SYNC de la recherche workspace, factorisé hors de `fs_grep_workspace`
 /// pour que la commande Tauri (root depuis le state) ET l'outil agent
-/// `fs_search` (root = la COPIE sandbox du banc) partagent exactement le même
+/// `fs_search` (root = le workspace de l'agent) partagent exactement le même
 /// moteur. Bloque pendant que le walker parallèle tourne — à appeler dans un
 /// `spawn_blocking` (la commande) ou un contexte déjà bloquant (le dispatcher
 /// d'outils agent tourne sous `spawn_blocking`).

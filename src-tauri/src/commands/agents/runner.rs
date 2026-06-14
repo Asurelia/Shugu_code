@@ -37,23 +37,14 @@ use super::tools::{execute_tool, ToolCall, ToolResult};
 use super::{get_conn, now_ms, persist_and_emit, AgentEvent, AgentHandle};
 use crate::commands::chat::{self, AssistantTurn, ChatMessage};
 
-/// Maximum tool-use rounds per agent run. 8 ≈ "read 3-5 files, write 1-2,
-/// verify, summarize" with comfortable headroom. Beyond 8 we treat the
-/// agent as wedged but RETURN whatever content it produced rather than
-/// erroring (cf. logic in `tool_use_loop`) — see below.
-///
-/// 2026-05-17 — bumped from 6 to 8 after a real test where DeepSeek V4
-/// Flash kept calling tools (22 in a single iteration) without producing
-/// a final answer. Plus on the LAST iteration, we inject a synthetic
-/// "[Shugu system] FINAL iteration" message and force-accept whatever
-/// content the model returns — even empty — so the user gets SOME
-/// signal instead of "agent exceeded MAX_ITERATIONS" with no output.
-const MAX_ITERATIONS: u32 = 8;
-
-/// Iteration budget for the Atelier (exec) path. Higher than chat because each
-/// write→run-test→fix cycle costs one iteration; the agent needs room to see a
-/// real failure, fix it, and re-run before producing its final answer.
-const MAX_ITERATIONS_EXEC: u32 = 24;
+/// Maximum tool-use rounds per agent run. Unifié à 24 depuis le pivot
+/// exec-directe (2026-06-10) : TOUT agent peut maintenant exécuter du code,
+/// et chaque cycle write→run-test→fix coûte une itération — l'agent a besoin
+/// de marge pour voir un échec réel, corriger, relancer. Sur la DERNIÈRE
+/// itération on injecte un message "[Shugu system] FINAL iteration" et on
+/// force-accepte ce que le modèle produit (même vide) plutôt qu'une erreur
+/// "exceeded MAX_ITERATIONS" sans output.
+const MAX_ITERATIONS: u32 = 24;
 
 // ────────────────────────────────────────────────────────────────────
 // Internal conversation history shape
@@ -270,15 +261,10 @@ pub(super) async fn run_agent_task(
     chat_template_kwargs: Option<serde_json::Value>,
     design_context: Option<String>,
     abort: Arc<tokio::sync::Notify>,
-    // Atelier additions: when set, the agent works on a disposable mirror with
-    // execution enabled and a task-specific prompt. Chat passes (None, false, None).
+    // Atelier : quand `Some`, l'agent travaille dans CE dossier (temp de
+    // création) au lieu du workspace ouvert. `None` = workspace réel.
     workspace_override: Option<PathBuf>,
-    allow_exec: bool,
     system_prompt_override: Option<String>,
-    // Read-only `(host, container)` mounts added to the exec sandbox. Grounded
-    // Run passes the live project's `node_modules` so `pnpm`/`tsc` resolve
-    // OFFLINE; chat/atelier pass an empty vec (no extra mounts).
-    exec_ro_mounts: Vec<(String, String)>,
 ) {
     let start = std::time::Instant::now();
     let protocol = protocol.unwrap_or_else(|| "openai".to_string());
@@ -348,7 +334,15 @@ pub(super) async fn run_agent_task(
         },
     ];
 
-    let client = reqwest::Client::new();
+    // Client borné (lot timeouts) : connect 15 s + 300 s de silence max entre
+    // deux chunks — un provider mort ne pend plus l'agent indéfiniment.
+    let client = match chat::streaming_client() {
+        Ok(c) => c,
+        Err(e) => {
+            finish_error(&app, &state, &agent_id, &e);
+            return;
+        }
+    };
 
     // Whole loop racing the abort token. Inside, the multi-turn loop
     // body (`tool_use_loop`) calls the LLM, executes tools, appends to
@@ -369,8 +363,6 @@ pub(super) async fn run_agent_task(
             &mut history,
             &mut loop_metrics,
             workspace_override,
-            allow_exec,
-            exec_ro_mounts,
         ) => r,
         _ = abort.notified() => {
             mark_killed(&app, &agent_id);
@@ -458,16 +450,9 @@ pub(super) async fn tool_use_loop(
     history: &mut Vec<AgentMessage>,
     metrics: &mut LoopMetrics,
     // When `Some`, tool calls resolve against THIS root instead of the global
-    // open workspace — the measurement bench points it at a copied fixture so a
-    // run never touches the user's real project. `None` = current behaviour.
+    // open workspace (the Atelier's throwaway creation dir). `None` = the
+    // real open workspace.
     workspace_override: Option<PathBuf>,
-    // When `false`, the `run_command` tool is REFUSED. Executing code runs
-    // arbitrary commands a path-guard can't contain, so only the bench (which
-    // works on a disposable copy) passes `true`; real chat agents pass `false`.
-    allow_exec: bool,
-    // Read-only mounts threaded to `run_command`'s sandbox (Grounded Run's
-    // `node_modules`); empty for chat/atelier.
-    exec_ro_mounts: Vec<(String, String)>,
 ) -> Result<(String, String), String> {
     // Stall-detection state: repeated identical tool-call signatures and
     // consecutive tool-error rounds are the two cheap "stuck" signals, recorded
@@ -476,9 +461,9 @@ pub(super) async fn tool_use_loop(
     let mut last_sig: Option<String> = None;
     let mut repeat_count: u32 = 0;
     let mut err_streak: u32 = 0;
-    // Iteration budget. The Atelier (exec) path gets more room because each
-    // write→run-test→fix cycle costs one iteration; chat stays tight.
-    let budget = if allow_exec { MAX_ITERATIONS_EXEC } else { MAX_ITERATIONS };
+    // Iteration budget — unified now that every agent can exec (each
+    // write→run-test→fix cycle costs one iteration).
+    let budget = MAX_ITERATIONS;
     let mut iteration: u32 = 0;
 
     // Load this role's learned skills (Voyager/Hermes) into context, right after
@@ -536,8 +521,8 @@ pub(super) async fn tool_use_loop(
     // Env-verified skill gate: `run_command` writes its exit code here; the
     // `skill_save` tool refuses unless the LAST run was exit 0. A skill is thus
     // only ever born from a test the REAL environment confirmed — never an LLM
-    // opinion. Sentinel i64::MIN = "no command run yet" (so chat, which can't
-    // exec, never saves a skill). Shared (Arc) into each parallel tool task.
+    // opinion. Sentinel i64::MIN = "no command run yet". Shared (Arc) into
+    // each parallel tool task.
     let last_exec_exit = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN));
 
     // Lot C — MCP : assemble the tools manifest ONCE per run (not per iteration).
@@ -711,9 +696,9 @@ pub(super) async fn tool_use_loop(
                     let app_clone = app.clone();
                     let role_clone = role.to_string();
                     let last_exec_clone = last_exec_exit.clone();
-                    let mounts_clone = exec_ro_mounts.clone();
+                    let agent_id_clone = agent_id.to_string();
                     let r = tokio::task::spawn_blocking(move || {
-                        execute_tool(&tc_clone, &root_clone, allow_exec, &app_clone, &role_clone, &last_exec_clone, &mounts_clone)
+                        execute_tool(&tc_clone, &root_clone, &app_clone, &role_clone, &last_exec_clone, &agent_id_clone)
                     })
                     .await
                     .unwrap_or_else(|join_err| ToolResult {
@@ -751,7 +736,7 @@ pub(super) async fn tool_use_loop(
                 let app_clone = app.clone();
                 let role_clone = role.to_string();
                 let last_exec_clone = last_exec_exit.clone();
-                let mounts_clone = exec_ro_mounts.clone();
+                let agent_id_clone = agent_id.to_string();
                 async move {
                     // `spawn_blocking` because the fs ops are synchronous —
                     // running them on the async runtime thread would starve
@@ -759,7 +744,7 @@ pub(super) async fn tool_use_loop(
                     // a JoinError (panic in the closure); `execute_tool`
                     // itself never panics for normal fs failures.
                     tokio::task::spawn_blocking(move || {
-                        execute_tool(&tc_clone, &root_clone, allow_exec, &app_clone, &role_clone, &last_exec_clone, &mounts_clone)
+                        execute_tool(&tc_clone, &root_clone, &app_clone, &role_clone, &last_exec_clone, &agent_id_clone)
                     })
                         .await
                         .unwrap_or_else(|join_err| ToolResult {
@@ -1013,45 +998,37 @@ async fn call_agent_llm_with_tools(
 /// strings in `seed_prompt` stay untouched.
 const GENERATION_MODE_PROMPT: &str = "=== GENERATION MODE (a design system is active) ===\nWhen the task asks you to build, generate, create, or design a page, site, landing page, dashboard, component, or any UI, you MUST produce a COMPLETE, SELF-CONTAINED static web project WRITTEN TO DISK using `fs_write_file` — NOT a chat answer and NOT a single fenced code block.\n\nBefore writing files, call `todo_write` with a short checklist (3-6 steps) of your plan, then update the statuses as you complete each step.\n\nRules:\n1. Write the entry point at `.shugu-forge/preview/index.html`.\n2. Put CSS in `.shugu-forge/preview/styles.css` and JS in `.shugu-forge/preview/script.js`, linked from index.html with RELATIVE paths (href=\"styles.css\", src=\"script.js\").\n3. Apply the design context below (a design system and/or a colour direction): declare its color / typography / spacing tokens as CSS custom properties in `:root { ... }`, and follow the visual direction, component patterns, and anti-patterns.\n4. Produce real, polished, responsive markup with enough sections to demonstrate the design (e.g. hero, content sections, footer). No placeholder-only output.\n5. Always (over)write the files under `.shugu-forge/preview/` so the live preview reflects the latest version; read existing files first when iterating.\n6. After writing, reply with ONE short line: what you built, which design skill(s) you applied, + the entry path `.shugu-forge/preview/index.html`.";
 
-/// System prompt for an Atelier run — the env-grounded learning loop. The agent
-/// builds a small web UI on a throwaway mirror, then PROVES it works by driving a
-/// real browser (Playwright in the Docker sandbox), iterates on real failures,
-/// and only saves a skill once the test exits 0 (the gate enforces this). This is
-/// the Voyager/Hermes loop: act → observe real feedback → adapt → capture.
-pub(super) const GROUNDED_PROMPT: &str = r#"You are Shugu's Grounded agent. You work on a DISPOSABLE COPY of the user's real project — never the live tree — with execution ENABLED inside a network-isolated sandbox. Your job: make the requested change AND prove it works by running the project's own checks.
+/// System prompt for a Grounded Run — the env-grounded loop on the user's REAL
+/// project (exec directe depuis le pivot 2026-06-10 ; le filet de sécurité est
+/// git, visible dans l'onglet Git de l'app).
+pub(super) const GROUNDED_PROMPT: &str = r#"You are Shugu's Grounded agent. You work DIRECTLY on the user's real project, with execution enabled on their machine. Git is the safety net: every change you make is visible in the app's Git panel, where the user can review and discard it. Your job: make the requested change AND prove it works by running the project's own checks.
 
 LOOP (DeepSWE-shaped):
 1. UNDERSTAND before editing. Use fs_search and fs_read_file to locate the relevant code and read it FULLY. Never edit a file you have not read.
 2. EDIT surgically: fs_edit for changes to existing files, fs_write_file for new ones.
-3. VERIFY after every change with run_command. If a verification command was provided below, run it — but adapt it to the sandbox toolchain below if needed.
+3. VERIFY after every change with run_command. If a verification command was provided below, run EXACTLY that. Otherwise read package.json / Cargo.toml to find the project's own check (typecheck, test, build) and run it.
 4. READ the failure. A non-zero exit is INFORMATION, not defeat: read stderr, find the root cause, fix it, then run the check AGAIN.
 5. Declare done ONLY when the check passes (exit 0). End with a short plain-text summary of what you changed and why.
 
-SANDBOX TOOLCHAIN (what actually exists in this container):
-- Available: `node`, `npm`, `npx` (with `--no-install`), and any local binary under `node_modules/.bin/`. The project's installed `node_modules` IS mounted, so local tools resolve.
-- NOT usable: `pnpm` and `yarn` are absent, and the network is OFF — `corepack` exists but cannot fetch them offline, so you CANNOT install anything. Translate any `pnpm`/`yarn` command to its offline equivalent:
-    `pnpm typecheck` / `pnpm run typecheck`  →  read the script in `package.json` and run it directly, e.g. `node_modules/.bin/tsc -b --noEmit`
-    `pnpm test`                               →  `node_modules/.bin/<runner> ...` or `npx --no-install <runner>`
-    `pnpm exec X` / `pnpm dlx X`              →  `npx --no-install X`
-- For TypeScript projects, `node_modules/.bin/tsc --noEmit` (or `-b --noEmit` for project references) is the reliable type check.
-- For Rust/Python projects in the sandbox, prefer `cargo check` / `pytest` only if that toolchain is present; otherwise verify what you can.
+TOOLCHAIN: you run on the user's real machine — `node`, `pnpm`, `npm`, `npx`, `cargo`, `git`, etc. resolve exactly as in their terminal, network included.
 
-RULES:
-- The copy is throwaway; the user reviews your diff and can revert it with one click. Be bold but correct.
-- run_command runs OFFLINE (no network). Do not try to install packages or fetch anything — work with what is already present (see toolchain above).
+RULES (you are editing the REAL project — be surgical):
+- NEVER run destructive commands outside the task scope: no `rm`/`del` sweeps, no `git commit`, `git push`, `git checkout`, `git reset` unless the task EXPLICITLY asks for it.
+- Do not install global tools or modify files outside the workspace unless the task explicitly requires it.
+- No drive-by refactors: change what the task needs, nothing else.
 - Keep going until the check is green or you exhaust your iteration budget. Honest partial progress beats a confident wrong answer.
 "#;
 
 pub(super) const ATELIER_PROMPT: &str = r#"You are Shugu's Atelier agent. You build a small WEB UI and then PROVE it works by actually driving a real browser — never by claiming it looks correct.
 
-You work on a DISPOSABLE copy of nothing (a throwaway mirror), never the user's real project. All file paths are workspace-relative POSIX paths (e.g. `index.html`, `app.js`). Your tools: `fs_write_file(path, content)`, `fs_read_file(path)`, `fs_edit(path, old_string, new_string)`, `fs_list_dir(path)`, `run_command(command)`, and `skill_save(name, when_to_use, body)`.
+You work in a THROWAWAY creation directory (empty temp dir), never the user's real project. All file paths are workspace-relative POSIX paths (e.g. `index.html`, `app.js`). Your tools: `fs_write_file(path, content)`, `fs_read_file(path)`, `fs_edit(path, old_string, new_string)`, `fs_list_dir(path)`, `run_command(command)`, and `skill_save(name, when_to_use, body)`. Commands run directly on the user's machine (real node/npm toolchain, network available), cwd = your creation directory.
 
 THE LOOP — follow it exactly:
-1. BUILD the app: write a self-contained static web app to disk — `index.html` plus optional `styles.css` / `app.js` linked with relative paths. Vanilla HTML/CSS/JS only: NO build step, NO frameworks, NO npm packages.
+1. BUILD the app: write a self-contained static web app to disk — `index.html` plus optional `styles.css` / `app.js` linked with relative paths. Vanilla HTML/CSS/JS only: NO build step, NO frameworks.
 2. WRITE a browser test that DRIVES the UI. Create a CommonJS file `test.cjs` that uses Playwright for real interaction:
-   - `const { chromium } = require('playwright');`
-   - launch with `chromium.launch({ args: ['--no-sandbox'] })` (the `--no-sandbox` flag is REQUIRED inside the container),
-   - `await page.goto('file:///work/index.html');`  (your files are mounted at /work in the sandbox),
+   - first check Playwright resolves: `run_command("node -e \"require('playwright')\"")`. If it fails, install it locally: `run_command("npm init -y && npm install playwright && npx playwright install chromium", timeoutSecs: 300)`.
+   - `const { chromium } = require('playwright');` and `chromium.launch()`,
+   - open the page with an ABSOLUTE file URL built from the cwd: `const url = 'file:///' + process.cwd().replace(/\\/g, '/').replace(/^\//, '') + '/index.html'; await page.goto(url);`,
    - interact for real: `await page.click('#add')`, `await page.fill('#name', 'x')`, etc.,
    - ASSERT the resulting DOM, e.g. `const n = await page.locator('.item').count();` then `if (n !== 1) { console.error('FAIL: expected 1, got ' + n); process.exit(1); }`,
    - `await browser.close();` and finish with exit 0 on success. Wrap in `.catch(e => { console.error(e); process.exit(1); })`.
@@ -1060,8 +1037,6 @@ THE LOOP — follow it exactly:
 5. When the test PASSES (exit 0): call `skill_save` to capture the REUSABLE approach — a concise, generalizable recipe (how to build + test this kind of UI), NOT this one app's full source. The skill loads automatically into future runs so you get faster over time. NOTE: `skill_save` is REFUSED unless your last `run_command` exited 0 — the environment must confirm it works first.
 
 Rules:
-- The container has NO network. Do NOT `npm install` — Playwright is already importable via `require('playwright')`.
-- Inside `test.cjs`, always reference the page as `file:///work/...`.
 - Keep the app small but genuinely INTERACTIVE (the point is to test behavior, not render static text).
 - Finish with ONE short line: what you built and that its browser test passes."#;
 

@@ -45,12 +45,20 @@ import type { DockState, FileNode, Generation } from "@/lib/types";
 import { db, seedIfEmpty, toGenerationRow } from "@/lib/db";
 import { useActiveConv, createConversation, sendChatMessage } from "@/features/chat/chat-sync";
 import { loadOpenFiles, saveOpenFiles } from "@/lib/ide-state";
-import { fsReadFile, fsWriteFile, fsCreateDir, fsCreateFile, langToExt } from "@/lib/fs";
+import { fsReadFile, fsReadFiles, fsWriteFile, fsCreateDir, fsCreateFile, langToExt, fsSetWorkspaceRoot, fsGetWorkspaceRoot } from "@/lib/fs";
+import { RecentWorkspacesPalette } from "@/features/fs/RecentWorkspacesPalette";
+import {
+  recordRecentWorkspace,
+  removeRecentWorkspace,
+} from "@/features/fs/recentWorkspaces";
+import { pushToast } from "@/components/toast";
 import { invalidateFileTree } from "@/features/fs/queries";
 import { useFsEvents } from "@/features/fs/useEvents";
 import { useGitEvents } from "@/features/git/useEvents";
 import { useRefreshOpenFiles } from "@/features/fs/useRefreshOpenFiles";
 import { indexWorkspace } from "@/features/fs/workspaceIndexer";
+import { QuickOpenPalette } from "@/features/code/QuickOpenPalette";
+import { useRegenerateLast } from "@/features/chat/mutations";
 import { AgentsPanel } from "@/features/agents/AgentsPanel";
 import { useAgentEvents } from "@/features/agents/useEvents";
 import { setSelectedAgentId, useAgentsRailDisplay } from "@/features/agents/queries";
@@ -337,6 +345,11 @@ export function RootLayout() {
 
   const [tweaks, setTweak] = useTweaks(TWEAK_DEFAULTS);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  // Lot stubs-palette (2026-06-10) — Quick Open (Cmd+P) + Regenerate (Cmd+R).
+  const [quickOpenOpen, setQuickOpenOpen] = useState(false);
+  const regenerateLast = useRegenerateLast();
+  // Lot projets-récents — picker « Open Recent Folder… » (palette).
+  const [recentOpen, setRecentOpen] = useState(false);
 
   // Chat state — activeConvo is cross-window synchronised via chat-sync's
   // useActiveConv hook (localStorage + Tauri event). Messages no longer
@@ -564,9 +577,60 @@ export function RootLayout() {
   // first openFile), each one invalidating the file tree query, each
   // invalidation re-running this effect, each re-run spawning a parallel
   // workspace walk → catastrophic freeze (observed 2026-05-17).
+  // Lot projets-récents — le root restauré au boot entre dans l'historique
+  // (la liste se peuple donc sans action utilisateur), et la bascule depuis
+  // le picker refait le même cleanup que la commande open-folder.
+  useEffect(() => {
+    void fsGetWorkspaceRoot()
+      .then((r) => { if (r) void recordRecentWorkspace(r); })
+      .catch(() => {});
+  }, []);
+  const openRecentWorkspace = useCallback((path: string) => {
+    void (async () => {
+      try {
+        const { disconnectAllClients } = await import("@/features/code/lsp/client");
+        await disconnectAllClients();
+      } catch (err) {
+        console.warn("[recent] LSP disconnect failed:", err);
+      }
+      try {
+        const display = await fsSetWorkspaceRoot(path);
+        await recordRecentWorkspace(display);
+        invalidateFileTree();
+        setOpenFiles([]);
+        setActiveFile(null);
+        setFileContents({});
+        pushToast(`Projet ouvert : ${display.replace(/\\/g, "/").split("/").pop()}`, "success", 3000);
+      } catch (err) {
+        // Dossier supprimé/déplacé : message clair + purge de l'entrée morte.
+        pushToast(String(err), "error", 5000);
+        void removeRecentWorkspace(path);
+      }
+    })();
+  }, [invalidateFileTree, setOpenFiles, setActiveFile, setFileContents]);
+
   useEffect(() => {
     const t = setTimeout(() => { void indexWorkspace(); }, 5000);
-    return () => clearTimeout(t);
+    // Ré-index quand l'utilisateur OUVRE UN AUTRE dossier sans relancer l'app
+    // (Rust émet `workspace://changed` depuis fs_open_folder). Le hash de la
+    // liste de fichiers change → nouveau stamp TTL → vraie ré-indexation ;
+    // sur le même workspace, le TTL 24 h + le guard in-flight rendent l'appel
+    // no-op. Petit délai pour laisser le file tree se recharger d'abord.
+    let unlisten: (() => void) | null = null;
+    void (async () => {
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
+        unlisten = await listen("workspace://changed", () => {
+          setTimeout(() => { void indexWorkspace(); }, 3000);
+        });
+      } catch (err) {
+        console.warn("[RootLayout] workspace://changed listen failed:", err);
+      }
+    })();
+    return () => {
+      clearTimeout(t);
+      unlisten?.();
+    };
   }, []);
 
   // Restore the previously open tabs + active file from SQLite.
@@ -580,18 +644,30 @@ export function RootLayout() {
     let cancelled = false;
     (async () => {
       const restored = await loadOpenFiles();
-      if (cancelled || !restored) return;
-      for (const path of restored.openFiles) {
-        try {
-          const content = await fsReadFile(path);
-          if (cancelled) return;
-          setFileContents(c => ({ ...c, [path]: content }));
-          setOpenFiles(p => p.includes(path) ? p : [...p, path]);
-        } catch {
-          // File no longer exists — skip silently.
-        }
+      if (cancelled || !restored || restored.openFiles.length === 0) return;
+      // ONE batch invoke (fs_read_files) instead of one fs_read_file round-trip
+      // per tab — the old per-file loop also did 2 setState per file, i.e.
+      // ~2N re-renders of the whole shell on a cold start with N tabs.
+      // Files that no longer exist (renamed/deleted since last session) are
+      // simply absent from the returned map — same silent skip as before.
+      let contents: Awaited<ReturnType<typeof fsReadFiles>>;
+      try {
+        contents = await fsReadFiles(restored.openFiles);
+      } catch {
+        // No workspace open (or the batch failed) — nothing to restore.
+        return;
       }
       if (cancelled) return;
+      const restoredPaths = restored.openFiles.filter(p => contents[p] !== undefined);
+      if (restoredPaths.length === 0) return;
+      setFileContents(c => ({ ...c, ...contents }));
+      setOpenFiles(p => {
+        const merged = [...p];
+        for (const path of restoredPaths) {
+          if (!merged.includes(path)) merged.push(path);
+        }
+        return merged;
+      });
       // Only restore activeFile if it actually made it into openFiles
       // (avoids a "blank editor pointing at a deleted file" state).
       if (restored.activeFile) {
@@ -954,6 +1030,11 @@ export function RootLayout() {
     // LOT 3 — compare mode
     compareFile,
     setCompareFile,
+    // Lot stubs-palette (2026-06-10) — Quick Open (Cmd+P) + Regenerate (Cmd+R)
+    setQuickOpenOpen,
+    regenerateLast,
+    // Lot projets-récents
+    setRecentOpen,
   }), [
     navigateTo, view, setPaletteOpen,
     sideCollapsed, setSideCollapsed,
@@ -976,6 +1057,8 @@ export function RootLayout() {
     setEditorPref,
     // LOT 3 — compare mode
     compareFile, setCompareFile,
+    // Lot stubs-palette
+    regenerateLast,
   ]);
 
   // Global keybinding dispatcher — replaces the hardcoded Cmd+K useEffect.
@@ -1251,6 +1334,25 @@ export function RootLayout() {
           open={paletteOpen}
           onClose={() => setPaletteOpen(false)}
           ctx={cmdCtx}
+        />
+
+        {/* Lot stubs-palette — Quick Open (Cmd+P) : fuzzy picker sur le
+            workspace, ouvre dans l'éditeur via le même chemin que
+            app://open-file (openFile + navigate /code). */}
+        <QuickOpenPalette
+          open={quickOpenOpen}
+          onClose={() => setQuickOpenOpen(false)}
+          onOpen={(path) => {
+            void openFile(path);
+            navigate({ to: "/code" });
+          }}
+        />
+
+        {/* Lot projets-récents — picker « Open Recent Folder… » (palette). */}
+        <RecentWorkspacesPalette
+          open={recentOpen}
+          onClose={() => setRecentOpen(false)}
+          onPick={openRecentWorkspace}
         />
 
         {/* LOT 2 — Find-in-files workspace panel (ripgrep backend).

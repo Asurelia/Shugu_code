@@ -364,6 +364,26 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
   // Tâches/Git/Prévisu/Sources/Env). Quand c'est une carte, elle REMPLACE le
   // fil de chat dans le panneau (pas de flottant) — cf. retour utilisateur.
   const [tab, setTab] = useState<"feed" | "history" | "agents" | CtxTabId>("feed");
+  // Lot mascotte-avatar (2026-06-10) — un clic sur la bulle de parole émet
+  // `app://reveal-agent` (broadcast Tauri) : ICI on bascule le panneau mascotte
+  // sur son onglet Agents (le RootLayout du main IDE a son propre listener).
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    void (async () => {
+      try {
+        const mod = await import("@tauri-apps/api/event");
+        unlisten = await mod.listen("app://reveal-agent", () => {
+          setTab("agents");
+          setMode("full");
+        });
+      } catch (err) {
+        console.warn("[ChatPanel] reveal-agent listen failed:", err);
+      }
+    })();
+    return () => unlisten?.();
+    // setMode est stable (vient du contexte FloatShell) — deps vides voulu.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const ctxCounts = useCtxCounts(activeConv);
   // Non-null quand l'onglet actif est une carte ctx → elle s'affiche en panneau.
   const ctxMeta = CTX_TABS.find((t) => t.id === tab) ?? null;

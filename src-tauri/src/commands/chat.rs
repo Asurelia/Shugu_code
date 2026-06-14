@@ -127,6 +127,86 @@ struct ChatDelta {
     done: bool,
 }
 
+/// Coalescing emitter for `chat://delta` — accumulates token-level chunks and
+/// broadcasts ONE merged delta per ~50 ms window (or on a content/reasoning
+/// kind switch) instead of one event per token. Every `chat://delta` is
+/// delivered to BOTH webviews (main + mascot); at 30+ tokens/s the per-token
+/// firehose saturated the mascot's main thread (freeze observed 2026-06-13).
+/// Same idea as `agents::delta_buffer`, but stream-local: one coalescer lives
+/// for the duration of a single `chat_send` / tool loop, no global map.
+///
+/// Ordering contract: callers MUST `flush()` before emitting anything else on
+/// the conversation (`kind:"tool"` activity, `chat://writes`, the terminal
+/// `done` delta) so buffered text never arrives after events that follow it.
+struct ChatDeltaCoalescer {
+    app: tauri::AppHandle,
+    conversation_id: Option<String>,
+    kind: &'static str,
+    acc: String,
+    window_start: std::time::Instant,
+}
+
+impl ChatDeltaCoalescer {
+    const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+    fn new(app: tauri::AppHandle, conversation_id: Option<String>) -> Self {
+        Self {
+            app,
+            conversation_id,
+            kind: "content",
+            acc: String::new(),
+            window_start: std::time::Instant::now(),
+        }
+    }
+
+    /// Accumulate one chunk; emits the merged buffer when the kind changes
+    /// (content ↔ reasoning must not interleave inside one delta) or when the
+    /// current window is older than [`Self::FLUSH_INTERVAL`].
+    fn push(&mut self, kind: &str, chunk: &str) {
+        let delta_kind: &'static str = if kind == "reasoning" { "reasoning" } else { "content" };
+        if self.kind != delta_kind {
+            self.flush();
+            self.kind = delta_kind;
+        }
+        if self.acc.is_empty() {
+            self.window_start = std::time::Instant::now();
+        }
+        self.acc.push_str(chunk);
+        if self.window_start.elapsed() >= Self::FLUSH_INTERVAL {
+            self.flush();
+        }
+    }
+
+    /// Emit the accumulated buffer as a single non-terminal delta (no-op when
+    /// empty, so calling it defensively is free).
+    fn flush(&mut self) {
+        if self.acc.is_empty() {
+            return;
+        }
+        let delta = ChatDelta {
+            conversation_id: self.conversation_id.clone(),
+            chunk: std::mem::take(&mut self.acc),
+            kind: self.kind,
+            done: false,
+        };
+        let _ = self.app.emit("chat://delta", delta);
+    }
+}
+
+impl Drop for ChatDeltaCoalescer {
+    /// Safety net for early-return paths. `run_chat_tool_loop` flushes
+    /// explicitly after each streamed turn, but a mid-stream provider error
+    /// (`call_*_structured(...).await?`) returns via `?` BEFORE that flush —
+    /// the last <50 ms of streamed text would be lost. Dropping the coalescer
+    /// at every scope exit flushes that tail. On the success path `acc` is
+    /// already empty after the explicit flush, so this is a no-op (and the
+    /// owning function returns before the caller emits its terminal `done`
+    /// delta, so ordering is preserved).
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Key resolution
 // ---------------------------------------------------------------------------
@@ -146,6 +226,33 @@ struct ChatDelta {
 ///     with a clear HTTP 401 — surfacing that as the visible error is better
 ///     UX than a pre-emptive "no API key" before we've even tried.
 ///
+/// Clients HTTP partagés (lot timeouts 2026-06-10) — avant ça, chaque site
+/// faisait `reqwest::Client::new()` SANS timeout : un provider qui ne répond
+/// plus pendait indéfiniment (chat, FIM, runner d'agents, images).
+///
+/// `streaming_client` — pour les appels LLM en streaming (SSE/NDJSON) : connect
+/// borné + `read_timeout` = silence max entre DEUX chunks, PAS une durée totale
+/// (une longue réponse reste vivante tant qu'elle émet). 300 s couvre le
+/// prompt-processing lent d'un llama.cpp CPU sur gros contexte tout en
+/// décoinçant un pair mort.
+pub(crate) fn streaming_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| format!("http client: {e}"))
+}
+
+/// `request_client` — pour les appels one-shot (JSON, pas de stream) : deadline
+/// TOTALE dure en plus du connect borné.
+pub(crate) fn request_client(total_secs: u64) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(total_secs))
+        .build()
+        .map_err(|e| format!("http client: {e}"))
+}
+
 /// Anthropic always needs `x-api-key` to be set, so we still hard-fail there.
 pub(crate) fn resolve_key(protocol: &str, api_key: &Option<String>) -> Result<String, String> {
     if let Some(k) = api_key {
@@ -810,6 +917,11 @@ async fn run_chat_tool_loop(
         })
         .collect();
 
+    // One coalescer for ALL loop iterations — flushed after every streamed
+    // turn (before tool-activity deltas) so ordering survives the iteration
+    // boundaries. See `ChatDeltaCoalescer` for the why.
+    let mut coalescer = ChatDeltaCoalescer::new(app.clone(), conversation_id.clone());
+
     for iter in 0..CHAT_TOOL_MAX_ITERS {
         // The last allowed iteration forces a final text answer (no tools), the
         // same termination guarantee as `runner::tool_use_loop`'s last round.
@@ -838,50 +950,35 @@ async fn run_chat_tool_loop(
             None
         };
 
-        // Live-streaming sink — forwards `content`/`reasoning` chunks to
-        // `chat://delta` token-by-token, EXACTLY like the legacy chat path's
-        // `on_chunk` (same kind mapping). This preserves the live "typing" feel
-        // for every iteration. Tool-call activity is emitted SEPARATELY below as
-        // `kind:"tool"`.
-        //
-        // We clone `app` + `conversation_id` INTO the closure (owned) so it
-        // doesn't borrow the outer `app`/`conversation_id` — otherwise the
-        // `&mut sink` passed to `call_*_structured` would conflict with the
-        // tool-delta `app.emit` calls below (same pattern the agent runner uses:
-        // `app_for_chunks = app.clone()`). `AppHandle` clone is an Arc bump.
-        let sink_app = app.clone();
-        let sink_conv = conversation_id.clone();
-        let mut sink = move |kind: &str, chunk: &str| {
-            let delta_kind: &'static str =
-                if kind == "reasoning" { "reasoning" } else { "content" };
-            let _ = sink_app.emit(
-                "chat://delta",
-                ChatDelta {
-                    conversation_id: sink_conv.clone(),
-                    chunk: chunk.to_string(),
-                    kind: delta_kind,
-                    done: false,
-                },
-            );
-        };
-
+        // Live-streaming sink — `content`/`reasoning` chunks feed the shared
+        // coalescer (one merged `chat://delta` per ~50 ms instead of one per
+        // token), same kind mapping as the legacy chat path. Tool-call
+        // activity is emitted SEPARATELY below as `kind:"tool"`, after the
+        // post-turn flush so it can never overtake the streamed text.
         let turn: AssistantTurn = match protocol {
             "anthropic" => {
                 call_anthropic_structured(
                     client, base_url, model, msgs, system, api_key, with_tools, tools_json,
-                    abort.clone(), &mut sink,
+                    abort.clone(),
+                    &mut |kind: &str, chunk: &str| coalescer.push(kind, chunk),
                 )
                 .await?
             }
             "openai" | "custom" => {
                 call_openai_compat_structured(
                     client, base_url, model, msgs, api_key, protocol, chat_template_kwargs,
-                    with_tools, tools_json, abort.clone(), &mut sink,
+                    with_tools, tools_json, abort.clone(),
+                    &mut |kind: &str, chunk: &str| coalescer.push(kind, chunk),
                 )
                 .await?
             }
             other => return Err(format!("chat tool loop: unsupported protocol {other}")),
         };
+
+        // The turn's stream is over — flush the buffered tail BEFORE the
+        // tool-activity deltas below (or the final return) so the text always
+        // lands first on the frontend.
+        coalescer.flush();
 
         // No tool calls → final answer. The content was ALREADY streamed live by
         // `sink` above, so we DON'T re-emit it (that would double it in the
@@ -1014,7 +1111,7 @@ pub async fn chat_send(
         return Err("messages array is empty".into());
     }
 
-    let client = reqwest::Client::new();
+    let client = streaming_client()?;
     let protocol_str = protocol.as_str();
 
     // Register an abort flag for this conversation (if we have an ID).
@@ -1028,25 +1125,14 @@ pub async fn chat_send(
     });
 
     // Build the chat-channel emit callback. The streaming helpers no
-    // longer emit Tauri events themselves — instead they call this
-    // closure once per chunk with `(kind, chunk)` where kind ∈ {"content",
-    // "reasoning"}. We wrap each call into a ChatDelta and broadcast on
-    // `chat://delta` so the existing useChatStream / chat-sync listener
-    // path stays unchanged.
-    let app_ref = app.clone();
-    let conv_id = conversation_id.clone();
-    let mut on_chunk = move |kind: &str, chunk: &str| {
-        // We only send "content" and "reasoning" through here; map both
-        // to the static-str variants the existing ChatDelta type expects.
-        let delta_kind: &'static str = if kind == "reasoning" { "reasoning" } else { "content" };
-        let delta = ChatDelta {
-            conversation_id: conv_id.clone(),
-            chunk: chunk.to_string(),
-            kind: delta_kind,
-            done: false,
-        };
-        let _ = app_ref.emit("chat://delta", delta);
-    };
+    // longer emit Tauri events themselves — instead they feed the coalescer
+    // once per chunk with `(kind, chunk)` where kind ∈ {"content",
+    // "reasoning"}. Chunks are merged into ONE `chat://delta` per ~50 ms
+    // window instead of one broadcast per token; the existing useChatStream /
+    // chat-sync listener path is unchanged, it just receives bigger chunks
+    // less often.
+    let mut coalescer = ChatDeltaCoalescer::new(app.clone(), conversation_id.clone());
+    let mut on_chunk = |kind: &str, chunk: &str| coalescer.push(kind, chunk);
 
     // The chat surface never issues tool calls — always pass with_tools:false
     // so the body stays exactly as Phase 1 had it. The new AssistantTurn
@@ -1125,6 +1211,10 @@ pub async fn chat_send(
         };
         turn_result.map(|turn| turn.content)
     };
+
+    // Stream over (success, abort, or error) — flush any buffered tail before
+    // the writes/done events below so the streamed text always lands first.
+    coalescer.flush();
 
     // Clean up the abort flag from the registry (always, regardless of result).
     if let Some(id) = &conversation_id {
@@ -1221,7 +1311,8 @@ pub async fn fim_complete(
         body["stop"] = serde_json::json!(s);
     }
 
-    let client = reqwest::Client::new();
+    // FIM = complétion inline : au-delà de 60 s le ghost text n'a plus de sens.
+    let client = request_client(60)?;
     let mut req = client
         .post(&url)
         .header("content-type", "application/json")

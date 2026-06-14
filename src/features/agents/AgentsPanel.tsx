@@ -20,7 +20,6 @@ import {
   atelierRun,
   groundedRun,
   execPreflight,
-  reversePatch,
   type AgentRow,
   type AgentEvent,
   type ExecCapability,
@@ -88,17 +87,17 @@ function previewOrigin(): string {
 }
 
 // Flag de parking de l'UI Atelier (2026-05-29). L'Atelier (build → test
-// Playwright Docker → learn) reste câblé côté backend (commande
-// `agent_atelier_run`, `ATELIER_PROMPT`, sandbox Docker, image
-// `shugu-playwright:1.60`), mais son UI est masquée tant qu'elle n'a pas été
-// validée end-to-end et que son utilité produit n'est pas tranchée. Repasser
-// à `true` pour réactiver la carte launcher + bouton Démo.
+// Playwright → learn, exec directe depuis le pivot 2026-06-10) reste câblé
+// côté backend (commande `agent_atelier_run`, `ATELIER_PROMPT`), mais son UI
+// est masquée tant qu'elle n'a pas été validée end-to-end et que son utilité
+// produit n'est pas tranchée. Repasser à `true` pour réactiver la carte
+// launcher + bouton Démo.
 const ATELIER_UI_ENABLED = false;
 
 // Preset for the "Démo : to-do list" button — a small but genuinely interactive
 // app the agent must build AND verify by driving a real browser.
 const ATELIER_TODO_PRESET =
-  "Construis une petite to-do list web : un champ texte + un bouton « Ajouter » qui ajoute la saisie comme nouvel item dans une liste (<ul>) ; chaque item a un bouton « Supprimer » qui le retire ; cliquer sur le texte d'un item le marque comme fait (une classe CSS qui barre le texte). Puis écris un test Playwright en CommonJS (require('playwright'), chromium.launch({ args: ['--no-sandbox'] }), page sur file:///work/index.html) qui : ajoute deux items, en supprime un, marque l'autre comme fait, et vérifie le DOM à chaque étape (process.exit(1) si un check échoue). Lance le test avec run_command et corrige jusqu'à exit 0, puis sauve le skill.";
+  "Construis une petite to-do list web : un champ texte + un bouton « Ajouter » qui ajoute la saisie comme nouvel item dans une liste (<ul>) ; chaque item a un bouton « Supprimer » qui le retire ; cliquer sur le texte d'un item le marque comme fait (une classe CSS qui barre le texte). Puis écris un test Playwright en CommonJS (require('playwright'), chromium.launch(), URL file:// absolue construite depuis process.cwd()) qui : ajoute deux items, en supprime un, marque l'autre comme fait, et vérifie le DOM à chaque étape (process.exit(1) si un check échoue). Lance le test avec run_command et corrige jusqu'à exit 0, puis sauve le skill.";
 
 // Tick utility — force un re-render périodique tant que `active=true`.
 // Cas d'usage : faire que `fmtAge()` (qui lit `Date.now()`) tick en live
@@ -231,8 +230,6 @@ export function TranscriptDrawer({
 }) {
   const { data, isLoading } = useAgentTranscript(agentId);
   const [previewNonce, setPreviewNonce] = useState(0);
-  const [reverseState, setReverseState] = useState<"idle" | "reversing" | "done">("idle");
-  const [reverseErr, setReverseErr] = useState<string | null>(null);
 
   if (isLoading || !data) {
     return (
@@ -262,18 +259,15 @@ export function TranscriptDrawer({
   const toolCallCount = events.filter((e) => e.kind === "toolCall").length;
   const isActive = row.status === "running" || row.status === "pending";
 
-  // Atelier-specific views: the real browser-test runs (run_command) + the
-  // skills the env-verified gate accepted. An "atelier" run is detected by the
-  // presence of run_command tool calls (chat agents never execute).
+  // Exec views: the real test runs (run_command) + the skills the env-verified
+  // gate accepted. Any agent can execute now (exec directe) — the "real-env
+  // tests" view applies whenever run_command was called. The browser-preview
+  // iframe stays Atelier-ONLY (keyed on the agent's role).
   const skillEvents = events.filter((e) => e.kind === "skillLearned");
   const lessonEvents = events.filter((e) => e.kind === "lessonsInjected");
   const runCalls = events.filter((e) => e.kind === "toolCall" && e.tool === "run_command");
-  // Both Atelier and Grounded execute via run_command, so the "real-env tests"
-  // view applies to either. The browser-preview iframe is Atelier-ONLY; the
-  // diff + "Annuler ce run" are Grounded-ONLY — keyed on the agent's role.
   const hasExecRuns = runCalls.length > 0;
   const isAtelierRun = row.role === "atelier";
-  const diffEvent = events.find((e) => e.kind === "diff");
   const resultByCall = new Map<string, string>();
   for (const e of events) {
     if (e.kind === "toolResult") {
@@ -642,120 +636,16 @@ export function TranscriptDrawer({
         </div>
       )}
 
-      {/* Grounded — the diff auto-applied to the live project, reversible. */}
-      {diffEvent && diffEvent.kind === "diff" && (
+      {/* Grounded — exec directe sur le vrai projet : les modifications sont
+          visibles et annulables dans l'onglet Git (le watcher le rafraîchit
+          en live), plus de diff/patch dédié ici. */}
+      {row.role === "grounded" && hasExecRuns && (
         <div style={sectionStyle}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-            <span style={{ ...labelStyle, marginBottom: 0 }}>Modifications du projet</span>
-            <span style={{ flex: 1 }} />
-            {reverseState === "done" ? (
-              <span
-                style={{
-                  fontSize: 10,
-                  fontWeight: 700,
-                  padding: "2px 8px",
-                  borderRadius: 99,
-                  background: "rgba(150,150,150,0.18)",
-                  color: "var(--on-surface-muted)",
-                }}
-              >
-                ⊘ run annulé
-              </span>
-            ) : diffEvent.applied ? (
-              <>
-                <span
-                  style={{
-                    fontSize: 10,
-                    fontWeight: 700,
-                    padding: "2px 8px",
-                    borderRadius: 99,
-                    background: "rgba(74, 222, 128, 0.15)",
-                    color: "var(--success, #4ade80)",
-                    border: "1px solid rgba(74, 222, 128, 0.35)",
-                  }}
-                >
-                  ✓ appliqué au projet
-                </span>
-                <button
-                  onClick={() => {
-                    if (reverseState === "reversing") return;
-                    setReverseState("reversing");
-                    setReverseErr(null);
-                    void reversePatch(diffEvent.patch)
-                      .then(() => setReverseState("done"))
-                      .catch((err) => {
-                        setReverseErr(err instanceof Error ? err.message : String(err));
-                        setReverseState("idle");
-                      });
-                  }}
-                  disabled={reverseState === "reversing"}
-                  title="Défaire tous les changements de ce run sur le vrai projet"
-                  style={{
-                    fontSize: 10,
-                    padding: "2px 8px",
-                    borderRadius: 4,
-                    background: "rgba(255, 107, 107, 0.12)",
-                    color: "var(--error, #ff6b6b)",
-                    border: "1px solid rgba(255, 107, 107, 0.3)",
-                    cursor: reverseState === "reversing" ? "default" : "pointer",
-                    opacity: reverseState === "reversing" ? 0.6 : 1,
-                  }}
-                >
-                  {reverseState === "reversing" ? "Annulation…" : "Annuler ce run"}
-                </button>
-              </>
-            ) : (
-              <span
-                title={diffEvent.applyError ?? undefined}
-                style={{
-                  fontSize: 10,
-                  fontWeight: 700,
-                  padding: "2px 8px",
-                  borderRadius: 99,
-                  background: "rgba(255, 107, 107, 0.12)",
-                  color: "var(--error, #ff6b6b)",
-                  border: "1px solid rgba(255, 107, 107, 0.3)",
-                }}
-              >
-                ✗ non appliqué
-              </span>
-            )}
+          <div style={{ fontSize: 10.5, color: "var(--on-surface-muted)", lineHeight: 1.5 }}>
+            🌱 Cet agent travaille directement sur ton projet — suis ses modifications
+            dans l'onglet <b>Git</b>, où tu peux les examiner et les annuler fichier
+            par fichier.
           </div>
-          {!diffEvent.applied && diffEvent.applyError && (
-            <div
-              style={{
-                fontSize: 10,
-                color: "var(--error, #ff6b6b)",
-                marginBottom: 6,
-                whiteSpace: "pre-wrap",
-              }}
-            >
-              {diffEvent.applyError}
-            </div>
-          )}
-          {reverseErr && (
-            <div style={{ fontSize: 10, color: "var(--error, #ff6b6b)", marginBottom: 6 }}>
-              {reverseErr}
-            </div>
-          )}
-          <pre
-            style={{
-              margin: 0,
-              padding: 8,
-              fontSize: 10,
-              lineHeight: 1.4,
-              maxHeight: 320,
-              overflow: "auto",
-              whiteSpace: "pre",
-              fontFamily: "var(--font-mono)",
-              color: "var(--on-surface-muted)",
-              background: "var(--surface, #14141f)",
-              borderRadius: 6,
-              border: "1px solid rgba(124,58,237,0.12)",
-            }}
-          >
-            {diffEvent.patch}
-          </pre>
         </div>
       )}
     </div>
@@ -788,25 +678,22 @@ export function AgentsPanel() {
   const [launching, setLaunching] = useState(false);
   const [atelierErr, setAtelierErr] = useState<string | null>(null);
 
-  // ── Grounded Run launcher state + Docker preflight ──
+  // ── Grounded Run launcher state + git-safety-net preflight ──
   const [groundedTask, setGroundedTask] = useState("");
   const [groundedTestCmd, setGroundedTestCmd] = useState("");
   const [groundedLaunching, setGroundedLaunching] = useState(false);
   const [groundedErr, setGroundedErr] = useState<string | null>(null);
   const [execCap, setExecCap] = useState<ExecCapability | null>(null);
 
-  // Probe Docker once on mount so the button reflects real capability. Re-probed
-  // when the user clicks "Revérifier" after starting Docker / building the image.
-  // A rejected IPC (not running under Tauri) is treated as "sandbox unavailable".
+  // Probe the git safety net once on mount (exec directe : toujours possible,
+  // le préflight ne sert qu'à afficher un avertissement NON bloquant quand le
+  // filet git est absent ou partiel). Re-probed via "Revérifier" après un
+  // commit / git init. A rejected IPC = unknown → no warning shown.
   const refreshPreflight = async () => {
     try {
       setExecCap(await execPreflight());
     } catch {
-      setExecCap({
-        dockerAvailable: false,
-        imagePresent: false,
-        reason: "Préflight Docker impossible (sandbox indisponible).",
-      });
+      setExecCap(null);
     }
   };
   useEffect(() => {
@@ -851,7 +738,9 @@ export function AgentsPanel() {
     }
   };
 
-  const execReady = execCap?.dockerAvailable === true && execCap?.imagePresent === true;
+  // Exec directe : seul "aucun projet ouvert" bloque (ready=false). Un filet
+  // git absent/partiel n'empêche PAS le lancement — il affiche un warning.
+  const execReady = execCap?.ready !== false;
   const launchGrounded = async () => {
     const t = groundedTask.trim();
     if (!t || groundedLaunching || !execReady) return;
@@ -891,8 +780,8 @@ export function AgentsPanel() {
 
       {/* Atelier — env-grounded build → test → learn loop. PARQUÉ 2026-05-29
           derrière `ATELIER_UI_ENABLED` : code backend intact (`agent_atelier_run`,
-          sandbox Docker, image Playwright), UI masquée le temps qu'on tranche
-          son utilité produit. La carte revient en flippant le flag. */}
+          exec directe), UI masquée le temps qu'on tranche son utilité produit.
+          La carte revient en flippant le flag. */}
       {ATELIER_UI_ENABLED && (
       <div
         style={{
@@ -921,10 +810,10 @@ export function AgentsPanel() {
             marginBottom: 8,
           }}
         >
-          L'agent construit une UI web sur une copie jetable, la <b>teste pour de vrai</b> dans
-          un navigateur (Playwright en sandbox), corrige sur l'échec réel, et ne garde un{" "}
-          <b>skill vérifié</b> qu'une fois le test au vert. La boucle, l'app et le skill
-          s'affichent dans le transcript.
+          L'agent construit une UI web dans un dossier de création jetable, la{" "}
+          <b>teste pour de vrai</b> dans un navigateur (Playwright), corrige sur l'échec réel,
+          et ne garde un <b>skill vérifié</b> qu'une fois le test au vert. La boucle, l'app et
+          le skill s'affichent dans le transcript.
         </div>
         <textarea
           value={atelierTask}
@@ -987,10 +876,10 @@ export function AgentsPanel() {
       </div>
       )}
 
-      {/* Grounded Run — exec ancré sur une COPIE jetable du vrai projet. L'agent
-          lit → écrit → lance les tests → corrige → relance, le tout dans une
-          sandbox Docker (réseau coupé). À la fin le diff est auto-appliqué au
-          vrai projet et réversible d'un clic. */}
+      {/* Grounded Run — exec DIRECTE sur le vrai projet (pivot 2026-06-10).
+          L'agent lit → écrit → lance les tests → corrige → relance, avec la
+          vraie toolchain de la machine. Le filet de sécurité est git : les
+          changements sont suivis et annulables dans l'onglet Git. */}
       <div
         style={{
           marginBottom: 12,
@@ -1018,27 +907,28 @@ export function AgentsPanel() {
             marginBottom: 8,
           }}
         >
-          L'agent travaille sur une <b>copie jetable</b> de ton projet, lance ses tests dans une
-          sandbox isolée, corrige sur les <b>échecs réels</b> et relance jusqu'au vert. À la fin, ses
-          changements sont <b>appliqués au vrai projet</b> — tu vois le diff et tu peux{" "}
-          <b>tout annuler d'un clic</b>. Ton projet n'est jamais modifié pendant que l'agent travaille.
+          L'agent travaille <b>directement sur ton projet</b> avec la vraie toolchain
+          (pnpm, node, cargo…), lance les tests, corrige sur les <b>échecs réels</b> et
+          relance jusqu'au vert. Le filet de sécurité, c'est <b>git</b> : chaque
+          modification apparaît dans l'onglet <b>Git</b>, où tu peux l'examiner et
+          l'annuler.
         </div>
 
-        {/* Preflight status — Docker readiness with an actionable reason. */}
-        {execCap && !execReady ? (
+        {/* Préflight filet git — avertissement NON bloquant (pas de repo /
+            changements non commités) avec un bouton pour re-vérifier après
+            un commit ou un git init. */}
+        {execCap?.warning ? (
           <div
             style={{
               fontSize: 10,
-              color: "var(--error, #ff6b6b)",
+              color: "var(--warn, #fbbf24)",
               marginBottom: 8,
               display: "flex",
               alignItems: "flex-start",
               gap: 6,
             }}
           >
-            <span style={{ whiteSpace: "pre-wrap", flex: 1 }}>
-              ⚠ {execCap.reason ?? "Sandbox d'exécution indisponible."}
-            </span>
+            <span style={{ whiteSpace: "pre-wrap", flex: 1 }}>⚠ {execCap.warning}</span>
             <button
               onClick={() => void refreshPreflight()}
               style={{
@@ -1098,7 +988,7 @@ export function AgentsPanel() {
             disabled={groundedLaunching || !groundedTask.trim() || !execReady}
             title={
               !execReady
-                ? execCap?.reason ?? "Sandbox indisponible"
+                ? execCap?.warning ?? "Ouvre un dossier d'abord"
                 : "Lancer un Grounded Run sur le projet ouvert"
             }
             style={{

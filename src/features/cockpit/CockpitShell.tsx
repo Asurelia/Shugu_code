@@ -24,6 +24,35 @@ import {
 } from "./layoutStore";
 import { loadLayout } from "./layoutPersistence";
 
+// react-resizable-panels ne connaît que des POURCENTAGES : un minSize de 12%
+// vaut 72px de terminal utile sur une fenêtre de 600px de haut, et 20% de
+// right panel devient illisible à 720px de large. Ce hook convertit un
+// minimum exprimé en PIXELS en % du conteneur cockpit mesuré en live
+// (ResizeObserver — la taille du .cockpit = fenêtre moins titlebar/rail,
+// plus juste que window.inner*). Clamp à 90% pour ne jamais rendre un panel
+// non-réductible sur une fenêtre minuscule. `el` arrive via callback-ref
+// (state) parce que le div cockpit ne monte qu'après l'hydratation du layout.
+function useMinSizePct(
+  el: HTMLElement | null,
+  minPx: number,
+  axis: "w" | "h",
+  fallbackPct: number,
+): number {
+  const [pct, setPct] = useState(fallbackPct);
+  useEffect(() => {
+    if (!el) return;
+    const compute = () => {
+      const size = axis === "w" ? el.clientWidth : el.clientHeight;
+      if (size > 0) setPct(Math.min(90, (minPx / size) * 100));
+    };
+    compute();
+    const ro = new ResizeObserver(compute);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [el, minPx, axis]);
+  return pct;
+}
+
 export function CockpitShell({ activeConv }: { activeConv: string }) {
   const shell = useShell();
   const layout = useCockpitLayout();
@@ -41,6 +70,25 @@ export function CockpitShell({ activeConv }: { activeConv: string }) {
   // cached, so re-navigating into the cockpit skips the loader flash (the
   // spinner only ever shows on the very first mount of the session).
   const [hydrated, setHydrated] = useState(() => isLayoutHydrated());
+
+  // Minima des panels en PIXELS réels (convertis en % du cockpit mesuré) :
+  // chat 320px, right panel 260px (FileList Révision + diff lisible),
+  // dock 140px (header 28px + ~6 lignes de terminal). Les fallbacks sont les
+  // anciens minSize statiques, utilisés avant la première mesure.
+  const [cockpitEl, setCockpitEl] = useState<HTMLDivElement | null>(null);
+  const chatMinPctRaw = useMinSizePct(cockpitEl, 320, "w", 30);
+  const rightMinPctRaw = useMinSizePct(cockpitEl, 260, "w", 20);
+  const dockMinPct = useMinSizePct(cockpitEl, 140, "h", 12);
+  // chat | right vivent dans le MÊME PanelGroup horizontal : react-resizable-
+  // panels FIGE tout resize si la somme de leurs minSize dépasse 100 %. La
+  // fenêtre min Tauri (720px de large → ~80 %) ne l'atteint pas, mais sur une
+  // largeur atypique (sous ~580px) chat 320 + right 260 franchit le seuil. On
+  // rabote proportionnellement à 92 % max (8 % de marge pour garder la poignée
+  // mobile). Le dock est dans le groupe vertical → hors de cette somme.
+  const horizMinSum = chatMinPctRaw + rightMinPctRaw;
+  const minScale = horizMinSum > 92 ? 92 / horizMinSum : 1;
+  const chatMinPct = chatMinPctRaw * minScale;
+  const rightMinPct = rightMinPctRaw * minScale;
 
   // Hydrate the store from SQLite once at mount (LOCAL-FIRST restore).
   useEffect(() => {
@@ -127,7 +175,7 @@ export function CockpitShell({ activeConv }: { activeConv: string }) {
   );
 
   return (
-    <div className="cockpit" style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column" }}>
+    <div ref={setCockpitEl} className="cockpit" style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column" }}>
       {/* Portal the toggle into the titlebar right cluster (next to History/Bell). */}
       {tbRightSlot && createPortal(rightPanelToggle, tbRightSlot)}
 
@@ -152,7 +200,7 @@ export function CockpitShell({ activeConv }: { activeConv: string }) {
               if (sizes.length === 2 && sizes[1] > 1) setSizes([sizes[0], sizes[1]]);
             }}
           >
-            <Panel id="cockpit-chat" order={1} minSize={30} defaultSize={layout.sizes[0]}>
+            <Panel id="cockpit-chat" order={1} minSize={chatMinPct} defaultSize={layout.sizes[0]}>
               {/* position:relative + overflow:hidden is REQUIRED here: ChatView's
                   root `.cx` is `position:absolute; inset:0`, so without a positioned
                   wrapper it fills the whole `.cockpit` instead of this panel — the
@@ -177,7 +225,7 @@ export function CockpitShell({ activeConv }: { activeConv: string }) {
               ref={panelRef}
               collapsible
               collapsedSize={0}
-              minSize={20}
+              minSize={rightMinPct}
               defaultSize={layout.rightPanelOpen ? layout.sizes[1] : 0}
               onCollapse={() => setRightPanelOpen(false)}
               onExpand={() => setRightPanelOpen(true)}
@@ -197,7 +245,7 @@ export function CockpitShell({ activeConv }: { activeConv: string }) {
           ref={bottomRef}
           collapsible
           collapsedSize={0}
-          minSize={12}
+          minSize={dockMinPct}
           defaultSize={layout.bottomDockOpen ? layout.bottomDockSize : 0}
           onCollapse={() => setBottomDockOpen(false)}
           onExpand={() => setBottomDockOpen(true)}

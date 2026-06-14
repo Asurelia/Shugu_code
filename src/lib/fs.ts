@@ -142,6 +142,13 @@ export async function fsOpenFolder(): Promise<string | null> {
   return invoke<string | null>("fs_open_folder");
 }
 
+/** Set the workspace root from a KNOWN absolute path (projets récents — lot
+ *  2026-06-10). Pas de dialog ; mêmes effets que fsOpenFolder (state, persist,
+ *  watchers, workspace://changed). Rejette si le dossier n'existe plus. */
+export async function fsSetWorkspaceRoot(path: string): Promise<string> {
+  return invoke<string>("fs_set_workspace_root", { path });
+}
+
 /**
  * Returns the current workspace root as an absolute, forward-slash path,
  * or null when no workspace is open.
@@ -200,6 +207,31 @@ export async function fsListFiles(
 export async function fsReadFile(path: string): Promise<FileContent> {
   const text = await invoke<string>("fs_read_file", { path });
   return { lang: langFromPath(path), text };
+}
+
+/** Wire shape of one `fs_read_files` entry. `content: null` = unreadable
+ *  (renamed, deleted, binary, too large) — callers skip those silently. */
+interface RestoredFile {
+  path: string;
+  content: string | null;
+}
+
+/** Read MANY workspace-relative files in ONE IPC round-trip.
+ *
+ *  Used by the boot-time open-tabs restoration: one invoke per persisted tab
+ *  meant N round-trips on a cold start. Returns a map keyed by path holding
+ *  only the files that could actually be read. */
+export async function fsReadFiles(
+  paths: string[],
+): Promise<Record<string, FileContent>> {
+  const entries = await invoke<RestoredFile[]>("fs_read_files", { paths });
+  const out: Record<string, FileContent> = {};
+  for (const entry of entries) {
+    if (entry.content != null) {
+      out[entry.path] = { lang: langFromPath(entry.path), text: entry.content };
+    }
+  }
+  return out;
 }
 
 /** Atomic write (temp-file + rename on the Rust side) of a workspace-relative path. */

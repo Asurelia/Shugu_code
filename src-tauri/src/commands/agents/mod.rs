@@ -60,6 +60,11 @@ use uuid::Uuid;
 // Split out so this file stays under the CLAUDE.md 500-line ceiling.
 pub(crate) mod runner;
 
+// Coalescing buffer for streaming Delta events — merges token-level chunks
+// into ~14 events/s per (agent, kind) before they hit the Tauri event bus.
+// See the module doc for the ordering contract with `persist_and_emit`.
+mod delta_buffer;
+
 // Phase 2 tools submodule. Defines the closed set of file-system tools the
 // orchestrator can call (`fs_read_file`, `fs_write_file`, `fs_list_dir`),
 // the JSON-schema renderers per provider dialect (OpenAI / Anthropic), and
@@ -68,16 +73,11 @@ pub(crate) mod runner;
 // (the `pub(super)` items) from here.
 mod tools;
 
-/// Sandboxed execution — runs agent-written code/tests inside a throwaway,
-/// network-isolated Docker container (the "environment" that gives real
-/// pass/fail feedback). Gated by `allow_exec`: the Atelier's disposable copy
-/// only, never the user's real project.
-pub(crate) mod sandbox;
-
-/// Disposable project mirror — clones the user's real project into a throwaway
-/// temp dir so Grounded Run executes on a COPY, never the live tree. The patch
-/// it produces is auto-applied to the real project and is reversible.
-mod mirror;
+/// Direct command execution (pivot 2026-06-10) — runs agent commands straight
+/// on the user's machine with the real toolchain, exactly like Claude Code /
+/// Codex CLI. The safety net is git (visible in the app's Git panel); the
+/// preflight half reports whether that net is in place.
+pub(crate) mod exec;
 
 /// Skill library (Voyager / Hermes) — the agent saves reusable skills it learns
 /// (`skill_save` tool) and loads them into context on future runs. Persistent,
@@ -116,6 +116,11 @@ pub(crate) const ALLOWED_ROLES: &[&str] = &[
     "coder",
     "researcher",
     "tester",
+    // Roles spawned by their dedicated commands (agent_atelier_run /
+    // agent_grounded_run) — listed here so the set is the single source of
+    // truth and a direct agent_spawn with these roles works too.
+    "atelier",
+    "grounded",
 ];
 
 /// Tauri event channel name — single channel, every event carries its own
@@ -286,16 +291,16 @@ pub enum AgentEvent {
         role: String,
         count: usize,
     },
-    /// Grounded Run produced a unified diff (mirror vs baseline) and tried to
-    /// auto-apply it to the live project. `applied` reports whether the write
-    /// succeeded; `apply_error` carries the reason when it didn't. The patch is
-    /// shown read-only in the panel and reversed via `agent_reverse_patch`.
-    Diff {
+    /// A file write performed by the agent (fs_write_file / fs_edit). Carries the
+    /// PRE-write content (`before`) so the chat can show a diff vs HEAD and offer
+    /// an "Annuler" that restores it — exactly like the chat-direct path's
+    /// `chat://writes`. `before == None` means the file was created this run.
+    /// Persisted to `agent_events` so the diff/undo survive a reload.
+    Write {
         agent_id: String,
-        patch: String,
-        applied: bool,
+        path: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        apply_error: Option<String>,
+        before: Option<String>,
     },
 }
 
@@ -313,7 +318,7 @@ impl AgentEvent {
             AgentEvent::Error { .. } => "error",
             AgentEvent::SkillLearned { .. } => "skillLearned",
             AgentEvent::LessonsInjected { .. } => "lessonsInjected",
-            AgentEvent::Diff { .. } => "diff",
+            AgentEvent::Write { .. } => "write",
         }
     }
 
@@ -330,7 +335,7 @@ impl AgentEvent {
             | AgentEvent::Error { agent_id, .. }
             | AgentEvent::SkillLearned { agent_id, .. }
             | AgentEvent::LessonsInjected { agent_id, .. }
-            | AgentEvent::Diff { agent_id, .. } => agent_id,
+            | AgentEvent::Write { agent_id, .. } => agent_id,
         }
     }
 }
@@ -367,8 +372,8 @@ pub struct SpawnArgs {
 }
 
 /// Arguments for an Atelier run (env-grounded build→test→learn loop). Mirrors the
-/// provider routing of `SpawnArgs`, but role is fixed to "coder" and the run
-/// happens on a disposable mirror with execution enabled.
+/// provider routing of `SpawnArgs`, but role is fixed to "atelier" and the run
+/// happens in a throwaway creation dir (empty temp dir, exec directe).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AtelierArgs {
@@ -380,9 +385,10 @@ pub struct AtelierArgs {
     pub chat_template_kwargs: Option<serde_json::Value>,
 }
 
-/// Arguments for a Grounded Run — exec on a disposable mirror of the user's
-/// REAL project. Mirrors `AtelierArgs` provider routing, plus an optional
-/// verification command the agent must run after each change.
+/// Arguments for a Grounded Run — exec DIRECTLY on the user's real project
+/// (pivot 2026-06-10, le filet est git). Mirrors `AtelierArgs` provider
+/// routing, plus an optional verification command the agent must run after
+/// each change.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroundedArgs {
@@ -515,8 +521,25 @@ pub(super) fn persist_and_emit(app: &tauri::AppHandle, event: &AgentEvent) -> Re
     // `agent_events`, which never had per-token rows; it will see the
     // assistant Message events that the runner emits at each turn boundary,
     // and those carry the full assembled content.
-    if matches!(event, AgentEvent::Delta { .. }) {
-        let emit_result = app.emit(EVENT_CHANNEL, event);
+    if let AgentEvent::Delta {
+        agent_id,
+        chunk,
+        delta_kind,
+    } = event
+    {
+        // Coalesce: most chunks just feed the buffer; one merged Delta comes
+        // out per FLUSH_INTERVAL per (agent, kind). The stream's tail is
+        // flushed by the non-delta branch below (the runner always closes a
+        // turn with Message/Complete/Error).
+        let Some(merged) = delta_buffer::push(agent_id, delta_kind, chunk) else {
+            return Ok(());
+        };
+        let merged_event = AgentEvent::Delta {
+            agent_id: agent_id.clone(),
+            chunk: merged,
+            delta_kind: delta_kind.clone(),
+        };
+        let emit_result = app.emit(EVENT_CHANNEL, &merged_event);
         if cfg!(debug_assertions) {
             let c = EMIT_DELTA_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if c == 1 || c % 50 == 0 {
@@ -529,6 +552,17 @@ pub(super) fn persist_and_emit(app: &tauri::AppHandle, event: &AgentEvent) -> Re
             }
         }
         return Ok(());
+    }
+
+    // Non-delta event: flush this agent's pending merged deltas FIRST so the
+    // frontend never sees a Message/ToolCall/Complete overtake its own text.
+    for (delta_kind, chunk) in delta_buffer::drain(event.agent_id()) {
+        let flushed = AgentEvent::Delta {
+            agent_id: event.agent_id().to_string(),
+            chunk,
+            delta_kind,
+        };
+        let _ = app.emit(EVENT_CHANNEL, &flushed);
     }
 
     let conn_mutex = get_conn(app)?;
@@ -704,14 +738,10 @@ pub async fn agent_spawn(
             chat_template_kwargs_for_task,
             design_context_for_task,
             abort_token,
-            None,  // workspace_override — chat works on the real open workspace
-            false, // allow_exec — DÉSACTIVÉ tant que l'isolation OS (compte sandbox
-                   // restreint + ACL + pare-feu, modèle Codex) n'est pas construite.
-                   // Le denylist `is_irreparable` seul ne tient pas (contournable via
-                   // `&&`/sous-shell) — revue sécurité 2026-06-07. On ne donne les
-                   // pleins pouvoirs d'exécution QU'UNE FOIS la cage OS en place.
+            None, // workspace_override — chat works on the real open workspace
+            // Exec directe pour TOUT agent (pivot 2026-06-10) : run_command tourne
+            // sur la machine, le filet de sécurité est git (onglet Git de l'app).
             system_prompt_override_for_task, // None ⇒ seed_prompt ; Some ⇒ .md custom
-            Vec::new(), // exec_ro_mounts — chat n'a pas de mounts supplémentaires
         )
         .await;
     });
@@ -719,12 +749,11 @@ pub async fn agent_spawn(
     Ok(agent_id)
 }
 
-/// Atelier run — the env-grounded learning loop. Spawns a `coder` agent on a
-/// DISPOSABLE mirror dir (under the OS temp dir, which Docker Desktop can mount)
-/// with execution ENABLED, driven by `ATELIER_PROMPT`: it builds a small web UI,
-/// writes a Playwright test, runs it in the sandbox, iterates on real failures,
-/// and saves a skill only once the test passes. Streams into the SAME transcript
-/// UI as any agent — no separate window.
+/// Atelier run — the env-grounded learning loop. Spawns an `atelier` agent in a
+/// THROWAWAY creation dir (under the OS temp dir), driven by `ATELIER_PROMPT`:
+/// it builds a small web UI, writes a Playwright test, runs it for real (exec
+/// directe), iterates on real failures, and saves a skill only once the test
+/// passes. Streams into the SAME transcript UI as any agent — no separate window.
 #[tauri::command]
 pub async fn agent_atelier_run(
     app: tauri::AppHandle,
@@ -756,9 +785,9 @@ pub async fn agent_atelier_run(
         );
     }
 
-    // Disposable mirror dir under the OS temp dir (already inside Docker Desktop's
-    // file-sharing scope). Canonicalize so the workspace path-guard's
-    // pre-canonicalized-root contract holds on Windows (the `\\?\` prefix).
+    // Throwaway creation dir under the OS temp dir. Canonicalize so the
+    // workspace path-guard's pre-canonicalized-root contract holds on Windows
+    // (the `\\?\` prefix).
     let ws_raw = std::env::temp_dir().join(format!("shugu-atelier-{agent_id}"));
     if let Err(e) = std::fs::create_dir_all(&ws_raw) {
         if let Ok(mut g) = state.0.lock() {
@@ -825,37 +854,36 @@ pub async fn agent_atelier_run(
             args.chat_template_kwargs,
             None, // design_context
             abort_token,
-            Some(ws_for_task), // workspace_override — the disposable mirror
-            true,              // allow_exec — the Atelier is the ONLY exec path
+            Some(ws_for_task), // workspace_override — the throwaway creation dir
             Some(runner::ATELIER_PROMPT.to_string()),
-            Vec::new(), // exec_ro_mounts — Atelier builds from scratch, no deps mount
         )
         .await;
-        // The mirror dir is intentionally left on disk so the preview pane can
+        // The creation dir is intentionally left on disk so the preview pane can
         // render the built app; the OS reclaims the temp dir over time.
     });
 
     Ok(agent_id)
 }
 
-/// Preflight the exec sandbox so the UI can enable/disable "Grounded Run" with
-/// an ACTIONABLE reason. Runs the (blocking) docker probes off the async runtime
-/// so a hung daemon never blocks the UI thread. Safe to call from desktop only —
-/// in web mode the `invoke` simply isn't available and the UI hides the button.
+/// Preflight the agent execution context: is the GIT SAFETY NET in place?
+/// Execution itself is always available (exec directe, pivot 2026-06-10) —
+/// what the UI surfaces is a NON-blocking warning when the workspace has no
+/// git repo or has uncommitted changes. Runs the blocking `git status` probe
+/// off the async runtime.
 #[tauri::command]
-pub async fn agent_exec_preflight() -> Result<sandbox::ExecCapability, String> {
-    tokio::task::spawn_blocking(sandbox::check_docker)
+pub async fn agent_exec_preflight(app: tauri::AppHandle) -> Result<exec::ExecCapability, String> {
+    let root = crate::commands::fs::restore_workspace_root(&app);
+    tokio::task::spawn_blocking(move || exec::check_git_safety(root))
         .await
         .map_err(|e| format!("preflight join error: {e}"))
 }
 
-/// Grounded Run — the env-grounded loop on a COPY of the user's REAL project.
-/// Spawns a `grounded` agent on a disposable mirror with execution ENABLED,
-/// driven by `GROUNDED_PROMPT`: it reads, edits, runs the project's checks, and
-/// iterates on real failures. When the run ends, the mirror diff is computed,
-/// AUTO-APPLIED to the live project (reversible via `agent_reverse_patch`), and
-/// emitted as a `Diff` event for the panel. The live project is touched ONLY by
-/// that single auto-apply — never by the agent's exec, which stays on the copy.
+/// Grounded Run — the env-grounded loop DIRECTLY on the user's real project
+/// (pivot 2026-06-10 : plus de miroir jetable). Spawns a `grounded` agent with
+/// execution enabled, driven by `GROUNDED_PROMPT`: it reads, edits, runs the
+/// project's checks, and iterates on real failures. Every change lands on the
+/// live tree as it happens — the user follows and reverts them in the app's
+/// Git panel (the git watcher refreshes it live).
 #[tauri::command]
 pub async fn agent_grounded_run(
     app: tauri::AppHandle,
@@ -864,9 +892,10 @@ pub async fn agent_grounded_run(
 ) -> Result<String, String> {
     let role = "grounded";
 
-    // The live project root must be open — that's what we mirror.
-    let real_root = crate::commands::fs::restore_workspace_root(&app)
-        .ok_or_else(|| "aucun projet ouvert : ouvre un dossier avant un Grounded Run".to_string())?;
+    // The live project root must be open — that's where the agent works.
+    if crate::commands::fs::restore_workspace_root(&app).is_none() {
+        return Err("aucun projet ouvert : ouvre un dossier avant un Grounded Run".to_string());
+    }
 
     // Capacity check + handle insertion (same cap as agent_spawn / Atelier).
     let agent_id = Uuid::new_v4().to_string();
@@ -886,29 +915,6 @@ pub async fn agent_grounded_run(
             },
         );
     }
-
-    // Build the disposable mirror from the live project (blocking git/fs work).
-    let real_root_for_mirror = real_root.clone();
-    let agent_id_for_mirror = agent_id.clone();
-    let mirror = match tokio::task::spawn_blocking(move || {
-        mirror::prepare_project_mirror(&real_root_for_mirror, &agent_id_for_mirror)
-    })
-    .await
-    {
-        Ok(Ok(m)) => m,
-        Ok(Err(e)) => {
-            if let Ok(mut g) = state.0.lock() {
-                g.remove(&agent_id);
-            }
-            return Err(format!("préparation du miroir : {e}"));
-        }
-        Err(e) => {
-            if let Ok(mut g) = state.0.lock() {
-                g.remove(&agent_id);
-            }
-            return Err(format!("mirror task join error: {e}"));
-        }
-    };
 
     // INSERT the agents row (standalone — no conversation, no parent).
     let created_at = now_ms();
@@ -961,33 +967,14 @@ pub async fn agent_grounded_run(
             .ok_or_else(|| "agent handle vanished between insert and spawn".to_string())?
     };
 
-    // Gate JS — mount the LIVE project's `node_modules` read-only at
-    // `/work/node_modules` so `pnpm`/`tsc`/etc. resolve OFFLINE inside the
-    // network-isolated sandbox (the mirror excludes node_modules; Docker creates
-    // the mount point). Verified: pnpm's relative symlinks stay valid when the
-    // whole dir is mounted as a unit. Read-only ⇒ the agent's exec can never
-    // mutate the real deps. Absent ⇒ no mount (a depless project still works).
-    let mut exec_ro_mounts: Vec<(String, String)> = Vec::new();
-    let real_node_modules = real_root.join("node_modules");
-    if real_node_modules.is_dir() {
-        match std::fs::canonicalize(&real_node_modules) {
-            Ok(nm) => exec_ro_mounts.push((
-                nm.to_string_lossy().to_string(),
-                "/work/node_modules".to_string(),
-            )),
-            Err(e) => eprintln!("[grounded] node_modules canonicalize failed, skipping mount: {e}"),
-        }
-    }
-
     let app_for_task = app.clone();
     let agent_state = state.0.clone();
     let agent_id_for_task = agent_id.clone();
-    let mirror_for_task = mirror.clone();
     tauri::async_runtime::spawn(async move {
         runner::run_agent_task(
-            app_for_task.clone(),
+            app_for_task,
             agent_state,
-            agent_id_for_task.clone(),
+            agent_id_for_task,
             role.to_string(),
             args.task,
             args.model,
@@ -997,58 +984,13 @@ pub async fn agent_grounded_run(
             args.chat_template_kwargs,
             None, // design_context
             abort_token,
-            Some(mirror_for_task.clone()), // workspace_override — the disposable mirror
-            true,                          // allow_exec — grounded execs on the copy
+            None, // workspace_override — the REAL open workspace
             Some(system_prompt),
-            exec_ro_mounts, // node_modules:ro so pnpm/tsc resolve offline (gate JS)
         )
         .await;
-
-        // POST-RUN (best-effort even if the run was killed): compute the diff of
-        // the agent's changes vs baseline, AUTO-APPLY it to the live project
-        // (reversible), emit it for the panel, then delete the mirror.
-        let diff_event = tokio::task::spawn_blocking(move || {
-            let patch = mirror::compute_mirror_patch(&mirror_for_task).unwrap_or_default();
-            if patch.trim().is_empty() {
-                mirror::cleanup_mirror(&mirror_for_task);
-                return None;
-            }
-            let (applied, apply_error) = match mirror::apply_patch(&real_root, &patch) {
-                Ok(()) => (true, None),
-                Err(e) => (false, Some(e)),
-            };
-            mirror::cleanup_mirror(&mirror_for_task);
-            Some((patch, applied, apply_error))
-        })
-        .await
-        .ok()
-        .flatten();
-
-        if let Some((patch, applied, apply_error)) = diff_event {
-            let _ = persist_and_emit(
-                &app_for_task,
-                &AgentEvent::Diff {
-                    agent_id: agent_id_for_task,
-                    patch,
-                    applied,
-                    apply_error,
-                },
-            );
-        }
     });
 
     Ok(agent_id)
-}
-
-/// Reverse a Grounded Run's auto-applied patch (the "Annuler ce run" button).
-/// Writes ONLY to the live workspace, behind the user's explicit click.
-#[tauri::command]
-pub async fn agent_reverse_patch(app: tauri::AppHandle, patch: String) -> Result<(), String> {
-    let real_root = crate::commands::fs::restore_workspace_root(&app)
-        .ok_or_else(|| "aucun projet ouvert".to_string())?;
-    tokio::task::spawn_blocking(move || mirror::reverse_patch(&real_root, &patch))
-        .await
-        .map_err(|e| format!("reverse task join error: {e}"))?
 }
 
 /// Kill a running agent. Cooperative cancellation: the runner task selects

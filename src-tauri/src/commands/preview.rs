@@ -167,9 +167,9 @@ pub fn serve(app: &AppHandle, raw_path: &str) -> Response<Cow<'static, [u8]>> {
     let rel = decoded.trim_start_matches('/');
 
     // Atelier preview: `__atelier__/<agentId>/<path>` serves from that run's
-    // DISPOSABLE mirror under the OS temp dir — the Atelier never writes into the
-    // user's workspace, so this path is workspace-independent. Lets the
-    // TranscriptDrawer render the web app the agent built + tested.
+    // THROWAWAY creation dir under the OS temp dir — the Atelier never writes
+    // into the user's workspace, so this path is workspace-independent. Lets
+    // the TranscriptDrawer render the web app the agent built + tested.
     if let Some(rest) = rel.strip_prefix("__atelier__/") {
         return serve_atelier(rest);
     }
@@ -211,7 +211,7 @@ pub fn serve(app: &AppHandle, raw_path: &str) -> Response<Cow<'static, [u8]>> {
     read_and_respond(&target)
 }
 
-/// Serve a file from an Atelier run's disposable mirror: `rest` is
+/// Serve a file from an Atelier run's throwaway creation dir: `rest` is
 /// `<agentId>/<path>` (path defaults to index.html). The agent id is validated
 /// (alphanumerics + `-` only, matching a UUID) so it can't escape the temp dir,
 /// and every sub-path component is checked the same way as the workspace branch.

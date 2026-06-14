@@ -527,7 +527,7 @@ function ToolsField({
         <ToolToggle
           icon="💻"
           label="Peut lancer des commandes système"
-          desc="Tools : bash — ⚠️ exécution de code arbitraire (sandbox Docker)"
+          desc="Tools : bash — ⚠️ exécution directe sur ta machine (le filet de sécurité est git)"
           danger
           on={has("bash")}
           onChange={(on) => setTool("bash", on)}

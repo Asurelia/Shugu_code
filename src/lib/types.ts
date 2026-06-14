@@ -136,8 +136,6 @@ export interface DockState {
   activeId: string | null;       // active tab id in pane 0
   splitActiveId: string | null;  // active tab id in pane 1 (null when not split)
   split: boolean;
-  /** @deprecated use splitActiveId. Kept transiently for migration of in-memory state. */
-  splitId?: string | null;
   splitRatio: number;
   _lastSide?: string;
 }

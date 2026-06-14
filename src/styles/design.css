@@ -16,7 +16,9 @@
 
 /* ── Left: catalogue browser ──────────────────────────────── */
 .design-browser {
-  width: clamp(300px, 26vw, 380px);
+  /* Plancher 260px (au lieu de 300) : entre ~901 et 1150px de large, le
+     catalogue cède de la place au canvas au lieu de bloquer à 300px. */
+  width: clamp(260px, 26vw, 380px);
   flex-shrink: 0;
   display: flex;
   flex-direction: column;

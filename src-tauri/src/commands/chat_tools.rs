@@ -2,17 +2,18 @@
 //! agents, exécutés en boucle bornée par chat_send. Pas de run_command, pas
 //! de skill_save. Écritures path-guardées (fs::safe_resolve_for_write) et
 //! consignées dans un journal d'annulation renvoyé au front (réversibilité du
-//! tour, esprit agent_reverse_patch mais sans Docker).
+//! tour).
 //!
 //! ## Pourquoi un module séparé de `agents::tools`
 //!
 //! Le dispatcher agent (`agents::tools::dispatch_inner`) expose un set PLUS LARGE
-//! (run_command sandboxé, skill_save, todo_write) destiné au banc Atelier. Le
-//! chat veut un sous-ensemble strict : lecture toujours, écriture optionnelle,
-//! JAMAIS d'exécution de code. Plutôt que de propager un flag à travers le
-//! dispatcher agent, on isole ici le renderer JSON filtré + le dispatcher chat,
-//! qui réutilisent les MÊMES helpers d'exécution (`fs::*_inner`, `grep::grep_inner`)
-//! que les agents — donc le même path-guard, sans duplication de la logique d'I/O.
+//! (run_command en exec directe, skill_save, todo_write). Le chat inline veut un
+//! sous-ensemble strict : lecture toujours, écriture optionnelle, pas d'exécution
+//! (pour exécuter, le chat délègue à un agent — qui a run_command). Plutôt que de
+//! propager un flag à travers le dispatcher agent, on isole ici le renderer JSON
+//! filtré + le dispatcher chat, qui réutilisent les MÊMES helpers d'exécution
+//! (`fs::*_inner`, `grep::grep_inner`) que les agents — donc le même path-guard,
+//! sans duplication de la logique d'I/O.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

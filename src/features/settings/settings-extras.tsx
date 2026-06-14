@@ -385,6 +385,11 @@ export function InterfaceSettings() {
             label="Le chat peut modifier les fichiers"
             desc="Autorise le chat à écrire / éditer des fichiers. Chaque tour reste réversible via « Annuler les modifications de ce message »."
           />
+          <ChatToolsRow
+            settingKey="chat.persona"
+            label="Personnalité de Shugu"
+            desc="Le chat répond avec la voix de Shugu (chaleureuse, directe, honnête) au lieu du ton neutre du modèle. S'applique à toutes les conversations."
+          />
           <CockpitRow />
         </div>
 
@@ -508,7 +513,7 @@ function ChatToolsRow({
   label,
   desc,
 }: {
-  settingKey: "chat.readTools" | "chat.writeTools";
+  settingKey: "chat.readTools" | "chat.writeTools" | "chat.persona";
   label: string;
   desc: string;
 }) {
@@ -548,17 +553,17 @@ export function SegRow({ value, onChange, options }: any) {
 }
 
 /**
- * Lot Cockpit-1 — toggle du flag `ui.cockpit` (défaut OFF).
- * Active la disposition « cockpit » (chat + IDE en surfaces) sur la vue Chat.
- * Pattern identique à ChatToolsRow MAIS défaut OFF : ON seulement si "true".
+ * Lot Cockpit-1 — toggle du flag `ui.cockpit` (défaut ON depuis le
+ * 2026-06-10). Active la disposition « cockpit » (chat + IDE en surfaces) sur
+ * la vue Chat ; désactiver ramène l'ancien shell mono-pane.
  */
 function CockpitRow() {
-  const [on, setOn] = useState(false); // défaut OFF (nouvelle feature)
+  const [on, setOn] = useState(true); // défaut ON (absent = ON)
 
   useEffect(() => {
     let alive = true;
     void db.settings.get("ui.cockpit").then((v) => {
-      if (alive) setOn(v === "true"); // ON uniquement si "true"
+      if (alive) setOn(v !== "false"); // OFF uniquement si "false"
     });
     return () => { alive = false; };
   }, []);
@@ -573,8 +578,8 @@ function CockpitRow() {
 
   return (
     <SettingRow
-      label="Cockpit (chat + IDE) — expérimental"
-      desc="Affiche la vue Chat comme un cockpit : chat à gauche, éditeur/révision en panneau droit redimensionnable."
+      label="Cockpit (chat + IDE)"
+      desc="Affiche la vue Chat comme un cockpit : chat à gauche, éditeur/révision en panneau droit redimensionnable. Désactiver ramène la vue chat simple."
     >
       <Switch on={on} onChange={change} />
     </SettingRow>

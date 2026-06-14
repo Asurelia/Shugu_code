@@ -12,7 +12,7 @@
 
 import React, { useState, useCallback } from "react";
 import { invoke } from "@/lib/tauri";
-import { useChatWrites, setChatWrites } from "./chatWritesStore";
+import { useChatWrites, setChatWrites, markAgentWritesReverted, isAgentWritesReverted } from "./chatWritesStore";
 import type { ChatWriteRecord } from "./chatWritesStore";
 import { useGitDiff } from "@/features/git/queries";
 import { useIsGitRepo } from "@/features/git/queries";
@@ -208,16 +208,26 @@ interface ChatWritesCardProps {
   messageId: string;
   /** onOpenFile handler from the parent CxMessage (uses handleOpenFile → in-chat split). */
   onOpenFile: (path: string) => void;
+  /** Source des écritures. Absent → mode chat-direct : lecture du store par
+   *  messageId. Fourni → mode AGENT : les records viennent du transcript
+   *  (useMessageDisplay), pas du store. L'undo reste `chat_revert_writes`. */
+  records?: ChatWriteRecord[];
 }
 
-export function ChatWritesCard({ messageId, onOpenFile }: ChatWritesCardProps): JSX.Element | null {
-  const records = useChatWrites(messageId);
+export function ChatWritesCard({ messageId, onOpenFile, records: propRecords }: ChatWritesCardProps): JSX.Element | null {
+  const storeRecords = useChatWrites(messageId);
+  const records = propRecords ?? storeRecords;
   const [open, setOpen] = useState(true);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // En mode agent il n'y a pas de store à vider après l'undo : on masque la
+  // carte localement pour qu'elle disparaisse comme en mode chat-direct.
+  const [dismissed, setDismissed] = useState(false);
 
   // Return null when there are no records (same condition as the old button).
-  if (records.length === 0) return null;
+  // En mode agent, isAgentWritesReverted persiste l'annulation au-delà du
+  // remount (le transcript garde les events write) — cf. revue fraîche.
+  if (dismissed || (propRecords != null && isAgentWritesReverted(messageId)) || records.length === 0) return null;
 
   const n = records.length;
 
@@ -231,7 +241,15 @@ export function ChatWritesCard({ messageId, onOpenFile }: ChatWritesCardProps): 
     void (async () => {
       try {
         await invoke("chat_revert_writes", { records });
-        setChatWrites(messageId, []); // retire la carte
+        // Mode agent : pas d'entrée store → on masque localement ET on mémorise
+        // l'annulation (session) pour ne pas réafficher au remount. Mode chat :
+        // on vide le store (persiste au remount).
+        if (propRecords) {
+          markAgentWritesReverted(messageId);
+          setDismissed(true);
+        } else {
+          setChatWrites(messageId, []);
+        }
         try {
           const mod = await import("@tauri-apps/api/event");
           await mod.emit("workspace://changed", {});

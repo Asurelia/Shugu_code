@@ -39,11 +39,32 @@ export const FMT_RELATIVE = (ts: number) => {
   return new Date(ts).toLocaleDateString();
 };
 
+// ─────────────────────────────────────────────────────────────────────────
+// Module-level cache of the last hydrated groups/convos.
+//
+// WHY: collapsing the left panel makes SidePanel return null (components.tsx),
+// which UNMOUNTS ChatSidebar entirely. Reopening REMOUNTS it from scratch.
+// Without this cache, every reopen re-initialised state from SEED_CONVOS and
+// flashed the hardcoded demo list ("amazing-grothendieck", "Research Liquid
+// technology"…) for the few ms of the async SQLite round-trip, before the
+// mount effect replaced it with the real list. The cache survives the
+// unmount/remount cycle so a reopen paints the real last-known list instantly.
+//
+// It is per-window (each webview has its own module instance) and is refreshed
+// from SQLite — the source of truth — by the hydrate effect on every mount.
+// ─────────────────────────────────────────────────────────────────────────
+let convosCache: any[] | null = null;
+let groupsCache: any[] | null = null;
+
 export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
-  // Initial state from seeds ensures the first paint always has data.
-  // The useEffect below replaces it with SQLite data after mount.
-  const [groups, setGroups]   = useState<any[]>(SEED_GROUPS);
-  const [convos, setConvos]   = useState<any[]>(SEED_CONVOS);
+  // Initial state comes from the module cache (real data, survives remounts).
+  // On a genuine cold start the cache is empty, so we start with an EMPTY convo
+  // list — never SEED_CONVOS — and let the hydrate effect fill it from SQLite.
+  // SEED_CONVOS stays a SQLite-bootstrap concern only (db.seedIfEmpty); it must
+  // never reach the UI as a placeholder again. SEED_GROUPS is the real default
+  // group structure (groups aren't persisted), so it remains the cold fallback.
+  const [groups, setGroups]   = useState<any[]>(() => groupsCache ?? SEED_GROUPS);
+  const [convos, setConvos]   = useState<any[]>(() => convosCache ?? []);
   const [filtersOpen, setFiltersOpen] = useState(false);
 
   // ─────────────────────────────────────────────────────────────────
@@ -80,16 +101,27 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
     onActiveTitle(c?.title || null);
   }, [activeId, convos, onActiveTitle]);
 
+  // Keep the module cache in sync with the live state so the next remount
+  // (panel reopen) starts from the real data, not a stale snapshot.
+  useEffect(() => { convosCache = convos; }, [convos]);
+  useEffect(() => { groupsCache = groups; }, [groups]);
+
   // Hydrate from SQLite on mount.
   // listNested() reconstructs the parent→children tree from parent_id so that
   // sub-conversations (e.g. c6a/c6b under c6) are properly nested instead of
   // appearing as flat top-level rows after a SQLite round-trip.
+  //
+  // We always apply the result (no `length > 0` guard): SQLite is the source of
+  // truth, so an empty list MUST be honoured — otherwise deleting every
+  // conversation would leave the stale in-memory list on screen. seedIfEmpty()
+  // re-seeds a genuinely empty table first, so a fresh install still shows the
+  // onboarding demo (loaded from SQLite, persistent — not a flashing placeholder).
   useEffect(() => {
     let cancelled = false;
     (async () => {
       await seedIfEmpty();
       const nested = await db.conversations.listNested();
-      if (!cancelled && nested.length > 0) {
+      if (!cancelled) {
         setConvos(nested);
       }
     })();

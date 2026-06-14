@@ -242,8 +242,10 @@ function FileList({
   return (
     <div
       style={{
-        width: 220,
-        minWidth: 160,
+        // flex 0 1 220px : la liste cède de la largeur (jusqu'à 120px) quand
+        // le right panel est étroit, au lieu de comprimer le diff à côté.
+        flex: "0 1 220px",
+        minWidth: 120,
         maxWidth: 280,
         borderRight: "1px solid rgba(255,255,255,0.06)",
         display: "flex",

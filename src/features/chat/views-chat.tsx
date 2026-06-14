@@ -22,9 +22,9 @@ import { useChatToolActivity } from "./chatToolActivityStore";
 import { ChatWritesCard } from "./ChatWritesCard";
 import { db } from "@/lib/db";
 import { ModelPicker } from "@/features/panels/panels";
-import { revealAgent } from "@/lib/agents";
+import { revealAgent, killAgent, type AgentStatus } from "@/lib/agents";
 import { useAgentDefs } from "@/features/agents/agentDefsQueries";
-import { useMessageDisplay } from "./useMessageDisplay";
+import { useMessageDisplay, type AgentActivityItem, type AgentPlanStep } from "./useMessageDisplay";
 import { useShell } from "@/routes/shell-context";
 import { detectBlockPath } from "@/lib/markdown";
 import { CodeMirrorEditor } from "@/features/code/CodeMirrorEditor";
@@ -793,6 +793,158 @@ export function ReviewFeedback({ reviewerId }: { reviewerId: string }) {
   );
 }
 
+// ─── Live agent activity timeline ───────────────────────────────
+// Rendu dans la bulle de l'orchestrateur : montre EN DIRECT ce que l'agent fait
+// (lit / écrit / exécute), avec un chrono et un état travaille/terminé/échec.
+// Les données viennent du transcript (useMessageDisplay → useAgentTranscript),
+// déjà tenu à jour en live par useAgentEvents (agent://lifecycle). Repliable :
+// déplié pendant le run, repliable une fois terminé — l'historique des actions
+// reste consultable. C'est le correctif au « placeholder figé » : avant, le fil
+// ne montrait QUE « Orchestrateur au travail… » jusqu'au résultat final ; les
+// commandes/outils (le vrai travail) vivaient uniquement dans le drawer Agents.
+function fmtElapsed(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return s + "s";
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return r ? `${m}m ${r}s` : `${m}m`;
+}
+
+// Plan vivant de l'orchestrateur (tool `todo_write`) — checklist qui se coche au
+// fil de l'exécution. N'apparaît que si l'agent a réellement posé un plan
+// (graceful : pas de plan → pas de bloc). Glyphes : ☐ à faire, ◐ en cours
+// (pulsé), ☑ fait.
+function AgentPlan({ steps }: { steps: AgentPlanStep[] }) {
+  const done = steps.filter((s) => s.status === "completed").length;
+  return (
+    <details className="cx-agent-plan" open>
+      <summary>
+        <span className="hl">Plan</span>
+        <span className="ct">{done}/{steps.length}</span>
+      </summary>
+      <ul>
+        {steps.map((s, i) => (
+          <li key={i} className={"pstep " + s.status}>
+            <span className="box">
+              {s.status === "completed" ? "☑" : s.status === "in_progress" ? "◐" : "☐"}
+            </span>
+            <span className="txt">{s.text}</span>
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+}
+
+// Une ligne de la timeline. Quand l'outil a renvoyé une sortie (`result`), la
+// ligne devient dépliable (clic → <pre> de la sortie : stdout/exit d'une
+// commande, contenu lu, message d'erreur). Sinon c'est une ligne simple.
+function ActivityRow({ it }: { it: AgentActivityItem }) {
+  const head = (
+    <>
+      <span className="ic">{it.icon}</span>
+      <span className="lb">{it.label}</span>
+      {it.detail && <span className="dt" title={it.detail}>{it.detail}</span>}
+      <span className="st">
+        {it.status === "running" ? "…" : it.status === "error" ? "✗" : "✓"}
+      </span>
+    </>
+  );
+  if (!it.result) {
+    return <li className={"act " + it.status}>{head}</li>;
+  }
+  return (
+    <li className={"act has-out " + it.status}>
+      <details>
+        <summary>{head}</summary>
+        <pre className="out">{it.result}</pre>
+      </details>
+    </li>
+  );
+}
+
+function AgentActivity({
+  items,
+  status,
+  startedAt,
+  finishedAt,
+  agentId,
+}: {
+  items: AgentActivityItem[];
+  status?: AgentStatus;
+  startedAt?: number;
+  finishedAt?: number | null;
+  /** Pour le bouton Stop (kill l'agent en cours). */
+  agentId?: string;
+}) {
+  const running = status === "running" || status === "pending";
+
+  // Ticker 1 s pendant le run : une commande longue peut ne rien émettre
+  // pendant 30 s — sans ça le chrono semblerait figé et l'utilisateur croirait
+  // l'agent planté. S'arrête net dès la fin du run.
+  const [, forceTick] = useState(0);
+  useEffect(() => {
+    if (!running) return;
+    const id = setInterval(() => forceTick((n) => n + 1), 1000);
+    return () => clearInterval(id);
+  }, [running]);
+
+  const [killed, setKilled] = useState(false);
+
+  if (!running && items.length === 0) return null;
+
+  const elapsed = startedAt != null ? fmtElapsed((finishedAt ?? Date.now()) - startedAt) : "";
+  // `killed` (clic Stop local) : on dit « Arrêté », pas « Échec » — l'agent n'a
+  // pas planté, l'utilisateur l'a stoppé (le statut backend devient error/killed).
+  const headLabel = running
+    ? (killed ? "Arrêt…" : "Travaille…")
+    : killed ? "Arrêté"
+    : status === "error" ? "Échec"
+    : "Terminé";
+
+  return (
+    <details className={"cx-agent-activity" + (running ? " running" : "")} open={running}>
+      <summary>
+        <span className={"dot" + (running ? " live" : "")} />
+        <span className="hl">{headLabel}</span>
+        {elapsed && <span className="el">{elapsed}</span>}
+        {items.length > 0 && (
+          <span className="ct">{items.length} action{items.length > 1 ? "s" : ""}</span>
+        )}
+        {running && agentId && (
+          <button
+            type="button"
+            className="stop"
+            title="Arrêter l'agent"
+            disabled={killed}
+            // stopPropagation : ne pas replier le <details> en cliquant Stop.
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              setKilled(true);
+              void killAgent(agentId).catch(() => setKilled(false));
+            }}
+          >
+            {killed ? "Arrêt…" : "✕ Stop"}
+          </button>
+        )}
+      </summary>
+      {items.length > 0 && (
+        <ul>
+          {items.map((it) => (
+            <ActivityRow key={it.key} it={it} />
+          ))}
+        </ul>
+      )}
+      {!running && elapsed && (
+        <div className="foot">
+          {killed ? "⏹ Arrêté" : status === "error" ? "✗ Échec" : "✓ Terminé"} · {elapsed}
+        </div>
+      )}
+    </details>
+  );
+}
+
 // ─── Per-message renderer ───────────────────────────────────
 function CxMessage({
   m,
@@ -813,7 +965,28 @@ function CxMessage({
   /** Lot A (Task 8) — apply a code block to a file (diff accept/reject). */
   onApply?: (code: string, lang: string, target: string) => void;
 }) {
-  const { displayBody, liveReasoning, isStreamingAgent, imageDataUrl } = useMessageDisplay(m);
+  const {
+    displayBody,
+    liveReasoning,
+    isStreamingAgent,
+    imageDataUrl,
+    isAgentRun,
+    agentRole,
+    agentStatus,
+    activity,
+    plan,
+    writeRecords,
+    startedAt,
+    finishedAt,
+  } = useMessageDisplay(m);
+
+  // Le journal d'activité ne s'affiche que pour le travail de l'ORCHESTRATEUR,
+  // pas pour les messages de plan / revue (préfixés 📋 / 🔎) que l'advisor
+  // appose — ceux-là sont déjà du texte lisible tel quel.
+  const showActivity =
+    isAgentRun &&
+    agentRole === "orchestrator" &&
+    !/^(📋|🔎)/.test(m.body ?? "");
 
   if (m.role === "user") {
     return (
@@ -850,6 +1023,17 @@ function CxMessage({
       {isStreamingAgent && liveReasoning && !m.reasoning && <ThinkBlock open text={liveReasoning} />}
       {m.reasoning && <ThinkBlock text={m.reasoning} label={`Thinking (${m.reasoning.length} chars)`} />}
 
+      {showActivity && plan && plan.length > 0 && <AgentPlan steps={plan} />}
+      {showActivity && (
+        <AgentActivity
+          items={activity}
+          status={agentStatus}
+          startedAt={startedAt}
+          finishedAt={finishedAt}
+          agentId={m.agentId}
+        />
+      )}
+
       <div className="cx-body">
         {imageDataUrl ? (
           <img src={imageDataUrl} alt="image générée" />
@@ -872,7 +1056,13 @@ function CxMessage({
         {/* Lot C3 — Carte d'opération in-chat : "✏️ N fichier(s) modifié(s)"
             avec liste dépliable des fichiers + diff par fichier + bouton Annuler ↺.
             Retourne null quand il n'y a pas d'écritures pour ce message. */}
-        <ChatWritesCard messageId={String(m.id)} onOpenFile={onOpenFile} />
+        {/* Mode AGENT : les écritures viennent du transcript (events `write`),
+            pas du store chat-direct. Sinon (chat direct) → fallback store. */}
+        <ChatWritesCard
+          messageId={String(m.id)}
+          onOpenFile={onOpenFile}
+          records={showActivity && writeRecords.length > 0 ? writeRecords : undefined}
+        />
         <div className="cx-react">
           <button title="Copier" onClick={() => copyText(displayBody || m.body || m.text || "")}>
             <Icon name="copy" size={12} />
@@ -1169,6 +1359,36 @@ export function ImageView({ generations, setGenerations }: any) {
     setSeed(nextSeed);
     void generate({ seed: nextSeed });
   };
+
+  // Lot stubs-palette (2026-06-10) — les commandes palette (Cmd+Enter /
+  // Cmd+Shift+V / Cmd+S sur /image) pilotent les fonctions internes de cette
+  // vue via des CustomEvents window-locaux. Ré-abonné à chaque render (cleanup
+  // systématique) pour capturer les états frais sans tableau de deps fragile.
+  useEffect(() => {
+    const onGen = () => {
+      if (!busy && prompt.trim()) void generate();
+    };
+    const onVar = () => {
+      if (!busy && current) makeVariation();
+    };
+    const onPin = () => {
+      if (!current?.resultUrl) return;
+      togglePinnedAsset(String(current.id));
+      pushToast(
+        currentPinned ? "Reference marque retiree" : "Reference marque ajoutee",
+        "success",
+        2400,
+      );
+    };
+    window.addEventListener("shugu:image-generate", onGen);
+    window.addEventListener("shugu:image-variation", onVar);
+    window.addEventListener("shugu:image-save", onPin);
+    return () => {
+      window.removeEventListener("shugu:image-generate", onGen);
+      window.removeEventListener("shugu:image-variation", onVar);
+      window.removeEventListener("shugu:image-save", onPin);
+    };
+  });
 
   return (
     <div className="image-shell">

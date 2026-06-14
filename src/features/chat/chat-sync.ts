@@ -36,11 +36,12 @@ import { parseAiReply } from "@/lib/markdown";
 import { parseMentions, resolveMentions, buildMentionContext } from "./mentions";
 import { resolveCodeContext, buildCodeContext } from "./codeContext";
 import { fireMoodReaction } from "@/features/mascot/moodReactionStore";
+import { SHUGU_PERSONA_PROMPT, personaEnabled } from "@/features/chat/persona";
 import { parseThinkingMode, resolveThinking } from "@/lib/thinkingHeuristic";
-import { resolveRoute, parseDelegateOverride, classifyComplexity } from "@/lib/routingHeuristic";
+import { resolveRoute, parseDelegateOverride } from "@/lib/routingHeuristic";
 import { spawnAgent, awaitAgentComplete } from "@/lib/agents";
 import { readAgentDef } from "@/lib/agentDefs";
-import { superviseDeliverable, supervisePlan } from "@/lib/supervisors";
+import { superviseDeliverable, supervisePlan, resolveReviewerArgs } from "@/lib/supervisors";
 import { getActiveDesignSystem, buildDesignSystemPrompt } from "@/features/design/activeDesignSystem";
 import { queryClient } from "@/lib/queryClient";
 import { diag } from "@/lib/diag";
@@ -458,11 +459,12 @@ export async function sendChatMessage(
     }
   }
 
-  // Suite Lot 4 — auto-RAG (OPT-IN via db.settings "rag.autoCodeContext").
-  // Injecte des extraits de code sémantiquement proches de la question. Désactivé
-  // par défaut : consomme des tokens et la pertinence dépend de la qualité de
-  // l'index/embedding (réglage runtime). Indépendant des @-mentions explicites.
-  if ((await db.settings.get("rag.autoCodeContext")) === "true") {
+  // Auto-RAG (db.settings "rag.autoCodeContext", absent = ON depuis le
+  // 2026-06-10 — même pattern que chat.readTools). Injecte des extraits de code
+  // sémantiquement proches de la question ; se désactive dans Réglages → Éditeur.
+  // Indépendant des @-mentions explicites. Dégrade en silence si l'index est
+  // vide (resolveCodeContext → []).
+  if ((await db.settings.get("rag.autoCodeContext")) !== "false") {
     const codeCtx = buildCodeContext(await resolveCodeContext(trimmed, 5));
     if (codeCtx) {
       const lastUserIdx = apiMessages.map((m) => m.role).lastIndexOf("user");
@@ -483,6 +485,15 @@ export async function sendChatMessage(
   const activeDs = getActiveDesignSystem();
   if (activeDs && (activeDs.designMd.trim() || activeDs.tokensCss.trim())) {
     apiMessages.unshift({ role: "system", content: buildDesignSystemPrompt(activeDs) });
+  }
+
+  // Persona Shugu (lot 2026-06-10) — la voix de la mascotte dans TOUTES les
+  // conversations (pipeline partagé main + mascotte). Unshift APRÈS le
+  // design-system pour finir en position 0 : l'identité d'abord, le contexte
+  // ensuite. INVOKE-ONLY comme le design-system (jamais persisté). Toggle
+  // Réglages → chat.persona (absent = ON).
+  if (await personaEnabled()) {
+    apiMessages.unshift({ role: "system", content: SHUGU_PERSONA_PROMPT });
   }
 
   // Capture the reasoning trace for persistence. The streaming UI hooks
@@ -767,23 +778,56 @@ async function handleDelegate(
   }
 
   // ── S2 + S1 shared gate ────────────────────────────────────────────────────
-  // Compute ONCE whether supervision is active for this invocation. Used by
-  // both S2 (pre-execution plan review) and S1 (post-execution deliverable
-  // review). Factored out here to avoid duplicating the db.settings read.
+  // L'advisor (plan S2 + revue S1) tourne sur TOUTE tâche déléguée. La
+  // délégation EST déjà le signal « c'est du travail, pas du bavardage » (le
+  // routeur a explicitement classé en "delegate"). On NE gate PLUS sur
+  // classifyComplexity : ce compteur de mots-clés ratait des tâches énormes
+  // mais courtes — « conçois un jeu vidéo complet » scorait "simple" pour un
+  // modèle fort (seuil 4), ce qui sautait l'advisor EN SILENCE. Restent
+  // l'interrupteur maître routing.superviseComplex (défaut ON) et l'anti-
+  // récursion (ne jamais superviser le reviewer/planner lui-même).
   const superviseRaw = await db.settings.get("routing.superviseComplex");
   const superviseOn = superviseRaw == null ? true : superviseRaw === "true";
   const isReviewerInvocation = !!agentDefPath && /reviewer|planner/i.test(agentDefPath);
-  const wantSupervise =
-    superviseOn &&
-    !isReviewerInvocation &&
-    classifyComplexity(task, realModel) === "complex";
+  const wantSupervise = superviseOn && !isReviewerInvocation;
+
+  // Si l'advisor est demandé mais qu'aucun reviewer n'est configuré, on le DIT
+  // dans le fil — sauter en silence laissait l'utilisateur croire que l'advisor
+  // tournait (« pas vu de plan »). Une seule résolution ici sert d'écran ; les
+  // supervisors re-résolvent de leur côté (coût négligeable, lectures DB).
+  let supervisorAvailable = false;
+  if (wantSupervise) {
+    supervisorAvailable = (await resolveReviewerArgs()) != null;
+    if (!supervisorAvailable) {
+      await appendMessage(convId, {
+        id: newMessageId("e"),
+        role: "ai",
+        body:
+          "ℹ️ **Advisor inactif** : aucun reviewer configuré, donc pas de plan ni de revue automatiques. " +
+          "Active un agent `reviewer` ou `reviewer-gpt` (Réglages → Agents) et choisis son modèle " +
+          "(Réglages → Connections, champ *Advisor*) pour voir le plan AVANT l'exécution et la revue après.",
+        ts: nowHHMM(),
+      });
+    }
+  }
 
   // ── S2 — plan review before execution ──────────────────────────────────────
   // If supervision is active, spawn the orchestrator in "plan-only" mode, have
   // the reviewer evaluate the plan, and optionally augment the task with the
   // reviewer's concerns (advisory — never blocks execution).
   let execTask = task;
-  if (wantSupervise) {
+  if (wantSupervise && supervisorAvailable) {
+    // Indicateur transitoire pendant la phase plan (S2). Sans lui, il y a un
+    // trou mort entre le message user et l'apparition du « 📋 Plan » : le
+    // planner tourne 10-90 s en silence et l'utilisateur croit que rien ne se
+    // passe. Soft-deleté dès que S2 rend la main (le 📋 Plan prend le relais).
+    const planningId = newMessageId("a");
+    await appendMessage(convId, {
+      id: planningId,
+      role: "ai",
+      body: "🧭 Planification…",
+      ts: nowHHMM(),
+    });
     try {
       const planResult = await supervisePlan({
         convId,
@@ -796,6 +840,14 @@ async function handleDelegate(
     } catch (s2Err) {
       console.warn("[chat-sync] S2 supervisePlan gate failed:", s2Err);
       // execTask stays as `task` — proceed normally.
+    } finally {
+      try {
+        await db.messages.softDelete(planningId);
+        const mod = await import("@tauri-apps/api/event");
+        await mod.emit(EVT_MESSAGES, { conversationId: convId });
+      } catch (rmErr) {
+        console.warn("[chat-sync] planning indicator cleanup failed:", rmErr);
+      }
     }
   }
 
@@ -926,7 +978,7 @@ async function handleDelegate(
     // `wantSupervise` is computed once above (shared with S2) — no re-read.
     // The review always uses the ORIGINAL `task` as the reference, not
     // `execTask` (which may carry the S2 warning injection).
-    if (wantSupervise) {
+    if (wantSupervise && supervisorAvailable) {
       void superviseDeliverable({ convId, agentId, task });
     }
   } catch (err) {

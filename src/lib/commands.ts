@@ -3,6 +3,7 @@
 // Pass 1: flat COMMANDS array with default keybindings, categories, run/when predicates.
 
 import { fsOpenFolder, fsGetWorkspaceRoot } from "@/lib/fs";
+import { recordRecentWorkspace } from "@/features/fs/recentWorkspaces";
 import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
 import { openSearchPanel } from "@codemirror/search";
 import type { EditorView } from "@codemirror/view";
@@ -106,6 +107,15 @@ export interface CommandContext {
   // clears it.
   compareFile?: { left: string; right: string } | null;
   setCompareFile?: React.Dispatch<React.SetStateAction<{ left: string; right: string } | null>>;
+
+  // ─── Lot stubs-palette (2026-06-10) ──────────────────────────────────
+  /** Ouvre/ferme le Quick Open (Cmd+P) — câblé par RootLayout. */
+  setQuickOpenOpen?: (open: boolean) => void;
+  /** Régénère le dernier message assistant de la conversation active
+   *  (Cmd+R). Retourne false quand il n'y a rien à régénérer. */
+  regenerateLast?: () => Promise<boolean>;
+  /** Ouvre/ferme le picker « projets récents » — câblé par RootLayout. */
+  setRecentOpen?: (open: boolean) => void;
 }
 
 // ─── Command interface ─────────────────────────────────────────
@@ -266,9 +276,9 @@ export const COMMANDS: Command[] = [
     category: "Workbench",
     icon: "search",
     keybinding: ["Cmd", "P"],
-    // Backend (search index) not yet wired.
-    when: () => false,
-    run: () => { /* TODO: open quick-open file picker */ },
+    description: "fuzzy file picker",
+    when: (ctx) => !!ctx.setQuickOpenOpen,
+    run: (ctx) => ctx.setQuickOpenOpen?.(true),
   },
   {
     id: "focus-float",
@@ -342,6 +352,8 @@ export const COMMANDS: Command[] = [
     run: async (ctx) => {
       const root = await fsOpenFolder();
       if (!root) return;
+      // Lot projets-récents — alimente l'historique (best-effort, fire-and-forget).
+      void recordRecentWorkspace(root);
       // LOT 3 — Disconnect tous les LSP clients AVANT le refetch tree :
       // leur workspaceUri pointe sur l'ancien dossier, les requêtes
       // go-to-def / find-refs y resteraient ancrées. Le prochain ouvrir
@@ -362,6 +374,16 @@ export const COMMANDS: Command[] = [
       ctx.setActiveFile(null);
       ctx.setFileContents({});
     },
+  },
+  {
+    // Lot projets-récents (2026-06-10) — picker des 8 derniers workspaces.
+    id: "open-recent-folder",
+    title: "Open Recent Folder…",
+    category: "File",
+    icon: "folderTree",
+    description: "projets récents",
+    when: (ctx) => !!ctx.setRecentOpen,
+    run: (ctx) => ctx.setRecentOpen?.(true),
   },
 
   // ── View ─────────────────────────────────────────────────
@@ -616,8 +638,11 @@ export const COMMANDS: Command[] = [
     title: "Regenerate last reply",
     category: "Edit",
     keybinding: ["Cmd", "R"],
-    when: () => false,
-    run: () => { /* TODO: retrigger last AI message (needs stream runner in ctx) */ },
+    when: (ctx) => ctx.currentView === "chat" && !!ctx.regenerateLast,
+    run: async (ctx) => {
+      const ok = await ctx.regenerateLast?.();
+      if (!ok) pushToast("Rien à régénérer dans cette conversation.", "info", 3000);
+    },
   },
   {
     // input-local: Enter in chat input — never dispatched globally.
@@ -842,13 +867,16 @@ export const COMMANDS: Command[] = [
   },
 
   // ── Image ─────────────────────────────────────────────────
+  // Lot stubs-palette (2026-06-10) — ces commandes pilotent les fonctions
+  // INTERNES de l'ImageView via des CustomEvents window-locaux (même fenêtre,
+  // pas besoin du bus Tauri) ; l'ImageView les écoute quand elle est montée.
   {
     id: "img-generate",
     title: "Generate image",
     category: "File",
     keybinding: ["Cmd", "Enter"],
     when: (ctx) => ctx.currentView === "image",
-    run: () => { /* TODO: trigger image generation (context: Image view) */ },
+    run: () => { window.dispatchEvent(new CustomEvent("shugu:image-generate")); },
   },
   {
     id: "img-variation",
@@ -856,16 +884,17 @@ export const COMMANDS: Command[] = [
     category: "File",
     keybinding: ["Cmd", "Shift", "V"],
     when: (ctx) => ctx.currentView === "image",
-    run: () => { /* TODO: trigger image variations (context: Image view) */ },
+    run: () => { window.dispatchEvent(new CustomEvent("shugu:image-variation")); },
   },
   {
     // ⌘S is shared with save-file; guarded by view context (intentional — see mapping doc §2.1).
     id: "img-save",
-    title: "Save to gallery",
+    title: "Pin as brand reference",
     category: "File",
     keybinding: ["Cmd", "S"],
+    description: "épingle l'image courante au brand board",
     when: (ctx) => ctx.currentView === "image",
-    run: () => { /* TODO: save current generation to gallery */ },
+    run: () => { window.dispatchEvent(new CustomEvent("shugu:image-save")); },
   },
 
   // ── Terminal ──────────────────────────────────────────────

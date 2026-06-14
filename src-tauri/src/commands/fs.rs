@@ -363,10 +363,49 @@ fn build_subtree(root: &Path, start: &Path, entries: Vec<walkdir::DirEntry>) -> 
 // Tauri commands
 // ---------------------------------------------------------------------------
 
+/// Shared tail of `fs_open_folder` / `fs_set_workspace_root` : canonicalize,
+/// store in managed state, persist to settings, rewire both watchers, and
+/// broadcast `workspace://changed` so anything anchored to the OLD root can
+/// react — notably the integrated terminal, which respawns its PTY in the new
+/// directory (VS Code behaviour). These two commands are the ONLY runtime
+/// mutations of `root_state` (Studio's openProject writes to .shugu-forge/
+/// preview without touching it), so this single emit covers every switch.
+fn apply_workspace_root(
+    app: &tauri::AppHandle,
+    root_state: &tauri::State<'_, Mutex<Option<PathBuf>>>,
+    watcher_ctl: &tauri::State<'_, crate::commands::watcher::WatcherCtl>,
+    git_watcher_ctl: &tauri::State<'_, crate::commands::git_watcher::WatcherCtl>,
+    raw_path: &Path,
+) -> Result<String, String> {
+    let canonical = std::fs::canonicalize(raw_path)
+        .map_err(|e| format!("canonicalize workspace: {e}"))?;
+
+    // Store in managed state.
+    let display = canonical.to_string_lossy().to_string();
+    {
+        let mut guard = root_state
+            .lock()
+            .map_err(|e| format!("workspace state lock: {e}"))?;
+        *guard = Some(canonical.clone());
+    }
+
+    // Persist to settings table (best-effort — don't fail the command on DB error).
+    let _ = persist_workspace_root(app, &canonical);
+
+    // Notify both watchers of the new root (best-effort — never fail the command).
+    let _ = watcher_ctl.0.send(canonical.clone());
+    let _ = git_watcher_ctl.0.send(canonical);
+
+    // Payload is the display path (forward-slash, no `\\?\`) for the frontend.
+    let _ = app.emit("workspace://changed", display.replace('\\', "/"));
+
+    Ok(display)
+}
+
 /// Open a native folder picker and set the workspace root.
 ///
 /// Returns the chosen folder's absolute path, or `null` if the user cancelled.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_open_folder(
     app: tauri::AppHandle,
     root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
@@ -384,34 +423,26 @@ pub fn fs_open_folder(
         .into_path()
         .map_err(|e| format!("invalid path from dialog: {e}"))?;
 
-    let canonical = std::fs::canonicalize(&raw_path)
-        .map_err(|e| format!("canonicalize workspace: {e}"))?;
+    apply_workspace_root(&app, &root_state, &watcher_ctl, &git_watcher_ctl, &raw_path).map(Some)
+}
 
-    // Store in managed state.
-    let display = canonical.to_string_lossy().to_string();
-    {
-        let mut guard = root_state
-            .lock()
-            .map_err(|e| format!("workspace state lock: {e}"))?;
-        *guard = Some(canonical.clone());
+/// Set the workspace root from a KNOWN absolute path — the « projets récents »
+/// path (lot 2026-06-10) : pas de dialog, même canonicalize/persist/watchers/
+/// broadcast que `fs_open_folder`. Rejette un chemin qui n'est pas un dossier
+/// existant pour qu'une entrée récente périmée échoue avec un message propre.
+#[tauri::command(async)]
+pub fn fs_set_workspace_root(
+    app: tauri::AppHandle,
+    root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
+    watcher_ctl: tauri::State<'_, crate::commands::watcher::WatcherCtl>,
+    git_watcher_ctl: tauri::State<'_, crate::commands::git_watcher::WatcherCtl>,
+    path: String,
+) -> Result<String, String> {
+    let raw = PathBuf::from(&path);
+    if !raw.is_dir() {
+        return Err(format!("dossier introuvable : {path}"));
     }
-
-    // Persist to settings table (best-effort — don't fail the command on DB error).
-    let _ = persist_workspace_root(&app, &canonical);
-
-    // Notify both watchers of the new root (best-effort — never fail the command).
-    let _ = watcher_ctl.0.send(canonical.clone());
-    let _ = git_watcher_ctl.0.send(canonical.clone());
-
-    // Broadcast the workspace change so anything anchored to the OLD root can
-    // react — notably the integrated terminal, which respawns its PTY in the
-    // new directory (VS Code behaviour). `fs_open_folder` is the ONLY runtime
-    // mutation of `root_state` (Studio's openProject writes to .shugu-forge/
-    // preview without touching it), so this single emit covers every switch.
-    // Payload is the display path (forward-slash, no `\\?\`) for the frontend.
-    let _ = app.emit("workspace://changed", display.replace('\\', "/"));
-
-    Ok(Some(display))
+    apply_workspace_root(&app, &root_state, &watcher_ctl, &git_watcher_ctl, &raw)
 }
 
 /// List the IMMEDIATE children of one directory (lazy tree loading).
@@ -427,7 +458,7 @@ pub fn fs_open_folder(
 /// Containment: the root is canonicalized; `rel` is resolved with `safe_resolve`
 /// (rejects traversal / symlink escape). Returns `Err("no workspace open")` when
 /// no folder is open, or `Err` if `rel` is not a directory inside the root.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_read_dir_shallow(
     rel: Option<String>,
     root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
@@ -499,7 +530,7 @@ pub fn fs_read_dir_shallow(
 /// Walk the workspace root and return a recursive directory tree.
 ///
 /// Returns `Err("no workspace open")` if no folder has been opened yet.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_read_dir(
     root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
 ) -> Result<Vec<FsEntry>, String> {
@@ -554,7 +585,7 @@ pub fn fs_read_dir(
 /// so the cap that protects the file-explorer's eager whole-tree render doesn't
 /// apply. Paths are full workspace-relative (so `fs_read_file`/`openFile` still
 /// resolve). Same `is_ignored` filter + dir-first sort as `fs_read_dir`.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_read_dir_scoped(
     rel: Option<String>,
     root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
@@ -626,7 +657,7 @@ pub struct FileListResult {
     pub total_seen: usize,
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_list_files(
     exclude_exts: Vec<String>,
     max_files: usize,
@@ -698,7 +729,9 @@ pub fn fs_list_files(
 /// Read a workspace-relative file path and return its content as a string.
 ///
 /// Rejects binary files (null bytes in first 8 KiB) and files over 5 MiB.
-#[tauri::command]
+/// Delegates to `read_file_inner` (the agent-tools core, defined below) with
+/// no soft cap — same guards, single implementation.
+#[tauri::command(async)]
 pub fn fs_read_file(
     path: String,
     root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
@@ -709,32 +742,49 @@ pub fn fs_read_file(
             .map_err(|e| format!("workspace state lock: {e}"))?;
         guard.clone().ok_or_else(|| "no workspace open".to_string())?
     };
+    read_file_inner(&root, &path, None)
+}
 
-    let resolved = safe_resolve(&root, &path)?;
+/// One entry of `fs_read_files`. `content: None` means the file could not be
+/// read (renamed/deleted/binary/too large) — callers skip those silently,
+/// matching the per-file catch the boot restoration used to do around
+/// individual `fs_read_file` invokes.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoredFile {
+    pub path: String,
+    pub content: Option<String>,
+}
 
-    // Size check before reading.
-    let meta = std::fs::metadata(&resolved).map_err(|e| format!("stat error: {e}"))?;
-    const MAX_SIZE: u64 = 5 * 1024 * 1024; // 5 MiB
-    if meta.len() > MAX_SIZE {
-        return Err("file too large (>5 MiB)".into());
-    }
-
-    let bytes = std::fs::read(&resolved).map_err(|e| format!("read error: {e}"))?;
-
-    // Binary detection: scan first 8 KiB for null bytes.
-    let scan_len = bytes.len().min(8 * 1024);
-    if bytes[..scan_len].contains(&0u8) {
-        return Err("binary file".into());
-    }
-
-    // Decode with lossy UTF-8 (invalid sequences → U+FFFD). Preserve CRLF.
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+/// Read MANY workspace-relative files in ONE IPC round-trip.
+///
+/// Boot-time open-tabs restoration used to issue one `fs_read_file` invoke
+/// per persisted tab (N round-trips + 2 React setState per file). This batch
+/// returns everything at once; the result vec mirrors the order of `paths`.
+#[tauri::command(async)]
+pub fn fs_read_files(
+    paths: Vec<String>,
+    root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
+) -> Result<Vec<RestoredFile>, String> {
+    let root = {
+        let guard = root_state
+            .lock()
+            .map_err(|e| format!("workspace state lock: {e}"))?;
+        guard.clone().ok_or_else(|| "no workspace open".to_string())?
+    };
+    Ok(paths
+        .into_iter()
+        .map(|path| {
+            let content = read_file_inner(&root, &path, None).ok();
+            RestoredFile { path, content }
+        })
+        .collect())
 }
 
 /// Write content to a workspace-relative file path (atomic via temp-file + rename).
 ///
 /// Creates intermediate directories if needed.  Rejects paths outside the workspace.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_write_file(
     path: String,
     content: String,
@@ -786,7 +836,7 @@ pub fn fs_write_file(
 /// Fails if the file already exists.  Creates intermediate parent directories.
 /// If `content` is `None` an empty file is written; otherwise the given string
 /// is written atomically (temp-file + rename — same pattern as `fs_write_file`).
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_create_file(
     path: String,
     content: Option<String>,
@@ -823,7 +873,7 @@ pub fn fs_create_file(
 /// Create a directory (and all parents) at a workspace-relative path.
 ///
 /// Idempotent: succeeds if the directory already exists.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_create_dir(
     path: String,
     root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
@@ -838,7 +888,7 @@ pub fn fs_create_dir(
 /// `from` must exist; `to` must not exist (no silent overwrite).  If `to`'s
 /// parent directories are missing they are created first.  Both `from` and `to`
 /// must remain inside the workspace root.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_rename(
     from: String,
     to: String,
@@ -878,7 +928,7 @@ pub fn fs_rename(
 /// symlink whose resolved target is outside the workspace.  This means a
 /// dangling or out-of-workspace symlink cannot be deleted through this command.
 /// That is intentional; use the host OS to remove such links.
-#[tauri::command]
+#[tauri::command(async)]
 pub fn fs_delete(
     path: String,
     root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,

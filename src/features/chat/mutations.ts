@@ -9,11 +9,12 @@
 // "Regenerate from here" additionally calls sendChatMessage to re-trigger the
 // LLM round-trip after the tail of the conversation is soft-deleted.
 
+import { useCallback } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { emit } from "@tauri-apps/api/event";
 import { db } from "@/lib/db";
 import { vecDelete } from "@/lib/vector";
-import { sendChatMessage } from "./chat-sync";
+import { sendChatMessage, useActiveConv, useActiveModel } from "./chat-sync";
 import { chatKeys } from "./keys";
 
 const EVT_MESSAGES = "chat://messages-changed";
@@ -127,4 +128,35 @@ export function useRegenerateFrom(convId: string, modelId: string) {
       await sendChatMessage(convId, promptText, modelId);
     },
   });
+}
+
+// ─── useRegenerateLast ───────────────────────────────────────────────────────
+//
+// Lot stubs-palette (2026-06-10) — variante "sans cible" pour la commande
+// globale Cmd+R : régénère le DERNIER message assistant de la conversation
+// active. Retourne false (sans rien toucher) quand il n'y a rien à régénérer,
+// pour que la commande affiche un toast au lieu d'échouer en silence.
+
+export function useRegenerateLast(): () => Promise<boolean> {
+  const [activeConv] = useActiveConv();
+  const [model] = useActiveModel();
+  const regen = useRegenerateFrom(activeConv, model);
+
+  return useCallback(async () => {
+    if (!activeConv) return false;
+    const rows = (await db.messages.listByConversation(activeConv)) as Array<{
+      id: string | number;
+      role: string;
+      deleted_at?: number | null;
+    }>;
+    const lastAi = [...rows]
+      .reverse()
+      .find((r) => r.role === "assistant" && !r.deleted_at);
+    if (!lastAi) return false;
+    regen.mutate({ messageId: String(lastAi.id) });
+    return true;
+    // regen est une mutation TanStack stable par identité de hook ; activeConv
+    // et model pilotent sa fraîcheur.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConv, model]);
 }
