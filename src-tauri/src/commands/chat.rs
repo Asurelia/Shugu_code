@@ -193,6 +193,20 @@ impl ChatDeltaCoalescer {
     }
 }
 
+impl Drop for ChatDeltaCoalescer {
+    /// Safety net for early-return paths. `run_chat_tool_loop` flushes
+    /// explicitly after each streamed turn, but a mid-stream provider error
+    /// (`call_*_structured(...).await?`) returns via `?` BEFORE that flush —
+    /// the last <50 ms of streamed text would be lost. Dropping the coalescer
+    /// at every scope exit flushes that tail. On the success path `acc` is
+    /// already empty after the explicit flush, so this is a no-op (and the
+    /// owning function returns before the caller emits its terminal `done`
+    /// delta, so ordering is preserved).
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Key resolution
 // ---------------------------------------------------------------------------

@@ -76,9 +76,19 @@ export function CockpitShell({ activeConv }: { activeConv: string }) {
   // dock 140px (header 28px + ~6 lignes de terminal). Les fallbacks sont les
   // anciens minSize statiques, utilisés avant la première mesure.
   const [cockpitEl, setCockpitEl] = useState<HTMLDivElement | null>(null);
-  const chatMinPct = useMinSizePct(cockpitEl, 320, "w", 30);
-  const rightMinPct = useMinSizePct(cockpitEl, 260, "w", 20);
+  const chatMinPctRaw = useMinSizePct(cockpitEl, 320, "w", 30);
+  const rightMinPctRaw = useMinSizePct(cockpitEl, 260, "w", 20);
   const dockMinPct = useMinSizePct(cockpitEl, 140, "h", 12);
+  // chat | right vivent dans le MÊME PanelGroup horizontal : react-resizable-
+  // panels FIGE tout resize si la somme de leurs minSize dépasse 100 %. La
+  // fenêtre min Tauri (720px de large → ~80 %) ne l'atteint pas, mais sur une
+  // largeur atypique (sous ~580px) chat 320 + right 260 franchit le seuil. On
+  // rabote proportionnellement à 92 % max (8 % de marge pour garder la poignée
+  // mobile). Le dock est dans le groupe vertical → hors de cette somme.
+  const horizMinSum = chatMinPctRaw + rightMinPctRaw;
+  const minScale = horizMinSum > 92 ? 92 / horizMinSum : 1;
+  const chatMinPct = chatMinPctRaw * minScale;
+  const rightMinPct = rightMinPctRaw * minScale;
 
   // Hydrate the store from SQLite once at mount (LOCAL-FIRST restore).
   useEffect(() => {

@@ -113,6 +113,10 @@ const inner = (
       //   • ["chat","stream"] → buffer de streaming live ; rehydrater un
       //     streaming:true périmé au boot = ghost "en cours" (bug latent).
       //     Le reste de ["chat"] (messages, conversations) reste persisté.
+      //   • ["cockpit"]       → layout des panels ; source autoritaire = SQLite
+      //     (loadLayout/hydrateLayout). Le persister en localStorage rejouerait
+      //     un layout inter-session périmé (surface retirée du schéma) avant le
+      //     rechargement SQLite.
       // Le reste du cache est persisté normalement.
       dehydrateOptions: {
         shouldDehydrateQuery: (q) =>
@@ -123,6 +127,7 @@ const inner = (
           q.queryKey[0] !== "fs" &&
           q.queryKey[0] !== "git" &&
           q.queryKey[0] !== "grep" &&
+          q.queryKey[0] !== "cockpit" &&
           !(q.queryKey[0] === "chat" && q.queryKey[1] === "stream") &&
           defaultShouldDehydrateQuery(q),
       },
