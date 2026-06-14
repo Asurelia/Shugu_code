@@ -1464,6 +1464,16 @@ async fn consult_advisor(
         advisor_history.push(m.clone());
     }
 
+    // Garde-fou : si rien d'autre que le system advisor (transcript 100% system),
+    // l'API rejetterait un `messages` vide (400). On renvoie un message clair
+    // plutôt qu'une erreur opaque. (En pratique le user(task) est toujours là.)
+    if advisor_history.len() <= 1 {
+        return (
+            "advisor: no conversation turns yet — call advisor after at least one step.".to_string(),
+            true,
+        );
+    }
+
     // Pas de streaming live pour le conseiller : la sortie arrive en un bloc.
     let mut sink = |_kind: &str, _chunk: &str| {};
 
