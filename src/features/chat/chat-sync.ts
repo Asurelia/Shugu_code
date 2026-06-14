@@ -362,10 +362,11 @@ export async function sendChatMessage(
     // non injecté à dessein : l'agent explore lui-même via fs_search/fs_read.
     let delegateTask = trimmed;
     let editorInjected = false;
+    const delegateMentions = parseMentions(trimmed);
     if (editorCtx) {
       try {
         const { buildEditorContext } = await import("./editorContext");
-        const ectx = buildEditorContext(editorCtx, { skipPaths: parseMentions(trimmed) });
+        const ectx = buildEditorContext(editorCtx, { skipPaths: delegateMentions });
         if (ectx) {
           delegateTask = `${ectx}\n\n---\n\n${delegateTask}`;
           editorInjected = true;
@@ -389,7 +390,7 @@ export async function sendChatMessage(
     try {
       const entries: { path: string; kind: string }[] = [];
       if (editorInjected && editorCtx) entries.push({ path: editorCtx.path, kind: "editor" });
-      for (const mpath of parseMentions(trimmed)) entries.push({ path: mpath, kind: "mention" });
+      for (const mpath of delegateMentions) entries.push({ path: mpath, kind: "mention" });
       if (entries.length > 0) await db.sources.record(convId, userId, entries);
     } catch (err) {
       console.warn("[chat-sync] source logging (delegate) failed", err);

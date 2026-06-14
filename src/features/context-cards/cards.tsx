@@ -521,9 +521,11 @@ function PreviewCard() {
   const [err, setErr] = useState("");
 
   // Adopt the first detected server as soon as one appears (unless the user
-  // already pointed the preview somewhere manually).
+  // already pointed the preview somewhere manually). `isSafePreviewUrl` is
+  // redundant here (ports come from a hardcoded localhost list) but kept as a
+  // defensive invariant in case the port source ever becomes dynamic.
   useEffect(() => {
-    if (first && !src) {
+    if (first && !src && isSafePreviewUrl(first)) {
       setUrl(first);
       setSrc(first);
     }
