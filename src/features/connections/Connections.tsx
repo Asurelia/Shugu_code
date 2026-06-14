@@ -1294,8 +1294,9 @@ function RoutingSection() {
   const [orchModel, setOrchModel] = useState<string>("");
   const [advisorModel, setAdvisorModel] = useState<string>("");
   const [override, setOverride] = useState<string>("");
-  // Reviewer automatique sur tâches complexes (S1 livrable + S2 plan). Défaut ON :
-  // l'utilisateur l'a demandé, et le gate complexité+tier empêche de tirer sur le trivial.
+  // Revue automatique du LIVRABLE (S1 → leçons). Défaut ON : l'utilisateur l'a
+  // demandé, et le gate complexité empêche de tirer sur le trivial. (S2 — revue
+  // de plan post-hoc — retiré 2026-06-14 : l'outil `advisor` in-loop la couvre.)
   const [supervise, setSupervise] = useState<boolean>(true);
   const [savingState, setSavingState] = useState<"idle" | "saving" | "saved">("idle");
 

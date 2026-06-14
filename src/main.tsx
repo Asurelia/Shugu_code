@@ -112,6 +112,12 @@ const inner = (
       // le widget ou rouvrirait un dialog tout seul) : ["ai-edit"], ["ai-apply"],
       // ["ai-review"].
       //
+      // Familles VOLUMINEUSES et/ou reconstructibles — exclues pour ne pas gonfler
+      // le blob localStorage (JSON.parse synchrone AVANT le premier render au boot)
+      // alors qu'elles se refetchent en ms : ["agents"] (transcripts reconstruits
+      // depuis SQLite), ["fs"]/["git"] (listings/status workspace), ["grep"]
+      // (résultats jetables), ["cockpit"] (layout — source autoritaire SQLite).
+      //
       // Le namespace "chat" passe en WHITELIST : on ne persiste QUE l'historique
       // durable (messages + conversations, qui viennent de SQLite). Tout le reste
       // sous "chat" est soit synthétique localStorage-backed (active-conv/model,
@@ -123,6 +129,10 @@ const inner = (
         shouldDehydrateQuery: (q) => {
           const ns = q.queryKey[0];
           if (ns === "ai-edit" || ns === "ai-apply" || ns === "ai-review") return false;
+          // Reconstructibles/volumineuses : jamais dans le snapshot persisté.
+          if (ns === "agents" || ns === "fs" || ns === "git" || ns === "grep" || ns === "cockpit") {
+            return false;
+          }
           if (ns === "chat") {
             return (
               typeof q.queryKey[1] === "string" &&

@@ -56,8 +56,10 @@ export function LspContextMenu({
 }) {
   if (!state) return null;
   const W = 240, H = 240;
-  const left = Math.min(state.x, window.innerWidth - W - 8);
-  const top = Math.min(state.y, window.innerHeight - H - 8);
+  // Math.max(8, …) — même garde que ContextMenu : jamais de left/top négatif
+  // (menu coupé) quand la fenêtre est plus petite que l'estimation W/H.
+  const left = Math.max(8, Math.min(state.x, window.innerWidth - W - 8));
+  const top = Math.max(8, Math.min(state.y, window.innerHeight - H - 8));
 
   // Capacités du serveur attaché (null si pas encore initialisé → tout activé
   // par défaut, le serveur rejettera proprement si besoin).

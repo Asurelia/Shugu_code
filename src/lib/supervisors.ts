@@ -312,177 +312,65 @@ export async function resolveReviewerArgs(): Promise<ReviewerArgs | null> {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// supervisePlan — S2 gate: plan → review → inject warning if BLOQUÉ
+// resolveAdvisorArgs — modèle CONSEILLER de l'outil `advisor` in-loop (v2)
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
- * S2 — automatic plan review before execution.
- *
- * 1. Spawns the orchestrator in "plan-only" mode (prompt instructs it not to
- *    write any file, only produce a step-by-step plan).
- * 2. Spawns the reviewer to evaluate that plan.
- * 3. Appends two messages: the plan, then the plan-review verdict.
- * 4. If the reviewer returns BLOQUÉ, injects an advisory warning into the
- *    returned `augmentedTask`. The caller uses this as the real task prompt
- *    for the execution spawn. A BLOQUÉ verdict does NOT stop execution — it
- *    only annotates the task so the orchestrator is aware of the reviewer's
- *    concerns during execution.
- *
- * Returns `null` on ANY internal error — caller must proceed normally in that
- * case (safe-no-op contract, same as superviseDeliverable).
+ * Résout le modèle conseiller distinct pour l'outil `advisor` IN-LOOP (runner
+ * consult_advisor). Lit `routing.advisorModel` ; si vide/absent ou provider
+ * désactivé → `null` (le runner retombe sur l'AUTO-consultation = le modèle de
+ * l'exécuteur). Contrairement à `resolveReviewerArgs`, n'exige AUCUN agent
+ * reviewer : seuls le modèle + son provider comptent (le conseiller in-loop
+ * n'est pas un agent spawné, c'est une sous-inférence côté Rust).
  */
-export async function supervisePlan(args: {
-  convId: string;
-  task: string;
-  orch: {
-    model: string;
-    protocol: Protocol;
-    baseUrl: string;
-    apiKey: string | undefined;
-  };
-}): Promise<{ augmentedTask: string } | null> {
-  const { convId, task, orch } = args;
-
-  if (activeSupervisions >= MAX_CONCURRENT_SUPERVISIONS) {
-    console.warn("[supervisors] limite de supervisions concurrentes — skip");
-    return null;
-  }
-  activeSupervisions++;
-
+export async function resolveAdvisorArgs(): Promise<{
+  model: string;
+  protocol: Protocol;
+  baseUrl: string;
+  apiKey: string | undefined;
+} | null> {
+  let setting: string | null = null;
   try {
-    // Break circular import: chat-sync imports supervisors, so we load
-    // appendMessage lazily (same pattern used in chat-sync.ts:890).
-    const { appendMessage } = await import("@/features/chat/chat-sync");
-
-    // 1. Resolver le reviewer — si absent, on saute S2.
-    const rev = await resolveReviewerArgs();
-    if (!rev) {
-      console.warn("[supervisors] reviewer unavailable, skip supervisePlan");
-      return null;
-    }
-
-    // 2. Spawn the orchestrator in "plan-only" mode.
-    //    Note: spawnAgent has no flag to disable file-write tools at the JS
-    //    layer — the prompt itself instructs the orchestrator not to execute
-    //    or write anything. This is best-effort; a poorly-behaved model may
-    //    still try to write, but the reviewer step will catch regressions.
-    const planPrompt =
-      `Produis UNIQUEMENT un plan étape-par-étape pour la tâche suivante.\n` +
-      `N'EXÉCUTE rien, n'écris AUCUN fichier, ne modifie rien.\n\n` +
-      `Tâche :\n${task}`;
-
-    const plannerId = await spawnAgent({
-      role: "orchestrator",
-      task: planPrompt,
-      model: orch.model,
-      protocol: orch.protocol,
-      baseUrl: orch.baseUrl,
-      apiKey: orch.apiKey,
-      conversationId: convId,
-    });
-
-    // 3. Await the plan output (90 s cap — plan generation is short).
-    const [planPromise] = awaitAgentComplete(plannerId, { timeoutMs: 90_000 });
-    const { output: planText } = await planPromise;
-
-    // 4. Persist the plan as a review row (kind = "plan", verdict = "unknown").
-    await db.reviews.save({
-      id:          `plan_${plannerId}`,
-      agent_id:    plannerId,
-      reviewer_id: plannerId,
-      kind:        "plan",
-      verdict:     "unknown",
-      validated:   0,
-      body:        planText,
-      ts:          Date.now(),
-    });
-
-    // 5. Spawn the reviewer to evaluate the plan.
-    const reviewerPrompt =
-      `Voici un PLAN proposé pour la tâche suivante :\n\n` +
-      `TÂCHE :\n${task}\n\n` +
-      `PLAN :\n${planText}\n\n` +
-      `Évalue ce plan : risques, étapes manquantes, erreurs probables, ` +
-      `incohérences. Conclus avec un verdict sur une ligne séparée :\n\n` +
-      `**APPROUVÉ** | **BLOQUÉ** | **À CORRIGER**`;
-
-    const reviewerId = await spawnAgent({
-      role:         rev.role,
-      task:         reviewerPrompt,
-      model:        rev.model,
-      protocol:     rev.protocol,
-      baseUrl:      rev.baseUrl,
-      apiKey:       rev.apiKey,
-      agentDefPath: rev.agentDefPath,
-      conversationId: convId,
-    });
-
-    // 6. Await reviewer completion.
-    const [reviewPromise] = awaitAgentComplete(reviewerId, { timeoutMs: 90_000 });
-    const { output: reviewOutput } = await reviewPromise;
-    const verdict = parseVerdict(reviewOutput);
-
-    // 7. Persist the plan-review row.
-    await db.reviews.save({
-      id:          `planrev_${reviewerId}`,
-      agent_id:    plannerId,
-      reviewer_id: reviewerId,
-      kind:        "plan-review",
-      verdict,
-      validated:   0,
-      body:        reviewOutput,
-      ts:          Date.now(),
-    });
-
-    // Best-effort vector index (fire-and-forget).
-    void vecIndex("patterns", reviewerId, reviewOutput).catch(() => {});
-
-    // 8. Append the plan message then the review message to the conversation.
-    await appendMessage(convId, {
-      id:       newMessageId("r"),
-      role:     "ai",
-      body:     `📋 Plan proposé\n\n${planText}`,
-      ts:       nowHHMM(),
-      viaAgent: true,
-      agentId:  plannerId,
-    });
-
-    await appendMessage(convId, {
-      id:       newMessageId("r"),
-      role:     "ai",
-      body:     `🔎 Revue du plan (${verdict})\n\n${reviewOutput}`,
-      ts:       nowHHMM(),
-      viaAgent: true,
-      agentId:  reviewerId,
-    });
-
-    // 9. If BLOQUÉ, augment the task with the reviewer's concerns as an
-    //    advisory warning. The execution proceeds regardless — the warning
-    //    is injected into the task so the orchestrator is aware of the issues.
-    if (verdict === "BLOQUÉ") {
-      return {
-        augmentedTask:
-          task +
-          "\n\n[AVERTISSEMENT DU REVIEWER SUR LE PLAN — corrige ces points pendant l'exécution]\n" +
-          reviewOutput,
-      };
-    }
-
-    return { augmentedTask: task };
-
-  } catch (err) {
-    // supervisePlan MUST NOT propagate — log and return null so the caller
-    // proceeds with a normal (unaugmented) execution.
-    console.warn("[supervisors] supervisePlan failed:", err);
+    setting = await db.settings.get("routing.advisorModel");
+  } catch {
     return null;
-  } finally {
-    activeSupervisions--;
   }
+  if (!setting || setting.trim() === "") return null;
+  const advisorModel = setting.trim();
+
+  const { providerId, protocol: defProto, baseUrl: defBase, model: realModel } =
+    resolveProvider(advisorModel);
+
+  let enabled: string | null;
+  try {
+    enabled = await getProviderEnabled(providerId);
+  } catch {
+    enabled = null;
+  }
+  if (enabled !== "true") return null;
+
+  const cfg = await loadProviderConfig(providerId);
+  let protocol: Protocol = defProto;
+  if (defProto === "custom") {
+    const stored = await getConfig(providerId, "protocol");
+    if (stored === "anthropic" || stored === "openai" || stored === "ollama" || stored === "custom") {
+      protocol = stored;
+    }
+  }
+  const baseUrl = cfg.baseUrl && cfg.baseUrl !== "" ? cfg.baseUrl : defBase;
+  const apiKey = cfg.apiKey && cfg.apiKey !== "" ? cfg.apiKey : undefined;
+
+  return { model: realModel, protocol, baseUrl, apiKey };
 }
 
 // ────────────────────────────────────────────────────────────────────────────
 // superviseDeliverable — main entry point
 // ────────────────────────────────────────────────────────────────────────────
+//
+// NOTE : `supervisePlan` (ex-S2, revue de plan post-hoc « plan-only ») a été
+// RETIRÉ le 2026-06-14 — la planification AVANT l'exécution passe désormais par
+// l'outil `advisor` IN-LOOP (model-invoked, runner.rs consult_advisor). Il ne
+// reste que S1 (revue du livrable → leçons).
 
 /**
  * S1 — automatic deliverable review.

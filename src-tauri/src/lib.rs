@@ -686,6 +686,7 @@ pub fn run() {
             commands::fs::fs_read_dir_scoped,
             commands::fs::fs_list_files,
             commands::fs::fs_read_file,
+            commands::fs::fs_read_files,
             commands::fs::fs_write_file,
             commands::fs::fs_create_file,
             commands::fs::fs_create_dir,

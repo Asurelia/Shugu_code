@@ -45,7 +45,7 @@ import type { DockState, FileNode, Generation } from "@/lib/types";
 import { db, seedIfEmpty, toGenerationRow } from "@/lib/db";
 import { useActiveConv, createConversation, sendChatMessage } from "@/features/chat/chat-sync";
 import { loadOpenFiles, saveOpenFiles } from "@/lib/ide-state";
-import { fsReadFile, fsWriteFile, fsCreateDir, fsCreateFile, langToExt, fsSetWorkspaceRoot, fsGetWorkspaceRoot } from "@/lib/fs";
+import { fsReadFile, fsReadFiles, fsWriteFile, fsCreateDir, fsCreateFile, langToExt, fsSetWorkspaceRoot, fsGetWorkspaceRoot } from "@/lib/fs";
 import { RecentWorkspacesPalette } from "@/features/fs/RecentWorkspacesPalette";
 import {
   recordRecentWorkspace,
@@ -644,18 +644,30 @@ export function RootLayout() {
     let cancelled = false;
     (async () => {
       const restored = await loadOpenFiles();
-      if (cancelled || !restored) return;
-      for (const path of restored.openFiles) {
-        try {
-          const content = await fsReadFile(path);
-          if (cancelled) return;
-          setFileContents(c => ({ ...c, [path]: content }));
-          setOpenFiles(p => p.includes(path) ? p : [...p, path]);
-        } catch {
-          // File no longer exists — skip silently.
-        }
+      if (cancelled || !restored || restored.openFiles.length === 0) return;
+      // ONE batch invoke (fs_read_files) instead of one fs_read_file round-trip
+      // per tab — the old per-file loop also did 2 setState per file, i.e.
+      // ~2N re-renders of the whole shell on a cold start with N tabs.
+      // Files that no longer exist (renamed/deleted since last session) are
+      // simply absent from the returned map — same silent skip as before.
+      let contents: Awaited<ReturnType<typeof fsReadFiles>>;
+      try {
+        contents = await fsReadFiles(restored.openFiles);
+      } catch {
+        // No workspace open (or the batch failed) — nothing to restore.
+        return;
       }
       if (cancelled) return;
+      const restoredPaths = restored.openFiles.filter(p => contents[p] !== undefined);
+      if (restoredPaths.length === 0) return;
+      setFileContents(c => ({ ...c, ...contents }));
+      setOpenFiles(p => {
+        const merged = [...p];
+        for (const path of restoredPaths) {
+          if (!merged.includes(path)) merged.push(path);
+        }
+        return merged;
+      });
       // Only restore activeFile if it actually made it into openFiles
       // (avoids a "blank editor pointing at a deleted file" state).
       if (restored.activeFile) {

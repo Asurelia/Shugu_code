@@ -823,6 +823,14 @@
   -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
   overflow: hidden;
+  /* CONTRE-FLIP du texte. La bulle vit DANS `.float-avatar-flip`, qui applique
+     `scaleX(var(--avatar-face-scale-x))` (= -1 quand la mascotte est à DROITE,
+     pour que le chibi regarde le panneau à sa gauche). Sans contre-scale, le
+     TEXTE héritait du miroir → illisible. La variable est héritée et reflète
+     TOUJOURS le flip réellement appliqué (l'état edge-hidden la remet à 1),
+     donc -1 × -1 = +1 : texte lisible des deux côtés. */
+  transform: scaleX(var(--avatar-face-scale-x, 1));
+  transform-origin: center;
 }
 /* Queue de la bulle — petit losange de la même matière, pointé vers la chibi. */
 .mascot-bubble-tail {

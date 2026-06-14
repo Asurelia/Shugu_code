@@ -60,6 +60,11 @@ use uuid::Uuid;
 // Split out so this file stays under the CLAUDE.md 500-line ceiling.
 pub(crate) mod runner;
 
+// Coalescing buffer for streaming Delta events — merges token-level chunks
+// into ~14 events/s per (agent, kind) before they hit the Tauri event bus.
+// See the module doc for the ordering contract with `persist_and_emit`.
+mod delta_buffer;
+
 // Phase 2 tools submodule. Defines the closed set of file-system tools the
 // orchestrator can call (`fs_read_file`, `fs_write_file`, `fs_list_dir`),
 // the JSON-schema renderers per provider dialect (OpenAI / Anthropic), and
@@ -383,6 +388,14 @@ pub struct SpawnArgs {
     /// None) ⇒ exécution directe complète. Seule la délégation chat le fournit ;
     /// Atelier/Studio le laissent None (write requis).
     pub mode: Option<String>,
+    /// Modèle CONSEILLER distinct pour l'outil `advisor` (v2). Résolu côté TS
+    /// depuis `routing.advisorModel`. Quand `advisor_model` est présent, le
+    /// runner consulte CE modèle (avec son provider) au lieu de l'exécuteur.
+    /// Les 4 champs vont ensemble (None ⇒ auto-consultation).
+    pub advisor_model: Option<String>,
+    pub advisor_protocol: Option<String>,
+    pub advisor_base_url: Option<String>,
+    pub advisor_api_key: Option<String>,
 }
 
 /// Arguments for an Atelier run (env-grounded build→test→learn loop). Mirrors the
@@ -551,8 +564,25 @@ pub(super) fn persist_and_emit(app: &tauri::AppHandle, event: &AgentEvent) -> Re
     // `agent_events`, which never had per-token rows; it will see the
     // assistant Message events that the runner emits at each turn boundary,
     // and those carry the full assembled content.
-    if matches!(event, AgentEvent::Delta { .. }) {
-        let emit_result = app.emit(EVENT_CHANNEL, event);
+    if let AgentEvent::Delta {
+        agent_id,
+        chunk,
+        delta_kind,
+    } = event
+    {
+        // Coalesce: most chunks just feed the buffer; one merged Delta comes
+        // out per FLUSH_INTERVAL per (agent, kind). The stream's tail is
+        // flushed by the non-delta branch below (the runner always closes a
+        // turn with Message/Complete/Error).
+        let Some(merged) = delta_buffer::push(agent_id, delta_kind, chunk) else {
+            return Ok(());
+        };
+        let merged_event = AgentEvent::Delta {
+            agent_id: agent_id.clone(),
+            chunk: merged,
+            delta_kind: delta_kind.clone(),
+        };
+        let emit_result = app.emit(EVENT_CHANNEL, &merged_event);
         if cfg!(debug_assertions) {
             let c = EMIT_DELTA_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if c == 1 || c % 50 == 0 {
@@ -565,6 +595,17 @@ pub(super) fn persist_and_emit(app: &tauri::AppHandle, event: &AgentEvent) -> Re
             }
         }
         return Ok(());
+    }
+
+    // Non-delta event: flush this agent's pending merged deltas FIRST so the
+    // frontend never sees a Message/ToolCall/Complete overtake its own text.
+    for (delta_kind, chunk) in delta_buffer::drain(event.agent_id()) {
+        let flushed = AgentEvent::Delta {
+            agent_id: event.agent_id().to_string(),
+            chunk,
+            delta_kind,
+        };
+        let _ = app.emit(EVENT_CHANNEL, &flushed);
     }
 
     let conn_mutex = get_conn(app)?;
@@ -732,6 +773,33 @@ pub async fn agent_spawn(
     // Mémoire de conversation : le chemin chat passe la conv pour recharger les
     // tours précédents dans l'historique de l'agent.
     let conversation_id_for_task = args.conversation_id.clone();
+    // Modèle conseiller distinct (v2) : Some seulement si un modèle advisor a été
+    // résolu côté TS (routing.advisorModel). Sinon None ⇒ auto-consultation.
+    let advisor_for_task: Option<runner::AdvisorConfig> = match (
+        args.advisor_model.clone(),
+        args.advisor_protocol.clone(),
+        args.advisor_base_url.clone(),
+    ) {
+        (Some(model), Some(protocol), Some(base_url)) if !model.trim().is_empty() => {
+            Some(runner::AdvisorConfig {
+                model,
+                protocol,
+                base_url,
+                api_key: args.advisor_api_key.clone().unwrap_or_default(),
+            })
+        }
+        // Filet : advisor_model fourni mais protocol/base_url manquant = bug de
+        // résolution TS. On retombe en auto-consultation (None) mais on le SIGNALE
+        // en dev (sinon un conseiller mal configuré dégrade en silence).
+        (Some(model), _, _) if !model.trim().is_empty() => {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[agent_spawn] advisor_model='{model}' fourni mais protocol/base_url manquant — auto-consultation (vérifier resolveAdvisorArgs)"
+            );
+            None
+        }
+        _ => None,
+    };
     tauri::async_runtime::spawn(async move {
         runner::run_agent_task(
             app_for_task,
@@ -752,6 +820,7 @@ pub async fn agent_spawn(
             system_prompt_override_for_task, // None ⇒ seed_prompt ; Some ⇒ .md custom
             read_only_for_task, // Plan mode ⇒ outils mutants retirés + refusés
             conversation_id_for_task, // recharge les tours précédents de la conv
+            advisor_for_task, // modèle conseiller distinct (v2) ou None
         )
         .await;
     });
@@ -868,6 +937,7 @@ pub async fn agent_atelier_run(
             Some(runner::ATELIER_PROMPT.to_string()),
             false, // read_only — l'Atelier doit écrire/exécuter (build→test→learn)
             None,  // conversation_id — l'Atelier n'est pas lié à une conversation
+            None,  // advisor — pas de conseiller distinct pour l'Atelier
         )
         .await;
         // The creation dir is intentionally left on disk so the preview pane can
@@ -1000,6 +1070,7 @@ pub async fn agent_grounded_run(
             Some(system_prompt),
             false, // read_only — Grounded Run écrit/exécute sur le vrai projet
             None,  // conversation_id — Grounded Run n'est pas lié à une conversation
+            None,  // advisor — pas de conseiller distinct pour Grounded Run
         )
         .await;
     });

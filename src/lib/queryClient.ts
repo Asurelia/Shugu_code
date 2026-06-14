@@ -44,6 +44,46 @@ export const queryClient = new QueryClient({
   },
 });
 
+// Cap dur sur le blob persisté. La réhydratation (main.tsx) fait un
+// JSON.parse SYNCHRONE du blob complet AVANT le premier render — un cache
+// multi-Mo (grosse session agents/grep d'une version sans exclusions, ou
+// dérive future) bloque le boot d'autant. Au-delà du cap :
+//   • setItem  → écriture sautée (le cache mémoire reste intact, seule la
+//     persistance inter-session de CE snapshot est perdue) ;
+//   • getItem  → purge + null (blob hérité : on refetch au lieu de parser).
+// `length` compte des code units UTF-16 (≈ octets pour du JSON ASCII) —
+// précision suffisante pour un garde-fou.
+const PERSIST_MAX_CHARS = 3_000_000;
+
+const cappedLocalStorage =
+  typeof window !== "undefined"
+    ? {
+        getItem: (key: string): string | null => {
+          const value = window.localStorage.getItem(key);
+          if (value !== null && value.length > PERSIST_MAX_CHARS) {
+            console.warn(
+              `[queryClient] cache persisté ${value.length} chars > cap ${PERSIST_MAX_CHARS} — purgé, les queries refetchent`,
+            );
+            window.localStorage.removeItem(key);
+            return null;
+          }
+          return value;
+        },
+        setItem: (key: string, value: string): void => {
+          if (value.length > PERSIST_MAX_CHARS) {
+            console.warn(
+              `[queryClient] snapshot cache ${value.length} chars > cap ${PERSIST_MAX_CHARS} — écriture sautée`,
+            );
+            return;
+          }
+          window.localStorage.setItem(key, value);
+        },
+        removeItem: (key: string): void => {
+          window.localStorage.removeItem(key);
+        },
+      }
+    : undefined;
+
 // Persister LocalStorage — remplace Zustand `persist` middleware sans
 // store custom. PersistQueryClientProvider sauvegarde le cache complet
 // du QueryClient en localStorage sous une clé unique, et le restaure au
@@ -52,7 +92,7 @@ export const queryClient = new QueryClient({
 // Les queries qui ne doivent PAS être persistées (sensibles, volatiles)
 // peuvent être filtrées via `dehydrateOptions.shouldDehydrateQuery`.
 export const queryPersister = createSyncStoragePersister({
-  storage: typeof window !== "undefined" ? window.localStorage : undefined,
+  storage: cappedLocalStorage,
   key: "shugu.tanstack-cache.v1",
   throttleTime: 1000,
 });

@@ -73,6 +73,18 @@ const MAX_ADVISOR_CALLS: u32 = 6;
 /// l'exécuteur — auto-consultation ; un modèle plus fort sera configurable.)
 const ADVISOR_SYSTEM_PROMPT: &str = "You are an ADVISOR: a senior reviewer consulted mid-task by a coding agent (the \"executor\"). You see the executor's ENTIRE transcript above — the task, every tool call, every result. The executor has paused to ask for your strategic guidance.\n\nGive a CONCISE plan or course-correction — a focused starting point, not a comprehensive essay (aim for a few hundred words). Be specific to THIS task and what you actually see in the transcript: reference the real files, errors, and decisions.\n- If the executor is just starting: lay out the approach, the main risks, and the order of steps.\n- If it is mid-task or stuck: diagnose what's going wrong and give the next concrete move.\n- If it is about to finish: point out what is missing, unverified, or likely to break.\n\nYou have NO tools and cannot act — output plain text guidance only. The executor will weigh your advice and continue.";
 
+/// Provider config d'un modèle CONSEILLER distinct (v2). Résolu côté TS
+/// (`routing.advisorModel`) et passé au runner. `None` ⇒ auto-consultation : le
+/// conseiller est le modèle de l'exécuteur (v1). `Some` ⇒ un modèle plus fort
+/// conseille (l'idéal « advisor ≥ executor » de l'outil officiel).
+#[derive(Clone)]
+pub(crate) struct AdvisorConfig {
+    pub model: String,
+    pub protocol: String,
+    pub base_url: String,
+    pub api_key: String,
+}
+
 /// Max prior conversation turns reloaded into a delegated agent's history.
 /// Bounds the token cost (M3 has 1M context, but lighter models don't).
 const MAX_HISTORY_MESSAGES: u32 = 30;
@@ -552,6 +564,9 @@ pub(super) async fn run_agent_task(
     // précédents de CETTE conversation dans l'historique (parité avec le chemin
     // chat-direct). `None` (Atelier/Studio/Grounded) = pas de conversation liée.
     conversation_id: Option<String>,
+    // Modèle conseiller distinct pour l'outil `advisor` (v2). `None` ⇒ le
+    // conseiller est le modèle de l'exécuteur (auto-consultation).
+    advisor: Option<AdvisorConfig>,
 ) {
     let start = std::time::Instant::now();
     let protocol = protocol.unwrap_or_else(|| "openai".to_string());
@@ -656,6 +671,7 @@ pub(super) async fn run_agent_task(
             &mut loop_metrics,
             workspace_override,
             read_only,
+            advisor.as_ref(),
         ) => r,
         _ = abort.notified() => {
             mark_killed(&app, &agent_id);
@@ -741,6 +757,9 @@ pub(super) async fn tool_use_loop(
     // Plan mode : lecture seule. Retire les outils mutants du manifest envoyé au
     // modèle ET refuse leur exécution si le modèle les invoque quand même.
     read_only: bool,
+    // Modèle conseiller distinct pour l'outil `advisor` (v2). `None` ⇒ le
+    // conseiller est le modèle de l'exécuteur (auto-consultation).
+    advisor: Option<&AdvisorConfig>,
 ) -> Result<(String, String), String> {
     // Stall-detection state: repeated identical tool-call signatures and
     // consecutive tool-error rounds are the two cheap "stuck" signals, recorded
@@ -1027,8 +1046,14 @@ pub(super) async fn tool_use_loop(
                             true,
                         )
                     } else {
+                        // v2 : modèle conseiller distinct si configuré, sinon
+                        // auto-consultation (le modèle de l'exécuteur).
+                        let (a_proto, a_base, a_model, a_key) = match advisor {
+                            Some(a) => (a.protocol.as_str(), a.base_url.as_str(), a.model.as_str(), a.api_key.as_str()),
+                            None => (protocol, base_url, model, api_key),
+                        };
                         consult_advisor(
-                            client, protocol, base_url, model, api_key, chat_template_kwargs, history,
+                            client, a_proto, a_base, a_model, a_key, chat_template_kwargs, history,
                         )
                         .await
                     };
