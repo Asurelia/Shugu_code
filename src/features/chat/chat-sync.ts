@@ -1050,9 +1050,9 @@ async function handleDelegate(
     // (anti-récursion via agentDefPath). Gated par routing.superviseComplex
     // (défaut ON — l'utilisateur l'a demandé ; le gate complexité empêche de
     // tirer sur le trivial).
-    // `wantSupervise` is computed once above (shared with S2) — no re-read.
-    // The review always uses the ORIGINAL `task` as the reference, not
-    // `execTask` (which may carry the S2 warning injection).
+    // `wantSupervise` est calculé une fois plus haut — pas de re-lecture. La
+    // revue (S1) utilise le `task` ORIGINAL (S2 et son augmentation de tâche
+    // ont été retirés ; `execTask` == `task`).
     if (wantSupervise && supervisorAvailable) {
       void superviseDeliverable({ convId, agentId, task });
     }

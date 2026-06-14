@@ -755,6 +755,16 @@ pub async fn agent_spawn(
                 api_key: args.advisor_api_key.clone().unwrap_or_default(),
             })
         }
+        // Filet : advisor_model fourni mais protocol/base_url manquant = bug de
+        // résolution TS. On retombe en auto-consultation (None) mais on le SIGNALE
+        // en dev (sinon un conseiller mal configuré dégrade en silence).
+        (Some(model), _, _) if !model.trim().is_empty() => {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[agent_spawn] advisor_model='{model}' fourni mais protocol/base_url manquant — auto-consultation (vérifier resolveAdvisorArgs)"
+            );
+            None
+        }
         _ => None,
     };
     tauri::async_runtime::spawn(async move {
