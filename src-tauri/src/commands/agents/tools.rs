@@ -91,8 +91,9 @@ fn agent_tools() -> &'static [ToolDef] {
                 name: "fs_read_file",
                 description: "Read a workspace-relative file and return its UTF-8 content. \
                               Returns an error string when the file is binary, >5 MiB, or outside \
-                              the workspace. Output is capped at 32 KiB with a truncation sentinel; \
-                              use this to inspect existing code before proposing any edit.",
+                              the workspace. Without offset/limit, output is capped at 32 KiB with a \
+                              truncation sentinel. For a large file, page through it with `offset` \
+                              (1-based start line) and `limit` (number of lines).",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -100,6 +101,14 @@ fn agent_tools() -> &'static [ToolDef] {
                             "type": "string",
                             "description": "Workspace-relative POSIX path, e.g. \"src/lib/db.ts\". \
                                             MUST be relative — absolute or traversal paths are rejected."
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Optional 1-based line to start from (paginated read of a large file)."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Optional number of lines to return from `offset` (default 400 when offset is set)."
                         }
                     },
                     "required": ["path"]
@@ -216,14 +225,45 @@ fn agent_tools() -> &'static [ToolDef] {
                         },
                         "old_string": {
                             "type": "string",
-                            "description": "Exact text to find — must be unique in the file. Copy it verbatim (with context)."
+                            "description": "Exact text to find. Must be unique in the file unless replace_all is true. Copy it verbatim (with context)."
                         },
                         "new_string": {
                             "type": "string",
                             "description": "Replacement text for that snippet."
+                        },
+                        "replace_all": {
+                            "type": "boolean",
+                            "description": "If true, replace EVERY occurrence of old_string (e.g. renaming a symbol). Default false (requires a single unique match)."
                         }
                     },
                     "required": ["path", "old_string", "new_string"]
+                }),
+            },
+            ToolDef {
+                name: "fs_delete",
+                description: "Delete a workspace-relative FILE. Use sparingly and only when the task \
+                              calls for it — the user's git history is the safety net. Rejects paths \
+                              outside the workspace and directories.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Workspace-relative POSIX path of the file to delete." }
+                    },
+                    "required": ["path"]
+                }),
+            },
+            ToolDef {
+                name: "fs_move",
+                description: "Rename or move a workspace-relative file from `from` to `to`. Creates \
+                              missing parent directories for the destination. Refuses to overwrite an \
+                              existing destination (delete it first if intended).",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "from": { "type": "string", "description": "Existing workspace-relative source path." },
+                        "to": { "type": "string", "description": "Workspace-relative destination path." }
+                    },
+                    "required": ["from", "to"]
                 }),
             },
             ToolDef {
@@ -325,8 +365,10 @@ fn agent_tools() -> &'static [ToolDef] {
                 name: "web_search",
                 description: "Search the public web and return the top results (title, URL, snippet). \
                               Use it for up-to-date information, library docs, an error message, or \
-                              anything NOT in the local project. Best-effort (DuckDuckGo). Read the \
-                              snippets; to read a full page, fetch its URL with run_command (curl).",
+                              anything NOT in the local project. Uses a real search API (Brave/Tavily) \
+                              when the user configured a key, otherwise a best-effort keyless engine. \
+                              Read the snippets, then call web_fetch on the most relevant URL to read \
+                              the full page.",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -340,6 +382,27 @@ fn agent_tools() -> &'static [ToolDef] {
                         }
                     },
                     "required": ["query"]
+                }),
+            },
+            ToolDef {
+                name: "web_fetch",
+                description: "Fetch a web page (or raw text/JSON URL) and return its readable text \
+                              content — HTML is stripped to plain text. Use it AFTER web_search to \
+                              actually read a result, or on any URL the user gives you. Output is \
+                              capped (default ~48k chars) with a truncation marker. http/https only.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "Absolute http(s) URL to fetch."
+                        },
+                        "max_chars": {
+                            "type": "integer",
+                            "description": "Max characters to return (default 48000, max 200000)."
+                        }
+                    },
+                    "required": ["url"]
                 }),
             },
             ToolDef {
@@ -517,12 +580,40 @@ fn dispatch_inner(
             let path = args["path"]
                 .as_str()
                 .ok_or_else(|| "missing required field: path".to_string())?;
-            // 32 KiB soft cap is the LLM-context budget — files larger
-            // than this are returned truncated with a sentinel so the
-            // model knows. Phase 3 may expose a `byte_range` parameter
-            // for paginated reads of larger files.
+            // 32 KiB soft cap is the LLM-context budget — files larger than this
+            // are returned truncated with a sentinel so the model knows. With
+            // `offset`/`limit` the model pages through a large file by lines.
             const AGENT_READ_CAP: usize = 32 * 1024;
-            crate::commands::fs::read_file_inner(root, path, Some(AGENT_READ_CAP))
+            let offset = args["offset"].as_u64();
+            let limit = args["limit"].as_u64();
+            if offset.is_some() || limit.is_some() {
+                let full = crate::commands::fs::read_file_inner(root, path, None)?;
+                let start = offset.unwrap_or(1).max(1) as usize; // 1-based
+                let count = limit.unwrap_or(400).clamp(1, 5000) as usize;
+                let lines: Vec<&str> = full.lines().collect();
+                let total = lines.len();
+                if start > total {
+                    return Ok(format!(
+                        "(offset {start} dépasse les {total} lignes du fichier — rien à lire)"
+                    ));
+                }
+                let end = (start - 1 + count).min(total);
+                let slice = lines[start - 1..end].join("\n");
+                // Cap dur de sortie (budget contexte), tronqué sur une frontière
+                // de caractère pour ne jamais couper un codepoint UTF-8.
+                let body = if slice.len() > AGENT_READ_CAP {
+                    let mut cut = AGENT_READ_CAP;
+                    while cut > 0 && !slice.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    format!("{}\n…[tronqué — réduis `limit`]", &slice[..cut])
+                } else {
+                    slice
+                };
+                Ok(format!("Lignes {start}-{end} sur {total} :\n{body}"))
+            } else {
+                crate::commands::fs::read_file_inner(root, path, Some(AGENT_READ_CAP))
+            }
         }
         "fs_write_file" => {
             let path = args["path"]
@@ -622,6 +713,7 @@ fn dispatch_inner(
             if old.is_empty() {
                 return Err("old_string must not be empty — use fs_write_file to create a file".to_string());
             }
+            let replace_all = args["replace_all"].as_bool().unwrap_or(false);
             // Read the FULL file (no cap) so a truncated read can never corrupt it.
             let content = crate::commands::fs::read_file_inner(root, path, None)?;
             let count = content.matches(old).count();
@@ -630,12 +722,16 @@ fn dispatch_inner(
                     "old_string not found in {path} — read the file (fs_read_file) and copy an exact snippet"
                 ));
             }
-            if count > 1 {
-                return Err(format!(
-                    "old_string appears {count} times in {path} — add surrounding context to make it unique"
-                ));
-            }
-            let updated = content.replacen(old, new, 1);
+            let (updated, replaced) = if replace_all {
+                (content.replace(old, new), count)
+            } else {
+                if count > 1 {
+                    return Err(format!(
+                        "old_string appears {count} times in {path} — add surrounding context to make it unique, or set replace_all=true"
+                    ));
+                }
+                (content.replacen(old, new, 1), 1)
+            };
             let bytes = crate::commands::fs::write_file_inner(root, path, &updated)?;
             // `content` est l'état d'avant l'édition (le fichier existait forcément
             // — old_string a matché). Émis comme `before` pour le diff+Annuler.
@@ -647,7 +743,45 @@ fn dispatch_inner(
                     before: Some(content),
                 },
             );
-            Ok(format!("edited {path} ({bytes} bytes written)"))
+            Ok(format!("edited {path} ({replaced} replacement(s), {bytes} bytes written)"))
+        }
+        "fs_delete" => {
+            let path = args["path"]
+                .as_str()
+                .ok_or_else(|| "missing required field: path".to_string())?;
+            // Capture le contenu d'avant pour la carte diff + un éventuel undo
+            // (restaurer = réécrire `before`). Le filet ultime reste git.
+            let before = crate::commands::fs::read_file_inner(root, path, None).ok();
+            crate::commands::fs::delete_file_inner(root, path)?;
+            let _ = super::persist_and_emit(
+                app,
+                &super::AgentEvent::Write {
+                    agent_id: agent_id.to_string(),
+                    path: path.to_string(),
+                    before,
+                },
+            );
+            Ok(format!("deleted {path}"))
+        }
+        "fs_move" => {
+            let from = args["from"]
+                .as_str()
+                .ok_or_else(|| "missing required field: from".to_string())?;
+            let to = args["to"]
+                .as_str()
+                .ok_or_else(|| "missing required field: to".to_string())?;
+            let bytes = crate::commands::fs::rename_inner(root, from, to)?;
+            // Event Write sur la DESTINATION (créée) pour la carte diff. La source
+            // disparue est couverte par git (filet de sécurité agent).
+            let _ = super::persist_and_emit(
+                app,
+                &super::AgentEvent::Write {
+                    agent_id: agent_id.to_string(),
+                    path: to.to_string(),
+                    before: None,
+                },
+            );
+            Ok(format!("moved {from} → {to} ({bytes} bytes)"))
         }
         "run_command" => {
             // Exec directe sur la machine (pivot 2026-06-10) : le filet de

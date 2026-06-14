@@ -666,12 +666,14 @@ export async function sendChatMessage(
     // Rust (chat.rs:961). Quand readTools=ON et le protocole supporte les outils
     // (anthropic/openai/custom, pas d'image jointe), chat_send pilote une boucle
     // d'outils bornée au lieu d'un appel unique. writeTools autorise l'écriture.
-    // Mode "chat" = conversation PURE : aucun outil fs (appel LLM unique, rapide).
+    // Mode "chat" = lecture + RECHERCHE : web_search/web_fetch/code_search +
+    //   lecture fs, JAMAIS d'écriture ni d'exécution (gouverné par chat.readTools,
+    //   défaut ON ; le désactiver ramène la conversation pure, appel unique rapide).
     // Mode "plan" = lecture seule : on coupe l'ÉCRITURE même sur ce chemin
     //   chat-direct (atteint par la mascotte via resolveRoute ; le cockpit, lui,
     //   délègue en mode Plan et l'enforcement dur vit dans le runner). Les
     //   lectures restent permises. Mode "agent" → suit le toggle Réglages → Éditeur.
-    const readTools = chatMode === "chat" ? false : (await db.settings.get("chat.readTools")) !== "false";
+    const readTools = (await db.settings.get("chat.readTools")) !== "false";
     const writeTools =
       chatMode === "chat" || chatMode === "plan"
         ? false
