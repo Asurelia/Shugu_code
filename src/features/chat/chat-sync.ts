@@ -858,21 +858,22 @@ async function handleDelegate(
     }
   }
 
-  // ── Advisor S2/S1 — OPT-IN (alignement Claude Code) ─────────────────────────
-  // Par DÉFAUT, pas de 2e modèle « reviewer » : l'agent s'auto-corrige tout seul
-  // — son system prompt lui ordonne de PLANIFIER (todo_write) puis de VÉRIFIER
-  // en exécutant (run_command). C'est le modèle Claude Code/Codex : un seul
-  // agent, pas de superviseur externe. L'advisor (plan S2 + revue S1) reste
-  // ACTIVABLE pour qui veut la boucle d'auto-amélioration : `routing.
-  // superviseComplex = "true"` (défaut OFF). Anti-récursion : ne jamais
-  // superviser le reviewer/planner lui-même.
+  // ── Advisor S2/S1 — DÉFAUT ON (l'utilisateur veut la boucle d'apprentissage) ──
+  // L'advisor est un 2e modèle « reviewer » qui (S2) review le plan et (S1) review
+  // le livrable APRÈS coup, ce qui REMPLIT la mémoire long-terme (lessons → S3 :
+  // réinjectées dans les runs suivants sur tâches similaires). Distinct de
+  // l'auto-correction de l'agent (qui, elle, reste un seul modèle façon Claude
+  // Code). L'utilisateur l'a explicitement redemandé (« il n'appelle jamais
+  // l'advisor / pas de mémoire ») → DÉFAUT ON, désactivable via
+  // `routing.superviseComplex = "false"`. Advisory & non-bloquant (S1 est
+  // fire-and-forget). Anti-récursion : ne jamais superviser le reviewer/planner.
   const superviseRaw = await db.settings.get("routing.superviseComplex");
-  const superviseOn = superviseRaw === "true";
+  const superviseOn = superviseRaw !== "false";
   const isReviewerInvocation = !!agentDefPath && /reviewer|planner/i.test(agentDefPath);
-  // Si l'advisor EST activé : on ne supervise pas le bavardage trivial (« merci »,
-  // salutation) — resolveThinking("auto") classe casual (false) vs substantiel
-  // (true) ; un agent custom explicite reste supervisé. L'ordre des `&&` court-
-  // circuite resolveThinking quand l'advisor est OFF (défaut) → zéro calcul inutile.
+  // On ne supervise pas le bavardage trivial (« merci », salutation) —
+  // resolveThinking("auto") classe casual (false) vs substantiel (true) ; un
+  // agent custom explicite reste supervisé. L'ordre des `&&` court-circuite
+  // resolveThinking si l'utilisateur a explicitement coupé l'advisor.
   const wantSupervise =
     superviseOn &&
     !isReviewerInvocation &&
