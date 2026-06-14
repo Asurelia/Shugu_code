@@ -61,6 +61,18 @@ fn is_write_tool(name: &str) -> bool {
 const PLAN_BLOCK_MSG: &str =
     "blocked: PLAN MODE is read-only — fs_write_file, fs_edit and run_command are disabled for this turn. Describe the change in your plan instead; the user will switch to Agent mode to execute it.";
 
+/// Max `advisor` consultations per run (par-requête, façon `max_uses` de l'outil
+/// officiel). Au-delà, l'appel renvoie une erreur et l'exécuteur continue seul —
+/// borne le coût (chaque consultation est une sous-inférence complète).
+const MAX_ADVISOR_CALLS: u32 = 6;
+
+/// System prompt du CONSEILLER (sous-inférence sans outils). Recrée le rôle de
+/// l'outil advisor officiel d'Anthropic, mais provider-agnostique : un « modèle
+/// conseiller » qui voit toute la transcription de l'exécuteur et renvoie un
+/// plan/correction de trajectoire concis. (v1 : le conseiller EST le modèle de
+/// l'exécuteur — auto-consultation ; un modèle plus fort sera configurable.)
+const ADVISOR_SYSTEM_PROMPT: &str = "You are an ADVISOR: a senior reviewer consulted mid-task by a coding agent (the \"executor\"). You see the executor's ENTIRE transcript above — the task, every tool call, every result. The executor has paused to ask for your strategic guidance.\n\nGive a CONCISE plan or course-correction — a focused starting point, not a comprehensive essay (aim for a few hundred words). Be specific to THIS task and what you actually see in the transcript: reference the real files, errors, and decisions.\n- If the executor is just starting: lay out the approach, the main risks, and the order of steps.\n- If it is mid-task or stuck: diagnose what's going wrong and give the next concrete move.\n- If it is about to finish: point out what is missing, unverified, or likely to break.\n\nYou have NO tools and cannot act — output plain text guidance only. The executor will weigh your advice and continue.";
+
 /// Max prior conversation turns reloaded into a delegated agent's history.
 /// Bounds the token cost (M3 has 1M context, but lighter models don't).
 const MAX_HISTORY_MESSAGES: u32 = 30;
@@ -281,6 +293,7 @@ fn strip_html(s: &str) -> String {
 // reuses the SAME multi-turn history shape + provider builders instead of
 // duplicating them (Lot A — Task 9/11, cleanup-on-replace / no-dup policy).
 // The variant fields must be `pub` too so `chat.rs` can construct them.
+#[derive(Clone)] // cloné par consult_advisor (rejoue la transcription au conseiller)
 #[allow(dead_code)] // variants used in match arms but rustc sees only construction
 pub(crate) enum AgentMessage {
     Text { role: String, content: String },
@@ -736,6 +749,8 @@ pub(super) async fn tool_use_loop(
     let mut last_sig: Option<String> = None;
     let mut repeat_count: u32 = 0;
     let mut err_streak: u32 = 0;
+    // Consultations advisor consommées ce run (cap MAX_ADVISOR_CALLS).
+    let mut advisor_calls: u32 = 0;
     // Iteration budget — unified now that every agent can exec (each
     // write→run-test→fix cycle costs one iteration).
     let budget = MAX_ITERATIONS;
@@ -974,7 +989,7 @@ pub(super) async fn tool_use_loop(
         let any_async = turn
             .tool_calls
             .iter()
-            .any(|tc| tc.name.starts_with("mcp__") || tc.name == "web_search");
+            .any(|tc| tc.name.starts_with("mcp__") || tc.name == "web_search" || tc.name == "advisor");
 
         let results: Vec<ToolResult> = if any_async {
             let mgr = app.state::<crate::commands::mcp::McpManager>();
@@ -991,6 +1006,31 @@ pub(super) async fn tool_use_loop(
                         ("web_search: missing required field: query".to_string(), true)
                     } else {
                         web_search_ddg(client, query, max).await
+                    };
+                    acc.push(ToolResult {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        is_error,
+                        content,
+                    });
+                } else if tc.name == "advisor" {
+                    // Outil advisor (façon Claude Code, provider-agnostique) :
+                    // sous-inférence sur le modèle conseiller avec toute la
+                    // transcription. Read-only → dispo aussi en mode Plan. Borné
+                    // par MAX_ADVISOR_CALLS pour le coût.
+                    advisor_calls += 1;
+                    let (content, is_error) = if advisor_calls > MAX_ADVISOR_CALLS {
+                        (
+                            format!(
+                                "advisor: max_uses_exceeded ({MAX_ADVISOR_CALLS} consultations per run) — proceed with your own judgement."
+                            ),
+                            true,
+                        )
+                    } else {
+                        consult_advisor(
+                            client, protocol, base_url, model, api_key, chat_template_kwargs, history,
+                        )
+                        .await
                     };
                     acc.push(ToolResult {
                         id: tc.id.clone(),
@@ -1391,6 +1431,94 @@ async fn call_agent_llm_with_tools(
     Ok((turn, reasoning))
 }
 
+/// Sous-inférence du CONSEILLER (outil `advisor`). Recrée le mécanisme de l'outil
+/// advisor officiel d'Anthropic, mais PROVIDER-AGNOSTIQUE : on rejoue la
+/// transcription de l'exécuteur à un modèle conseiller (v1 : le même modèle),
+/// précédée du system prompt advisor, SANS outils, et on renvoie son texte comme
+/// conseil. Dégrade en `(message, is_error=true)` sur échec — l'exécuteur continue.
+async fn consult_advisor(
+    client: &reqwest::Client,
+    protocol: &str,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+    chat_template_kwargs: &Option<serde_json::Value>,
+    history: &[AgentMessage],
+) -> (String, bool) {
+    // Vue du conseiller : son system prompt, puis la conversation de l'exécuteur
+    // SANS ses messages role="system" (seed/skills/lessons) — sinon ils seraient
+    // hoistés dans le system param et noieraient l'instruction advisor. On garde
+    // tous les tours user/assistant/tool pour qu'il voie le travail réel.
+    let mut advisor_history: Vec<AgentMessage> = Vec::with_capacity(history.len() + 1);
+    advisor_history.push(AgentMessage::Text {
+        role: "system".to_string(),
+        content: ADVISOR_SYSTEM_PROMPT.to_string(),
+    });
+    for m in history {
+        // Saute les messages role="system" de l'exécuteur (seed/skills/lessons).
+        if let AgentMessage::Text { role, .. } = m {
+            if role == "system" {
+                continue;
+            }
+        }
+        advisor_history.push(m.clone());
+    }
+
+    // Pas de streaming live pour le conseiller : la sortie arrive en un bloc.
+    let mut sink = |_kind: &str, _chunk: &str| {};
+
+    let turn = match protocol {
+        "anthropic" => {
+            let (messages, system) = build_anthropic_native(&advisor_history);
+            chat::call_anthropic_structured(
+                client, base_url, model, messages, system, api_key,
+                /* with_tools */ false,
+                /* tools */ None,
+                /* abort */ None,
+                &mut sink,
+            )
+            .await
+        }
+        "openai" | "custom" => {
+            let messages = build_openai_messages(&advisor_history);
+            chat::call_openai_compat_structured(
+                client, base_url, model, messages, api_key, protocol, chat_template_kwargs,
+                /* with_tools */ false,
+                /* tools */ None,
+                /* abort */ None,
+                &mut sink,
+            )
+            .await
+        }
+        "ollama" => {
+            let messages: Vec<ChatMessage> = advisor_history
+                .iter()
+                .filter_map(|m| match m {
+                    AgentMessage::Text { role, content } => Some(ChatMessage {
+                        role: role.clone(),
+                        content: content.clone(),
+                    }),
+                    _ => None,
+                })
+                .collect();
+            chat::call_ollama(client, base_url, model, &messages, None, &mut sink).await
+        }
+        other => return (format!("advisor: unsupported protocol '{other}'"), true),
+    };
+
+    match turn {
+        Ok(t) => {
+            let advice = t.content.trim().to_string();
+            if advice.is_empty() {
+                ("advisor returned empty guidance — proceed with your own judgement.".to_string(), false)
+            } else {
+                (advice, false)
+            }
+        }
+        Err(e) => (format!("advisor call failed: {e} — proceed with your own judgement."), true),
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────
 // System prompt + error helpers (unchanged from Phase 1)
 // ────────────────────────────────────────────────────────────────────
@@ -1472,7 +1600,7 @@ pub(crate) fn seed_prompt(role: &str) -> String {
     //      `fs_list_dir` at the relevant path — cheap, gives a tree to
     //      reason from, prevents hallucinated filenames.
     match role {
-        "orchestrator" => "You are Shugu — a helpful, friendly coding companion that lives IN the user's app and works ON their real machine. You are conversational AND capable: you talk naturally, and when there is real work to do you actually DO it.\n\nADAPT to the message:\n- Greeting / thanks / chit-chat / a simple question you can answer directly → just reply, warmly and concisely. Do NOT call tools, do NOT write a plan. (e.g. « merci », « ça va ? », « c'est quoi un closure ? ».)\n- A real task — build / create / fix / modify / refactor / explore this project / anything multi-step → switch into work mode below: plan, read, write, run, verify.\n\nWhen there IS work to do, you don't just answer — you DO it: plan, read, write code, run it, verify, fix, repeat, until the task is actually finished.\n\nYour tools (all act on the REAL project; paths are WORKSPACE-RELATIVE POSIX, e.g. `src/main.js`, `.` — absolute paths and `..` are rejected):\n- `fs_list_dir(path)`, `fs_read_file(path)`, `fs_search(query)` — explore & locate BEFORE editing.\n- `fs_write_file(path, content)`, `fs_edit(path, old_string, new_string)` — create / modify files.\n- `run_command(command)` — run the project's REAL toolchain (node, pnpm, npm, cargo, git, python…) with network. Use it to install deps, build, run, and TEST what you produce.\n- `code_search(query)` — SEMANTIC search over the project's vector index; use it when you don't know the exact identifier (smarter than fs_search's literal/regex).\n- `web_search(query)` — search the public web for up-to-date info, library docs, or an error message that isn't in the local project.\n- `todo_write(todos)` — record and update your plan as a checklist.\n- `skill_save(...)` — save a reusable recipe after a test passes.\n\nABSOLUTE RULES — they override any other reflex:\n\n1. NEVER answer from training data about THIS project. You only know what you read via the tools in THIS conversation. If about to say \"a file like this typically contains…\" or \"I can't see your files\" — STOP and call `fs_list_dir`/`fs_read_file`/`fs_search` instead. That is what they are for.\n\n2. PLAN FIRST. For ANY build or multi-step task, call `todo_write` with a short checklist (3-7 steps) BEFORE doing the work, then update each step's status (in_progress → completed) AS YOU GO. Keep the list current — it is how the user follows your progress.\n\n3. EXPLORE before editing: `fs_list_dir` / `fs_search` / `fs_read_file` the relevant code. NEVER edit a file you have not read.\n\n4. BUILD IT FOR REAL, then VERIFY. After writing files, use `run_command` to install/build/run/test. A non-zero exit is INFORMATION, not defeat: read stderr, find the cause, fix it, run AGAIN. Do not declare done until it actually runs.\n\n5. Building a whole app / game / site FROM SCRATCH: create the COMPLETE project (entry point, modules, assets, a way to run it), make it runnable, and run it to prove it works. No stubs, no \"the rest is similar\", no placeholder TODOs — write complete files.\n\n6. Be surgical on EXISTING projects (git is the safety net — change only what the task needs); be COMPLETE on NEW ones.\n\n7. Finish with a SHORT plain-text summary: what you built and how you verified it (the command you ran + that it passed).".to_string(),
+        "orchestrator" => "You are Shugu — a helpful, friendly coding companion that lives IN the user's app and works ON their real machine. You are conversational AND capable: you talk naturally, and when there is real work to do you actually DO it.\n\nADAPT to the message:\n- Greeting / thanks / chit-chat / a simple question you can answer directly → just reply, warmly and concisely. Do NOT call tools, do NOT write a plan. (e.g. « merci », « ça va ? », « c'est quoi un closure ? ».)\n- A real task — build / create / fix / modify / refactor / explore this project / anything multi-step → switch into work mode below: plan, read, write, run, verify.\n\nWhen there IS work to do, you don't just answer — you DO it: plan, read, write code, run it, verify, fix, repeat, until the task is actually finished.\n\nYour tools (all act on the REAL project; paths are WORKSPACE-RELATIVE POSIX, e.g. `src/main.js`, `.` — absolute paths and `..` are rejected):\n- `fs_list_dir(path)`, `fs_read_file(path)`, `fs_search(query)` — explore & locate BEFORE editing.\n- `fs_write_file(path, content)`, `fs_edit(path, old_string, new_string)` — create / modify files.\n- `run_command(command)` — run the project's REAL toolchain (node, pnpm, npm, cargo, git, python…) with network. Use it to install deps, build, run, and TEST what you produce.\n- `code_search(query)` — SEMANTIC search over the project's vector index; use it when you don't know the exact identifier (smarter than fs_search's literal/regex).\n- `web_search(query)` — search the public web for up-to-date info, library docs, or an error message that isn't in the local project.\n- `advisor()` — consult a senior reviewer that sees your FULL transcript; takes NO parameters. Call it BEFORE substantive work (before writing/editing or committing to an approach), when STUCK, and BEFORE declaring done. Weigh its advice, then continue.\n- `todo_write(todos)` — record and update your plan as a checklist.\n- `skill_save(...)` — save a reusable recipe after a test passes.\n\nABSOLUTE RULES — they override any other reflex:\n\n1. NEVER answer from training data about THIS project. You only know what you read via the tools in THIS conversation. If about to say \"a file like this typically contains…\" or \"I can't see your files\" — STOP and call `fs_list_dir`/`fs_read_file`/`fs_search` instead. That is what they are for.\n\n2. PLAN FIRST. For ANY build or multi-step task, call `todo_write` with a short checklist (3-7 steps) BEFORE doing the work, then update each step's status (in_progress → completed) AS YOU GO. Keep the list current — it is how the user follows your progress. On a non-trivial task, call `advisor()` for a strategic check BEFORE committing to an approach (after a little orientation, before the first write), and again BEFORE declaring done.\n\n3. EXPLORE before editing: `fs_list_dir` / `fs_search` / `fs_read_file` the relevant code. NEVER edit a file you have not read.\n\n4. BUILD IT FOR REAL, then VERIFY. After writing files, use `run_command` to install/build/run/test. A non-zero exit is INFORMATION, not defeat: read stderr, find the cause, fix it, run AGAIN. Do not declare done until it actually runs.\n\n5. Building a whole app / game / site FROM SCRATCH: create the COMPLETE project (entry point, modules, assets, a way to run it), make it runnable, and run it to prove it works. No stubs, no \"the rest is similar\", no placeholder TODOs — write complete files.\n\n6. Be surgical on EXISTING projects (git is the safety net — change only what the task needs); be COMPLETE on NEW ones.\n\n7. Finish with a SHORT plain-text summary: what you built and how you verified it (the command you ran + that it passed).".to_string(),
         other => format!(
             "You are a Shugu sub-agent with role '{other}', running on the user's machine. You have three filesystem tools: `fs_read_file(path)`, `fs_write_file(path, content)`, `fs_list_dir(path)`. All paths are workspace-relative.\n\nRULE: never answer from training data about the user's project. Always use the tools to gather evidence first. If the task is about a file or directory, your first action is `fs_list_dir` or `fs_read_file`. Output only the final result."
         ),

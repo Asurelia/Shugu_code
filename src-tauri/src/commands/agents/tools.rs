@@ -342,6 +342,22 @@ fn agent_tools() -> &'static [ToolDef] {
                     "required": ["query"]
                 }),
             },
+            ToolDef {
+                name: "advisor",
+                description: "Consult a senior ADVISOR that sees your ENTIRE conversation transcript — \
+                              the task, every tool call you've made, every result you've seen. It takes \
+                              NO parameters: when you call advisor(), your full history is forwarded \
+                              automatically. It returns a concise strategic plan or course-correction \
+                              (text only, no tools). Call advisor BEFORE substantive work (before writing/\
+                              editing or committing to an approach), when STUCK (errors recurring, approach \
+                              not converging), and BEFORE you declare the task done. On tasks longer than a \
+                              few steps, call it at least once before committing to an approach and once \
+                              before finishing. Weigh its advice seriously, then continue.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            },
         ]
     })
 }
