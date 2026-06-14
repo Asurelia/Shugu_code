@@ -1147,7 +1147,13 @@ pub(crate) fn rename_inner(root: &Path, from: &str, to: &str) -> Result<u64, Str
     // échouer (EXDEV) → repli copy+remove pour rester robuste cross-device.
     if let Err(e) = std::fs::rename(&src, &dst) {
         std::fs::copy(&src, &dst).map_err(|e2| format!("rename a échoué ({e}) et la copie aussi ({e2})"))?;
-        std::fs::remove_file(&src).map_err(|e3| format!("copié vers {to} mais suppression de {from} impossible: {e3}"))?;
+        // Si la suppression de la source échoue (AV/indexeur Windows qui verrouille),
+        // on ANNULE la copie pour ne pas laisser source ET destination présentes —
+        // sinon un retry buterait sur la garde « destination existe » (revue).
+        std::fs::remove_file(&src).map_err(|e3| {
+            let _ = std::fs::remove_file(&dst);
+            format!("déplacement annulé : copie OK mais suppression de {from} impossible ({e3})")
+        })?;
     }
     Ok(size)
 }

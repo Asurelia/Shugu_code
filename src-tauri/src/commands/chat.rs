@@ -433,7 +433,15 @@ pub(crate) async fn call_anthropic_structured(
                     Some("input_json_delta") => {
                         if let Some(partial) = delta["partial_json"].as_str() {
                             if let Some(b) = blocks.get_mut(&idx) {
-                                b.tool_input_acc.push_str(partial);
+                                // N'accumuler QUE pour un vrai bloc client `tool_use`.
+                                // Avec la recherche native Anthropic, des blocs
+                                // `server_tool_use` peuvent émettre leur propre
+                                // input_json_delta ; sans ce garde, leurs args
+                                // pourraient contaminer un tool-call client partageant
+                                // le même index SSE (revue indépendante).
+                                if b.kind == "tool_use" {
+                                    b.tool_input_acc.push_str(partial);
+                                }
                             }
                             // Signal — the agent runner will use this to
                             // update the UI "tool args streaming" indicator
