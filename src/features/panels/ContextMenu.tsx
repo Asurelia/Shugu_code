@@ -15,8 +15,13 @@ export function ContextMenu({ open, x, y, target, onClose, onAnnotate }: any) {
   if (!open) return null;
 
   const W = 260, H = 480;
-  const left = Math.min(x, window.innerWidth - W - 8);
-  const top = Math.min(y, window.innerHeight - H - 8);
+  // Math.max(8, …) — sur une fenêtre plus basse que l'estimation H (min
+  // 720×480), le clamp droit seul donnait un top NÉGATIF → menu coupé en haut.
+  const left = Math.max(8, Math.min(x, window.innerWidth - W - 8));
+  const top = Math.max(8, Math.min(y, window.innerHeight - H - 8));
+  // Sous-menus (220px) ouverts à droite du menu : s'il ne reste pas la place
+  // dans la fenêtre, la classe `flip` les ouvre à gauche (cf. panels.css).
+  const flipSubmenus = left + W + 220 > window.innerWidth - 8;
 
   const tagColors = [
     { name: "Bug",      hex: "#ff6a8a" },
@@ -35,7 +40,7 @@ export function ContextMenu({ open, x, y, target, onClose, onAnnotate }: any) {
   return (
     <>
       <div style={{position:"fixed", inset:0, zIndex:9998}} onClick={onClose} onContextMenu={(e) => { e.preventDefault(); onClose(); }}/>
-      <div className="ctx-menu" style={{ left, top }} onContextMenu={(e) => e.preventDefault()}>
+      <div className={"ctx-menu" + (flipSubmenus ? " flip" : "")} style={{ left, top }} onContextMenu={(e) => e.preventDefault()}>
         {target?.label && (
           <div className="ctx-target-info">
             <span className="badge">{target.kind || "selection"}</span>

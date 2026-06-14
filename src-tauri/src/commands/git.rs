@@ -474,7 +474,7 @@ fn git_status_inner(root: &Path) -> Result<Vec<GitFileStatus>, String> {
     Ok(out)
 }
 
-#[command]
+#[command(async)]
 pub fn git_status(app: AppHandle) -> Result<Vec<GitFileStatus>, String> {
     let root = workspace_root_required(&app)?;
     git_status_inner(&root)
@@ -535,7 +535,7 @@ fn git_diff_file_inner(root: &Path, path: &str, vs: &str) -> Result<String, Stri
     Ok(buf.replace("\r\n", "\n"))
 }
 
-#[command]
+#[command(async)]
 pub fn git_diff_file(app: AppHandle, path: String, vs: String) -> Result<String, String> {
     let root = workspace_root_required(&app)?;
     git_diff_file_inner(&root, &path, &vs)
@@ -829,7 +829,7 @@ fn git_log_inner(
     Ok(out)
 }
 
-#[command(rename_all = "camelCase")]
+#[command(async, rename_all = "camelCase")]
 pub fn git_log(
     app: AppHandle,
     max_count: u32,
@@ -918,7 +918,7 @@ fn git_branches_inner(root: &Path) -> Result<GitBranchList, String> {
     })
 }
 
-#[command]
+#[command(async)]
 pub fn git_branches(app: AppHandle) -> Result<GitBranchList, String> {
     let root = workspace_root_required(&app)?;
     git_branches_inner(&root)
@@ -1010,7 +1010,7 @@ fn git_blame_inner(root: &Path, path: &str) -> Result<Vec<GitBlameLine>, String>
     Ok(out)
 }
 
-#[command]
+#[command(async)]
 pub fn git_blame(app: AppHandle, path: String) -> Result<Vec<GitBlameLine>, String> {
     let root = workspace_root_required(&app)?;
     git_blame_inner(&root, &path)
@@ -1049,7 +1049,7 @@ fn git_stash_list_inner(root: &Path) -> Result<Vec<GitStash>, String> {
     Ok(out)
 }
 
-#[command]
+#[command(async)]
 pub fn git_stash_list(app: AppHandle) -> Result<Vec<GitStash>, String> {
     let root = workspace_root_required(&app)?;
     git_stash_list_inner(&root)
@@ -1084,7 +1084,7 @@ fn git_remotes_inner(root: &Path) -> Result<Vec<GitRemote>, String> {
     Ok(out)
 }
 
-#[command]
+#[command(async)]
 pub fn git_remotes(app: AppHandle) -> Result<Vec<GitRemote>, String> {
     let root = workspace_root_required(&app)?;
     git_remotes_inner(&root)

@@ -55,6 +55,15 @@
   --lg-tint-weak: rgba(26, 22, 40, 0.32);
   --lg-edge-top: rgba(255,255,255,0.18);
   --lg-edge-bottom: rgba(255,255,255,0.04);
+
+  /* Layout responsive knobs — consommés par chat-codex.css (cockpit).
+     Défauts = valeurs historiques (zéro diff visuel à 1280×800) ; les
+     paliers @1100/@900/@680 plus bas resserrent les paddings en douceur
+     (le palier @1100 supprime la transition autrefois brutale à 900px). */
+  --layout-pad-x: 32px;   /* padding horizontal du feed chat */
+  --layout-pad-y: 28px;   /* padding haut du feed chat */
+  --composer-pad-x: 24px; /* padding horizontal du composer */
+  --head-pad-x: 28px;     /* padding horizontal du header de conversation */
 }
 
 *, *::before, *::after { box-sizing: border-box; }
@@ -286,13 +295,28 @@ body {
 /* Side panel — width is now controlled by the wrap, drop the fixed width */
 .side { width: auto; min-width: 0; flex: 1; }
 
-/* ── Responsive breakpoints (window resize adaptation) ────── */
+/* ── Responsive breakpoints (window resize adaptation) ──────
+   NB : plus aucune règle .float-shell/.float-body ici — FloatShell ne rend
+   QUE dans la fenêtre mascotte, fixe à 1200×720 (non resizable), où ces
+   breakpoints ne s'appliquaient jamais (code mort hérité de l'époque où le
+   chat flottant vivait dans la fenêtre principale). Les gardes de taille du
+   panneau flottant vivent dans panels.css. */
 @media (max-width: 1100px) {
+  :root {
+    --layout-pad-x: 26px;
+    --layout-pad-y: 24px;
+    --composer-pad-x: 22px;
+    --head-pad-x: 22px;
+  }
   .image-controls { width: 280px; }
-  .float-shell { --avatar-size: 64px; }
-  .float-body { width: 380px; max-width: min(380px, calc(100vw - var(--avatar-size) - 60px)); }
 }
 @media (max-width: 900px) {
+  :root {
+    --layout-pad-x: 18px;
+    --layout-pad-y: 22px;
+    --composer-pad-x: 18px;
+    --head-pad-x: 16px;
+  }
   .rail { width: 56px; }
   .rail-btn { width: 38px; height: 38px; }
   .image-shell { flex-direction: column; }
@@ -307,12 +331,16 @@ body {
   .settings-shell { padding: 16px 18px; }
 }
 @media (max-width: 680px) {
+  :root {
+    --layout-pad-x: 14px;
+    --layout-pad-y: 16px;
+    --composer-pad-x: 14px;
+    --head-pad-x: 12px;
+  }
   .titlebar { gap: 8px; padding: 0 8px; height: 40px; }
   .brand-name .sub { display: none; }
   .tb-search { width: 180px; font-size: 11px; }
   .tb-search > span:not(.kbd) { display: none; }
-  .float-shell { --avatar-size: 56px; }
-  .float-body { width: calc(100vw - 96px); max-width: calc(100vw - 96px); }
 }
 
 /* When the window itself is small, drop ornaments */
@@ -952,6 +980,10 @@ body {
   padding: 0 8px;
   gap: 2px;
   flex-shrink: 0;
+  /* min-width:0 — sans cette garde, une rangée d'onglets longue étire le
+     parent flex (panel étroit) au lieu de scroller via .scroll-x. */
+  min-width: 0;
+  flex-wrap: nowrap;
 }
 .ide-tab {
   display: inline-flex; align-items: center; gap: 8px;

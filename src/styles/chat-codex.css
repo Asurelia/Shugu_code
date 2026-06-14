@@ -8,7 +8,10 @@
 .cx { position: absolute; inset: 0; display: flex; flex-direction: column; min-height: 0; }
 
 /* ── Feed ─────────────────────────────────────────────────── */
-.cx-feed { flex: 1; overflow-y: auto; padding: 28px 32px 12px; min-height: 0; }
+/* overflow-x hidden : avec seulement overflow-y:auto, le overflow-x calculé
+   devient "auto" → toute fuite horizontale (long mot, code large) crée une
+   scrollbar horizontale parasite sur TOUT le feed. */
+.cx-feed { flex: 1; overflow-y: auto; overflow-x: hidden; padding: var(--layout-pad-y) var(--layout-pad-x) 12px; min-height: 0; }
 .cx-feed-inner { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 22px; }
 
 /* ── Empty state (no messages) ────────────────────────────── */
@@ -87,7 +90,9 @@
   cursor: pointer;
 }
 
-/* User message — quieter, "›" mark + plain body, slightly indented */
+/* User message — quieter, "›" mark + plain body, slightly indented.
+   overflow-wrap:anywhere — pre-wrap seul ne casse PAS les mots longs ;
+   une URL/UUID de 200 chars étirait la bulle hors de la fenêtre. */
 .cx-msg.user .cx-body {
   font-size: 14.5px;
   line-height: 1.65;
@@ -97,16 +102,20 @@
   background: linear-gradient(90deg, rgba(129,236,255,0.05), transparent 70%);
   border-radius: 0 10px 10px 0;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  min-width: 0;
 }
 .cx-msg.user .cx-body img { max-width: 100%; max-height: 300px; border-radius: 6px; display: block; }
 
-/* AI message — open body, structured */
+/* AI message — open body, structured. Même garde overflow-wrap que la
+   bulle user (les blocs code gardent leur scroll-x interne, intouché). */
 .cx-msg.ai .cx-body {
   font-size: 14.5px;
   line-height: 1.7;
   color: var(--on-surface);
+  overflow-wrap: anywhere;
 }
-.cx-msg.ai .cx-body p { margin: 0 0 12px; white-space: pre-wrap; }
+.cx-msg.ai .cx-body p { margin: 0 0 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .cx-msg.ai .cx-body p:last-child { margin: 0; }
 .cx-msg.ai .cx-body ul { margin: 4px 0 12px; padding-left: 18px; }
 .cx-msg.ai .cx-body ul li { margin: 4px 0; }
@@ -183,7 +192,7 @@
   font-family: var(--font-mono); font-size: 10px;
   letter-spacing: 0.5px; text-transform: uppercase;
 }
-.cx-think .body { margin-top: 6px; font-style: italic; color: var(--on-surface-muted); white-space: pre-wrap; }
+.cx-think .body { margin-top: 6px; font-style: italic; color: var(--on-surface-muted); white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* ── Live agent activity timeline ──────────────────────────────────────────
    Rendu dans la bulle de l'orchestrateur : « Travaille… » + chrono + journal
@@ -474,7 +483,7 @@
 
 /* ── Composer (full agent-style) ──────────────────────────── */
 .cx-composer-wrap {
-  padding: 10px 24px 22px;
+  padding: 10px var(--composer-pad-x) 22px;
   flex-shrink: 0;
   display: flex; flex-direction: column; align-items: center;
 }
@@ -567,6 +576,12 @@
   color: var(--on-surface-variant);
   cursor: default;
   transition: all 160ms ease;
+  /* Un nom de branche/fichier long ne doit pas étirer la rangée hors du
+     composer : tronque avec ellipsis dans la limite de la ligne. */
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .cx-chip svg { opacity: 0.85; }
 .cx-chip.status {
@@ -714,7 +729,7 @@
 /* ── Conversation head (replaces big content-head when in chat) ── */
 .cx-head {
   display: flex; align-items: center; gap: 10px;
-  padding: 12px 28px;
+  padding: 12px var(--head-pad-x);
   border-bottom: 1px solid rgba(255,255,255,0.04);
   flex-shrink: 0;
   font-family: var(--font-mono); font-size: 11.5px;
@@ -806,10 +821,13 @@
 
 /* Responsive */
 @media (max-width: 900px) {
-  .cx-feed { padding: 22px 18px 10px; }
-  .cx-composer-wrap { padding: 8px 18px 14px; }
+  /* Les paddings HORIZONTAUX passent par les tokens --layout-pad-*/
+  /* (styles.css) — ne restent ici que les ajustements verticaux et
+     les changements structurels. */
+  .cx-feed { padding-bottom: 10px; }
+  .cx-composer-wrap { padding-top: 8px; padding-bottom: 14px; }
   .cx-empty-title { font-size: 24px; }
-  .cx-head { padding: 10px 16px; }
+  .cx-head { padding-top: 10px; padding-bottom: 10px; }
   .chat-split { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
   .chat-split-left { border-right: 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
 }

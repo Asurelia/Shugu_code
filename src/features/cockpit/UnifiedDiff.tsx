@@ -349,7 +349,6 @@ function DiffLineRow({
           flex: 1,
           whiteSpace: "pre",
           paddingRight: 16,
-          overflowX: "auto",
         }}
       >
         {line.text}
@@ -451,7 +450,12 @@ export function UnifiedDiff({ text, onRevealLine, onAddComment }: UnifiedDiffPro
       }}
     >
       {parsed.hunks.map((hunk, hi) => (
-        <div key={hi} data-hunk={hi}>
+        // width:max-content + minWidth:100% — le hunk s'élargit à sa ligne la
+        // plus longue, donc UN SEUL scroll horizontal (le conteneur parent)
+        // et des fonds de ligne add/remove qui peignent toute la largeur.
+        // Avant : chaque ligne portait son propre overflowX:auto → N mini-
+        // scrollbars indépendantes, illisible sur panel étroit.
+        <div key={hi} data-hunk={hi} style={{ width: "max-content", minWidth: "100%" }}>
           <HunkHeader text={hunk.header} />
           {hunk.lines.map((line, li) => {
             // C2.2 — a line is a jump target if it has a new-side number AND
