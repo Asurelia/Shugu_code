@@ -1,40 +1,45 @@
 // Shugu Forge — ContextBubble.
 //
-// The trigger is a small icon-button in the TITLEBAR (portaled to #tb-ctx-slot),
-// grouped with History/Bell/Settings — fixed icon + "Contexte" tooltip (it's the
-// category, it never mirrors a tab).
+// Trigger = a fixed icon-button in the TITLEBAR (#tb-ctx-slot), "Contexte"
+// tooltip. Click → a compact vertical MENU (icon + label per row, flyout-style).
+// Click a card row → that card's content replaces the menu (with a "‹" back).
+// The bubble is a MINI panel by default and can grow (mini → demi → plein) via
+// the size button, so big content (plan, diff, editor preview) gets room — the
+// full cockpit right panel stays for the heavy lifting.
 //
-// Click → a vertical MENU opens (icon + label per row, à la VS Code flyout).
-// Click a card row → that card's content replaces the menu (with a "‹" back to
-// the menu). The "Terminal" row is special: it doesn't open a card — it opens
-// the REAL bottom-dock terminal of the cockpit (like the IDE), then closes the
-// bubble. Chat view only.
+// "Terminal" is special: it opens the REAL bottom-dock terminal of the cockpit,
+// not a card. Chat view only. Editor data (open files / active file / contents)
+// is threaded from the parent shell so the "Éditeur" card can preview them;
+// absent that bridge (e.g. mascot) the card shows an empty state.
 
 import { useState } from "react";
 import { createPortal } from "react-dom";
 import { Icon } from "@/components/components";
-import { CTX_TABS, ContextCard, useCtxCounts, type CtxTabId } from "./cards";
+import { CTX_TABS, ContextCard, useCtxCounts, type CtxTabId, type EditorBridge } from "./cards";
 import { setBottomDockOpen } from "@/features/cockpit/layoutStore";
 
 type View = "menu" | CtxTabId;
+type Size = "mini" | "demi" | "plein";
+const SIZE_CYCLE: Record<Size, Size> = { mini: "demi", demi: "plein", plein: "mini" };
+const SIZE_LABEL: Record<Size, string> = { mini: "Mini", demi: "Demi", plein: "Plein" };
 
 export function ContextBubble({
   convId,
   onOpenFile,
+  editor = {},
 }: {
   convId: string;
   onOpenFile: (path: string) => void;
+  editor?: EditorBridge;
 }) {
   const [open, setOpen] = useState(false);
   const [view, setView] = useState<View>("menu");
+  const [size, setSize] = useState<Size>("mini");
   const counts = useCtxCounts(convId);
 
-  // Aggregate, tab-INDEPENDENT badge on the trigger: the live "attention"
-  // signals (running agents + uncommitted changes).
   const totalBadge = counts.tasks + counts.git;
 
-  // Opening always lands on the menu (the user's mental model: "click Contexte
-  // → the menu opens"). Toggling closed keeps nothing.
+  // Opening always lands on the menu ("click Contexte → the menu opens").
   const toggle = () => {
     if (!open) setView("menu");
     setOpen((o) => !o);
@@ -48,6 +53,9 @@ export function ContextBubble({
 
   const activeMeta = view !== "menu" ? CTX_TABS.find((t) => t.id === view) ?? null : null;
 
+  const cls =
+    "ctx-bubble" + (view === "menu" ? " is-menu" : " size-" + size);
+
   const slot = typeof document !== "undefined" ? document.getElementById("tb-ctx-slot") : null;
   const trigger = (
     <button className="tb-action ctx-tb-btn" onClick={toggle} title="Contexte" aria-pressed={open}>
@@ -60,7 +68,7 @@ export function ContextBubble({
     <>
       {slot && createPortal(trigger, slot)}
       {open && (
-        <div className="ctx-bubble">
+        <div className={cls}>
           {view === "menu" ? (
             <>
               <div className="ctx-bubble-head">
@@ -87,7 +95,6 @@ export function ContextBubble({
                   </button>
                 ))}
 
-                {/* Terminal — opens the real bottom-dock terminal, not a card. */}
                 <button role="menuitem" className="ctx-launch-item" onClick={openTerminal}>
                   <Icon name="term" size={15} />
                   <span className="label">Terminal</span>
@@ -105,13 +112,20 @@ export function ContextBubble({
                   {activeMeta && <Icon name={activeMeta.icon} size={13} />}
                   {activeMeta?.label}
                 </span>
+                <button
+                  className="ctx-size"
+                  onClick={() => setSize((s) => SIZE_CYCLE[s])}
+                  title={`Taille : ${SIZE_LABEL[size]} (cliquer pour agrandir)`}
+                >
+                  {SIZE_LABEL[size]}
+                </button>
                 <button className="ctx-bubble-close" onClick={() => setOpen(false)} title="Replier">
                   <Icon name="x" size={13} />
                 </button>
               </div>
 
               <div className="ctx-bubble-body">
-                <ContextCard tab={view} convId={convId} onOpenFile={onOpenFile} />
+                <ContextCard tab={view} convId={convId} onOpenFile={onOpenFile} editor={editor} />
               </div>
             </>
           )}

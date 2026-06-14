@@ -91,6 +91,12 @@
   from { opacity: 0; transform: translateY(-6px) scale(0.98); }
   to { opacity: 1; transform: translateY(0) scale(1); }
 }
+/* Tailles : menu compact ; cartes en mini (défaut) / demi / plein (le bouton
+   « taille » fait grandir la bulle pour le plan, les diffs, l'aperçu éditeur). */
+.ctx-bubble.is-menu      { width: 264px; }
+.ctx-bubble.size-mini    { width: 380px; max-height: 460px; }
+.ctx-bubble.size-demi    { width: min(560px, calc(100% - 36px)); max-height: calc(100% - 28px); }
+.ctx-bubble.size-plein   { width: calc(100% - 36px); max-height: calc(100% - 28px); }
 .ctx-bubble-head {
   display: flex; align-items: center; gap: 6px;
   padding: 8px 8px 8px 10px;
@@ -127,17 +133,25 @@
    flyout VS Code. Clic carte → la carte remplace le menu ; clic Terminal →
    dock du bas. */
 .ctx-launch {
-  display: flex; flex-direction: column; gap: 2px;
-  padding: 8px; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 1px;
+  padding: 6px; overflow-y: auto;
 }
 .ctx-launch-item {
-  display: flex; align-items: center; gap: 11px;
-  padding: 10px 11px; border-radius: 10px;
-  font-family: var(--font-display); font-weight: 500; font-size: 13px;
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px; border-radius: 9px;
+  font-family: var(--font-display); font-weight: 500; font-size: 12.5px;
   color: var(--on-surface-variant);
   background: transparent; border: 1px solid transparent; cursor: pointer;
   text-align: left; transition: all 130ms ease;
 }
+/* Bouton taille (mini/demi/plein) dans l'en-tête d'une carte. */
+.ctx-size {
+  flex-shrink: 0; height: 22px; padding: 0 8px; border-radius: 7px; cursor: pointer;
+  font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--on-surface-variant);
+  background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08);
+}
+.ctx-size:hover { color: var(--primary); border-color: rgba(224,142,254,0.28); }
 .ctx-launch-item:hover {
   background: rgba(224,142,254,0.08);
   border-color: rgba(224,142,254,0.20);
@@ -540,8 +554,58 @@
 }
 .ctx-env-raw:focus { border-color: rgba(224,142,254,0.35); }
 
+/* ── Éditeur : aperçu compact du fichier actif ──────────────── */
+.ctx-editor { display: flex; flex-direction: column; gap: 8px; min-height: 0; height: 100%; }
+.ctx-editor-tabs {
+  display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none; flex-shrink: 0;
+}
+.ctx-editor-tabs::-webkit-scrollbar { display: none; }
+.ctx-editor-tab {
+  flex-shrink: 0; padding: 4px 9px; border-radius: 7px; cursor: pointer;
+  font-family: var(--font-mono); font-size: 10.5px; white-space: nowrap;
+  color: var(--on-surface-variant);
+  background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.07);
+}
+.ctx-editor-tab:hover { color: var(--on-surface); }
+.ctx-editor-tab.on { color: var(--primary); border-color: rgba(224,142,254,0.3); background: rgba(224,142,254,0.08); }
+.ctx-code {
+  flex: 1; min-height: 120px; margin: 0; overflow: auto;
+  background: rgba(7,7,16,0.6); border: 1px solid rgba(255,255,255,0.07); border-radius: 8px;
+  padding: 9px 11px;
+  font-family: var(--font-mono); font-size: 11px; line-height: 1.55; color: var(--on-surface-variant);
+  white-space: pre; tab-size: 2;
+}
+.ctx-editor-open { align-self: flex-start; flex-shrink: 0; }
+
+/* ── Révision : diff réel de l'arbre de travail ─────────────── */
+.ctx-review { display: flex; flex-direction: column; gap: 8px; min-height: 0; height: 100%; }
+.ctx-review-files { display: flex; gap: 4px; overflow-x: auto; scrollbar-width: none; flex-shrink: 0; }
+.ctx-review-files::-webkit-scrollbar { display: none; }
+.ctx-review-file {
+  flex-shrink: 0; display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 9px; border-radius: 7px; cursor: pointer;
+  font-family: var(--font-mono); font-size: 10.5px; white-space: nowrap;
+  color: var(--on-surface-variant);
+  background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.07);
+}
+.ctx-review-file:hover { color: var(--on-surface); }
+.ctx-review-file.on { color: var(--on-surface); border-color: rgba(224,142,254,0.3); background: rgba(224,142,254,0.08); }
+.ctx-review-file .dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.ctx-review-file .dot.add { background: var(--success); }
+.ctx-review-file .dot.mod { background: var(--warn); }
+.ctx-review-file .dot.del { background: var(--danger); }
+.ctx-review-diff {
+  flex: 1; min-height: 120px; overflow: auto;
+  background: rgba(7,7,16,0.6); border: 1px solid rgba(255,255,255,0.07); border-radius: 8px;
+}
+.ctx-diff { margin: 0; padding: 8px 0; font-family: var(--font-mono); font-size: 11px; line-height: 1.5; white-space: pre; }
+.ctx-diff .dl { padding: 0 11px; color: var(--on-surface-muted); }
+.ctx-diff .dl.add { background: rgba(74,222,128,0.08); color: #9ff0bf; }
+.ctx-diff .dl.del { background: rgba(255,106,138,0.08); color: #ffb0c0; }
+.ctx-diff .dl.hunk { color: var(--tertiary); background: rgba(129,236,255,0.06); }
+
 @media (max-width: 900px) {
-  .ctx-bubble { width: calc(100% - 36px); }
+  .ctx-bubble, .ctx-bubble.is-menu, .ctx-bubble.size-mini, .ctx-bubble.size-demi { width: calc(100% - 36px); }
 }
 
 /* ── Conversations sidebar — vector search bar (VEC2) ──────────

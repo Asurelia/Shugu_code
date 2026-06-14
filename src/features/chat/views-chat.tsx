@@ -107,7 +107,7 @@ export function ChatView({
   const toolActivity = useChatToolActivity(activeConv);
 
   const navigate = useNavigate();
-  const { activeFile, openFile, fileContents, setFileContents, editorPrefs, compareFile, setCompareFile, applyCodeToFile } = useShell();
+  const { activeFile, openFiles, openFile, fileContents, setFileContents, editorPrefs, compareFile, setCompareFile, applyCodeToFile } = useShell();
 
   // Phase 2 — Chat→Editor handoff. When a file is opened from an action card,
   // we reveal an in-chat split (chat left, CodeMirror right) instead of
@@ -657,7 +657,11 @@ export function ChatView({
           History/Bell/Settings); the panel floats here when opened. Mounted for
           the whole chat view incl. the empty state; chatMain isn't rendered
           during the handoff split, so that case is already excluded. */}
-      <ContextBubble convId={activeConv} onOpenFile={handleOpenFile} />
+      <ContextBubble
+        convId={activeConv}
+        onOpenFile={handleOpenFile}
+        editor={{ openFiles, activeFile, fileContents }}
+      />
     </div>
   );
 

@@ -29,6 +29,7 @@ import {
   useGitLog,
   useGitWorktrees,
   useGitNumstat,
+  useGitDiff,
 } from "@/features/git/queries";
 import { useGitInit, useWorktreeAdd, useWorktreeRemove } from "@/features/git/mutations";
 import { useWorkspaceChanges } from "@/features/git/useWorkspaceChanges";
@@ -48,15 +49,26 @@ import type { AgentRow } from "@/lib/agents";
 
 // ─── Tab registry (shared with ContextBubble + FloatChat) ───
 export const CTX_TABS = [
-  { id: "plan",    label: "Plan",    icon: "commit" },
-  { id: "tasks",   label: "Agents",  icon: "agent" },
-  { id: "git",     label: "Git",     icon: "git" },
-  { id: "preview", label: "Prévisu", icon: "image" },
-  { id: "sources", label: "Sources", icon: "folderTree" },
-  { id: "env",     label: "Env",     icon: "shield" },
+  { id: "plan",    label: "Plan",     icon: "commit" },
+  { id: "tasks",   label: "Agents",   icon: "agent" },
+  { id: "editor",  label: "Éditeur",  icon: "code" },
+  { id: "review",  label: "Révision", icon: "diff" },
+  { id: "git",     label: "Git",      icon: "git" },
+  { id: "preview", label: "Prévisu",  icon: "image" },
+  { id: "sources", label: "Sources",  icon: "folderTree" },
+  { id: "env",     label: "Env",      icon: "shield" },
 ] as const;
 
 export type CtxTabId = (typeof CTX_TABS)[number]["id"];
+
+/** Données éditeur passées depuis le shell parent (views-chat). Optionnelles :
+ *  hors cockpit (ex. mascotte) elles sont absentes → la carte Éditeur montre un
+ *  état vide. */
+export interface EditorBridge {
+  openFiles?: string[];
+  activeFile?: string | null;
+  fileContents?: Record<string, { text?: string; lang?: string }>;
+}
 
 /** Live per-tab badge counts. Seuls les signaux « attention » portent un nombre
  *  (agents actifs, fichiers modifiés) ; les autres onglets n'ont pas de compteur
@@ -67,6 +79,8 @@ export function useCtxCounts(_convId: string): Record<CtxTabId, number> {
   return {
     plan: 0,
     tasks: activeAgents.length,
+    editor: 0,
+    review: changes,
     git: changes,
     preview: 0,
     sources: 0,
@@ -79,14 +93,25 @@ export function ContextCard({
   tab,
   convId,
   onOpenFile,
+  editor = {},
 }: {
   tab: CtxTabId;
   convId: string;
   onOpenFile: (path: string) => void;
+  editor?: EditorBridge;
 }) {
   switch (tab) {
     case "plan":    return <PlanCard convId={convId} />;
     case "tasks":   return <TasksCard />;
+    case "editor":  return (
+      <EditorCard
+        openFiles={editor.openFiles ?? []}
+        activeFile={editor.activeFile ?? null}
+        fileContents={editor.fileContents ?? {}}
+        onOpenFile={onOpenFile}
+      />
+    );
+    case "review":  return <ReviewCard onOpenFile={onOpenFile} />;
     case "git":     return <GitRecapCard onOpenFile={onOpenFile} />;
     case "preview": return <PreviewCard />;
     case "sources": return <SourcesCard convId={convId} onOpenFile={onOpenFile} />;
@@ -855,6 +880,128 @@ function EnvFileEditor({ path, onOpenFile }: { path: string; onOpenFile: (path: 
         </div>
       )}
     </div>
+  );
+}
+
+// ─── Éditeur (aperçu compact du fichier actif / fichiers ouverts) ─
+// Ouvre DANS la mini-bulle (lecture seule). Pour éditer pour de vrai, « Ouvrir
+// dans l'éditeur » bascule sur la surface éditeur complète. Hors cockpit (pas de
+// fichiers passés), état vide.
+function EditorCard({
+  openFiles,
+  activeFile,
+  fileContents,
+  onOpenFile,
+}: {
+  openFiles: string[];
+  activeFile: string | null;
+  fileContents: Record<string, { text?: string; lang?: string }>;
+  onOpenFile: (path: string) => void;
+}) {
+  const [sel, setSel] = useState<string | null>(null);
+  const current = sel && openFiles.includes(sel) ? sel : activeFile ?? openFiles[0] ?? null;
+
+  if (openFiles.length === 0) {
+    return (
+      <CardEmpty
+        icon="code"
+        text="Aucun fichier ouvert. Ouvre un fichier (explorateur, Sources, Révision) pour l'aperçu ici."
+      />
+    );
+  }
+
+  const text = current ? fileContents[current]?.text ?? "" : "";
+  return (
+    <div className="ctx-editor">
+      <div className="ctx-editor-tabs">
+        {openFiles.map((p) => {
+          const name = p.split("/").pop() ?? p;
+          return (
+            <button
+              key={p}
+              className={"ctx-editor-tab" + (p === current ? " on" : "")}
+              title={p}
+              onClick={() => setSel(p)}
+            >
+              {name}
+            </button>
+          );
+        })}
+      </div>
+      <pre className="ctx-code"><code>{text || "(fichier vide ou non chargé)"}</code></pre>
+      {current && (
+        <button className="lgb lgb-sm ctx-editor-open" onClick={() => onOpenFile(current)}>
+          Ouvrir dans l'éditeur
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ─── Révision (diff réel de l'arbre de travail, compact) ────
+function ReviewCard({ onOpenFile }: { onOpenFile: (path: string) => void }) {
+  const { files, isRepo } = useWorkspaceChanges();
+  const [sel, setSel] = useState<string | null>(null);
+  const current = sel && files.some((f) => f.name === sel) ? sel : files[0]?.name ?? null;
+  const { data: diff = "", isFetching } = useGitDiff(current, "worktree");
+
+  if (!isRepo) {
+    return <CardEmpty icon="diff" text="L'espace de travail n'est pas un dépôt git." />;
+  }
+  if (files.length === 0) {
+    return <CardEmpty icon="diff" text="Aucune modification à réviser. L'espace de travail est propre." />;
+  }
+
+  return (
+    <div className="ctx-review">
+      <div className="ctx-review-files">
+        {files.map((f) => {
+          const name = f.name.split("/").pop() ?? f.name;
+          return (
+            <button
+              key={f.name}
+              className={"ctx-review-file" + (f.name === current ? " on" : "")}
+              title={f.name}
+              onClick={() => setSel(f.name)}
+            >
+              <span className={"dot " + f.st} />
+              <span className="nm">{name}</span>
+            </button>
+          );
+        })}
+      </div>
+      <div
+        className="ctx-review-diff"
+        title="Double-clic : ouvrir le fichier dans l'éditeur"
+        onDoubleClick={() => current && onOpenFile(current)}
+      >
+        {isFetching ? (
+          <div className="ctx-env-sub" style={{ padding: 8 }}>chargement…</div>
+        ) : (
+          <DiffView text={diff} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Unified-diff renderer with +/- coloring. Pure presentational. */
+function DiffView({ text }: { text: string }) {
+  if (!text.trim()) {
+    return <div className="ctx-env-sub" style={{ padding: 8 }}>Aucun diff (fichier non suivi ou binaire).</div>;
+  }
+  const lines = text.split("\n");
+  return (
+    <pre className="ctx-diff">
+      {lines.map((l, i) => {
+        const cls =
+          l.startsWith("+") && !l.startsWith("+++") ? "add"
+          : l.startsWith("-") && !l.startsWith("---") ? "del"
+          : l.startsWith("@@") ? "hunk"
+          : "";
+        return <div key={i} className={"dl " + cls}>{l || " "}</div>;
+      })}
+    </pre>
   );
 }
 
