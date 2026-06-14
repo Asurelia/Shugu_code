@@ -71,6 +71,13 @@
   border: 1px solid rgba(224,142,254,0.3);
 }
 
+/* ── Window-manager work area ─────────────────────────────────
+   Calque plein-cadre qui héberge le menu-lanceur + les fenêtres flottantes.
+   pointer-events:none pour laisser passer les clics vers le chat ; chaque
+   bulle réactive les events. */
+.ctx-wm { position: absolute; inset: 0; z-index: 20; pointer-events: none; }
+.ctx-wm > .ctx-bubble { pointer-events: auto; }
+
 /* ── Open bubble ──────────────────────────────────────────── */
 .ctx-bubble {
   position: absolute; top: 14px; right: 18px; z-index: 20;
@@ -91,12 +98,15 @@
   from { opacity: 0; transform: translateY(-6px) scale(0.98); }
   to { opacity: 1; transform: translateY(0) scale(1); }
 }
-/* Tailles : menu compact ; cartes en mini (défaut) / demi / plein (le bouton
-   « taille » fait grandir la bulle pour le plan, les diffs, l'aperçu éditeur). */
-.ctx-bubble.is-menu      { width: 264px; }
-.ctx-bubble.size-mini    { width: 380px; max-height: 460px; }
-.ctx-bubble.size-demi    { width: min(560px, calc(100% - 36px)); max-height: calc(100% - 28px); }
-.ctx-bubble.size-plein   { width: calc(100% - 36px); max-height: calc(100% - 28px); }
+/* Menu-lanceur compact, ancré en haut à droite. */
+.ctx-bubble.is-menu { width: 264px; }
+
+/* Fenêtres flottantes : LARGEUR = inline (drag de la poignée droite),
+   HAUTEUR = preset via le bouton (mini / demi / plein). Position = inline. */
+.ctx-bubble.ctx-win { top: auto; right: auto; max-height: none; }
+.ctx-win.size-mini  { height: 360px; }
+.ctx-win.size-demi  { height: min(58vh, calc(100% - 24px)); }
+.ctx-win.size-plein { height: calc(100% - 24px); }
 .ctx-bubble-head {
   display: flex; align-items: center; gap: 6px;
   padding: 8px 8px 8px 10px;
@@ -168,6 +178,26 @@
   padding: 2px 6px; border-radius: 6px;
   background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08);
 }
+/* Entrée dont la fenêtre est déjà ouverte : pastille + léger surlignage. */
+.ctx-launch-item.open { color: var(--on-surface); }
+.ctx-open-dot {
+  width: 7px; height: 7px; flex-shrink: 0; border-radius: 50%;
+  background: var(--primary); box-shadow: 0 0 0 3px rgba(224,142,254,0.18);
+}
+
+/* ── Fenêtre flottante : en-tête déplaçable + poignée de largeur ──── */
+.ctx-win-head { cursor: move; user-select: none; touch-action: none; }
+.ctx-win-head .ctx-bubble-title { cursor: move; }
+.ctx-win-resize {
+  position: absolute; top: 8px; bottom: 8px; right: 0; width: 8px;
+  cursor: ew-resize; touch-action: none; z-index: 2;
+}
+.ctx-win-resize::after {
+  content: ""; position: absolute; top: 50%; right: 2px; transform: translateY(-50%);
+  width: 3px; height: 30px; border-radius: 2px; background: rgba(255,255,255,0.12);
+  transition: background 130ms ease;
+}
+.ctx-win-resize:hover::after { background: var(--primary); }
 
 /* overflow-y:auto (with default overflow-x) clips both axes, so the rounded
    bottom corners are honored even though the parent .ctx-bubble is now
@@ -327,7 +357,7 @@
 .ctx-source-sim { font-family: var(--font-mono); font-size: 10px; color: var(--tertiary); }
 
 /* ── Prévisu card ─────────────────────────────────────────── */
-.ctx-preview { display: flex; flex-direction: column; gap: 8px; height: 420px; }
+.ctx-preview { display: flex; flex-direction: column; gap: 8px; height: 100%; min-height: 260px; }
 .ctx-preview-bar { display: flex; align-items: center; gap: 6px; }
 .ctx-preview-url {
   flex: 1; min-width: 0;
