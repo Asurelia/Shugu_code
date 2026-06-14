@@ -64,19 +64,20 @@ REM   pnpm.cmd → node (vite) → esbuild workers
 REM and the SIGTERM emitted when Tauri shuts down does NOT propagate
 REM cleanly through pnpm.cmd. Result: every `tauri-dev` cycle leaks
 REM the vite node process + its esbuild service workers, which keep
-REM port 5173 in use and bloat the process table.
+REM port 1420 in use and bloat the process table.
 REM
-REM This block targets ONLY the process still holding port 5173 (the
-REM vite server) and kills its entire tree with /T. Esbuild workers
-REM are children of vite, so /T sweeps them too. We avoid blanket
-REM `taskkill /IM node.exe` because the user may have other node
-REM services running (vault CLI, MCP servers, etc.).
+REM This block targets ONLY the process still holding port 1420 (Shugu's
+REM DEDICATED vite port — see vite.config.ts) and kills its entire tree
+REM with /T. Esbuild workers are children of vite, so /T sweeps them too.
+REM We avoid blanket `taskkill /IM node.exe` because the user may have
+REM other node services running (vault CLI, MCP servers, the `taptapshugu`
+REM sim on 5173, etc.) — sweeping 1420 leaves all of those untouched.
 REM
 REM We use PowerShell rather than `for /f` + `netstat` so the script
 REM never spawns a sub-cmd.exe (the user has cmd.exe AutoRun
 REM configured, see vcvars64 comment above).
-echo [tauri-dev.cmd] Sweeping port 5173 for orphaned vite...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$h = Get-NetTCPConnection -LocalPort 5173 -State Listen -ErrorAction SilentlyContinue; if ($h) { foreach ($c in $h) { $p = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue; if ($p) { Write-Host ('  killing ' + $p.Name + ' PID ' + $p.Id + ' (+ children)'); & taskkill /PID $p.Id /T /F | Out-Null } } } else { Write-Host '  port 5173 clean' }"
+echo [tauri-dev.cmd] Sweeping port 1420 for orphaned vite...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$h = Get-NetTCPConnection -LocalPort 1420 -State Listen -ErrorAction SilentlyContinue; if ($h) { foreach ($c in $h) { $p = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue; if ($p) { Write-Host ('  killing ' + $p.Name + ' PID ' + $p.Id + ' (+ children)'); & taskkill /PID $p.Id /T /F | Out-Null } } } else { Write-Host '  port 1420 clean' }"
 
 echo.
 echo [tauri-dev.cmd] Tauri exited with code %TAURI_EXIT%.

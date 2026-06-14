@@ -13,7 +13,10 @@ export default defineConfig({
   },
   clearScreen: false,
   server: {
-    port: 5173,
+    // Port DÉDIÉ (1420, convention Tauri) plutôt que le 5173 par défaut de Vite,
+    // pour ne PAS collisionner avec d'autres projets Vite lancés en parallèle
+    // (ex. la simu `taptapshugu` sur 5173). strictPort = échec clair si pris.
+    port: 1420,
     strictPort: true,
     host: host || false,
     hmr: host
