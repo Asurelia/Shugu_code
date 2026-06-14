@@ -83,10 +83,13 @@ fn load_conversation_history(app: &AppHandle, conversation_id: &str, limit: u32)
         Err(_) => return Vec::new(),
     };
     // ts DESC + LIMIT = les N plus récents ; on réinverse en ASC ensuite.
+    // Tie-break sur `rowid` (ordre d'insertion) : deux messages au même ms ne
+    // doivent pas avoir un ordre indéterminé — le plus récemment inséré (= le
+    // message courant) doit rester en tête du DESC pour être droppé après.
     let mut stmt = match guard.prepare(
         "SELECT role, text, body, code_text, image FROM messages \
          WHERE conversation_id = ?1 AND deleted_at IS NULL \
-         ORDER BY ts DESC LIMIT ?2",
+         ORDER BY ts DESC, rowid DESC LIMIT ?2",
     ) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -110,7 +113,8 @@ fn load_conversation_history(app: &AppHandle, conversation_id: &str, limit: u32)
     if matches!(rows.last(), Some((role, ..)) if role == "user") {
         rows.pop();
     }
-    rows.into_iter()
+    let mut history: Vec<AgentMessage> = rows
+        .into_iter()
         .filter_map(|(role, text, body, code_text, image)| {
             let mapped_role = if role == "ai" { "assistant" } else { role.as_str() };
             // Seuls user/assistant sont des tours de dialogue valides.
@@ -140,7 +144,15 @@ fn load_conversation_history(app: &AppHandle, conversation_id: &str, limit: u32)
             }
             Some(AgentMessage::Text { role: mapped_role.to_string(), content })
         })
-        .collect()
+        .collect();
+    // Anthropic exige que le PREMIER message (après hoisting du system) soit
+    // `user`. Si la fenêtre de 30 messages démarre sur un tour `assistant` (conv
+    // ouverte par un message IA, ou coupe au milieu d'un échange), on retire les
+    // tours assistant de tête pour ne jamais produire `[assistant, …]`.
+    while matches!(history.first(), Some(AgentMessage::Text { role, .. }) if role == "assistant") {
+        history.remove(0);
+    }
+    history
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -157,6 +169,10 @@ async fn web_search_ddg(client: &reqwest::Client, query: &str, max: usize) -> (S
             reqwest::header::USER_AGENT,
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         )
+        // Deadline PROPRE à cette requête (le client est celui du streaming SSE,
+        // tolérant 300 s de silence — inadapté à un simple GET). Une réponse DDG
+        // qui pend ne gèle donc plus l'agent que 15 s.
+        .timeout(std::time::Duration::from_secs(15))
         .send()
         .await;
     let html = match resp {

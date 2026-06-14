@@ -378,8 +378,9 @@ export async function sendChatMessage(
       delegateTask = `${block}\n\n---\n\n${delegateTask}`;
     }
     // Le modèle de chat actif sert d'orchestrateur de REPLI (cf. resolveOrchestrator).
-    // `agentMode` propage le mode Plan (lecture seule) jusqu'au runner.
-    await handleDelegate(convId, delegateTask, agentDefPath, modelId, agentMode);
+    // `agentMode` propage le mode Plan (lecture seule) jusqu'au runner ; `trimmed`
+    // (texte original) sert à juger la trivialité pour l'advisor.
+    await handleDelegate(convId, delegateTask, agentDefPath, modelId, agentMode, trimmed);
     return;
   }
   // Below: chat-direct + chat-think continue the existing chat flow.
@@ -758,6 +759,11 @@ async function handleDelegate(
   agentDefPath?: string,
   fallbackModel?: string,
   mode: "plan" | "agent" = "agent",
+  // Texte ORIGINAL de l'utilisateur (sans l'enrichissement contexte éditeur /
+  // commentaires inline). Sert UNIQUEMENT à juger la trivialité pour l'advisor :
+  // sinon « merci » + un fichier ouvert ⇒ `task` long ⇒ resolveThinking=true ⇒
+  // advisor déclenché à tort. Défaut = task (rétro-compat si non fourni).
+  userText: string = task,
 ): Promise<void> {
   // fallbackModel = modèle de chat actif, utilisé comme orchestrateur si aucun
   // n'est configuré (délégation « out of the box »). Un agent custom (.md)
@@ -877,7 +883,7 @@ async function handleDelegate(
   const wantSupervise =
     superviseOn &&
     !isReviewerInvocation &&
-    (!!agentDefPath || resolveThinking("auto", task));
+    (!!agentDefPath || resolveThinking("auto", userText));
 
   // Si l'advisor est demandé mais qu'aucun reviewer n'est configuré, on le DIT
   // dans le fil — sauter en silence laissait l'utilisateur croire que l'advisor
