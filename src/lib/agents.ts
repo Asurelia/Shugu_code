@@ -200,6 +200,11 @@ export interface SpawnArgs {
    *  agent personnalisé. Si fourni, son frontmatter remplace `role`/`model`
    *  et son body devient le system prompt. Voir [src/lib/agentDefs.ts]. */
   agentDefPath?: string;
+  /** Mode du sélecteur de chat. `"plan"` ⇒ l'agent tourne en LECTURE SEULE
+   *  (le runner retire fs_write_file/fs_edit/run_command du manifest et refuse
+   *  toute mutation). `"agent"` (ou absent) ⇒ exécution directe complète.
+   *  Sérialise vers le champ Rust `mode` (SpawnArgs). */
+  mode?: "plan" | "agent" | (string & {});
 }
 
 /** Spawn an agent. Returns the freshly minted agent id (UUID v4 string).

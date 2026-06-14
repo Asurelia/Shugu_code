@@ -28,6 +28,7 @@ import { chatKeys } from "./keys";
 const EVT_MESSAGES = "chat://messages-changed";
 const EVT_ACTIVE = "chat://active-changed";
 const EVT_ACTIVE_MODEL = "chat://active-model-changed";
+const EVT_CHAT_MODE = "chat://chat-mode-changed";
 
 export function useChatEvents(): void {
   const qc = useQueryClient();
@@ -118,6 +119,20 @@ export function useChatEvents(): void {
         unlistens.push(un);
       } catch (err) {
         console.warn("[useChatEvents] active-model listen failed:", err);
+      }
+
+      // Agent mode sync cross-window (le sélecteur Chat/Plan/Agent).
+      try {
+        const un = await listen<{ mode?: string }>(EVT_CHAT_MODE, (payload) => {
+          if (cancelled) return;
+          const m = payload?.mode;
+          if (m === "chat" || m === "plan" || m === "agent") {
+            qc.setQueryData<string>(chatKeys.chatMode(), m);
+          }
+        });
+        unlistens.push(un);
+      } catch (err) {
+        console.warn("[useChatEvents] chat-mode listen failed:", err);
       }
     })();
 

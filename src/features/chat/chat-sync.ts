@@ -38,7 +38,7 @@ import { resolveCodeContext, buildCodeContext } from "./codeContext";
 import { fireMoodReaction } from "@/features/mascot/moodReactionStore";
 import { SHUGU_PERSONA_PROMPT, personaEnabled } from "@/features/chat/persona";
 import { parseThinkingMode, resolveThinking } from "@/lib/thinkingHeuristic";
-import { resolveRoute, parseDelegateOverride } from "@/lib/routingHeuristic";
+import { resolveRoute, parseDelegateOverride, type Route } from "@/lib/routingHeuristic";
 import { spawnAgent, awaitAgentComplete } from "@/lib/agents";
 import { readAgentDef } from "@/lib/agentDefs";
 import { superviseDeliverable, supervisePlan, resolveReviewerArgs } from "@/lib/supervisors";
@@ -55,9 +55,11 @@ import type { Message } from "@/lib/types";
 const EVT_MESSAGES     = "chat://messages-changed";
 const EVT_ACTIVE       = "chat://active-changed";
 const EVT_ACTIVE_MODEL = "chat://active-model-changed";
+const EVT_CHAT_MODE    = "chat://chat-mode-changed";
 const KEY_ACTIVE       = "shugu.chat.activeConv.v1";
 const KEY_ACTIVE_MODEL = "shugu.chat.activeModel.v1";
 const KEY_CODEX_EFFORT = "shugu.chat.codexEffort.v1";
+const KEY_CHAT_MODE    = "shugu.chat.mode.v1";
 
 // Fallback when no model has ever been chosen. We default to llama.cpp local
 // because (a) it doesn't need an API key, (b) it's the smoke-test target, and
@@ -329,11 +331,24 @@ export async function sendChatMessage(
     typeof window !== "undefined" &&
     typeof window.location !== "undefined" &&
     window.location.pathname.includes("mascot");
-  const route = agentDefPath
-    ? ("delegate" as const)
+  // ── Sélecteur de mode (cockpit) — Chat / Plan / Agent ─────────────────────
+  // Le mode est l'override PRINCIPAL du routage sur le chemin cockpit unifié :
+  //   • "chat"  → chat-direct SANS outils (conversation pure, rapide) ;
+  //   • "plan"  → délègue à l'agent en LECTURE SEULE (read_only côté runner) ;
+  //   • "agent" → délègue à l'agent complet (défaut, exec directe).
+  // `agentMode` est passé à handleDelegate quel que soit le chemin (cockpit OU
+  // mascotte) : ainsi « Plan » reste lecture-seule même quand la mascotte confie
+  // une tâche. Les exceptions historiques (image vision / never-delegate /
+  // mascotte) gardent resolveRoute pour le SPLIT direct↔think.
+  const chatMode = getActiveChatMode();
+  const agentMode: "plan" | "agent" = chatMode === "plan" ? "plan" : "agent";
+  const route: Route = agentDefPath
+    ? "delegate"
     : imageDataUrl || isMascot || delegateOverride === "never-delegate"
       ? resolveRoute(trimmed, delegateOverride)
-      : ("delegate" as const);
+      : chatMode === "chat"
+        ? "chat-direct"
+        : "delegate";
 
   if (route === "delegate") {
     // Enrichit la tâche déléguée avec le contexte éditeur (fichier actif +
@@ -360,7 +375,8 @@ export async function sendChatMessage(
       delegateTask = `${block}\n\n---\n\n${delegateTask}`;
     }
     // Le modèle de chat actif sert d'orchestrateur de REPLI (cf. resolveOrchestrator).
-    await handleDelegate(convId, delegateTask, agentDefPath, modelId);
+    // `agentMode` propage le mode Plan (lecture seule) jusqu'au runner.
+    await handleDelegate(convId, delegateTask, agentDefPath, modelId, agentMode);
     return;
   }
   // Below: chat-direct + chat-think continue the existing chat flow.
@@ -600,8 +616,16 @@ export async function sendChatMessage(
     // Rust (chat.rs:961). Quand readTools=ON et le protocole supporte les outils
     // (anthropic/openai/custom, pas d'image jointe), chat_send pilote une boucle
     // d'outils bornée au lieu d'un appel unique. writeTools autorise l'écriture.
-    const readTools = (await db.settings.get("chat.readTools")) !== "false";
-    const writeTools = (await db.settings.get("chat.writeTools")) !== "false";
+    // Mode "chat" = conversation PURE : aucun outil fs (appel LLM unique, rapide).
+    // Mode "plan" = lecture seule : on coupe l'ÉCRITURE même sur ce chemin
+    //   chat-direct (atteint par la mascotte via resolveRoute ; le cockpit, lui,
+    //   délègue en mode Plan et l'enforcement dur vit dans le runner). Les
+    //   lectures restent permises. Mode "agent" → suit le toggle Réglages → Éditeur.
+    const readTools = chatMode === "chat" ? false : (await db.settings.get("chat.readTools")) !== "false";
+    const writeTools =
+      chatMode === "chat" || chatMode === "plan"
+        ? false
+        : (await db.settings.get("chat.writeTools")) !== "false";
     const reply = await invoke<string>("chat_send", {
       messages: apiMessages,
       model: realModel,
@@ -730,6 +754,7 @@ async function handleDelegate(
   task: string,
   agentDefPath?: string,
   fallbackModel?: string,
+  mode: "plan" | "agent" = "agent",
 ): Promise<void> {
   // fallbackModel = modèle de chat actif, utilisé comme orchestrateur si aucun
   // n'est configuré (délégation « out of the box »). Un agent custom (.md)
@@ -929,6 +954,9 @@ async function handleDelegate(
       // le backend charge ce `.md` et remplace role/model/system_prompt par
       // ses valeurs (cf. agent_spawn + agent_defs::load_def).
       agentDefPath,
+      // Mode Plan → read_only côté runner (outils mutants retirés). Le défaut
+      // "agent" laisse l'exécution directe complète.
+      mode,
     });
   } catch (err) {
     await appendMessage(convId, {
@@ -1311,6 +1339,57 @@ export function useActiveCodexEffort(): [string, (e: string) => void] {
     }
   }, []);
   return [effort, setEffort];
+}
+
+// ─── Agent mode (chat | plan | agent) — le sélecteur du composer ───────
+// Façon Claude Code, MAIS adapté au pivot Shugu « exec directe + filet git »
+// (pas de système de permissions) :
+//   • "chat"  — conversation pure : appel LLM unique, AUCUN outil (rapide).
+//   • "plan"  — délègue à l'agent en LECTURE SEULE : il explore + propose un
+//               plan, mais ne peut PAS écrire/exécuter (outils mutants retirés
+//               du manifest + garde côté dispatcher). Cf. runner.rs read_only.
+//   • "agent" — DÉFAUT : délègue à l'agent complet (exec directe, git = filet).
+// Persisté en localStorage + diffusé cross-fenêtre comme le modèle actif, pour
+// que le cockpit et la mascotte voient le même mode.
+export type ChatMode = "chat" | "plan" | "agent";
+const DEFAULT_CHAT_MODE: ChatMode = "agent";
+
+function parseChatMode(raw: string | null | undefined): ChatMode {
+  return raw === "chat" || raw === "plan" || raw === "agent" ? raw : DEFAULT_CHAT_MODE;
+}
+
+/** Plain getter for the send path (localStorage-only, no React). */
+export function getActiveChatMode(): ChatMode {
+  try {
+    return parseChatMode(localStorage.getItem(KEY_CHAT_MODE));
+  } catch {
+    return DEFAULT_CHAT_MODE;
+  }
+}
+
+/** Picker hook: the active agent mode + a setter. TanStack-backed so every
+ *  mounted selector re-renders on change; the Tauri custom event guarantees
+ *  cross-WebviewWindow delivery (same belt-and-suspenders as useActiveModel). */
+export function useChatMode(): [ChatMode, (m: ChatMode) => void] {
+  const { data: mode = getActiveChatMode() } = useQuery<ChatMode>({
+    queryKey: chatKeys.chatMode(),
+    queryFn: () => getActiveChatMode(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  const setMode = useCallback((m: ChatMode) => {
+    queryClient.setQueryData<ChatMode>(chatKeys.chatMode(), m);
+    try { localStorage.setItem(KEY_CHAT_MODE, m); } catch { /* quota */ }
+    void (async () => {
+      try {
+        const mod = await import("@tauri-apps/api/event");
+        await mod.emit(EVT_CHAT_MODE, { mode: m });
+      } catch (err) {
+        console.warn("[chat-sync] emit chat-mode failed:", err);
+      }
+    })();
+  }, []);
+  return [mode, setMode];
 }
 
 // ─── createConversation — insert a fresh conv row + return its id ──────

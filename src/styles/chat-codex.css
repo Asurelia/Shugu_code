@@ -583,6 +583,48 @@
 .cx-chip.branch .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--tertiary); }
 .cx-chip-spacer { flex: 1; }
 
+/* ── Mode selector (Chat / Plan / Agent) — trigger chip ────────────────── */
+/* Contrairement aux autres chips (purement informatives, cursor:default), le
+   sélecteur est INTERACTIF : pointer + hover + focus ring. La couleur d'accent
+   suit le mode actif (jamais la couleur SEULE — il y a aussi l'icône + libellé). */
+.cx-chip.mode {
+  cursor: pointer;
+  padding-right: 8px;
+  font-weight: 600;
+}
+.cx-chip.mode .dot { width: 6px; height: 6px; border-radius: 50%; }
+.cx-chip.mode .mode-label { letter-spacing: 0.02em; }
+.cx-chip.mode:hover { border-color: rgba(255,255,255,0.16); background: rgba(28,24,44,0.7); }
+.cx-chip.mode:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+/* Accent par mode (dot + icône + bordure subtile). */
+.cx-chip.mode-agent { color: var(--primary); border-color: rgba(224,142,254,0.30); background: rgba(224,142,254,0.06); }
+.cx-chip.mode-agent .dot { background: var(--primary); box-shadow: 0 0 6px var(--primary); }
+.cx-chip.mode-plan  { color: var(--tertiary); border-color: rgba(129,236,255,0.28); background: rgba(129,236,255,0.06); }
+.cx-chip.mode-plan .dot { background: var(--tertiary); box-shadow: 0 0 6px var(--tertiary); }
+.cx-chip.mode-chat  { color: var(--on-surface-variant); border-color: rgba(255,255,255,0.10); background: rgba(20,18,32,0.55); }
+.cx-chip.mode-chat .dot { background: var(--on-surface-variant); box-shadow: none; }
+
+/* ── Mode selector — popover (réutilise .model-pop) ───────────────────── */
+.mode-pop { width: 268px; }
+.mode-item { align-items: flex-start; padding: 9px 10px; }
+.mode-item .mode-item-text { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+.mode-item .mode-item-text .name { font-weight: 600; }
+.mode-item .mode-item-desc {
+  font-size: 10.5px; line-height: 1.35;
+  color: var(--on-surface-muted);
+  white-space: normal;
+}
+.mode-item svg { margin-top: 1px; flex-shrink: 0; opacity: 0.9; }
+/* Teinte d'accent de l'item actif, alignée sur le mode. */
+.mode-item.mode-agent.on { background: rgba(224,142,254,0.12); color: var(--primary); }
+.mode-item.mode-plan.on  { background: rgba(129,236,255,0.12); color: var(--tertiary); }
+.mode-item.mode-chat.on  { background: rgba(255,255,255,0.07); color: var(--on-surface); }
+.mode-item.mode-plan.on .check { color: var(--tertiary); }
+.mode-item.mode-chat.on .check { color: var(--on-surface); }
+
 /* ── Code block (inside AI body) ──────────────────────────── */
 .cx-code-block {
   margin: 12px 0 6px;

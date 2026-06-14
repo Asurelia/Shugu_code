@@ -377,6 +377,12 @@ pub struct SpawnArgs {
     /// agent custom. Si fourni, son frontmatter remplace `role`/`model` et
     /// son body devient le `system_prompt_override` envoyé au runner.
     pub agent_def_path: Option<String>,
+    /// Mode du sélecteur de chat (cockpit). `Some("plan")` ⇒ run en LECTURE
+    /// SEULE : le runner retire fs_write_file/fs_edit/run_command du manifest
+    /// et refuse toute mutation (defense-in-depth). Toute autre valeur (ou
+    /// None) ⇒ exécution directe complète. Seule la délégation chat le fournit ;
+    /// Atelier/Studio le laissent None (write requis).
+    pub mode: Option<String>,
 }
 
 /// Arguments for an Atelier run (env-grounded build→test→learn loop). Mirrors the
@@ -720,6 +726,9 @@ pub async fn agent_spawn(
     let chat_template_kwargs_for_task = args.chat_template_kwargs.clone();
     let design_context_for_task = args.design_context.clone();
     let system_prompt_override_for_task = system_prompt_override;
+    // Mode Plan → lecture seule. Le sélecteur de chat envoie `mode: "plan"` ;
+    // tout le reste (agent / Atelier / Studio) reste en exécution complète.
+    let read_only_for_task = args.mode.as_deref() == Some("plan");
     tauri::async_runtime::spawn(async move {
         runner::run_agent_task(
             app_for_task,
@@ -738,6 +747,7 @@ pub async fn agent_spawn(
             // Exec directe pour TOUT agent (pivot 2026-06-10) : run_command tourne
             // sur la machine, le filet de sécurité est git (onglet Git de l'app).
             system_prompt_override_for_task, // None ⇒ seed_prompt ; Some ⇒ .md custom
+            read_only_for_task, // Plan mode ⇒ outils mutants retirés + refusés
         )
         .await;
     });
@@ -852,6 +862,7 @@ pub async fn agent_atelier_run(
             abort_token,
             Some(ws_for_task), // workspace_override — the throwaway creation dir
             Some(runner::ATELIER_PROMPT.to_string()),
+            false, // read_only — l'Atelier doit écrire/exécuter (build→test→learn)
         )
         .await;
         // The creation dir is intentionally left on disk so the preview pane can
@@ -982,6 +993,7 @@ pub async fn agent_grounded_run(
             abort_token,
             None, // workspace_override — the REAL open workspace
             Some(system_prompt),
+            false, // read_only — Grounded Run écrit/exécute sur le vrai projet
         )
         .await;
     });

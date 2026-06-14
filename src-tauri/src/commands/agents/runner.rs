@@ -46,6 +46,17 @@ use crate::commands::chat::{self, AssistantTurn, ChatMessage};
 /// "exceeded MAX_ITERATIONS" sans output.
 const MAX_ITERATIONS: u32 = 24;
 
+/// Native tools that MUTATE the project — removed from the manifest AND refused
+/// by the dispatcher in plan mode (read-only). MCP tools are not classified.
+fn is_write_tool(name: &str) -> bool {
+    matches!(name, "fs_write_file" | "fs_edit" | "run_command")
+}
+
+/// Returned to the model if it invokes a write tool while in plan mode
+/// (defense-in-depth — the tool is already absent from the manifest).
+const PLAN_BLOCK_MSG: &str =
+    "blocked: PLAN MODE is read-only — fs_write_file, fs_edit and run_command are disabled for this turn. Describe the change in your plan instead; the user will switch to Agent mode to execute it.";
+
 // ────────────────────────────────────────────────────────────────────
 // Internal conversation history shape
 // ────────────────────────────────────────────────────────────────────
@@ -317,6 +328,9 @@ pub(super) async fn run_agent_task(
     // création) au lieu du workspace ouvert. `None` = workspace réel.
     workspace_override: Option<PathBuf>,
     system_prompt_override: Option<String>,
+    // Mode Plan (sélecteur de chat) : lecture seule. Le manifest d'outils perd
+    // fs_write_file/fs_edit/run_command et le dispatcher refuse toute mutation.
+    read_only: bool,
 ) {
     let start = std::time::Instant::now();
     let protocol = protocol.unwrap_or_else(|| "openai".to_string());
@@ -326,6 +340,13 @@ pub(super) async fn run_agent_task(
     // STATIQUE du rôle. (Le Refiner qui faisait évoluer le prompt par
     // « génération » est retiré — plus d'indirection ActiveHarness/generation.)
     let mut system_prompt = system_prompt_override.unwrap_or_else(|| seed_prompt(&role));
+    // Mode Plan → on rappelle au modèle qu'il est en lecture seule : explorer +
+    // proposer un plan, ne rien écrire ni exécuter. Le filtrage d'outils (plus
+    // bas, dans tool_use_loop) est l'enforcement DUR ; ceci aligne juste le
+    // comportement pour qu'il ne PROMETTE pas d'écrire ce qu'il ne peut pas.
+    if read_only {
+        system_prompt.push_str(PLAN_MODE_PROMPT);
+    }
     // Phase A (Design Studio) — when the Studio passes a design-system context,
     // append GENERATION MODE so the agent writes a complete styled project to
     // `.shugu-forge/preview/` (served live by the preview:// protocol). Chat
@@ -408,6 +429,7 @@ pub(super) async fn run_agent_task(
             &mut history,
             &mut loop_metrics,
             workspace_override,
+            read_only,
         ) => r,
         _ = abort.notified() => {
             mark_killed(&app, &agent_id);
@@ -490,6 +512,9 @@ pub(super) async fn tool_use_loop(
     // open workspace (the Atelier's throwaway creation dir). `None` = the
     // real open workspace.
     workspace_override: Option<PathBuf>,
+    // Plan mode : lecture seule. Retire les outils mutants du manifest envoyé au
+    // modèle ET refuse leur exécution si le modèle les invoque quand même.
+    read_only: bool,
 ) -> Result<(String, String), String> {
     // Stall-detection state: repeated identical tool-call signatures and
     // consecutive tool-error rounds are the two cheap "stuck" signals, recorded
@@ -581,6 +606,20 @@ pub(super) async fn tool_use_loop(
         let mcp_tools = crate::commands::mcp::enabled_tools_json(app, &mgr, protocol).await;
         if let Some(a) = arr.as_array_mut() {
             a.extend(mcp_tools);
+        }
+        // Mode Plan (lecture seule) : retire les outils NATIFS mutants du manifest
+        // — le modèle ne les voit pas, donc ne les planifie pas. Enforcement DUR
+        // doublé d'une garde au dispatch (plus bas). NB : on ne classe pas les
+        // outils MCP (noms namespacés `mcp__…`, mutation inconnue) ; un MCP en
+        // écriture resterait visible — limite assumée du v1 (le plan part du
+        // cockpit où aucun MCP mutant n'est branché par défaut).
+        if read_only {
+            if let Some(a) = arr.as_array_mut() {
+                a.retain(|t| {
+                    let name = t["name"].as_str().or_else(|| t["function"]["name"].as_str());
+                    !name.is_some_and(is_write_tool)
+                });
+            }
         }
         // Gate vie privée : `agents.allowScreenCapture = "false"` retire
         // l'outil de capture d'écran du manifest (défaut ON — clé absente ou
@@ -737,6 +776,15 @@ pub(super) async fn tool_use_loop(
                         is_error,
                         content,
                     });
+                } else if read_only && is_write_tool(&tc.name) {
+                    // Plan mode : outil mutant refusé (defense-in-depth — déjà
+                    // hors manifest, mais M3 peut l'émettre en texte).
+                    acc.push(ToolResult {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        is_error: true,
+                        content: PLAN_BLOCK_MSG.to_string(),
+                    });
                 } else if let Some(root) = workspace_root.as_ref() {
                     // Native fs tool: sync dispatch on a blocking thread, same as
                     // the parallel path but awaited one at a time.
@@ -783,12 +831,22 @@ pub(super) async fn tool_use_loop(
                 // a ToolResult because tc_clone has already moved.
                 let fallback_id = tc_clone.id.clone();
                 let fallback_name = tc_clone.name.clone();
+                // Plan mode : refuse les outils mutants (defense-in-depth).
+                let blocked = read_only && is_write_tool(&tc_clone.name);
                 let root_clone = root_arc.clone();
                 let app_clone = app.clone();
                 let role_clone = role.to_string();
                 let last_exec_clone = last_exec_exit.clone();
                 let agent_id_clone = agent_id.to_string();
                 async move {
+                    if blocked {
+                        return ToolResult {
+                            id: fallback_id,
+                            name: fallback_name,
+                            is_error: true,
+                            content: PLAN_BLOCK_MSG.to_string(),
+                        };
+                    }
                     // `spawn_blocking` because the fs ops are synchronous —
                     // running them on the async runtime thread would starve
                     // other tokio tasks. `unwrap_or_else` defends against
@@ -1107,6 +1165,13 @@ async fn call_agent_llm_with_tools(
 /// (`preview://` protocol) can render it. Kept as a const so the large role
 /// strings in `seed_prompt` stay untouched.
 const GENERATION_MODE_PROMPT: &str = "=== GENERATION MODE (a design system is active) ===\nWhen the task asks you to build, generate, create, or design a page, site, landing page, dashboard, component, or any UI, you MUST produce a COMPLETE, SELF-CONTAINED static web project WRITTEN TO DISK using `fs_write_file` — NOT a chat answer and NOT a single fenced code block.\n\nBefore writing files, call `todo_write` with a short checklist (3-6 steps) of your plan, then update the statuses as you complete each step.\n\nRules:\n1. Write the entry point at `.shugu-forge/preview/index.html`.\n2. Put CSS in `.shugu-forge/preview/styles.css` and JS in `.shugu-forge/preview/script.js`, linked from index.html with RELATIVE paths (href=\"styles.css\", src=\"script.js\").\n3. Apply the design context below (a design system and/or a colour direction): declare its color / typography / spacing tokens as CSS custom properties in `:root { ... }`, and follow the visual direction, component patterns, and anti-patterns.\n4. Produce real, polished, responsive markup with enough sections to demonstrate the design (e.g. hero, content sections, footer). No placeholder-only output.\n5. Always (over)write the files under `.shugu-forge/preview/` so the live preview reflects the latest version; read existing files first when iterating.\n6. After writing, reply with ONE short line: what you built, which design skill(s) you applied, + the entry path `.shugu-forge/preview/index.html`.";
+
+/// Appended to the agent's system prompt in PLAN MODE (the chat's read-only
+/// selector). Behaviour mirror of Claude Code's plan mode: the agent explores
+/// and proposes, but never mutates. The HARD enforcement is tool filtering +
+/// the dispatch guard in `tool_use_loop`; this just keeps the model honest so
+/// it doesn't promise edits it cannot perform.
+const PLAN_MODE_PROMPT: &str = "\n\n=== PLAN MODE (READ-ONLY) ===\nYou are in PLAN MODE. The write/exec tools (fs_write_file, fs_edit, run_command) are DISABLED for this turn — calling them will fail. Do NOT promise to write files or run commands.\n\nYour job is to UNDERSTAND and PROPOSE, not to act:\n1. Use the read tools (fs_list_dir, fs_read_file, fs_search) to investigate the real code as needed.\n2. Optionally use todo_write to sketch the steps you WOULD take.\n3. Finish with a clear, concrete PLAN in plain text: which files you'd create/change, what each change does, and how you'd verify it. The user will switch you to Agent mode to actually execute it.";
 
 /// System prompt for a Grounded Run — the env-grounded loop on the user's REAL
 /// project (exec directe depuis le pivot 2026-06-10 ; le filet de sécurité est

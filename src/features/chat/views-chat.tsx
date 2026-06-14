@@ -20,6 +20,7 @@ import { useMessages, sendChatMessage, useActiveModel } from "./chat-sync";
 import { useEditorSelection } from "./editorSelectionStore";
 import { useChatToolActivity } from "./chatToolActivityStore";
 import { CaptureButton } from "./CaptureButton";
+import { ModeSelector } from "./ModeSelector";
 import { ChatWritesCard } from "./ChatWritesCard";
 import { db } from "@/lib/db";
 import { ModelPicker } from "@/features/panels/panels";
@@ -540,10 +541,10 @@ export function ChatView({
             </button>
           </span>
         )}
-        <button className="cx-chip status" title="Accès au système de fichiers (Tauri)">
-          <span className="dot" />
-          Accès complet
-        </button>
+        {/* Vrai sélecteur de mode (Chat / Plan / Agent) — remplace l'ancienne
+            pastille décorative « Accès complet ». Le mode pilote le routage
+            (chat-sync) + l'enforcement read-only en mode Plan (runner Rust). */}
+        <ModeSelector />
         <button className="cx-chip" title="Espace de travail">
           <Icon name="folder" size={11} />
           {cwd}
