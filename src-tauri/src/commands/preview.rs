@@ -252,3 +252,42 @@ fn read_and_respond(target: &std::path::Path) -> Response<Cow<'static, [u8]>> {
         Err(_) => not_found(),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Dev-server detection — onglet "Prévisu"
+// ---------------------------------------------------------------------------
+
+/// Probe a set of localhost ports and return those currently accepting TCP
+/// connections. The Contexte "Prévisu" tab shows its iframe ONLY when a real dev
+/// server is running (empty state otherwise). Probes run concurrently, each
+/// capped at 150 ms, so a full sweep finishes in well under a second even when
+/// every port is closed. No new dependency — tokio is already pulled in.
+#[tauri::command]
+pub async fn preview_detect_server(ports: Vec<u16>) -> Result<Vec<u16>, String> {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::time::Duration;
+
+    let mut handles = Vec::with_capacity(ports.len());
+    for port in ports {
+        handles.push(tokio::spawn(async move {
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+            let ok = tokio::time::timeout(
+                Duration::from_millis(150),
+                tokio::net::TcpStream::connect(addr),
+            )
+            .await
+            .map(|r| r.is_ok())
+            .unwrap_or(false);
+            (port, ok)
+        }));
+    }
+
+    let mut open = Vec::new();
+    for h in handles {
+        if let Ok((port, true)) = h.await {
+            open.push(port);
+        }
+    }
+    open.sort_unstable();
+    Ok(open)
+}

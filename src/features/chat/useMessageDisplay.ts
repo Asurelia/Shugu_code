@@ -167,7 +167,7 @@ function resultIsError(ev: Extract<AgentEvent, { kind: "toolResult" }>): boolean
 }
 
 /** Parse les `todos` d'un appel `todo_write` en étapes de plan typées. */
-function parsePlan(args: unknown): AgentPlanStep[] | undefined {
+export function parsePlan(args: unknown): AgentPlanStep[] | undefined {
   const todos = asRecord(args)["todos"];
   if (!Array.isArray(todos)) return undefined;
   const steps: AgentPlanStep[] = [];
@@ -277,5 +277,43 @@ export function useMessageDisplay(m: Message): MessageDisplay {
     plan,
     writeRecords,
     imageDataUrl,
+  };
+}
+
+/** L'action en cours d'un agent (dernier appel d'outil hors `todo_write`),
+ *  pour l'onglet "Agents" du panneau Contexte — montre CE QUE l'agent fait. */
+export interface AgentCurrentActivity {
+  icon: string;
+  label: string;
+  detail: string;
+  /** true tant qu'aucun `toolResult` n'est revenu pour cet appel. */
+  running: boolean;
+}
+
+/**
+ * Dérive la dernière action d'un agent depuis son transcript live (mis à jour
+ * par `useAgentEvents`). `todo_write` est ignoré (c'est le plan, pas une
+ * action). Retourne null si l'agent n'a encore rien fait d'observable.
+ */
+export function useAgentCurrentActivity(agentId: string | null): AgentCurrentActivity | null {
+  const { data: transcript } = useAgentTranscript(agentId);
+  if (!transcript) return null;
+
+  const resultSeen = new Set<string>();
+  let last: { icon: string; label: string; detail: string; toolCallId: string } | null = null;
+  for (const ev of transcript.events) {
+    if (ev.kind === "toolResult") {
+      resultSeen.add(ev.toolCallId);
+    } else if (ev.kind === "toolCall" && ev.tool !== "todo_write") {
+      const d = describeToolCall(ev.tool, ev.args);
+      last = { ...d, toolCallId: ev.toolCallId };
+    }
+  }
+  if (!last) return null;
+  return {
+    icon: last.icon,
+    label: last.label,
+    detail: last.detail,
+    running: !resultSeen.has(last.toolCallId),
   };
 }

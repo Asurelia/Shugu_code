@@ -19,8 +19,10 @@ import type {
   GitBranchList,
   GitFileStatus,
   GitLogEntry,
+  GitNumstat,
   GitRemote,
   GitStash,
+  GitWorktree,
 } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -150,4 +152,52 @@ export async function gitRemoteAdd(name: string, url: string): Promise<void> {
 
 export async function gitRemoteRemove(name: string): Promise<void> {
   await invoke<void>("git_remote_remove", { name });
+}
+
+// ---------------------------------------------------------------------------
+// Init + worktrees (onglet "Git" du panneau Contexte)
+// ---------------------------------------------------------------------------
+
+/** Initialize a git repo at the open workspace. Returns the repo root path. */
+export async function gitInit(): Promise<string> {
+  return invoke<string>("git_init");
+}
+
+export async function gitWorktreeList(): Promise<GitWorktree[]> {
+  return invoke<GitWorktree[]>("git_worktree_list");
+}
+
+/**
+ * Add a worktree. With `newBranch` true, creates a NEW branch named `branch` at
+ * `path` (`git worktree add -b <branch> <path>`); otherwise checks out the
+ * EXISTING `branch` there (`git worktree add <path> [<branch>]`).
+ */
+export async function gitWorktreeAdd(
+  path: string,
+  branch?: string | null,
+  newBranch = false,
+): Promise<void> {
+  await invoke<void>("git_worktree_add", {
+    path,
+    branch: branch ?? null,
+    newBranch,
+  });
+}
+
+export async function gitWorktreeRemove(path: string, force = false): Promise<void> {
+  await invoke<void>("git_worktree_remove", { path, force });
+}
+
+/** Per-file added/removed line counts vs HEAD (empty on a repo with no commits). */
+export async function gitNumstat(): Promise<GitNumstat[]> {
+  return invoke<GitNumstat[]>("git_numstat");
+}
+
+// ---------------------------------------------------------------------------
+// Dev-server detection (onglet "Prévisu")
+// ---------------------------------------------------------------------------
+
+/** Returns the subset of `ports` currently accepting localhost TCP connections. */
+export async function previewDetectServer(ports: number[]): Promise<number[]> {
+  return invoke<number[]>("preview_detect_server", { ports });
 }

@@ -26,7 +26,8 @@ import { db } from "@/lib/db";
 import { ModelPicker } from "@/features/panels/panels";
 import { revealAgent, killAgent, type AgentStatus } from "@/lib/agents";
 import { useAgentDefs } from "@/features/agents/agentDefsQueries";
-import { useMessageDisplay, type AgentActivityItem, type AgentPlanStep } from "./useMessageDisplay";
+import { useMessageDisplay, type AgentActivityItem } from "./useMessageDisplay";
+import { AgentPlan } from "./AgentPlan";
 import { Markdown } from "./markdownView";
 import { useShell } from "@/routes/shell-context";
 import { detectBlockPath } from "@/lib/markdown";
@@ -823,31 +824,8 @@ function fmtElapsed(ms: number): string {
   return r ? `${m}m ${r}s` : `${m}m`;
 }
 
-// Plan vivant de l'orchestrateur (tool `todo_write`) — checklist qui se coche au
-// fil de l'exécution. N'apparaît que si l'agent a réellement posé un plan
-// (graceful : pas de plan → pas de bloc). Glyphes : ☐ à faire, ◐ en cours
-// (pulsé), ☑ fait.
-function AgentPlan({ steps }: { steps: AgentPlanStep[] }) {
-  const done = steps.filter((s) => s.status === "completed").length;
-  return (
-    <details className="cx-agent-plan" open>
-      <summary>
-        <span className="hl">Plan</span>
-        <span className="ct">{done}/{steps.length}</span>
-      </summary>
-      <ul>
-        {steps.map((s, i) => (
-          <li key={i} className={"pstep " + s.status}>
-            <span className="box">
-              {s.status === "completed" ? "☑" : s.status === "in_progress" ? "◐" : "☐"}
-            </span>
-            <span className="txt">{s.text}</span>
-          </li>
-        ))}
-      </ul>
-    </details>
-  );
-}
+// `AgentPlan` (checklist `todo_write`) est désormais un composant partagé
+// (./AgentPlan) — réutilisé tel quel par l'onglet "Plan" du panneau Contexte.
 
 // Une ligne de la timeline. Quand l'outil a renvoyé une sortie (`result`), la
 // ligne devient dépliable (clic → <pre> de la sortie : stdout/exit d'une

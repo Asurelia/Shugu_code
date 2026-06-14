@@ -387,6 +387,22 @@ const MIGRATION_V14: &str = "
 ALTER TABLE agent_skills ADD COLUMN created_by TEXT NOT NULL DEFAULT 'agent';
 ";
 
+// V15 — "sources réellement utilisées" par conversation. Loggé au send (front,
+// chat-sync.ts) avec les chemins effectivement injectés dans le prompt :
+// contexte éditeur, @-mentions résolues, hits RAG. Alimente l'onglet "Sources"
+// du panneau Contexte (vraies sources ≠ recherche sémantique "pertinents").
+const MIGRATION_V15: &str = "
+CREATE TABLE IF NOT EXISTS message_sources (
+  conversation_id TEXT NOT NULL,
+  message_id      TEXT NOT NULL,
+  path            TEXT NOT NULL,
+  kind            TEXT NOT NULL,
+  ts              INTEGER NOT NULL,
+  PRIMARY KEY (message_id, path, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_message_sources_conv ON message_sources(conversation_id);
+";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = vec![
@@ -472,6 +488,12 @@ pub fn run() {
             version: 14,
             description: "agent_skills_created_by",
             sql: MIGRATION_V14,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 15,
+            description: "message_sources",
+            sql: MIGRATION_V15,
             kind: MigrationKind::Up,
         },
     ];
@@ -753,6 +775,14 @@ pub fn run() {
             commands::git::git_remotes,
             commands::git::git_remote_add,
             commands::git::git_remote_remove,
+            // Onglet "Git" du panneau Contexte — init + worktrees + diffstat.
+            commands::git::git_init,
+            commands::git::git_worktree_list,
+            commands::git::git_worktree_add,
+            commands::git::git_worktree_remove,
+            commands::git::git_numstat,
+            // Onglet "Prévisu" — détection de serveur de dev (TCP probe).
+            commands::preview::preview_detect_server,
             // Définitions d'agents portables (format Claude Code .md).
             commands::agent_defs::agent_def_list,
             commands::agent_defs::agent_def_read,

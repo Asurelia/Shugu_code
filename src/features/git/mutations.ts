@@ -27,6 +27,9 @@ import {
   gitStashApply,
   gitRemoteAdd,
   gitRemoteRemove,
+  gitInit,
+  gitWorktreeAdd,
+  gitWorktreeRemove,
 } from "@/lib/git";
 
 // ---------------------------------------------------------------------------
@@ -169,6 +172,45 @@ export function useRemoveRemote() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (name: string) => gitRemoteRemove(name),
+    onSuccess: () => qc.invalidateQueries({ queryKey: gitKeys.all }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Init + worktrees (onglet "Git" du panneau Contexte)
+// ---------------------------------------------------------------------------
+
+/** Initialize a git repo at the open workspace. Invalidates ALL git cache so
+ *  `useIsGitRepo` flips to true and status/branches/log light up. */
+export function useGitInit() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => gitInit(),
+    onSuccess: () => qc.invalidateQueries({ queryKey: gitKeys.all }),
+  });
+}
+
+export function useWorktreeAdd() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      path,
+      branch,
+      newBranch = false,
+    }: {
+      path: string;
+      branch?: string | null;
+      newBranch?: boolean;
+    }) => gitWorktreeAdd(path, branch, newBranch),
+    onSuccess: () => qc.invalidateQueries({ queryKey: gitKeys.all }),
+  });
+}
+
+export function useWorktreeRemove() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ path, force = false }: { path: string; force?: boolean }) =>
+      gitWorktreeRemove(path, force),
     onSuccess: () => qc.invalidateQueries({ queryKey: gitKeys.all }),
   });
 }

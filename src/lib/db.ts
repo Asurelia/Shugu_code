@@ -123,6 +123,24 @@ export interface ReviewRow {
   ts: number;
 }
 
+/** Une source réellement injectée dans le contexte d'une conversation
+ *  (V15 schema). `kind` : 'editor' | 'mention' | 'rag'. */
+export interface MessageSourceRow {
+  conversation_id: string;
+  message_id: string;
+  path: string;
+  kind: string;
+  ts: number;
+}
+
+/** Source agrégée par chemin pour l'onglet "Sources" (kinds joints, dernier usage). */
+export interface ConversationSource {
+  path: string;
+  /** Comma-joined kinds, ex. "editor,rag". */
+  kind: string;
+  ts: number;
+}
+
 // ---------------------------------------------------------------------------
 // Shape mappers: UI <-> Row
 // The UI shape used by ChatSidebar/SEED_CONVOS differs from the DDL row.
@@ -672,6 +690,48 @@ const reviews = {
 };
 
 // ---------------------------------------------------------------------------
+// message_sources — vraies sources injectées par conversation (onglet "Sources")
+// ---------------------------------------------------------------------------
+
+const sources = {
+  /**
+   * Enregistre les sources réellement injectées pour un message user.
+   * Idempotent par (message_id, path, kind) via INSERT OR IGNORE — renvoyer le
+   * même message deux fois (régénération) ne duplique pas.
+   */
+  async record(
+    convId: string,
+    messageId: string,
+    entries: { path: string; kind: string }[],
+  ): Promise<void> {
+    if (entries.length === 0) return;
+    const database = await getDb();
+    const ts = Date.now();
+    for (const e of entries) {
+      await database.execute(
+        `INSERT OR IGNORE INTO message_sources
+           (conversation_id, message_id, path, kind, ts)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [convId, messageId, e.path, e.kind, ts],
+      );
+    }
+  },
+
+  /** Sources distinctes d'une conversation, plus récemment utilisées d'abord. */
+  async listByConversation(convId: string): Promise<ConversationSource[]> {
+    const database = await getDb();
+    return database.select(
+      `SELECT path, GROUP_CONCAT(DISTINCT kind) AS kind, MAX(ts) AS ts
+         FROM message_sources
+        WHERE conversation_id = $1
+        GROUP BY path
+        ORDER BY ts DESC`,
+      [convId],
+    ) as Promise<ConversationSource[]>;
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Public repository facade
 // ---------------------------------------------------------------------------
 
@@ -684,6 +744,7 @@ export const db = {
   logs,
   settings,
   reviews,
+  sources,
 
   /**
    * Wipe all user-generated data from the local SQLite database.
@@ -700,6 +761,7 @@ export const db = {
     // Delete in FK-safe order: children before parents.
     await database.execute("DELETE FROM agent_events");
     await database.execute("DELETE FROM agents");
+    await database.execute("DELETE FROM message_sources");
     await database.execute("DELETE FROM messages");
     await database.execute("DELETE FROM conversations");
     await database.execute("DELETE FROM projects");

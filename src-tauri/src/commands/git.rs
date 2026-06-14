@@ -291,6 +291,20 @@ pub struct GitRemote {
     pub push_url: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GitWorktree {
+    /// Absolute path of the worktree's working directory (forward-slashed).
+    pub path: String,
+    /// Short branch name checked out there, or `None` if detached/bare.
+    pub branch: Option<String>,
+    /// Commit OID the worktree is on.
+    pub head: Option<String>,
+    pub is_bare: bool,
+    pub is_locked: bool,
+    pub is_detached: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Status char translation
 // ---------------------------------------------------------------------------
@@ -757,6 +771,170 @@ async fn git_remote_remove_inner(root: &Path, name: &str) -> Result<(), String> 
 pub async fn git_remote_remove(app: AppHandle, name: String) -> Result<(), String> {
     let root = workspace_root_required(&app)?;
     git_remote_remove_inner(&root, &name).await
+}
+
+// ---------------------------------------------------------------------------
+// git_init (git2) + worktrees (CLI) — Contexte panel "Git" tab
+// ---------------------------------------------------------------------------
+
+/// Initialize a fresh git repository at the open workspace root. No-op-safe:
+/// `Repository::init` on an existing repo just re-opens it. Refreshes the
+/// repo-presence cache so `git_is_repo` / status / diff queries pick it up
+/// immediately (otherwise the cached `false` would linger).
+#[command]
+pub fn git_init(app: AppHandle) -> Result<String, String> {
+    let root = workspace_root_required(&app)?;
+    Repository::init(&root).map_err(libgit2_err)?;
+    {
+        let mut cache = repo_cache()
+            .write()
+            .map_err(|e| format!("repo cache write lock: {e}"))?;
+        cache.insert(root.clone(), true);
+    }
+    Ok(strip_extended_prefix(root).to_string_lossy().to_string())
+}
+
+/// Parse `git worktree list --porcelain` into structured entries. Blocks are
+/// separated by blank lines; each starts with a `worktree <path>` line.
+fn parse_worktree_list(out: &str) -> Vec<GitWorktree> {
+    let mut result = Vec::new();
+    let mut cur: Option<GitWorktree> = None;
+    let flush = |cur: &mut Option<GitWorktree>, result: &mut Vec<GitWorktree>| {
+        if let Some(w) = cur.take() {
+            result.push(w);
+        }
+    };
+    for line in out.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            flush(&mut cur, &mut result);
+            continue;
+        }
+        if let Some(p) = line.strip_prefix("worktree ") {
+            flush(&mut cur, &mut result);
+            cur = Some(GitWorktree {
+                path: normalize_path(p),
+                branch: None,
+                head: None,
+                is_bare: false,
+                is_locked: false,
+                is_detached: false,
+            });
+        } else if let Some(w) = cur.as_mut() {
+            if let Some(h) = line.strip_prefix("HEAD ") {
+                w.head = Some(h.to_string());
+            } else if let Some(b) = line.strip_prefix("branch ") {
+                w.branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
+            } else if line == "bare" {
+                w.is_bare = true;
+            } else if line == "detached" {
+                w.is_detached = true;
+            } else if line == "locked" || line.starts_with("locked ") {
+                w.is_locked = true;
+            }
+        }
+    }
+    flush(&mut cur, &mut result);
+    result
+}
+
+#[command]
+pub async fn git_worktree_list(app: AppHandle) -> Result<Vec<GitWorktree>, String> {
+    let root = workspace_root_required(&app)?;
+    let out = run_git_cli(&root, &["worktree", "list", "--porcelain"]).await?;
+    Ok(parse_worktree_list(&out))
+}
+
+async fn git_worktree_add_inner(
+    root: &Path,
+    path: &str,
+    branch: Option<&str>,
+    new_branch: bool,
+) -> Result<(), String> {
+    let mut args: Vec<&str> = vec!["worktree", "add"];
+    if new_branch {
+        // Create a NEW branch at the new worktree: `git worktree add -b <b> <path>`.
+        if let Some(b) = branch {
+            args.push("-b");
+            args.push(b);
+        }
+        args.push(path);
+    } else {
+        // Check out an EXISTING branch: `git worktree add <path> [<branch>]`.
+        args.push(path);
+        if let Some(b) = branch {
+            args.push(b);
+        }
+    }
+    run_git_cli(root, &args).await?;
+    Ok(())
+}
+
+#[command(rename_all = "camelCase")]
+pub async fn git_worktree_add(
+    app: AppHandle,
+    path: String,
+    branch: Option<String>,
+    new_branch: bool,
+) -> Result<(), String> {
+    let root = workspace_root_required(&app)?;
+    git_worktree_add_inner(&root, &path, branch.as_deref(), new_branch).await
+}
+
+#[command]
+pub async fn git_worktree_remove(
+    app: AppHandle,
+    path: String,
+    force: bool,
+) -> Result<(), String> {
+    let root = workspace_root_required(&app)?;
+    let mut args: Vec<&str> = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(&path);
+    run_git_cli(&root, &args).await?;
+    Ok(())
+}
+
+/// Per-file added/removed line counts for the recap diffstat. `git_status`
+/// carries no numstat, so the "Git" tab gets real `+/-` bars from here.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GitNumstat {
+    pub path: String,
+    pub added: u32,
+    pub removed: u32,
+}
+
+#[command]
+pub async fn git_numstat(app: AppHandle) -> Result<Vec<GitNumstat>, String> {
+    let root = workspace_root_required(&app)?;
+    // vs HEAD covers staged + unstaged changes to tracked files. On a fresh
+    // repo (no commits yet) HEAD is invalid and the diff errors — return empty
+    // rather than failing the whole recap. Untracked files have no blob to diff
+    // so they don't appear here (the recap lists them from git_status). Binary
+    // files emit "-\t-" → parse falls back to 0.
+    let out = match run_git_cli(&root, &["diff", "--numstat", "HEAD"]).await {
+        Ok(o) => o,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut result = Vec::new();
+    for line in out.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let added = parts.next().unwrap_or("0");
+        let removed = parts.next().unwrap_or("0");
+        let path = parts.next().unwrap_or("");
+        if path.is_empty() {
+            continue;
+        }
+        result.push(GitNumstat {
+            path: normalize_path(path),
+            added: added.parse().unwrap_or(0),
+            removed: removed.parse().unwrap_or(0),
+        });
+    }
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------

@@ -234,3 +234,21 @@ export interface GitRemote {
   /** Only set if different from `url`. */
   pushUrl: string | null;
 }
+
+export interface GitWorktree {
+  /** Absolute path of the worktree's working directory (forward-slashed). */
+  path: string;
+  /** Short branch name checked out there, or null if detached/bare. */
+  branch: string | null;
+  /** Commit OID the worktree is on. */
+  head: string | null;
+  isBare: boolean;
+  isLocked: boolean;
+  isDetached: boolean;
+}
+
+export interface GitNumstat {
+  path: string;
+  added: number;
+  removed: number;
+}

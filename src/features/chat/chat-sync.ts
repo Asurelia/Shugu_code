@@ -361,11 +361,15 @@ export async function sendChatMessage(
     // les annotations (régression revue). Reste du texte (RAG auto, persona)
     // non injecté à dessein : l'agent explore lui-même via fs_search/fs_read.
     let delegateTask = trimmed;
+    let editorInjected = false;
     if (editorCtx) {
       try {
         const { buildEditorContext } = await import("./editorContext");
         const ectx = buildEditorContext(editorCtx, { skipPaths: parseMentions(trimmed) });
-        if (ectx) delegateTask = `${ectx}\n\n---\n\n${delegateTask}`;
+        if (ectx) {
+          delegateTask = `${ectx}\n\n---\n\n${delegateTask}`;
+          editorInjected = true;
+        }
       } catch (err) {
         console.warn("[chat-sync] editor context for delegate failed", err);
       }
@@ -376,6 +380,16 @@ export async function sendChatMessage(
         ...inlineComments.map((c) => `- ${c.path}:${c.line} — ${c.note}   (\`${c.snippet}\`)`),
       ].join("\n");
       delegateTask = `${block}\n\n---\n\n${delegateTask}`;
+    }
+    // Source réellement injectée sur le chemin délégué = le fichier éditeur
+    // (les @-mentions / RAG ne sont PAS injectés ici — l'agent explore seul).
+    // Best-effort : un échec de log ne doit jamais bloquer l'envoi.
+    if (editorInjected && editorCtx) {
+      try {
+        await db.sources.record(convId, userId, [{ path: editorCtx.path, kind: "editor" }]);
+      } catch (err) {
+        console.warn("[chat-sync] source logging (delegate) failed", err);
+      }
     }
     // Le modèle de chat actif sert d'orchestrateur de REPLI (cf. resolveOrchestrator).
     // `agentMode` propage le mode Plan (lecture seule) jusqu'au runner.
@@ -473,6 +487,11 @@ export async function sendChatMessage(
   // au modèle (jamais persisté). On saute le fichier actif s'il est déjà
   // @-mentionné (dédoublonnage). Désactivable via settings (le composer ne
   // passe `editorCtx` que si le toggle est ON et le chip pas retiré).
+  // Sources réellement injectées dans CE message — loggées pour l'onglet
+  // "Sources" du panneau Contexte (vraies sources ≠ recherche sémantique
+  // "pertinents"). On accumule au fil des injections puis on enregistre une fois.
+  const sourceEntries: { path: string; kind: string }[] = [];
+
   if (editorCtx) {
     const { buildEditorContext } = await import("./editorContext");
     const skipPaths = parseMentions(trimmed);
@@ -482,6 +501,7 @@ export async function sendChatMessage(
       if (lastUserIdx >= 0) {
         apiMessages[lastUserIdx].content = `${ectx}\n\n---\n\n${apiMessages[lastUserIdx].content}`;
       }
+      sourceEntries.push({ path: editorCtx.path, kind: "editor" });
     }
   }
 
@@ -508,12 +528,17 @@ export async function sendChatMessage(
   // aucune dépendance à la qualité d'embedding).
   const mentioned = parseMentions(trimmed);
   if (mentioned.length > 0) {
-    const ctx = buildMentionContext(await resolveMentions(mentioned));
+    const resolvedMentions = await resolveMentions(mentioned);
+    const ctx = buildMentionContext(resolvedMentions);
     if (ctx) {
       const lastUserIdx = apiMessages.map((m) => m.role).lastIndexOf("user");
       if (lastUserIdx >= 0) {
         apiMessages[lastUserIdx].content = `${ctx}\n\n---\n\n${apiMessages[lastUserIdx].content}`;
       }
+    }
+    // Seules les @-mentions LUES (sans erreur) ont vraiment été injectées.
+    for (const r of resolvedMentions) {
+      if (!r.error) sourceEntries.push({ path: r.path, kind: "mention" });
     }
   }
 
@@ -523,12 +548,29 @@ export async function sendChatMessage(
   // Indépendant des @-mentions explicites. Dégrade en silence si l'index est
   // vide (resolveCodeContext → []).
   if ((await db.settings.get("rag.autoCodeContext")) !== "false") {
-    const codeCtx = buildCodeContext(await resolveCodeContext(trimmed, 5));
+    const ragChunks = await resolveCodeContext(trimmed, 5);
+    const codeCtx = buildCodeContext(ragChunks);
     if (codeCtx) {
       const lastUserIdx = apiMessages.map((m) => m.role).lastIndexOf("user");
       if (lastUserIdx >= 0) {
         apiMessages[lastUserIdx].content = `${codeCtx}\n\n---\n\n${apiMessages[lastUserIdx].content}`;
       }
+      const seenRag = new Set<string>();
+      for (const c of ragChunks) {
+        if (!seenRag.has(c.path)) {
+          seenRag.add(c.path);
+          sourceEntries.push({ path: c.path, kind: "rag" });
+        }
+      }
+    }
+  }
+
+  // Persiste les vraies sources injectées (best-effort — ne bloque pas l'envoi).
+  if (sourceEntries.length > 0) {
+    try {
+      await db.sources.record(convId, userId, sourceEntries);
+    } catch (err) {
+      console.warn("[chat-sync] source logging failed", err);
     }
   }
 

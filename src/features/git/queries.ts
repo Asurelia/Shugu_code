@@ -37,6 +37,8 @@ import {
   gitBlame,
   gitStashList,
   gitRemotes,
+  gitWorktreeList,
+  gitNumstat,
 } from "@/lib/git";
 import type {
   DiffSource,
@@ -44,8 +46,10 @@ import type {
   GitBranchList,
   GitFileStatus,
   GitLogEntry,
+  GitNumstat,
   GitRemote,
   GitStash,
+  GitWorktree,
 } from "@/lib/types";
 
 // ---------------------------------------------------------------------------
@@ -225,6 +229,30 @@ export function useGitRemotes() {
   return useQuery<GitRemote[]>({
     queryKey: gitKeys.remotes(),
     queryFn: gitRemotes,
+    enabled: isRepo,
+    staleTime: 0,
+    retry: false,
+  });
+}
+
+/** Linked worktrees of the current repo (path + branch + head). */
+export function useGitWorktrees() {
+  const isRepo = useIsGitRepo();
+  return useQuery<GitWorktree[]>({
+    queryKey: gitKeys.worktrees(),
+    queryFn: gitWorktreeList,
+    enabled: isRepo,
+    staleTime: 0,
+    retry: false,
+  });
+}
+
+/** Per-file added/removed line counts vs HEAD — feeds the recap diffstat. */
+export function useGitNumstat() {
+  const isRepo = useIsGitRepo();
+  return useQuery<GitNumstat[]>({
+    queryKey: gitKeys.numstat(),
+    queryFn: gitNumstat,
     enabled: isRepo,
     staleTime: 0,
     retry: false,

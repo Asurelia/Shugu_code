@@ -1,33 +1,55 @@
-// Shugu Forge — contextual cards (Plan / Tâches / Git / Prévisu / Sources / Env).
+// Shugu Forge — contextual cards (Plan / Agents / Git / Prévisu / Sources / Env).
 //
-// Shared between the main chat's ContextBubble and the mascot FloatChat
-// (Phase 4) — exigence mémoire "pas de duplication, logique data partagée".
-// Every card is wired to REAL data via existing TanStack hooks; none mock.
+// Partagé entre le ContextBubble du chat principal et la mascotte — exigence
+// mémoire « pas de duplication, logique data partagée ». Chaque carte est
+// branchée sur la VRAIE donnée, scopée à la conversation / au projet courant :
 //
-//   Plan     → useAgentsByConversation  (the orchestrator + its sub-agents,
-//              rendered as the design's checkbox step list)
-//   Tâches   → useActiveAgents          (active agents as background-task
-//              cards; no fake progress — indeterminate sweep + real elapsed)
-//   Git      → <SideGit/>               (the full Source Control panel)
-//   Env      → git branch + worktree changes + remotes
-//   Sources  → vecSearch("code", …)     (semantic file retrieval for the conv)
-//   Prévisu  → live web iframe (editable URL)
+//   Plan     → le dernier `todo_write` de l'orchestrateur de la conversation,
+//              rendu via le composant partagé <AgentPlan/> (même format que le
+//              fil de chat — façon Claude Code).
+//   Agents   → useActiveAgents + l'action en COURS de chaque agent (ce qu'il fait).
+//   Git      → récap visuel (branche, diffstat, commits, worktrees) + git init,
+//              avec accès au panneau Source Control complet (<SideGit/>).
+//   Prévisu  → iframe SEULEMENT si un serveur de dev est détecté (TCP probe).
+//   Sources  → les VRAIES sources injectées dans la conversation (db.sources).
+//   Env      → voir / éditer les fichiers .env du projet ouvert.
 
 import { useMemo, useState, useEffect } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Icon } from "@/components/components";
 import { SideGit } from "@/features/git/SideGit";
-import { useAgentsByConversation, useActiveAgents } from "@/features/agents/queries";
-import { useGitBranches, useGitRemotes } from "@/features/git/queries";
+import {
+  useAgentsByConversation,
+  useActiveAgents,
+  useAgentTranscript,
+} from "@/features/agents/queries";
+import {
+  useIsGitRepo,
+  useGitBranches,
+  useGitLog,
+  useGitWorktrees,
+  useGitNumstat,
+} from "@/features/git/queries";
+import { useGitInit, useWorktreeAdd, useWorktreeRemove } from "@/features/git/mutations";
 import { useWorkspaceChanges } from "@/features/git/useWorkspaceChanges";
 import { useMessages } from "@/features/chat/chat-sync";
-import { vecSearch } from "@/lib/vector";
+import { AgentPlan } from "@/features/chat/AgentPlan";
+import { parsePlan, useAgentCurrentActivity } from "@/features/chat/useMessageDisplay";
+import {
+  fsReadDirShallow,
+  fsReadFile,
+  fsWriteFile,
+  fsGetWorkspaceRoot,
+  fsSetWorkspaceRoot,
+} from "@/lib/fs";
+import { previewDetectServer } from "@/lib/git";
+import { db } from "@/lib/db";
 import type { AgentRow } from "@/lib/agents";
 
 // ─── Tab registry (shared with ContextBubble + FloatChat) ───
 export const CTX_TABS = [
   { id: "plan",    label: "Plan",    icon: "commit" },
-  { id: "tasks",   label: "Tâches",  icon: "agent" },
+  { id: "tasks",   label: "Agents",  icon: "agent" },
   { id: "git",     label: "Git",     icon: "git" },
   { id: "preview", label: "Prévisu", icon: "image" },
   { id: "sources", label: "Sources", icon: "folderTree" },
@@ -36,13 +58,14 @@ export const CTX_TABS = [
 
 export type CtxTabId = (typeof CTX_TABS)[number]["id"];
 
-/** Live per-tab badge counts. */
-export function useCtxCounts(convId: string): Record<CtxTabId, number> {
-  const { data: convAgents = [] } = useAgentsByConversation(convId);
+/** Live per-tab badge counts. Seuls les signaux « attention » portent un nombre
+ *  (agents actifs, fichiers modifiés) ; les autres onglets n'ont pas de compteur
+ *  pertinent. */
+export function useCtxCounts(_convId: string): Record<CtxTabId, number> {
   const { data: activeAgents = [] } = useActiveAgents();
   const { count: changes } = useWorkspaceChanges();
   return {
-    plan: convAgents.length,
+    plan: 0,
     tasks: activeAgents.length,
     git: changes,
     preview: 0,
@@ -64,7 +87,7 @@ export function ContextCard({
   switch (tab) {
     case "plan":    return <PlanCard convId={convId} />;
     case "tasks":   return <TasksCard />;
-    case "git":     return <div className="ctx-embed"><SideGit /></div>;
+    case "git":     return <GitRecapCard onOpenFile={onOpenFile} />;
     case "preview": return <PreviewCard />;
     case "sources": return <SourcesCard convId={convId} onOpenFile={onOpenFile} />;
     case "env":     return <EnvCard onOpenFile={onOpenFile} />;
@@ -73,13 +96,6 @@ export function ContextCard({
 }
 
 // ─── Shared helpers ─────────────────────────────────────────
-function agentStepStatus(s: string): "done" | "running" | "pending" | "error" {
-  if (s === "complete") return "done";
-  if (s === "running") return "running";
-  if (s === "pending") return "pending";
-  return "error";
-}
-
 /** Compact duration: <60s → "0.4s", else "2m 13s". */
 function fmtElapsed(ms: number): string {
   const s = Math.max(0, ms) / 1000;
@@ -87,8 +103,32 @@ function fmtElapsed(ms: number): string {
   return `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
 }
 
-/** Re-render every `ms` while `active` so live elapsed counters keep moving
- *  between query invalidations. Pure UI ticker — local state, not TanStack. */
+/** Relative "il y a …" from a unix-seconds timestamp. */
+function fmtAgo(unixSeconds: number): string {
+  const s = Math.max(0, Date.now() / 1000 - unixSeconds);
+  if (s < 60) return "à l'instant";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `il y a ${m} min`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `il y a ${h} h`;
+  const d = Math.floor(h / 24);
+  return `il y a ${d} j`;
+}
+
+/** "…/parent/file" — keep the last two segments of a long path. */
+function shortPath(p: string): string {
+  const seg = p.split("/").filter(Boolean);
+  return seg.length <= 2 ? p : "…/" + seg.slice(-2).join("/");
+}
+
+/** Loose cross-platform path equality (slashes, trailing slash, case). */
+function samePath(a: string | null, b: string | null): boolean {
+  if (!a || !b) return false;
+  const norm = (s: string) => s.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  return norm(a) === norm(b);
+}
+
+/** Re-render every `ms` while `active` so live elapsed counters keep moving. */
 function useTick(ms: number, active: boolean): void {
   const [, setN] = useState(0);
   useEffect(() => {
@@ -98,221 +138,332 @@ function useTick(ms: number, active: boolean): void {
   }, [ms, active]);
 }
 
-const CheckGlyph = () => (
-  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
-    <polyline points="20 6 9 17 4 12" />
-  </svg>
-);
-
 // ─── Plan ───────────────────────────────────────────────────
-// The conversation's orchestrator plan as the design's checkbox step list.
-// Real source: useAgentsByConversation → the root orchestrator (parentId ===
-// null) and its child sub-agents are the ordered steps. No mock data: status
-// drives the checkbox, role the sub-line, finishedAt−createdAt the timer.
+// Le VRAI plan de la conversation = le dernier `todo_write` de l'orchestrateur
+// racine (parentId === null). Parsé via `parsePlan` et rendu via le composant
+// partagé <AgentPlan/> — exactement le même format (☐/◐/☑) que dans le fil de
+// chat, façon Claude Code. Plus de dump illisible des tâches d'agents.
 function PlanCard({ convId }: { convId: string }) {
   const { data: agents = [] } = useAgentsByConversation(convId);
 
-  const { title, steps } = useMemo(() => {
-    const orchestrator = agents.find((a) => a.parentId === null) ?? null;
-    const children = orchestrator ? agents.filter((a) => a.parentId === orchestrator.id) : [];
-    const list = (children.length > 0 ? children : agents).slice().sort((a, b) => a.createdAt - b.createdAt);
-    return { title: orchestrator?.task ?? "Plan", steps: list };
+  const rootId = useMemo(() => {
+    const roots = agents.filter((a) => a.parentId === null);
+    if (roots.length === 0) return null;
+    return roots.reduce((a, b) => (b.createdAt > a.createdAt ? b : a)).id;
   }, [agents]);
 
-  const hasRunning = steps.some((s) => s.status === "running");
+  const { data: transcript } = useAgentTranscript(rootId);
+
+  const plan = useMemo(() => {
+    if (!transcript) return undefined;
+    let p: ReturnType<typeof parsePlan>;
+    for (const ev of transcript.events) {
+      if (ev.kind === "toolCall" && ev.tool === "todo_write") {
+        p = parsePlan(ev.args) ?? p;
+      }
+    }
+    return p;
+  }, [transcript]);
+
+  const hasRunning = plan?.some((s) => s.status === "in_progress") ?? false;
   useTick(1000, hasRunning);
 
-  if (steps.length === 0) {
-    return <CardEmpty icon="commit" text="Aucun plan pour cette conversation. Délègue une tâche à l'orchestrateur pour le voir apparaître ici." />;
+  if (!plan || plan.length === 0) {
+    return (
+      <CardEmpty
+        icon="commit"
+        text="Aucun plan pour cette conversation. Passe en mode Plan ou Agent et confie une tâche : la checklist du plan apparaîtra ici."
+      />
+    );
   }
 
-  const doneCount = steps.filter((s) => s.status === "complete").length;
-  const minStart = Math.min(...steps.map((s) => s.createdAt));
-  const maxEnd = Math.max(...steps.map((s) => s.finishedAt ?? Date.now()));
-
   return (
-    <div className="ctx-plan">
-      <div className="ctx-card-head">
-        <div className="ctx-card-title" title={title}>{title}</div>
-        <span className="ctx-card-sub">{doneCount}/{steps.length} · {fmtElapsed(maxEnd - minStart)}</span>
-      </div>
-      {steps.map((a: AgentRow) => {
-        const st = agentStepStatus(a.status);
-        const cls = st === "done" ? "done" : st === "running" ? "run" : st === "error" ? "error" : "";
-        const timer =
-          st === "done" && a.finishedAt ? fmtElapsed(a.finishedAt - a.createdAt)
-          : st === "running" ? "en cours · " + fmtElapsed(Date.now() - a.createdAt)
-          : "";
-        return (
-          <div key={a.id} className={"plan-step " + cls}>
-            <div className="box">
-              {st === "done" && <CheckGlyph />}
-              {st === "error" && <span className="x">✕</span>}
-            </div>
-            <div className="content">
-              <div className="label">{a.task || a.role}</div>
-              {(a.role || timer) && (
-                <div className="meta">
-                  {a.role && <span className="file">{a.role}</span>}
-                  {timer && <span className="timer">{timer}</span>}
-                </div>
-              )}
-            </div>
-          </div>
-        );
-      })}
+    <div className="ctx-plan-wrap">
+      <AgentPlan steps={plan} />
     </div>
   );
 }
 
-// ─── Tâches ─────────────────────────────────────────────────
-// Active background work in the design's task-card aesthetic. Real source:
-// useActiveAgents (status pending|running). The design's progress percentages
-// have NO real source (agents carry no %), so running tasks show an
-// indeterminate sweep + real elapsed instead of a fabricated bar; pending
-// tasks read "en file". Concise by design — respects the AgentsPanel UX rule
-// (no live per-event streaming dump here).
+// ─── Agents (active sub-agents + current activity) ──────────
 function TasksCard() {
   const { data: agents = [] } = useActiveAgents();
   const hasRunning = agents.some((a) => a.status === "running");
   useTick(1000, hasRunning);
 
   if (agents.length === 0) {
-    return <CardEmpty icon="agent" text="Pas de tâche active. Les agents de l'orchestrateur apparaîtront ici pendant qu'ils travaillent." />;
+    return (
+      <CardEmpty
+        icon="agent"
+        text="Aucun agent actif. Les sous-agents lancés par l'orchestrateur apparaîtront ici avec ce qu'ils font en temps réel."
+      />
+    );
   }
 
   return (
     <div className="ctx-tasks">
       <div className="ctx-card-head">
-        <div className="ctx-card-title">Tâches en arrière-plan</div>
-        <span className="ctx-card-sub">{agents.length} active{agents.length > 1 ? "s" : ""}</span>
+        <div className="ctx-card-title">Agents en cours</div>
+        <span className="ctx-card-sub">{agents.length} actif{agents.length > 1 ? "s" : ""}</span>
       </div>
-      {agents.map((a: AgentRow) => {
-        const running = a.status === "running";
-        return (
-          <div key={a.id} className={"task-card" + (running ? " run" : "")}>
-            <div className="task-row1">
-              <span className="task-name" title={a.task}>{a.task || a.role}</span>
-              <span className={"task-badge " + (running ? "running" : "queued")}>
-                {running ? "en cours" : "en file"}
-              </span>
-            </div>
-            <div className="task-stream">{a.role} · {a.model}</div>
-            <div className="task-foot">
-              {running && <div className="task-bar"><span /></div>}
-              <span className="task-time">{running ? fmtElapsed(Date.now() - a.createdAt) : "en attente"}</span>
-            </div>
-          </div>
-        );
-      })}
+      {agents.map((a) => (
+        <AgentTaskCard key={a.id} a={a} />
+      ))}
     </div>
   );
 }
 
-// ─── Env ────────────────────────────────────────────────────
-function EnvCard({ onOpenFile }: { onOpenFile: (path: string) => void }) {
-  const { data: branches } = useGitBranches();
-  const { data: remotes = [] } = useGitRemotes();
-  const { files, isRepo } = useWorkspaceChanges();
+function AgentTaskCard({ a }: { a: AgentRow }) {
+  const activity = useAgentCurrentActivity(a.id);
+  const running = a.status === "running";
+  return (
+    <div className={"task-card" + (running ? " run" : "")}>
+      <div className="task-row1">
+        <span className="task-name" title={a.task}>{a.task || a.role}</span>
+        <span className={"task-badge " + (running ? "running" : "queued")}>
+          {running ? "en cours" : "en file"}
+        </span>
+      </div>
+      <div className="task-stream">{a.role} · {a.model}</div>
+      {activity && (
+        <div className="task-activity">
+          <span className="ic">{activity.icon}</span>
+          <span className="lb">{activity.label}</span>
+          {activity.detail && <span className="dt" title={activity.detail}>{activity.detail}</span>}
+          <span className="st">{activity.running ? "…" : "✓"}</span>
+        </div>
+      )}
+      <div className="task-foot">
+        {running && <div className="task-bar"><span /></div>}
+        <span className="task-time">{running ? fmtElapsed(Date.now() - a.createdAt) : "en attente"}</span>
+      </div>
+    </div>
+  );
+}
+
+// ─── Git (récap visuel + worktrees + accès panneau complet) ──
+function GitRecapCard({ onOpenFile }: { onOpenFile: (path: string) => void }) {
+  const [full, setFull] = useState(false);
+  const isRepo = useIsGitRepo();
+  const initMut = useGitInit();
 
   if (!isRepo) {
-    return <CardEmpty icon="git" text="L'espace de travail n'est pas un dépôt git." />;
+    return (
+      <div className="ctx-git-init">
+        <Icon name="git" size={24} />
+        <p>Cet espace de travail n'est pas un dépôt git.</p>
+        <button
+          className="lgb lgb-primary lgb-sm"
+          disabled={initMut.isPending}
+          onClick={() => initMut.mutate()}
+        >
+          {initMut.isPending ? "Initialisation…" : "Initialiser un dépôt"}
+        </button>
+        {initMut.isError && <div className="ctx-err">{String(initMut.error)}</div>}
+      </div>
+    );
   }
+
+  if (full) {
+    return (
+      <div className="ctx-git-full">
+        <button className="ctx-git-back" onClick={() => setFull(false)}>
+          ‹ Récap
+        </button>
+        <div className="ctx-embed"><SideGit /></div>
+      </div>
+    );
+  }
+
+  return <GitRecap onOpenFile={onOpenFile} onFull={() => setFull(true)} />;
+}
+
+function GitRecap({
+  onOpenFile,
+  onFull,
+}: {
+  onOpenFile: (path: string) => void;
+  onFull: () => void;
+}) {
+  const { data: branches } = useGitBranches();
+  const { files } = useWorkspaceChanges();
+  const { data: numstat = [] } = useGitNumstat();
+  const { data: commits = [] } = useGitLog(6);
+
+  const numByPath = useMemo(() => {
+    const m = new Map<string, { a: number; r: number }>();
+    for (const n of numstat) m.set(n.path, { a: n.added, r: n.removed });
+    return m;
+  }, [numstat]);
+  const totalAdd = numstat.reduce((s, n) => s + n.added, 0);
+  const totalRem = numstat.reduce((s, n) => s + n.removed, 0);
+
   const current = branches?.current ?? "(detached)";
   const curBranch = branches?.local.find((b) => b.name === current);
 
   return (
-    <div className="ctx-env">
-      <div className="ctx-env-section">
-        <div className="ctx-env-label">Branche</div>
-        <div className="ctx-env-row">
-          <span className="ctx-tag branch"><Icon name="branch" size={11} /> {current}</span>
-          {curBranch && (curBranch.ahead > 0 || curBranch.behind > 0) && (
-            <span className="ctx-env-aheadbehind">↑{curBranch.ahead} ↓{curBranch.behind}</span>
-          )}
-        </div>
-        {curBranch?.upstream && <div className="ctx-env-sub">suit {curBranch.upstream}</div>}
+    <div className="ctx-git">
+      <div className="ctx-git-branch">
+        <span className="ctx-tag branch"><Icon name="branch" size={11} /> {current}</span>
+        {curBranch && (curBranch.ahead > 0 || curBranch.behind > 0) && (
+          <span className="ctx-env-aheadbehind">↑{curBranch.ahead} ↓{curBranch.behind}</span>
+        )}
+        <button className="ctx-git-fullbtn" onClick={onFull} title="Ouvrir le gestionnaire complet">
+          Gérer
+        </button>
       </div>
 
-      <div className="ctx-env-section">
-        <div className="ctx-env-label">Modifications ({files.length})</div>
+      <div className="ctx-git-section">
+        <div className="ctx-git-sec-head">
+          <span>Modifications ({files.length})</span>
+          {(totalAdd > 0 || totalRem > 0) && (
+            <span className="ctx-diffstat">
+              <span className="add">+{totalAdd}</span> <span className="rem">−{totalRem}</span>
+            </span>
+          )}
+        </div>
         {files.length === 0 ? (
           <div className="ctx-env-sub">espace de travail propre</div>
         ) : (
-          <div className="ctx-env-files">
-            {files.slice(0, 8).map((f) => (
-              <div key={f.name} className="ctx-env-file" onClick={() => onOpenFile(f.name)} title="Ouvrir">
-                <span className={"dot " + f.st} />
-                <span className="name">{f.name}</span>
-              </div>
-            ))}
+          <div className="ctx-git-files">
+            {files.slice(0, 8).map((f) => {
+              const n = numByPath.get(f.name);
+              return (
+                <div
+                  key={f.name}
+                  className="ctx-git-file"
+                  onClick={() => onOpenFile(f.name)}
+                  title={"Ouvrir " + f.name}
+                >
+                  <span className={"dot " + f.st} />
+                  <span className="name">{f.name}</span>
+                  {n && (n.a > 0 || n.r > 0) && (
+                    <span className="nums">
+                      <span className="add">+{n.a}</span>
+                      <span className="rem">−{n.r}</span>
+                    </span>
+                  )}
+                </div>
+              );
+            })}
             {files.length > 8 && <div className="ctx-env-sub">+{files.length - 8} de plus…</div>}
           </div>
         )}
       </div>
 
-      <div className="ctx-env-section">
-        <div className="ctx-env-label">Remotes</div>
-        {remotes.length === 0 ? (
-          <div className="ctx-env-sub">aucun remote configuré</div>
+      <div className="ctx-git-section">
+        <div className="ctx-git-sec-head"><span>Commits récents</span></div>
+        {commits.length === 0 ? (
+          <div className="ctx-env-sub">aucun commit pour l'instant</div>
         ) : (
-          remotes.map((r) => (
-            <div key={r.name} className="ctx-env-remote">
-              <span className="ctx-tag"><Icon name="push" size={11} /> {r.name}</span>
-              <span className="ctx-env-url" title={r.url}>{r.url}</span>
-            </div>
-          ))
+          <ul className="ctx-git-commits">
+            {commits.map((c) => (
+              <li key={c.oid} className="ctx-commit">
+                <span className="graph"><span className="cdot" /></span>
+                <div className="cbody">
+                  <div className="csum" title={c.summary}>{c.summary}</div>
+                  <div className="cmeta">
+                    <span className="coid">{c.shortOid}</span> · {c.authorName} · {fmtAgo(c.timestamp)}
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
         )}
       </div>
+
+      <WorktreesSection />
     </div>
   );
 }
 
-// ─── Sources ────────────────────────────────────────────────
-// Semantic file retrieval for the conversation. The query is the latest user
-// message (the conversation's current intent); results come from the "code"
-// vector collection populated by the workspace indexer.
-function SourcesCard({ convId, onOpenFile }: { convId: string; onOpenFile: (path: string) => void }) {
-  const { data: messages = [] } = useMessages(convId);
-  const query = useMemo(() => {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const m = messages[i];
-      if (m.role === "user" && (m.text || "").trim()) return (m.text as string).trim().slice(0, 400);
-    }
-    return "";
-  }, [messages]);
-
-  const { data: hits = [], isFetching } = useQuery({
-    queryKey: ["ctx-sources", convId, query],
-    queryFn: () => vecSearch("code", query, 8),
-    enabled: query.length > 0,
-    staleTime: 30_000,
+function WorktreesSection() {
+  const { data: worktrees = [] } = useGitWorktrees();
+  const { data: wsRoot = null } = useQuery({
+    queryKey: ["ws-root"],
+    queryFn: fsGetWorkspaceRoot,
+    staleTime: Infinity,
     retry: false,
   });
+  const addMut = useWorktreeAdd();
+  const rmMut = useWorktreeRemove();
+  const [creating, setCreating] = useState(false);
+  const [branch, setBranch] = useState("");
 
-  if (!query) {
-    return <CardEmpty icon="folderTree" text="Envoie un message pour retrouver les fichiers pertinents de l'espace de travail." />;
-  }
+  const create = () => {
+    const b = branch.trim();
+    if (!b) return;
+    addMut.mutate(
+      { path: `.worktrees/${b}`, branch: b, newBranch: true },
+      { onSuccess: () => { setCreating(false); setBranch(""); } },
+    );
+  };
+
+  const open = (path: string) => {
+    void fsSetWorkspaceRoot(path).catch((e) => console.warn("[ctx] open worktree", e));
+  };
+
   return (
-    <div className="ctx-sources">
-      <div className="ctx-sources-meta">
-        <span className="ctx-tag"><Icon name="sparkle" size={10} /> vectoriel</span>
-        <span className="ctx-sources-hint">{isFetching ? "recherche…" : `${hits.length} fichier${hits.length > 1 ? "s" : ""} · top-k 8`}</span>
+    <div className="ctx-git-section">
+      <div className="ctx-git-sec-head">
+        <span>Worktrees</span>
+        <button className="ctx-wt-add" onClick={() => setCreating((v) => !v)} title="Créer un worktree">
+          <Icon name="plus" size={12} />
+        </button>
       </div>
-      {hits.length === 0 && !isFetching ? (
-        <div className="ctx-env-sub" style={{ padding: "8px 4px" }}>aucune source pertinente trouvée.</div>
+
+      {creating && (
+        <div className="ctx-wt-form">
+          <input
+            className="ctx-wt-input"
+            value={branch}
+            onChange={(e) => setBranch(e.target.value)}
+            placeholder="nom-de-branche"
+            spellCheck={false}
+            onKeyDown={(e) => { if (e.key === "Enter") create(); }}
+          />
+          <button
+            className="lgb lgb-sm lgb-primary"
+            disabled={addMut.isPending || !branch.trim()}
+            onClick={create}
+          >
+            {addMut.isPending ? "…" : "Créer"}
+          </button>
+        </div>
+      )}
+      {addMut.isError && <div className="ctx-err">{String(addMut.error)}</div>}
+      {rmMut.isError && <div className="ctx-err">{String(rmMut.error)}</div>}
+
+      {worktrees.length === 0 ? (
+        <div className="ctx-env-sub">aucun worktree lié</div>
       ) : (
-        <div className="ctx-sources-list">
-          {hits.map((h) => {
-            const seg = h.id.split("/");
-            const name = seg.pop() ?? h.id;
-            const dir = seg.join("/");
+        <div className="ctx-wt-list">
+          {worktrees.map((w) => {
+            const isCurrent = samePath(w.path, wsRoot);
             return (
-              <div key={h.id} className="ctx-source" onClick={() => onOpenFile(h.id)} title={"Ouvrir " + h.id}>
-                <Icon name="file" size={12} />
-                <span className="ctx-source-name">{name}</span>
-                {dir && <span className="ctx-source-dir">{dir}</span>}
-                <span className="ctx-source-sim">{(1 - h.distance).toFixed(2)}</span>
+              <div key={w.path} className={"ctx-wt" + (isCurrent ? " current" : "")}>
+                <button
+                  className="ctx-wt-main"
+                  title={isCurrent ? w.path : "Ouvrir " + w.path}
+                  disabled={isCurrent}
+                  onClick={() => !isCurrent && open(w.path)}
+                >
+                  <Icon name="folder" size={12} />
+                  <span className="wt-branch">
+                    {w.branch ?? (w.isDetached ? "(detached)" : "(bare)")}
+                  </span>
+                  <span className="wt-path">{shortPath(w.path)}</span>
+                  {isCurrent && <span className="wt-cur">courant</span>}
+                </button>
+                {!isCurrent && (
+                  <button
+                    className="ctx-wt-rm"
+                    title="Supprimer ce worktree"
+                    disabled={rmMut.isPending}
+                    onClick={() => rmMut.mutate({ path: w.path })}
+                  >
+                    <Icon name="x" size={11} />
+                  </button>
+                )}
               </div>
             );
           })}
@@ -322,27 +473,82 @@ function SourcesCard({ convId, onOpenFile }: { convId: string; onOpenFile: (path
   );
 }
 
-// ─── Prévisu ────────────────────────────────────────────────
-// Live web preview. Defaults to the running app's own origin (the dev server
-// in dev mode); the URL is editable so any local page can be previewed.
+// ─── Prévisu (iframe SEULEMENT si un serveur est détecté) ───
+const PREVIEW_PORTS = [5173, 3000, 4173, 8080, 8000, 5000];
+
 function PreviewCard() {
-  // Default to the running origin only when it's the real web dev server
-  // (http/https AND not the Tauri webview host). A packaged Tauri build serves
-  // the app itself from tauri://localhost or http://tauri.localhost (Windows) —
-  // neither is a useful preview target, so fall back to the configured Vite dev
-  // URL, which the user can edit to point at any local server.
-  const origin = typeof window !== "undefined" ? window.location.origin : "";
-  const isWebDev = /^https?:\/\//.test(origin) && !origin.includes("tauri.localhost");
-  const initial = isWebDev ? origin : "http://localhost:5173";
-  const [url, setUrl] = useState(initial);
-  const [src, setSrc] = useState(initial);
+  const { data: openPorts = [] } = useQuery({
+    queryKey: ["ctx-preview-ports"],
+    queryFn: () => previewDetectServer(PREVIEW_PORTS),
+    refetchInterval: 2500,
+    staleTime: 0,
+    retry: false,
+  });
+  const first = openPorts.length ? `http://localhost:${openPorts[0]}` : "";
+
+  const [url, setUrl] = useState("");
+  const [src, setSrc] = useState("");
   const [nonce, setNonce] = useState(0);
+  const [manual, setManual] = useState("");
+
+  // Adopt the first detected server as soon as one appears (unless the user
+  // already pointed the preview somewhere manually).
+  useEffect(() => {
+    if (first && !src) {
+      setUrl(first);
+      setSrc(first);
+    }
+  }, [first, src]);
 
   const go = () => { setSrc(url); setNonce((n) => n + 1); };
+  const openManual = () => {
+    const u = manual.trim();
+    if (!u) return;
+    setUrl(u);
+    setSrc(u);
+    setNonce((n) => n + 1);
+  };
+
+  if (!src) {
+    return (
+      <div className="ctx-preview-empty">
+        <Icon name="image" size={24} />
+        <p>
+          Aucun serveur de prévisu détecté.<br />
+          Lance ton serveur de dev (ex. <code>pnpm dev</code>) pour le voir ici.
+        </p>
+        <div className="ctx-preview-manual">
+          <input
+            value={manual}
+            onChange={(e) => setManual(e.target.value)}
+            placeholder="ou saisir une URL…"
+            spellCheck={false}
+            onKeyDown={(e) => { if (e.key === "Enter") openManual(); }}
+          />
+          <button className="lgb lgb-sm" disabled={!manual.trim()} onClick={openManual}>
+            Ouvrir
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="ctx-preview">
       <div className="ctx-preview-bar">
+        {openPorts.length > 1 && (
+          <select
+            className="ctx-preview-sel"
+            value={openPorts.some((p) => `http://localhost:${p}` === url) ? url : ""}
+            onChange={(e) => { setUrl(e.target.value); setSrc(e.target.value); setNonce((n) => n + 1); }}
+          >
+            <option value="" disabled>serveurs…</option>
+            {openPorts.map((p) => {
+              const u = `http://localhost:${p}`;
+              return <option key={p} value={u}>localhost:{p}</option>;
+            })}
+          </select>
+        )}
         <input
           className="ctx-preview-url"
           value={url}
@@ -351,11 +557,261 @@ function PreviewCard() {
           placeholder="http://localhost:5173"
           spellCheck={false}
         />
-        <button className="ctx-preview-go" onClick={go} title="Recharger"><Icon name="history" size={12} /></button>
+        <button className="ctx-preview-go" onClick={go} title="Recharger">
+          <Icon name="history" size={12} />
+        </button>
       </div>
       <div className="ctx-preview-frame">
         <iframe key={nonce} src={src} title="Prévisu" sandbox="allow-scripts allow-same-origin allow-forms" />
       </div>
+    </div>
+  );
+}
+
+// ─── Sources (vraies sources injectées dans la conversation) ─
+function SourcesCard({ convId, onOpenFile }: { convId: string; onOpenFile: (path: string) => void }) {
+  const { data: messages = [] } = useMessages(convId);
+  // Re-key on message count so the just-logged sources show up after a send.
+  const { data: srcs = [] } = useQuery({
+    queryKey: ["ctx-sources-used", convId, messages.length],
+    queryFn: () => db.sources.listByConversation(convId),
+    staleTime: 3_000,
+    retry: false,
+  });
+
+  if (srcs.length === 0) {
+    return (
+      <CardEmpty
+        icon="folderTree"
+        text="Aucune source utilisée pour l'instant. Les fichiers réellement injectés dans le contexte (éditeur, @mentions, RAG) apparaîtront ici après un message."
+      />
+    );
+  }
+
+  return (
+    <div className="ctx-sources">
+      <div className="ctx-sources-meta">
+        <span className="ctx-tag"><Icon name="folderTree" size={10} /> {srcs.length} source{srcs.length > 1 ? "s" : ""}</span>
+        <span className="ctx-sources-hint">réellement injectées</span>
+      </div>
+      <div className="ctx-sources-list">
+        {srcs.map((s) => {
+          const seg = s.path.split("/");
+          const name = seg.pop() ?? s.path;
+          const dir = seg.join("/");
+          return (
+            <div key={s.path} className="ctx-source" onClick={() => onOpenFile(s.path)} title={"Ouvrir " + s.path}>
+              <Icon name="file" size={12} />
+              <span className="ctx-source-name">{name}</span>
+              {dir && <span className="ctx-source-dir">{dir}</span>}
+              <span className="ctx-source-kinds">{kindTags(s.kind)}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function kindTags(kind: string): string {
+  const map: Record<string, string> = { editor: "éditeur", mention: "@mention", rag: "RAG" };
+  return kind
+    .split(",")
+    .map((k) => map[k] ?? k)
+    .join(" · ");
+}
+
+// ─── Env (voir / éditer les .env du projet) ─────────────────
+function EnvCard({ onOpenFile }: { onOpenFile: (path: string) => void }) {
+  const { data: envFiles = [], isLoading } = useQuery({
+    queryKey: ["ctx-env-files"],
+    queryFn: async () => {
+      const entries = await fsReadDirShallow("");
+      return entries
+        .filter((e) => !e.isDir && e.name.startsWith(".env"))
+        .map((e) => e.path)
+        .sort();
+    },
+    staleTime: 5_000,
+    retry: false,
+  });
+
+  if (isLoading) {
+    return <div className="ctx-env-sub" style={{ padding: 12 }}>chargement…</div>;
+  }
+  if (envFiles.length === 0) {
+    return (
+      <CardEmpty
+        icon="shield"
+        text="Aucun fichier .env à la racine du projet. Crée un .env (ou .env.local) pour gérer tes variables d'environnement ici."
+      />
+    );
+  }
+
+  return (
+    <div className="ctx-env-editor">
+      {envFiles.map((p) => (
+        <EnvFileEditor key={p} path={p} onOpenFile={onOpenFile} />
+      ))}
+    </div>
+  );
+}
+
+interface EnvRow { key: string; value: string }
+
+function parseDotenv(text: string): EnvRow[] {
+  const out: EnvRow[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t || t.startsWith("#")) continue;
+    const eq = t.indexOf("=");
+    if (eq < 0) continue;
+    const key = t.slice(0, eq).trim().replace(/^export\s+/, "");
+    let value = t.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (key) out.push({ key, value });
+  }
+  return out;
+}
+
+function serializeDotenv(rows: EnvRow[]): string {
+  const body = rows
+    .filter((r) => r.key.trim())
+    .map((r) => {
+      const needsQuote = /\s|#|"|'/.test(r.value);
+      const v = needsQuote ? `"${r.value.replace(/"/g, '\\"')}"` : r.value;
+      return `${r.key.trim()}=${v}`;
+    })
+    .join("\n");
+  return body ? body + "\n" : "";
+}
+
+function EnvFileEditor({ path, onOpenFile }: { path: string; onOpenFile: (path: string) => void }) {
+  const qc = useQueryClient();
+  const { data: content = "" } = useQuery({
+    queryKey: ["ctx-env-content", path],
+    queryFn: async () => (await fsReadFile(path)).text,
+    staleTime: 5_000,
+    retry: false,
+  });
+
+  const [rows, setRows] = useState<EnvRow[]>([]);
+  const [raw, setRaw] = useState(false);
+  const [rawText, setRawText] = useState("");
+  const [reveal, setReveal] = useState<Record<number, boolean>>({});
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  // (Re)hydrate from disk content. Resets dirty + reveal on external change.
+  useEffect(() => {
+    setRows(parseDotenv(content));
+    setRawText(content);
+    setReveal({});
+    setDirty(false);
+  }, [content]);
+
+  const name = path.split("/").pop() ?? path;
+
+  const setRow = (i: number, patch: Partial<EnvRow>) => {
+    setRows((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+    setDirty(true);
+  };
+  const removeRow = (i: number) => {
+    setRows((rs) => rs.filter((_, j) => j !== i));
+    setDirty(true);
+  };
+  const addRow = () => {
+    setRows((rs) => [...rs, { key: "", value: "" }]);
+    setDirty(true);
+  };
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      const text = raw ? rawText : serializeDotenv(rows);
+      await fsWriteFile(path, text);
+      setDirty(false);
+      void qc.invalidateQueries({ queryKey: ["ctx-env-content", path] });
+    } catch (e) {
+      console.warn("[ctx] save .env", e);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="ctx-envfile">
+      <div className="ctx-envfile-head">
+        <button className="ctx-envfile-name" onClick={() => onOpenFile(path)} title={"Ouvrir " + path}>
+          <Icon name="shield" size={12} /> {name}
+        </button>
+        <div className="ctx-envfile-actions">
+          <button
+            className={"ctx-envfile-toggle" + (raw ? " on" : "")}
+            onClick={() => { if (!raw) setRawText(serializeDotenv(rows)); setRaw((v) => !v); }}
+            title="Édition brute"
+          >
+            {raw ? "table" : "brut"}
+          </button>
+          <button
+            className="lgb lgb-sm lgb-primary"
+            disabled={!dirty || saving}
+            onClick={save}
+          >
+            {saving ? "…" : "Enregistrer"}
+          </button>
+        </div>
+      </div>
+
+      {raw ? (
+        <textarea
+          className="ctx-env-raw"
+          value={rawText}
+          spellCheck={false}
+          onChange={(e) => { setRawText(e.target.value); setDirty(true); }}
+        />
+      ) : (
+        <div className="ctx-env-rows">
+          {rows.length === 0 && <div className="ctx-env-sub">fichier vide</div>}
+          {rows.map((r, i) => (
+            <div key={i} className="ctx-env-kv">
+              <input
+                className="ctx-env-key"
+                value={r.key}
+                placeholder="CLÉ"
+                spellCheck={false}
+                onChange={(e) => setRow(i, { key: e.target.value })}
+              />
+              <input
+                className="ctx-env-val"
+                type={reveal[i] ? "text" : "password"}
+                value={r.value}
+                placeholder="valeur"
+                spellCheck={false}
+                onChange={(e) => setRow(i, { value: e.target.value })}
+              />
+              <button
+                className="ctx-env-eye"
+                title={reveal[i] ? "Masquer" : "Révéler"}
+                onClick={() => setReveal((m) => ({ ...m, [i]: !m[i] }))}
+              >
+                {reveal[i] ? "🙈" : "👁"}
+              </button>
+              <button className="ctx-env-del" title="Supprimer" onClick={() => removeRow(i)}>
+                <Icon name="x" size={11} />
+              </button>
+            </div>
+          ))}
+          <button className="ctx-env-addrow" onClick={addRow}>
+            <Icon name="plus" size={11} /> Ajouter une variable
+          </button>
+        </div>
+      )}
     </div>
   );
 }

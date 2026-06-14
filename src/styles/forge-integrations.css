@@ -74,7 +74,7 @@
 /* ── Open bubble ──────────────────────────────────────────── */
 .ctx-bubble {
   position: absolute; top: 14px; right: 18px; z-index: 20;
-  width: 360px; max-width: calc(100% - 36px);
+  width: 408px; max-width: calc(100% - 36px);
   max-height: calc(100% - 28px);
   display: flex; flex-direction: column;
   border-radius: 16px;
@@ -84,74 +84,52 @@
   border: 1px solid rgba(255,255,255,0.09);
   box-shadow: 0 24px 60px -24px rgba(0,0,0,0.8);
   animation: ctx-pop 180ms ease-out both;
-  /* visible (not hidden) so the absolutely-positioned .ctx-menu dropdown can
-     extend past a short bubble without being clipped. The body clips its own
-     content to the rounded bottom corners (see .ctx-bubble-body). */
-  overflow: visible;
+  /* Direct tab bar (no dropdown) — clip to the rounded corners. */
+  overflow: hidden;
 }
 @keyframes ctx-pop {
   from { opacity: 0; transform: translateY(-6px) scale(0.98); }
   to { opacity: 1; transform: translateY(0) scale(1); }
 }
 .ctx-bubble-head {
-  position: relative;
-  display: flex; align-items: center; gap: 8px;
-  padding: 8px 8px 8px 10px;
+  display: flex; align-items: center; gap: 6px;
+  padding: 7px 7px 7px 8px;
   border-bottom: 1px solid rgba(255,255,255,0.06);
   flex-shrink: 0;
 }
-.ctx-trigger {
+/* Direct tab bar — one click switches content (no nested dropdown). Scrolls
+   horizontally on a narrow bubble so all six tabs stay reachable. */
+.ctx-tabs {
   flex: 1; min-width: 0;
-  display: inline-flex; align-items: center; gap: 8px;
-  padding: 6px 10px; border-radius: 10px;
-  font-family: var(--font-display); font-weight: 600; font-size: 12.5px;
-  color: var(--on-surface);
-  background: rgba(255,255,255,0.04);
-  border: 1px solid rgba(255,255,255,0.06);
-  cursor: pointer; transition: all 140ms ease;
+  display: flex; align-items: center; gap: 2px;
+  overflow-x: auto; scrollbar-width: none;
 }
-.ctx-trigger:hover { background: rgba(255,255,255,0.07); border-color: rgba(224,142,254,0.28); }
-.ctx-trigger-label { flex: 1; text-align: left; }
-.ctx-trigger svg:first-child { color: var(--primary); }
+.ctx-tabs::-webkit-scrollbar { display: none; }
+.ctx-tab {
+  position: relative; flex-shrink: 0;
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 6px 9px; border-radius: 9px;
+  font-family: var(--font-display); font-weight: 600; font-size: 11.5px;
+  color: var(--on-surface-variant);
+  background: transparent; border: 1px solid transparent; cursor: pointer;
+  transition: all 130ms ease; white-space: nowrap;
+}
+.ctx-tab:hover { background: rgba(255,255,255,0.05); color: var(--on-surface); }
+.ctx-tab.on {
+  color: var(--primary);
+  background: rgba(224,142,254,0.1);
+  border-color: rgba(224,142,254,0.26);
+}
+.ctx-tab .label { line-height: 1; }
+.ctx-tab svg:first-child { opacity: 0.9; }
+.ctx-tab .ctx-pill-count { min-width: 14px; height: 14px; padding: 0 3px; font-size: 8.5px; }
 .ctx-bubble-close {
-  width: 28px; height: 28px; flex-shrink: 0;
+  width: 26px; height: 26px; flex-shrink: 0;
   display: inline-flex; align-items: center; justify-content: center;
   border-radius: 8px; border: 0; cursor: pointer;
   background: transparent; color: var(--on-surface-muted);
 }
 .ctx-bubble-close:hover { background: rgba(255,255,255,0.06); color: var(--on-surface); }
-
-/* Dropdown menu (closed via click-outside hook in ContextBubble, not a scrim:
-   .ctx-bubble's backdrop-filter would trap a fixed scrim inside the bubble).
-   SCOPED to .ctx-bubble: the bare `.ctx-menu` class also belongs to the global
-   right-click menu (panels.css, z-index:9999). Unscoped, this rule won the
-   cascade (imported later) and dropped that menu to z-index:31 — under its own
-   close-overlay (9998) — so every click hit the overlay and the menu was
-   unclickable. The descendant selector keeps this style on the bubble dropdown
-   (higher specificity) while leaving the global menu on panels.css. */
-.ctx-bubble .ctx-menu {
-  position: absolute; top: calc(100% + 4px); left: 8px; right: 8px; z-index: 31;
-  padding: 6px;
-  border-radius: 12px;
-  background: rgba(16,14,28,0.97);
-  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturation));
-  border: 1px solid rgba(255,255,255,0.1);
-  box-shadow: 0 18px 44px -18px rgba(0,0,0,0.85);
-  display: flex; flex-direction: column; gap: 2px;
-}
-.ctx-menu-item {
-  display: flex; align-items: center; gap: 9px;
-  padding: 8px 10px; border-radius: 8px;
-  font-family: var(--font-display); font-size: 12px; font-weight: 500;
-  color: var(--on-surface-variant);
-  background: transparent; border: 0; cursor: pointer; text-align: left;
-  transition: all 130ms ease;
-}
-.ctx-menu-item:hover { background: rgba(255,255,255,0.05); color: var(--on-surface); }
-.ctx-menu-item.on { color: var(--primary); }
-.ctx-menu-item .label { flex: 1; }
-.ctx-menu-item .check { color: var(--primary); font-size: 11px; }
-.ctx-menu-item svg:first-child { opacity: 0.85; }
 
 /* overflow-y:auto (with default overflow-x) clips both axes, so the rounded
    bottom corners are honored even though the parent .ctx-bubble is now
@@ -332,6 +310,211 @@
 .ctx-preview-go:hover { color: var(--on-surface); background: rgba(255,255,255,0.08); }
 .ctx-preview-frame { flex: 1; min-height: 0; border-radius: 10px; overflow: hidden; border: 1px solid rgba(255,255,255,0.08); background: #fff; }
 .ctx-preview-frame iframe { width: 100%; height: 100%; border: 0; display: block; }
+
+/* ── Plan card (réutilise le rendu partagé <AgentPlan/>) ──── */
+.ctx-plan-wrap .cx-agent-plan { margin: 0; }
+
+/* ── Agents : ligne « ce qu'il fait » (action en cours) ──── */
+.task-activity {
+  display: flex; align-items: center; gap: 6px; margin-top: 8px;
+  padding: 5px 7px; border-radius: 7px;
+  background: rgba(255,255,255,0.03);
+  font-family: var(--font-mono); font-size: 10.5px; color: var(--on-surface-variant);
+}
+.task-activity .ic { flex-shrink: 0; }
+.task-activity .lb { color: var(--on-surface); flex-shrink: 0; }
+.task-activity .dt { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--on-surface-muted); }
+.task-activity .st { flex-shrink: 0; color: var(--primary); }
+
+/* ── Erreur inline (init / worktree / save) ─────────────── */
+.ctx-err {
+  margin-top: 8px; padding: 6px 9px; border-radius: 8px;
+  font-family: var(--font-mono); font-size: 10.5px; line-height: 1.4;
+  color: var(--danger);
+  background: rgba(255,106,138,0.08); border: 1px solid rgba(255,106,138,0.22);
+  word-break: break-word;
+}
+
+/* ── Git : état « pas de dépôt » (init) ─────────────────── */
+.ctx-git-init {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 12px; padding: 28px 18px; text-align: center; color: var(--on-surface-muted);
+}
+.ctx-git-init svg { color: var(--on-surface-muted); opacity: 0.7; }
+.ctx-git-init p { margin: 0; font-size: 12px; line-height: 1.5; max-width: 240px; }
+
+/* ── Git : récap visuel ─────────────────────────────────── */
+.ctx-git { display: flex; flex-direction: column; gap: 16px; }
+.ctx-git-branch { display: flex; align-items: center; gap: 8px; }
+.ctx-git-fullbtn {
+  margin-left: auto; flex-shrink: 0;
+  padding: 4px 10px; border-radius: 8px; cursor: pointer;
+  font-family: var(--font-display); font-weight: 600; font-size: 10.5px;
+  color: var(--on-surface-variant);
+  background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08);
+  transition: all 130ms ease;
+}
+.ctx-git-fullbtn:hover { color: var(--primary); border-color: rgba(224,142,254,0.28); }
+.ctx-git-section { display: flex; flex-direction: column; gap: 6px; }
+.ctx-git-sec-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase;
+  letter-spacing: 0.12em; color: var(--on-surface-muted);
+}
+.ctx-diffstat { font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0; text-transform: none; }
+.ctx-git .add { color: var(--success); }
+.ctx-git .rem { color: var(--danger); }
+
+.ctx-git-files { display: flex; flex-direction: column; gap: 1px; }
+.ctx-git-file {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 6px; border-radius: 7px;
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--on-surface-variant);
+  cursor: pointer; transition: background 130ms ease;
+}
+.ctx-git-file:hover { background: rgba(255,255,255,0.04); color: var(--on-surface); }
+.ctx-git-file .dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.ctx-git-file .name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ctx-git-file .nums { flex-shrink: 0; display: inline-flex; gap: 6px; font-size: 10px; }
+
+/* mini commit graph — pastille reliée par une ligne verticale */
+.ctx-git-commits { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.ctx-commit { display: flex; gap: 10px; padding: 4px 0; }
+.ctx-commit .graph { position: relative; width: 12px; flex-shrink: 0; display: flex; justify-content: center; }
+.ctx-commit .graph::before {
+  content: ""; position: absolute; top: 0; bottom: -8px; left: 50%;
+  width: 1px; transform: translateX(-50%); background: rgba(255,255,255,0.1);
+}
+.ctx-commit:last-child .graph::before { display: none; }
+.ctx-commit .cdot {
+  position: relative; z-index: 1; margin-top: 4px;
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--primary); box-shadow: 0 0 0 3px rgba(224,142,254,0.12);
+}
+.ctx-commit .cbody { flex: 1; min-width: 0; }
+.ctx-commit .csum { font-size: 12px; color: var(--on-surface); line-height: 1.35; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ctx-commit .cmeta { margin-top: 2px; font-family: var(--font-mono); font-size: 9.5px; color: var(--on-surface-muted); }
+.ctx-commit .cmeta .coid { color: var(--tertiary); }
+
+/* ── Git : worktrees ────────────────────────────────────── */
+.ctx-wt-add {
+  width: 22px; height: 22px; display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 6px; cursor: pointer; color: var(--on-surface-variant);
+  background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08);
+}
+.ctx-wt-add:hover { color: var(--primary); border-color: rgba(224,142,254,0.28); }
+.ctx-wt-form { display: flex; align-items: center; gap: 6px; }
+.ctx-wt-input {
+  flex: 1; min-width: 0;
+  background: rgba(7,7,16,0.6); border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px; padding: 6px 9px;
+  font-family: var(--font-mono); font-size: 11px; color: var(--on-surface); outline: none;
+}
+.ctx-wt-input:focus { border-color: rgba(224,142,254,0.35); }
+.ctx-wt-list { display: flex; flex-direction: column; gap: 2px; }
+.ctx-wt { display: flex; align-items: center; gap: 4px; }
+.ctx-wt-main {
+  flex: 1; min-width: 0;
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 7px; border-radius: 7px;
+  background: transparent; border: 1px solid transparent; cursor: pointer;
+  color: var(--on-surface-variant); text-align: left; transition: background 130ms ease;
+}
+.ctx-wt-main:hover:not(:disabled) { background: rgba(255,255,255,0.04); color: var(--on-surface); }
+.ctx-wt-main:disabled { cursor: default; }
+.ctx-wt-main svg { color: var(--tertiary); flex-shrink: 0; }
+.ctx-wt-main .wt-branch { font-family: var(--font-mono); font-size: 11.5px; color: var(--on-surface); flex-shrink: 0; }
+.ctx-wt-main .wt-path { font-family: var(--font-mono); font-size: 10px; color: var(--on-surface-muted); flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ctx-wt-main .wt-cur { flex-shrink: 0; font-family: var(--font-mono); font-size: 8.5px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--primary); padding: 1px 6px; border-radius: 999px; background: rgba(224,142,254,0.12); border: 1px solid rgba(224,142,254,0.3); }
+.ctx-wt.current .ctx-wt-main { border-color: rgba(224,142,254,0.2); background: rgba(224,142,254,0.05); }
+.ctx-wt-rm {
+  width: 24px; height: 24px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 6px; cursor: pointer; color: var(--on-surface-muted);
+  background: transparent; border: 0;
+}
+.ctx-wt-rm:hover:not(:disabled) { color: var(--danger); background: rgba(255,106,138,0.08); }
+
+/* ── Prévisu : état vide + sélecteur de serveur ─────────── */
+.ctx-preview-empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 14px; padding: 28px 18px; text-align: center; color: var(--on-surface-muted);
+}
+.ctx-preview-empty svg { color: var(--on-surface-muted); opacity: 0.7; }
+.ctx-preview-empty p { margin: 0; font-size: 12px; line-height: 1.55; max-width: 260px; }
+.ctx-preview-empty code { font-family: var(--font-mono); font-size: 11px; color: var(--tertiary); background: rgba(129,236,255,0.08); padding: 1px 5px; border-radius: 5px; }
+.ctx-preview-manual { display: flex; align-items: center; gap: 6px; width: 100%; }
+.ctx-preview-manual input {
+  flex: 1; min-width: 0;
+  background: rgba(7,7,16,0.6); border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px; padding: 6px 10px;
+  font-family: var(--font-mono); font-size: 11px; color: var(--on-surface); outline: none;
+}
+.ctx-preview-manual input:focus { border-color: rgba(224,142,254,0.35); }
+.ctx-preview-sel {
+  flex-shrink: 0; max-width: 130px;
+  background: rgba(7,7,16,0.6); border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px; padding: 6px 8px;
+  font-family: var(--font-mono); font-size: 11px; color: var(--on-surface); outline: none;
+}
+
+/* ── Sources : tags de provenance (éditeur / @mention / RAG) ── */
+.ctx-source-kinds { flex-shrink: 0; font-family: var(--font-mono); font-size: 9.5px; color: var(--tertiary); }
+
+/* ── Env : éditeur de fichiers .env ─────────────────────── */
+.ctx-env-editor { display: flex; flex-direction: column; gap: 14px; }
+.ctx-envfile {
+  border: 1px solid rgba(255,255,255,0.07); border-radius: 12px;
+  padding: 10px; background: rgba(255,255,255,0.02);
+}
+.ctx-envfile-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 9px; }
+.ctx-envfile-name {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--on-surface);
+  background: transparent; border: 0; cursor: pointer; padding: 0;
+}
+.ctx-envfile-name svg { color: var(--tertiary); }
+.ctx-envfile-name:hover { color: var(--primary); }
+.ctx-envfile-actions { display: flex; align-items: center; gap: 6px; }
+.ctx-envfile-toggle {
+  padding: 4px 9px; border-radius: 7px; cursor: pointer;
+  font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--on-surface-variant);
+  background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08);
+}
+.ctx-envfile-toggle.on { color: var(--primary); border-color: rgba(224,142,254,0.28); }
+.ctx-env-rows { display: flex; flex-direction: column; gap: 5px; }
+.ctx-env-kv { display: flex; align-items: center; gap: 5px; }
+.ctx-env-key, .ctx-env-val {
+  background: rgba(7,7,16,0.6); border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 7px; padding: 5px 8px;
+  font-family: var(--font-mono); font-size: 11px; color: var(--on-surface); outline: none; min-width: 0;
+}
+.ctx-env-key { flex: 0 0 38%; }
+.ctx-env-val { flex: 1; }
+.ctx-env-key:focus, .ctx-env-val:focus { border-color: rgba(224,142,254,0.35); }
+.ctx-env-eye, .ctx-env-del {
+  width: 26px; height: 26px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 6px; cursor: pointer; color: var(--on-surface-muted);
+  background: transparent; border: 0; font-size: 12px;
+}
+.ctx-env-eye:hover { color: var(--on-surface); background: rgba(255,255,255,0.06); }
+.ctx-env-del:hover { color: var(--danger); background: rgba(255,106,138,0.08); }
+.ctx-env-addrow {
+  display: inline-flex; align-items: center; gap: 5px; margin-top: 3px;
+  padding: 5px 8px; border-radius: 7px; cursor: pointer;
+  font-family: var(--font-display); font-size: 11px; color: var(--on-surface-variant);
+  background: transparent; border: 1px dashed rgba(255,255,255,0.12);
+}
+.ctx-env-addrow:hover { color: var(--primary); border-color: rgba(224,142,254,0.3); }
+.ctx-env-raw {
+  width: 100%; min-height: 140px; resize: vertical;
+  background: rgba(7,7,16,0.6); border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px; padding: 9px 10px;
+  font-family: var(--font-mono); font-size: 11px; line-height: 1.5; color: var(--on-surface); outline: none;
+}
+.ctx-env-raw:focus { border-color: rgba(224,142,254,0.35); }
 
 @media (max-width: 900px) {
   .ctx-bubble { width: calc(100% - 36px); }

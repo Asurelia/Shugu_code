@@ -38,4 +38,10 @@ export const gitKeys = {
 
   /** Configured remotes (name + url + push_url). */
   remotes: () => [...gitKeys.all, "remotes"] as const,
+
+  /** Linked worktrees (path + branch + head). */
+  worktrees: () => [...gitKeys.all, "worktrees"] as const,
+
+  /** Per-file numstat (added/removed lines vs HEAD). */
+  numstat: () => [...gitKeys.all, "numstat"] as const,
 };
