@@ -205,6 +205,16 @@ export interface SpawnArgs {
    *  toute mutation). `"agent"` (ou absent) ⇒ exécution directe complète.
    *  Sérialise vers le champ Rust `mode` (SpawnArgs). */
   mode?: "plan" | "agent" | (string & {});
+  /** Modèle CONSEILLER distinct pour l'outil `advisor` in-loop (v2). Résolu
+   *  côté appelant depuis `routing.advisorModel` (provider compris). Quand
+   *  fourni, le runner consulte CE modèle au lieu de l'exécuteur (sinon
+   *  auto-consultation). Les 4 champs vont ensemble. Sérialisent vers les
+   *  champs Rust `advisor_model`/`advisor_protocol`/`advisor_base_url`/
+   *  `advisor_api_key`. */
+  advisorModel?: string;
+  advisorProtocol?: string;
+  advisorBaseUrl?: string;
+  advisorApiKey?: string;
 }
 
 /** Spawn an agent. Returns the freshly minted agent id (UUID v4 string).
