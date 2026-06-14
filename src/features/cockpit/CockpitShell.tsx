@@ -16,7 +16,6 @@ import {
   hydrateLayout,
   isLayoutHydrated,
   setRightPanelOpen,
-  openSurface,
   setSizes,
   setBottomDockOpen,
   setBottomDockSize,
@@ -153,14 +152,8 @@ export function CockpitShell({ activeConv }: { activeConv: string }) {
     <button
       className="tb-action"
       aria-label="Afficher/Masquer le panneau"
-      title="Afficher/Masquer le panneau (Éditeur / Révision)"
-      onClick={() => {
-        if (layout.rightPanelOpen) {
-          setRightPanelOpen(false);
-        } else {
-          openSurface(layout.activeSurface);
-        }
-      }}
+      title="Afficher/Masquer le panneau de droite (tuiles)"
+      onClick={() => setRightPanelOpen(!layout.rightPanelOpen)}
     >
       {/* Mirrors the left tb-side-toggle but flipped: divider on the right
           side (x=15) and chevron direction reflects panel open/closed state. */}

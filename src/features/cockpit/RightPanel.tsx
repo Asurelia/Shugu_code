@@ -1,147 +1,28 @@
 // src/features/cockpit/RightPanel.tsx
-// Right-panel chrome: tab bar of OPENED surfaces (Codex model) + "+"-menu to
-// add more + close button. Hosts SurfaceHost. The tab bar shows only surfaces
-// the user has opened; "+" lists the ones not yet open.
-import { useState } from "react";
-import { Icon } from "@/components/components";
+// Le panneau de droite EST le système de TUILES (façon Claude Code) : la grille
+// redimensionnable des tuiles ouvertes via le menu « Contexte » (cf.
+// ContextTiles + tilesStore). Plus d'ancienne surface mono-onglet ni de "+"-menu :
+// l'éditeur est désormais une tuile (« Éditeur »), comme tout le reste. Quand
+// aucune tuile n'est ouverte, ContextTiles affiche son état vide (invite à
+// ouvrir un panneau depuis « Contexte »).
 import { useShell } from "@/routes/shell-context";
-import { SurfaceHost } from "./SurfaceHost";
-import { SURFACE_MENU } from "./surfaces";
-import { closeSurface, openSurface, setActiveSurface, setBottomDockOpen, setRightPanelOpen, useCockpitLayout } from "./layoutStore";
 import { ContextTiles } from "@/features/context-cards/ContextTiles";
-import { useOpenTiles } from "@/features/context-cards/tilesStore";
+import { openTile } from "@/features/context-cards/tilesStore";
 
 export function RightPanel({ convId }: { convId: string }) {
   const shell = useShell();
-  const openTiles = useOpenTiles();
-  const layout = useCockpitLayout();
-
-  // Mode TUILES : dès qu'une tuile est ouverte (via le menu « Contexte »), le
-  // panneau droit devient la grille redimensionnable de tuiles. Sinon, la
-  // surface classique (éditeur / révision…) ci-dessous.
-  if (openTiles.length > 0) {
-    return (
-      <div className="cockpit-right" style={{ display: "flex", flexDirection: "column", height: "100%", minWidth: 0 }}>
-        <ContextTiles
-          convId={convId}
-          onOpenFile={(p) => { void shell.openFile(p); }}
-          editor={{ openFiles: shell.openFiles, activeFile: shell.activeFile, fileContents: shell.fileContents }}
-        />
-      </div>
-    );
-  }
-  const { openedSurfaces, activeSurface } = layout;
-  const [menuOpen, setMenuOpen] = useState(false);
-
-  // Surfaces available to add via "+" = those not yet in openedSurfaces.
-  const addableSurfaces = SURFACE_MENU.filter((s) => !openedSurfaces.includes(s.id));
-  // "allOpen" means all RIGHT-PANEL surfaces are open — but we always show
-  // the Terminal bottom-dock entry in the menu, so we never fully disable "+".
-  const allRightSurfacesOpen = addableSurfaces.length === 0;
-
   return (
-    <div className="cockpit-right" style={{ display: "flex", flexDirection: "column", height: "100%", minWidth: 0 }}>
-      <div
-        className="cockpit-right-tabs"
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 4,
-          padding: "6px 8px",
-          borderBottom: "1px solid rgba(255,255,255,0.07)",
-        }}
-      >
-        {/* Tabs — only opened surfaces. Each has a × to close (hidden when
-            it's the last one). */}
-        {openedSurfaces.map((id) => {
-          const meta = SURFACE_MENU.find((s) => s.id === id);
-          if (!meta) return null;
-          const isActive = activeSurface === id;
-          const isLast = openedSurfaces.length === 1;
-          return (
-            <span key={id} style={{ display: "inline-flex", alignItems: "center", gap: 2 }}>
-              <button
-                className={"lgb lgb-sm" + (isActive ? " lgb-primary" : "")}
-                onClick={() => setActiveSurface(id)}
-              >
-                {meta.label}
-              </button>
-              {!isLast && (
-                <button
-                  className="lgb lgb-sm"
-                  aria-label={`Fermer ${meta.label}`}
-                  title={`Fermer ${meta.label}`}
-                  style={{ padding: "0 3px", opacity: 0.55 }}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    closeSurface(id);
-                  }}
-                >
-                  <Icon name="x" size={10} />
-                </button>
-              )}
-            </span>
-          );
-        })}
-
-        {/* "+"-menu — lists surfaces not yet opened + Terminal bottom-dock toggle. */}
-        <span style={{ position: "relative" }}>
-          <button
-            className="lgb lgb-sm"
-            title="Ajouter une surface"
-            onClick={() => setMenuOpen((o) => !o)}
-          >
-            <Icon name="sparkle" size={11} /> +
-          </button>
-          {menuOpen && (
-            <>
-              <div style={{ position: "fixed", inset: 0, zIndex: 9997 }} onClick={() => setMenuOpen(false)} />
-              <div
-                className="chat-ctx"
-                style={{ position: "absolute", top: "calc(100% + 6px)", left: 0, minWidth: 200, zIndex: 9998 }}
-              >
-                <div className="chat-ctx-target">Ouvrir une surface</div>
-                {addableSurfaces.map((s) => (
-                  <button
-                    key={s.id}
-                    className="chat-ctx-item"
-                    onClick={() => {
-                      openSurface(s.id);
-                      setMenuOpen(false);
-                    }}
-                  >
-                    <span className="label">{s.label}</span>
-                  </button>
-                ))}
-                {allRightSurfacesOpen && addableSurfaces.length === 0 && (
-                  <div className="chat-ctx-target" style={{ opacity: 0.5, fontSize: 11 }}>
-                    Toutes les surfaces sont ouvertes
-                  </div>
-                )}
-                {/* Terminal lives in the bottom dock — always offered. */}
-                <button
-                  className="chat-ctx-item"
-                  onClick={() => {
-                    setBottomDockOpen(true);
-                    setMenuOpen(false);
-                  }}
-                >
-                  <span className="label">Terminal (bas)</span>
-                </button>
-              </div>
-            </>
-          )}
-        </span>
-
-        <span style={{ flex: 1 }} />
-
-        {/* Close (collapse) the right panel. */}
-        <button className="lgb lgb-sm" aria-label="Fermer le panneau" title="Fermer le panneau" onClick={() => setRightPanelOpen(false)}>
-          <Icon name="x" size={13} />
-        </button>
-      </div>
-
-      <SurfaceHost active={activeSurface} />
+    <div
+      className="cockpit-right"
+      style={{ display: "flex", flexDirection: "column", height: "100%", minWidth: 0 }}
+    >
+      <ContextTiles
+        convId={convId}
+        // Ouvrir un fichier (depuis Fichiers / Sources / Révision) le montre dans
+        // la tuile Éditeur — qu'on ouvre au besoin.
+        onOpenFile={(p) => { void shell.openFile(p); openTile("editor"); }}
+        editor={{ openFiles: shell.openFiles, activeFile: shell.activeFile, fileContents: shell.fileContents }}
+      />
     </div>
   );
 }

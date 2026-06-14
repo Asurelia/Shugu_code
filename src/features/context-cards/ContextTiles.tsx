@@ -9,6 +9,8 @@ import { Fragment } from "react";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import { Icon, SideFiles } from "@/components/components";
 import { DockTerminal } from "@/features/dock/Dock";
+import { CodeView } from "@/features/code/views-code";
+import { useShell } from "@/routes/shell-context";
 import { ContextCard, CTX_TABS, type CtxTabId, type EditorBridge } from "./cards";
 import { useOpenTiles, closeTile, type TileId } from "./tilesStore";
 
@@ -85,7 +87,9 @@ function Tile({
   onOpenFile: (path: string) => void;
   editor: EditorBridge;
 }) {
+  const shell = useShell();
   const meta = tileMeta(id);
+  const flush = id === "terminal" || id === "files" || id === "editor";
   return (
     <div className="ctx-tile-slot">
       <div className="ctx-tile">
@@ -97,13 +101,26 @@ function Tile({
             <Icon name="x" size={12} />
           </button>
         </div>
-        <div className={"ctx-tile-body" + (id === "terminal" || id === "files" ? " flush" : "")}>
+        <div className={"ctx-tile-body" + (flush ? " flush" : "")}>
           {id === "terminal" ? (
             <DockTerminal tabId="ctx-tile-terminal" name="Terminal" />
           ) : id === "files" ? (
             <div className="ctx-tile-files">
               <SideFiles active={editor.activeFile ?? null} onPick={(p: string) => onOpenFile(p)} />
             </div>
+          ) : id === "editor" ? (
+            // Tuile « Éditeur » = le VRAI éditeur cockpit (CodeView embarqué), pour
+            // que l'ancien panneau de droite disparaisse tout en gardant l'éditeur.
+            <CodeView
+              activeFile={shell.activeFile}
+              openFiles={shell.openFiles}
+              setOpenFiles={shell.setOpenFiles}
+              setActiveFile={shell.setActiveFile}
+              fileContents={shell.fileContents}
+              setFileContents={shell.setFileContents}
+              editorViewRef={shell.editorViewRef}
+              embedded
+            />
           ) : (
             <ContextCard tab={id} convId={convId} onOpenFile={onOpenFile} editor={editor} />
           )}
