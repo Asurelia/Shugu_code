@@ -162,72 +162,8 @@ export function resolveRoute(text: string, override?: DelegateOverride): Route {
   return resolveThinking("auto", text) ? "chat-think" : "chat-direct";
 }
 
-// ────────────────────────────────────────────────────────────────────
-// Model-tier-aware complexity classifier
-// ────────────────────────────────────────────────────────────────────
-
-export type ModelTier = "weak" | "strong";
-
-/**
- * Tier de capacité du modèle qui exécute. Détermine à quel point on doit
- * superviser : un modèle faible se plante sur des tâches qu'un fort gère seul.
- *
- * weak  = local/petit (llamacpp, ollama, *mini*, *7b/8b*, haiku…)
- * strong = frontière (opus, sonnet, gpt-4o non-mini, gpt-4.1, gpt-5…)
- *
- * Défaut prudent = "weak" (mieux vaut superviser que rater).
- *
- * NOTE: les patterns weak sont testés EN PREMIER pour que des ids comme
- * "gpt-4o-mini" tombent dans "weak" avant d'atteindre le test "gpt-4o".
- */
-export function resolveModelTier(modelId: string): ModelTier {
-  const id = (modelId || "").toLowerCase();
-
-  // Weak patterns — checked FIRST (gpt-4o-mini must not match the gpt-4o strong pattern)
-  if (/^(llamacpp|ollama)\//.test(id)) return "weak";
-  if (/(?:^|[^a-z0-9])(mini|small|haiku|1\.5b|2b|3b|4b|7b|8b|9b)(?:[^a-z0-9]|$)/.test(id)) return "weak";
-
-  // Strong patterns — frontier / large models
-  if (/(opus|sonnet|gpt-4o(?!-mini)|gpt-4\.1|gpt-4-turbo|gpt-5|minimax-m3|minimax-m2\.7)/.test(id)) return "strong";
-
-  // Default: treat unknown models as weak (supervise rather than miss)
-  return "weak";
-}
-
-/**
- * Une tâche est "complex" (mérite un reviewer) selon des signaux statiques,
- * comparés à un SEUIL QUI DÉPEND DU TIER :
- *
- *   weak  → seuil BAS  (review souvent, le petit modèle a besoin du filet)
- *   strong → seuil HAUT (review rarement, le grand modèle gère seul)
- *
- * Pur, aucun appel LLM.
- */
-export function classifyComplexity(task: string, modelId: string): "simple" | "complex" {
-  const t = (task || "").toLowerCase();
-  let score = 0;
-
-  // Multi-step sequencing signals
-  if (/\b(puis|ensuite|étape|step\s*\d|d'?abord|enfin|then|after that)\b/i.test(t)) score += 2;
-
-  // High-risk verbs (structural changes, moves, renames, redesign)
-  if (/\b(refactor\w*|migr\w*|rewrite|réécri\w*|architect\w*|conçois|design|restructur\w*|renomm\w*|rename|déplac\w*)\b/i.test(t)) score += 2;
-
-  // Multi-file / broad-scope signals
-  if (/\b(fichiers|files|plusieurs|tous les|partout|across|everywhere|modules?)\b/i.test(t)) score += 2;
-
-  // Text length (longer prompts → more likely complex)
-  if (t.length > 500) score += 2;
-  else if (t.length > 240) score += 1;
-
-  // Many distinct action verbs → multi-step intent
-  const actionVerbs = (
-    t.match(/\b(create|add|implement|impl[ée]ment\w*|write|écri\w*|fix|corrig\w*|update|ajout\w*|build|crée|créer)\b/gi) || []
-  ).length;
-  if (actionVerbs >= 3) score += 1;
-
-  // Threshold: low for weak models (review often), high for strong models (review rarely).
-  // DIRECTION INVARIANT: weak threshold < strong threshold — never invert.
-  const threshold = resolveModelTier(modelId) === "weak" ? 2 : 4;
-  return score >= threshold ? "complex" : "simple";
-}
+// NOTE (nettoyage 2026-06-14) : `classifyComplexity` + `resolveModelTier` (qui
+// devinaient « simple/complexe » et « weak/strong » par mots-clés pour gater
+// l'advisor) ont été SUPPRIMÉS — l'advisor est désormais opt-in et l'agent
+// s'auto-corrige (alignement Claude Code), donc ces classifieurs fragiles
+// (le fameux « conçois un jeu vidéo = simple ») n'ont plus de consommateur.

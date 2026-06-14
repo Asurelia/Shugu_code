@@ -81,18 +81,12 @@ void (async () => {
 // queryClient est maintenant un singleton importé depuis lib/queryClient
 // (réutilisé par les helpers hors-React via import direct).
 
-// Sous-clés ["chat", X] à NE PAS persister (synthétique localStorage-backed ou
-// live éphémère) — cf. dehydrateOptions ci-dessous. Les messages/conversations
-// (autres sous-clés) restent persistés.
-const VOLATILE_CHAT_STATE = new Set<string>([
-  "active-conv",
-  "active-model",
-  "codex-effort",
-  "busy",
-  "unread",
-  "stream",
-  "toolActivity",
-]);
+// WHITELIST des sous-clés ["chat", X] DURABLES à persister. Tout le reste sous
+// "chat" est synthétique (localStorage-backed : active-conv/model/codex-effort)
+// ou live éphémère (busy/unread/stream/toolActivity) → JAMAIS persisté (sinon
+// 2e source de vérité qui diverge). Une whitelist (vs l'ancienne blacklist) est
+// robuste aux futures clés : toute nouvelle clé chat est non-persistée par défaut.
+const DURABLE_CHAT_SUBKEYS = new Set<string>(["messages", "conversations"]);
 
 // PersistQueryClientProvider remplace QueryClientProvider :
 //   - Hydrate le cache depuis localStorage au mount (cache rehydration)
@@ -110,43 +104,34 @@ const inner = (
       // ["chat","active-conv"] (etc.). shouldDehydrateQuery ne filtre QUE
       // l'écriture, pas la restauration — sans bump, l'ancienne valeur serait
       // rehydratée une dernière fois et la divergence persisterait un boot.
-      buster: "v2",
+      // v3 : la règle de déshydratation a changé (blacklist → whitelist chat) ;
+      // on invalide le snapshot existant pour repartir propre.
+      buster: "v3",
       // Les états AI inline sont PUREMENT éphémères et ne doivent JAMAIS être
-      // persistés/rehydratés :
-      //   • ["ai-edit","session"]  → rehydrater un "preview"/"streaming" périmé
-      //     casserait le widget (pas de diff réel sous-jacent).
-      //   • ["ai-apply","request"] → rehydrater une requête d'apply périmée la
-      //     rejouerait au 1er mount /code (diff surprise / fichier disparu).
-      //   • ["ai-review","dialog"] → rehydrater open:true rouvrirait le dialog
-      //     de review tout seul au reload.
+      // persistés/rehydratés (rehydrater un preview/diff/dialog périmé casserait
+      // le widget ou rouvrirait un dialog tout seul) : ["ai-edit"], ["ai-apply"],
+      // ["ai-review"].
       //
-      // Les états SYNTHÉTIQUES/VOLATILES du chat ne doivent pas non plus être
-      // persistés ici — c'est une SECONDE source de vérité qui DIVERGE :
-      //   • ["chat","active-conv"] / ["chat","active-model"] / ["chat",
-      //     "codex-effort"] sont DÉJÀ persistés dans localStorage (KEY_ACTIVE…)
-      //     et partagés cross-window par ce biais. Si on les rehydrate AUSSI
-      //     depuis le snapshot tanstack, la fenêtre principale (qui a un
-      //     PersistQueryClientProvider) repart sur la valeur du snapshot tandis
-      //     que la mascotte (provider simple) lit localStorage → les deux
-      //     fenêtres peuvent diverger de conversation active. On les exclut donc
-      //     du snapshot : les DEUX fenêtres retombent sur loadActive()/localStorage,
-      //     source unique partagée, et restent synchronisées via chat://active-changed.
-      //   • ["chat","busy"|"unread"|"stream"|"toolActivity"] sont des états LIVE
-      //     éphémères ; rehydrater un "streaming:true" périmé afficherait une
-      //     fausse bulle « en train de travailler » au boot.
-      // Les messages et la liste de conversations RESTENT persistés (rendu
-      // instantané au boot, puis refetch SQLite).
+      // Le namespace "chat" passe en WHITELIST : on ne persiste QUE l'historique
+      // durable (messages + conversations, qui viennent de SQLite). Tout le reste
+      // sous "chat" est soit synthétique localStorage-backed (active-conv/model,
+      // partagés cross-window → les persister AUSSI dans le snapshot tanstack
+      // créait une 2e source de vérité divergente), soit live éphémère (busy/
+      // unread/stream/toolActivity → un "streaming:true" périmé afficherait une
+      // fausse bulle au boot). La whitelist est robuste aux futures clés chat.
       dehydrateOptions: {
-        shouldDehydrateQuery: (q) =>
-          q.queryKey[0] !== "ai-edit" &&
-          q.queryKey[0] !== "ai-apply" &&
-          q.queryKey[0] !== "ai-review" &&
-          !(
-            q.queryKey[0] === "chat" &&
-            typeof q.queryKey[1] === "string" &&
-            VOLATILE_CHAT_STATE.has(q.queryKey[1])
-          ) &&
-          defaultShouldDehydrateQuery(q),
+        shouldDehydrateQuery: (q) => {
+          const ns = q.queryKey[0];
+          if (ns === "ai-edit" || ns === "ai-apply" || ns === "ai-review") return false;
+          if (ns === "chat") {
+            return (
+              typeof q.queryKey[1] === "string" &&
+              DURABLE_CHAT_SUBKEYS.has(q.queryKey[1]) &&
+              defaultShouldDehydrateQuery(q)
+            );
+          }
+          return defaultShouldDehydrateQuery(q);
+        },
       },
     }}
   >

@@ -322,17 +322,10 @@ pub(super) async fn run_agent_task(
     let protocol = protocol.unwrap_or_else(|| "openai".to_string());
     let base_url = base_url.unwrap_or_default();
 
-    // System prompt: the Atelier passes a task-specific override; chat loads the
-    // role's static seed via `load_active_harness`. `active_generation` (always 0
-    // now that the Refiner is retired) is still recorded against the run outcome
-    // for telemetry.
-    let (active_generation, mut system_prompt) = match system_prompt_override {
-        Some(p) => (0, p),
-        None => {
-            let harness = load_active_harness(&app, &role);
-            (harness.generation, harness.system_prompt)
-        }
-    };
+    // System prompt : l'Atelier passe un override par tâche ; sinon le seed
+    // STATIQUE du rôle. (Le Refiner qui faisait évoluer le prompt par
+    // « génération » est retiré — plus d'indirection ActiveHarness/generation.)
+    let mut system_prompt = system_prompt_override.unwrap_or_else(|| seed_prompt(&role));
     // Phase A (Design Studio) — when the Studio passes a design-system context,
     // append GENERATION MODE so the agent writes a complete styled project to
     // `.shugu-forge/preview/` (served live by the preview:// protocol). Chat
@@ -424,17 +417,9 @@ pub(super) async fn run_agent_task(
 
     let ms = start.elapsed().as_millis() as u64;
 
-    // Record the run outcome for per-generation metrics (Continual Harness P1).
-    // Written for both success and failure; abort (killed) returns earlier and
-    // is intentionally not scored.
-    record_outcome(
-        &app,
-        &agent_id,
-        &role,
-        active_generation,
-        loop_result.is_ok(),
-        &loop_metrics,
-    );
+    // Télémétrie par run (succès / blocage / itérations). Écrit pour succès ET
+    // échec ; un abort (killed) sort plus tôt et n'est pas scoré.
+    record_outcome(&app, &agent_id, &role, loop_result.is_ok(), &loop_metrics);
 
     match loop_result {
         Ok((output, reasoning)) => {
@@ -1165,9 +1150,8 @@ Rules:
 - Keep the app small but genuinely INTERACTIVE (the point is to test behavior, not render static text).
 - Finish with ONE short line: what you built and that its browser test passes."#;
 
-/// Seed system prompt for a role (chat path). Served verbatim by
-/// `load_active_harness` — the Refiner that used to evolve it is retired, so this
-/// is the agent's stable prompt; learning now lives in the skill library.
+/// Seed system prompt STATIQUE pour un rôle. Le Refiner qui le faisait évoluer
+/// est retiré ; l'apprentissage vit désormais dans la skill library.
 pub(crate) fn seed_prompt(role: &str) -> String {
     // Why this prompt is so directive: cloud LLMs (DeepSeek, GLM, Kimi, …) tend
     // to default to "respond from training data" when the system prompt is soft
@@ -1194,38 +1178,14 @@ pub(crate) fn seed_prompt(role: &str) -> String {
     }
 }
 
-/// One active harness generation, as served to a running agent.
-pub(super) struct ActiveHarness {
-    /// Generation number — recorded against the run's outcome (P1) so
-    /// per-generation metrics can be computed.
-    pub(super) generation: i64,
-    /// Assembled system prompt `p` for this generation.
-    pub(super) system_prompt: String,
-}
-
-/// Load the system prompt for `role`.
-///
-/// Since the lot « agent ancré » retired the prompt-rewriting Refiner and the
-/// `harness_generations` table, this is now a pure, static seed: every run uses
-/// generation 0 (`seed_prompt`). The agent's LEARNING lives in the env-verified
-/// skill library (`agent_skills`), not in prompt rewrites. Kept as a function
-/// (not inlined) so the call site and the `ActiveHarness`/`generation` plumbing
-/// stay unchanged.
-pub(super) fn load_active_harness(_app: &AppHandle, role: &str) -> ActiveHarness {
-    ActiveHarness {
-        generation: 0,
-        system_prompt: seed_prompt(role),
-    }
-}
-
-/// Persist the per-run outcome row consumed by per-generation metrics (P1).
-/// `user_feedback` is left untouched here — it is set later from the UI; a run
-/// records its outcome exactly once at completion, so INSERT OR REPLACE is safe.
+/// Persist the per-run outcome row (telemetry par run : succès, raison de
+/// blocage, itérations). La colonne `generation` est conservée pour compat de
+/// schéma mais vaut toujours 0 (le Refiner « par génération » est retiré).
+/// INSERT OR REPLACE : un run écrit son outcome une seule fois à la fin.
 fn record_outcome(
     app: &AppHandle,
     agent_id: &str,
     role: &str,
-    generation: i64,
     success: bool,
     metrics: &LoopMetrics,
 ) {
@@ -1235,11 +1195,10 @@ fn record_outcome(
                 "INSERT OR REPLACE INTO agent_outcomes
                     (agent_id, role, generation, success, stuck_reason,
                      iterations, tool_errors, ts)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     agent_id,
                     role,
-                    generation,
                     success as i64,
                     metrics.stuck_reason.as_deref(),
                     metrics.iterations as i64,

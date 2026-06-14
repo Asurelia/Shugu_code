@@ -830,17 +830,16 @@ async function handleDelegate(
     }
   }
 
-  // ── S2 + S1 shared gate ────────────────────────────────────────────────────
-  // L'advisor (plan S2 + revue S1) tourne sur TOUTE tâche déléguée. La
-  // délégation EST déjà le signal « c'est du travail, pas du bavardage » (le
-  // routeur a explicitement classé en "delegate"). On NE gate PLUS sur
-  // classifyComplexity : ce compteur de mots-clés ratait des tâches énormes
-  // mais courtes — « conçois un jeu vidéo complet » scorait "simple" pour un
-  // modèle fort (seuil 4), ce qui sautait l'advisor EN SILENCE. Restent
-  // l'interrupteur maître routing.superviseComplex (défaut ON) et l'anti-
-  // récursion (ne jamais superviser le reviewer/planner lui-même).
+  // ── Advisor S2/S1 — OPT-IN (alignement Claude Code) ─────────────────────────
+  // Par DÉFAUT, pas de 2e modèle « reviewer » : l'agent s'auto-corrige tout seul
+  // — son system prompt lui ordonne de PLANIFIER (todo_write) puis de VÉRIFIER
+  // en exécutant (run_command). C'est le modèle Claude Code/Codex : un seul
+  // agent, pas de superviseur externe. L'advisor (plan S2 + revue S1) reste
+  // ACTIVABLE pour qui veut la boucle d'auto-amélioration : `routing.
+  // superviseComplex = "true"` (défaut OFF). Anti-récursion : ne jamais
+  // superviser le reviewer/planner lui-même.
   const superviseRaw = await db.settings.get("routing.superviseComplex");
-  const superviseOn = superviseRaw == null ? true : superviseRaw === "true";
+  const superviseOn = superviseRaw === "true";
   const isReviewerInvocation = !!agentDefPath && /reviewer|planner/i.test(agentDefPath);
   // Pas d'advisor sur le bavardage TRIVIAL (« merci », « ok », salutation) :
   // depuis l'unification, le cockpit délègue CHAQUE message — un remerciement
