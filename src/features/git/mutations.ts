@@ -186,7 +186,10 @@ export function useGitInit() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: () => gitInit(),
-    onSuccess: () => qc.invalidateQueries({ queryKey: gitKeys.all }),
+    // refetchType "all" : `useIsGitRepo` a un staleTime Infinity — on force le
+    // refetch (et pas seulement le marquage stale) pour que isRepo bascule à
+    // true immédiatement et débloque les onglets git.
+    onSuccess: () => qc.invalidateQueries({ queryKey: gitKeys.all, refetchType: "all" }),
   });
 }
 

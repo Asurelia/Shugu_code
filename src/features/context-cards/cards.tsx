@@ -14,7 +14,7 @@
 //   Sources  → les VRAIES sources injectées dans la conversation (db.sources).
 //   Env      → voir / éditer les fichiers .env du projet ouvert.
 
-import { useMemo, useState, useEffect } from "react";
+import { useMemo, useState, useEffect, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Icon } from "@/components/components";
 import { SideGit } from "@/features/git/SideGit";
@@ -388,10 +388,19 @@ function WorktreesSection() {
   const rmMut = useWorktreeRemove();
   const [creating, setCreating] = useState(false);
   const [branch, setBranch] = useState("");
+  const [wtErr, setWtErr] = useState("");
 
   const create = () => {
     const b = branch.trim();
     if (!b) return;
+    // Le nom alimente le chemin `.worktrees/<b>` : on rejette tout ce qui
+    // pourrait sortir du dossier (path traversal) ou n'est pas un nom de
+    // branche git valide. `/` reste autorisé (branches namespacées feature/x).
+    if (/\.\./.test(b) || b.includes("\\") || b.startsWith("/") || /\s/.test(b) || /[~^:?*[\]]/.test(b)) {
+      setWtErr("Nom de branche invalide (pas de .. \\ espaces ni ~^:?*[ ]).");
+      return;
+    }
+    setWtErr("");
     addMut.mutate(
       { path: `.worktrees/${b}`, branch: b, newBranch: true },
       { onSuccess: () => { setCreating(false); setBranch(""); } },
@@ -430,6 +439,7 @@ function WorktreesSection() {
           </button>
         </div>
       )}
+      {wtErr && <div className="ctx-err">{wtErr}</div>}
       {addMut.isError && <div className="ctx-err">{String(addMut.error)}</div>}
       {rmMut.isError && <div className="ctx-err">{String(rmMut.error)}</div>}
 
@@ -476,6 +486,24 @@ function WorktreesSection() {
 // ─── Prévisu (iframe SEULEMENT si un serveur est détecté) ───
 const PREVIEW_PORTS = [5173, 3000, 4173, 8080, 8000, 5000];
 
+// Sécurité (revue) : l'iframe garde `allow-same-origin` (les dev-servers réels
+// en ont besoin — localStorage, HMR…) ; c'est SAIN tant que la cible est un
+// localhost http(s), donc CROSS-origin par rapport au host Tauri
+// (tauri.localhost) — la SOP bloque alors tout accès au DOM parent et Tauri
+// n'injecte pas son IPC dans une iframe cross-origin. La seule voie d'escalade
+// serait de charger l'origine de l'app elle-même : on la ferme en n'autorisant
+// QUE les hôtes locaux ci-dessous (ports détectés ET saisie manuelle).
+function isSafePreviewUrl(u: string): boolean {
+  try {
+    const url = new URL(u);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+    const h = url.hostname.toLowerCase();
+    return h === "localhost" || h === "127.0.0.1" || h === "0.0.0.0" || h === "::1" || h === "[::1]";
+  } catch {
+    return false;
+  }
+}
+
 function PreviewCard() {
   const { data: openPorts = [] } = useQuery({
     queryKey: ["ctx-preview-ports"],
@@ -490,6 +518,7 @@ function PreviewCard() {
   const [src, setSrc] = useState("");
   const [nonce, setNonce] = useState(0);
   const [manual, setManual] = useState("");
+  const [err, setErr] = useState("");
 
   // Adopt the first detected server as soon as one appears (unless the user
   // already pointed the preview somewhere manually).
@@ -500,14 +529,19 @@ function PreviewCard() {
     }
   }, [first, src]);
 
-  const go = () => { setSrc(url); setNonce((n) => n + 1); };
-  const openManual = () => {
-    const u = manual.trim();
-    if (!u) return;
+  const load = (u: string): boolean => {
+    if (!isSafePreviewUrl(u)) {
+      setErr("URL non autorisée — uniquement http(s) sur localhost.");
+      return false;
+    }
+    setErr("");
     setUrl(u);
     setSrc(u);
     setNonce((n) => n + 1);
+    return true;
   };
+  const go = () => load(url.trim());
+  const openManual = () => { if (manual.trim()) load(manual.trim()); };
 
   if (!src) {
     return (
@@ -521,7 +555,7 @@ function PreviewCard() {
           <input
             value={manual}
             onChange={(e) => setManual(e.target.value)}
-            placeholder="ou saisir une URL…"
+            placeholder="ou saisir une URL localhost…"
             spellCheck={false}
             onKeyDown={(e) => { if (e.key === "Enter") openManual(); }}
           />
@@ -529,6 +563,7 @@ function PreviewCard() {
             Ouvrir
           </button>
         </div>
+        {err && <div className="ctx-err">{err}</div>}
       </div>
     );
   }
@@ -540,7 +575,7 @@ function PreviewCard() {
           <select
             className="ctx-preview-sel"
             value={openPorts.some((p) => `http://localhost:${p}` === url) ? url : ""}
-            onChange={(e) => { setUrl(e.target.value); setSrc(e.target.value); setNonce((n) => n + 1); }}
+            onChange={(e) => load(e.target.value)}
           >
             <option value="" disabled>serveurs…</option>
             {openPorts.map((p) => {
@@ -561,6 +596,7 @@ function PreviewCard() {
           <Icon name="history" size={12} />
         </button>
       </div>
+      {err && <div className="ctx-err">{err}</div>}
       <div className="ctx-preview-frame">
         <iframe key={nonce} src={src} title="Prévisu" sandbox="allow-scripts allow-same-origin allow-forms" />
       </div>
@@ -707,12 +743,16 @@ function EnvFileEditor({ path, onOpenFile }: { path: string; onOpenFile: (path: 
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
 
-  // (Re)hydrate from disk content. Resets dirty + reveal on external change.
+  // (Re)hydrate from disk content — but NEVER clobber unsaved edits (the 5s
+  // refetch could otherwise wipe an in-progress edit). Strings compare by value,
+  // so this effect only re-runs when the file actually changed on disk.
+  const dirtyRef = useRef(false);
+  useEffect(() => { dirtyRef.current = dirty; }, [dirty]);
   useEffect(() => {
+    if (dirtyRef.current) return;
     setRows(parseDotenv(content));
     setRawText(content);
     setReveal({});
-    setDirty(false);
   }, [content]);
 
   const name = path.split("/").pop() ?? path;

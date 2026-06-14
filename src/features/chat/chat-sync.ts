@@ -381,15 +381,18 @@ export async function sendChatMessage(
       ].join("\n");
       delegateTask = `${block}\n\n---\n\n${delegateTask}`;
     }
-    // Source réellement injectée sur le chemin délégué = le fichier éditeur
-    // (les @-mentions / RAG ne sont PAS injectés ici — l'agent explore seul).
-    // Best-effort : un échec de log ne doit jamais bloquer l'envoi.
-    if (editorInjected && editorCtx) {
-      try {
-        await db.sources.record(convId, userId, [{ path: editorCtx.path, kind: "editor" }]);
-      } catch (err) {
-        console.warn("[chat-sync] source logging (delegate) failed", err);
-      }
+    // Sources sur le chemin délégué : le fichier éditeur (injecté ci-dessus) +
+    // les @-mentions que l'utilisateur a explicitement pointées dans la tâche
+    // (leur contenu n'est pas auto-injecté ici — l'agent les lit lui-même — mais
+    // ce sont des sources voulues, donc visibles dans l'onglet Sources). Le RAG
+    // n'est pas appliqué sur ce chemin. Best-effort : ne bloque jamais l'envoi.
+    try {
+      const entries: { path: string; kind: string }[] = [];
+      if (editorInjected && editorCtx) entries.push({ path: editorCtx.path, kind: "editor" });
+      for (const mpath of parseMentions(trimmed)) entries.push({ path: mpath, kind: "mention" });
+      if (entries.length > 0) await db.sources.record(convId, userId, entries);
+    } catch (err) {
+      console.warn("[chat-sync] source logging (delegate) failed", err);
     }
     // Le modèle de chat actif sert d'orchestrateur de REPLI (cf. resolveOrchestrator).
     // `agentMode` propage le mode Plan (lecture seule) jusqu'au runner.
