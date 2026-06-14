@@ -93,36 +93,27 @@
 }
 .ctx-bubble-head {
   display: flex; align-items: center; gap: 6px;
-  padding: 7px 7px 7px 8px;
+  padding: 8px 8px 8px 10px;
   border-bottom: 1px solid rgba(255,255,255,0.06);
   flex-shrink: 0;
 }
-/* Direct tab bar — one click switches content (no nested dropdown). Scrolls
-   horizontally on a narrow bubble so all six tabs stay reachable. */
-.ctx-tabs {
+/* Header title — "Contexte" (menu) or the open card's icon+label. */
+.ctx-bubble-title {
   flex: 1; min-width: 0;
-  display: flex; align-items: center; gap: 2px;
-  overflow-x: auto; scrollbar-width: none;
+  display: inline-flex; align-items: center; gap: 7px;
+  font-family: var(--font-display); font-weight: 600; font-size: 12.5px;
+  color: var(--on-surface);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.ctx-tabs::-webkit-scrollbar { display: none; }
-.ctx-tab {
-  position: relative; flex-shrink: 0;
-  display: inline-flex; align-items: center; gap: 5px;
-  padding: 6px 9px; border-radius: 9px;
-  font-family: var(--font-display); font-weight: 600; font-size: 11.5px;
-  color: var(--on-surface-variant);
-  background: transparent; border: 1px solid transparent; cursor: pointer;
-  transition: all 130ms ease; white-space: nowrap;
+.ctx-bubble-title svg { color: var(--primary); flex-shrink: 0; }
+/* "‹" back-to-menu button (card view). */
+.ctx-back {
+  width: 26px; height: 26px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 8px; border: 0; cursor: pointer;
+  background: transparent; color: var(--on-surface-variant);
 }
-.ctx-tab:hover { background: rgba(255,255,255,0.05); color: var(--on-surface); }
-.ctx-tab.on {
-  color: var(--primary);
-  background: rgba(224,142,254,0.1);
-  border-color: rgba(224,142,254,0.26);
-}
-.ctx-tab .label { line-height: 1; }
-.ctx-tab svg:first-child { opacity: 0.9; }
-.ctx-tab .ctx-pill-count { min-width: 14px; height: 14px; padding: 0 3px; font-size: 8.5px; }
+.ctx-back:hover { background: rgba(255,255,255,0.06); color: var(--primary); }
 .ctx-bubble-close {
   width: 26px; height: 26px; flex-shrink: 0;
   display: inline-flex; align-items: center; justify-content: center;
@@ -130,6 +121,39 @@
   background: transparent; color: var(--on-surface-muted);
 }
 .ctx-bubble-close:hover { background: rgba(255,255,255,0.06); color: var(--on-surface); }
+
+/* ── Vertical launch menu (button "Contexte" → cette liste) ────
+   Une ligne par entrée : icône + libellé + (badge) + chevron/raccourci, façon
+   flyout VS Code. Clic carte → la carte remplace le menu ; clic Terminal →
+   dock du bas. */
+.ctx-launch {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 8px; overflow-y: auto;
+}
+.ctx-launch-item {
+  display: flex; align-items: center; gap: 11px;
+  padding: 10px 11px; border-radius: 10px;
+  font-family: var(--font-display); font-weight: 500; font-size: 13px;
+  color: var(--on-surface-variant);
+  background: transparent; border: 1px solid transparent; cursor: pointer;
+  text-align: left; transition: all 130ms ease;
+}
+.ctx-launch-item:hover {
+  background: rgba(224,142,254,0.08);
+  border-color: rgba(224,142,254,0.20);
+  color: var(--on-surface);
+}
+.ctx-launch-item > svg:first-child { color: var(--primary); flex-shrink: 0; opacity: 0.9; }
+.ctx-launch-item .label { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ctx-launch-item .chev { color: var(--on-surface-muted); opacity: 0; transition: opacity 130ms ease; }
+.ctx-launch-item:hover .chev { opacity: 0.7; }
+.ctx-launch-kbd {
+  flex-shrink: 0;
+  font-family: var(--font-mono); font-size: 9.5px; letter-spacing: 0.02em;
+  color: var(--on-surface-muted);
+  padding: 2px 6px; border-radius: 6px;
+  background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08);
+}
 
 /* overflow-y:auto (with default overflow-x) clips both axes, so the rounded
    bottom corners are honored even though the parent .ctx-bubble is now
