@@ -383,6 +383,14 @@ pub struct SpawnArgs {
     /// None) ⇒ exécution directe complète. Seule la délégation chat le fournit ;
     /// Atelier/Studio le laissent None (write requis).
     pub mode: Option<String>,
+    /// Modèle CONSEILLER distinct pour l'outil `advisor` (v2). Résolu côté TS
+    /// depuis `routing.advisorModel`. Quand `advisor_model` est présent, le
+    /// runner consulte CE modèle (avec son provider) au lieu de l'exécuteur.
+    /// Les 4 champs vont ensemble (None ⇒ auto-consultation).
+    pub advisor_model: Option<String>,
+    pub advisor_protocol: Option<String>,
+    pub advisor_base_url: Option<String>,
+    pub advisor_api_key: Option<String>,
 }
 
 /// Arguments for an Atelier run (env-grounded build→test→learn loop). Mirrors the
@@ -732,6 +740,23 @@ pub async fn agent_spawn(
     // Mémoire de conversation : le chemin chat passe la conv pour recharger les
     // tours précédents dans l'historique de l'agent.
     let conversation_id_for_task = args.conversation_id.clone();
+    // Modèle conseiller distinct (v2) : Some seulement si un modèle advisor a été
+    // résolu côté TS (routing.advisorModel). Sinon None ⇒ auto-consultation.
+    let advisor_for_task: Option<runner::AdvisorConfig> = match (
+        args.advisor_model.clone(),
+        args.advisor_protocol.clone(),
+        args.advisor_base_url.clone(),
+    ) {
+        (Some(model), Some(protocol), Some(base_url)) if !model.trim().is_empty() => {
+            Some(runner::AdvisorConfig {
+                model,
+                protocol,
+                base_url,
+                api_key: args.advisor_api_key.clone().unwrap_or_default(),
+            })
+        }
+        _ => None,
+    };
     tauri::async_runtime::spawn(async move {
         runner::run_agent_task(
             app_for_task,
@@ -752,6 +777,7 @@ pub async fn agent_spawn(
             system_prompt_override_for_task, // None ⇒ seed_prompt ; Some ⇒ .md custom
             read_only_for_task, // Plan mode ⇒ outils mutants retirés + refusés
             conversation_id_for_task, // recharge les tours précédents de la conv
+            advisor_for_task, // modèle conseiller distinct (v2) ou None
         )
         .await;
     });
@@ -868,6 +894,7 @@ pub async fn agent_atelier_run(
             Some(runner::ATELIER_PROMPT.to_string()),
             false, // read_only — l'Atelier doit écrire/exécuter (build→test→learn)
             None,  // conversation_id — l'Atelier n'est pas lié à une conversation
+            None,  // advisor — pas de conseiller distinct pour l'Atelier
         )
         .await;
         // The creation dir is intentionally left on disk so the preview pane can
@@ -1000,6 +1027,7 @@ pub async fn agent_grounded_run(
             Some(system_prompt),
             false, // read_only — Grounded Run écrit/exécute sur le vrai projet
             None,  // conversation_id — Grounded Run n'est pas lié à une conversation
+            None,  // advisor — pas de conseiller distinct pour Grounded Run
         )
         .await;
     });

@@ -41,7 +41,7 @@ import { parseThinkingMode, resolveThinking } from "@/lib/thinkingHeuristic";
 import { resolveRoute, parseDelegateOverride, type Route } from "@/lib/routingHeuristic";
 import { spawnAgent, awaitAgentComplete } from "@/lib/agents";
 import { readAgentDef } from "@/lib/agentDefs";
-import { superviseDeliverable, supervisePlan, resolveReviewerArgs } from "@/lib/supervisors";
+import { superviseDeliverable, resolveReviewerArgs, resolveAdvisorArgs } from "@/lib/supervisors";
 import { getActiveDesignSystem, buildDesignSystemPrompt } from "@/features/design/activeDesignSystem";
 import { queryClient } from "@/lib/queryClient";
 import { diag } from "@/lib/diag";
@@ -864,15 +864,15 @@ async function handleDelegate(
     }
   }
 
-  // ── Advisor S2/S1 — DÉFAUT ON (l'utilisateur veut la boucle d'apprentissage) ──
-  // L'advisor est un 2e modèle « reviewer » qui (S2) review le plan et (S1) review
-  // le livrable APRÈS coup, ce qui REMPLIT la mémoire long-terme (lessons → S3 :
-  // réinjectées dans les runs suivants sur tâches similaires). Distinct de
-  // l'auto-correction de l'agent (qui, elle, reste un seul modèle façon Claude
-  // Code). L'utilisateur l'a explicitement redemandé (« il n'appelle jamais
-  // l'advisor / pas de mémoire ») → DÉFAUT ON, désactivable via
-  // `routing.superviseComplex = "false"`. Advisory & non-bloquant (S1 est
-  // fire-and-forget). Anti-récursion : ne jamais superviser le reviewer/planner.
+  // ── Advisor post-hoc S1 — DÉFAUT ON (REMPLIT la mémoire long-terme) ─────────
+  // Il ne reste QUE S1 : une revue du LIVRABLE après coup (fire-and-forget) qui
+  // alimente les leçons (→ S3 : réinjectées dans les runs suivants sur tâches
+  // similaires). La planification AVANT l'exécution (ex-S2) est désormais
+  // couverte par l'outil `advisor` IN-LOOP (model-invoked, runner.rs
+  // consult_advisor) — le modèle consulte le conseiller lui-même, plus besoin
+  // d'une revue de plan post-hoc imposée par l'app. Distinct de l'auto-correction
+  // (un seul modèle). DÉFAUT ON, désactivable via `routing.superviseComplex =
+  // "false"`. Anti-récursion : ne jamais superviser le reviewer lui-même.
   const superviseRaw = await db.settings.get("routing.superviseComplex");
   const superviseOn = superviseRaw !== "false";
   const isReviewerInvocation = !!agentDefPath && /reviewer|planner/i.test(agentDefPath);
@@ -897,53 +897,25 @@ async function handleDelegate(
         id: newMessageId("e"),
         role: "ai",
         body:
-          "ℹ️ **Advisor inactif** : aucun reviewer configuré, donc pas de plan ni de revue automatiques. " +
+          "ℹ️ **Revue automatique inactive** : aucun reviewer configuré, donc pas de revue du livrable ni de leçons apprises. " +
           "Active un agent `reviewer` ou `reviewer-gpt` (Réglages → Agents) et choisis son modèle " +
-          "(Réglages → Connections, champ *Advisor*) pour voir le plan AVANT l'exécution et la revue après.",
+          "(Réglages → Connections, champ *Advisor*) pour que Shugu revoie ses livrables et en tire des leçons. " +
+          "(La planification, elle, passe désormais par l'outil `advisor` que le modèle appelle lui-même.)",
         ts: nowHHMM(),
       });
     }
   }
 
-  // ── S2 — plan review before execution ──────────────────────────────────────
-  // If supervision is active, spawn the orchestrator in "plan-only" mode, have
-  // the reviewer evaluate the plan, and optionally augment the task with the
-  // reviewer's concerns (advisory — never blocks execution).
-  let execTask = task;
-  if (wantSupervise && supervisorAvailable) {
-    // Indicateur transitoire pendant la phase plan (S2). Sans lui, il y a un
-    // trou mort entre le message user et l'apparition du « 📋 Plan » : le
-    // planner tourne 10-90 s en silence et l'utilisateur croit que rien ne se
-    // passe. Soft-deleté dès que S2 rend la main (le 📋 Plan prend le relais).
-    const planningId = newMessageId("a");
-    await appendMessage(convId, {
-      id: planningId,
-      role: "ai",
-      body: "🧭 Planification…",
-      ts: nowHHMM(),
-    });
-    try {
-      const planResult = await supervisePlan({
-        convId,
-        task,
-        orch: { model: realModel, protocol, baseUrl, apiKey },
-      });
-      if (planResult) {
-        execTask = planResult.augmentedTask;
-      }
-    } catch (s2Err) {
-      console.warn("[chat-sync] S2 supervisePlan gate failed:", s2Err);
-      // execTask stays as `task` — proceed normally.
-    } finally {
-      try {
-        await db.messages.softDelete(planningId);
-        const mod = await import("@tauri-apps/api/event");
-        await mod.emit(EVT_MESSAGES, { conversationId: convId });
-      } catch (rmErr) {
-        console.warn("[chat-sync] planning indicator cleanup failed:", rmErr);
-      }
-    }
-  }
+  // S2 (revue de plan post-hoc « plan-only » + augmentation de la tâche) RETIRÉ
+  // 2026-06-14 : l'outil `advisor` IN-LOOP couvre désormais la planification
+  // AVANT l'exécution (le modèle consulte le conseiller lui-même). On ne garde
+  // que S1 (revue du livrable → leçons), déclenché APRÈS le run plus bas.
+  const execTask = task;
+
+  // Modèle conseiller distinct pour l'outil `advisor` in-loop (v2). `null` si
+  // `routing.advisorModel` n'est pas configuré → le runner auto-consulte (le
+  // modèle de l'exécuteur). Résolu une fois ici, passé au spawn.
+  const advisor = await resolveAdvisorArgs();
 
   // Spawn the agent FIRST. We need the agentId to attach to the placeholder
   // so the reconciler (on mount) can match an orphan placeholder back to
@@ -967,6 +939,12 @@ async function handleDelegate(
       // Mode Plan → read_only côté runner (outils mutants retirés). Le défaut
       // "agent" laisse l'exécution directe complète.
       mode,
+      // v2 : modèle conseiller distinct pour l'outil `advisor` (sinon
+      // auto-consultation côté runner). Les 4 champs vont ensemble.
+      advisorModel: advisor?.model,
+      advisorProtocol: advisor?.protocol,
+      advisorBaseUrl: advisor?.baseUrl,
+      advisorApiKey: advisor?.apiKey,
     });
   } catch (err) {
     await appendMessage(convId, {
