@@ -298,6 +298,66 @@ fn agent_tools() -> &'static [ToolDef] {
                     "required": ["name", "body"]
                 }),
             },
+            ToolDef {
+                name: "code_search",
+                description: "Semantic code search over the project's VECTOR index (embeddings). \
+                              Returns the most RELEVANT code locations for a natural-language query \
+                              (e.g. \"where is the auth token refreshed\") — smarter than fs_search \
+                              (literal/regex) when you don't know the exact identifier. Each hit is a \
+                              closeness score + `path#Lstart-end`; then fs_read_file those paths. \
+                              Returns empty if the index isn't built yet for this workspace.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Natural-language description of the code you're looking for."
+                        },
+                        "k": {
+                            "type": "integer",
+                            "description": "How many hits to return (default 8, max 20)."
+                        }
+                    },
+                    "required": ["query"]
+                }),
+            },
+            ToolDef {
+                name: "web_search",
+                description: "Search the public web and return the top results (title, URL, snippet). \
+                              Use it for up-to-date information, library docs, an error message, or \
+                              anything NOT in the local project. Best-effort (DuckDuckGo). Read the \
+                              snippets; to read a full page, fetch its URL with run_command (curl).",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The web search query (plain text)."
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "How many results to return (default 5, max 10)."
+                        }
+                    },
+                    "required": ["query"]
+                }),
+            },
+            ToolDef {
+                name: "advisor",
+                description: "Consult a senior ADVISOR that sees your ENTIRE conversation transcript — \
+                              the task, every tool call you've made, every result you've seen. It takes \
+                              NO parameters: when you call advisor(), your full history is forwarded \
+                              automatically. It returns a concise strategic plan or course-correction \
+                              (text only, no tools). Call advisor BEFORE substantive work (before writing/\
+                              editing or committing to an approach), when STUCK (errors recurring, approach \
+                              not converging), and BEFORE you declare the task done. On tasks longer than a \
+                              few steps, call it at least once before committing to an approach and once \
+                              before finishing. Weigh its advice seriously, then continue.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            },
         ]
     })
 }
@@ -496,6 +556,35 @@ fn dispatch_inner(
             // continues its loop.
             let n = args["todos"].as_array().map(|a| a.len()).unwrap_or(0);
             Ok(format!("recorded {n} todo(s)"))
+        }
+        "code_search" => {
+            let query = args["query"]
+                .as_str()
+                .ok_or_else(|| "missing required field: query".to_string())?;
+            let k = args["k"].as_u64().unwrap_or(8).clamp(1, 20) as u32;
+            // Recherche SÉMANTIQUE sur l'index vectoriel du projet (collection
+            // "code", peuplée par le workspace indexer). Rend le système vectoriel
+            // — jusqu'ici réservé au RAG passif du chat-direct — appelable par
+            // l'agent. Dégrade proprement si l'index n'est pas encore construit.
+            match crate::commands::vector::vec_search_internal(app, "code", query, k) {
+                Ok(hits) if hits.is_empty() => Ok(
+                    "no semantic matches — the code index may not be built yet for this workspace. \
+                     Use fs_search (literal/regex) instead, or open the workspace so it gets indexed."
+                        .to_string(),
+                ),
+                Ok(hits) => {
+                    let lines: Vec<String> = hits
+                        .iter()
+                        .map(|h| format!("  {:.3}  {}", h.distance, h.id))
+                        .collect();
+                    Ok(format!(
+                        "Top {} semantic matches (closeness asc, then `path#Lstart-end` — read them with fs_read_file):\n{}",
+                        lines.len(),
+                        lines.join("\n"),
+                    ))
+                }
+                Err(e) => Err(format!("code_search failed: {e}")),
+            }
         }
         "fs_search" => {
             let query = args["query"]

@@ -395,8 +395,9 @@ export async function sendChatMessage(
       console.warn("[chat-sync] source logging (delegate) failed", err);
     }
     // Le modèle de chat actif sert d'orchestrateur de REPLI (cf. resolveOrchestrator).
-    // `agentMode` propage le mode Plan (lecture seule) jusqu'au runner.
-    await handleDelegate(convId, delegateTask, agentDefPath, modelId, agentMode);
+    // `agentMode` propage le mode Plan (lecture seule) jusqu'au runner ; `trimmed`
+    // (texte original) sert à juger la trivialité pour l'advisor.
+    await handleDelegate(convId, delegateTask, agentDefPath, modelId, agentMode, trimmed);
     return;
   }
   // Below: chat-direct + chat-think continue the existing chat flow.
@@ -803,6 +804,11 @@ async function handleDelegate(
   agentDefPath?: string,
   fallbackModel?: string,
   mode: "plan" | "agent" = "agent",
+  // Texte ORIGINAL de l'utilisateur (sans l'enrichissement contexte éditeur /
+  // commentaires inline). Sert UNIQUEMENT à juger la trivialité pour l'advisor :
+  // sinon « merci » + un fichier ouvert ⇒ `task` long ⇒ resolveThinking=true ⇒
+  // advisor déclenché à tort. Défaut = task (rétro-compat si non fourni).
+  userText: string = task,
 ): Promise<void> {
   // fallbackModel = modèle de chat actif, utilisé comme orchestrateur si aucun
   // n'est configuré (délégation « out of the box »). Un agent custom (.md)
@@ -903,25 +909,26 @@ async function handleDelegate(
     }
   }
 
-  // ── Advisor S2/S1 — OPT-IN (alignement Claude Code) ─────────────────────────
-  // Par DÉFAUT, pas de 2e modèle « reviewer » : l'agent s'auto-corrige tout seul
-  // — son system prompt lui ordonne de PLANIFIER (todo_write) puis de VÉRIFIER
-  // en exécutant (run_command). C'est le modèle Claude Code/Codex : un seul
-  // agent, pas de superviseur externe. L'advisor (plan S2 + revue S1) reste
-  // ACTIVABLE pour qui veut la boucle d'auto-amélioration : `routing.
-  // superviseComplex = "true"` (défaut OFF). Anti-récursion : ne jamais
-  // superviser le reviewer/planner lui-même.
+  // ── Advisor S2/S1 — DÉFAUT ON (l'utilisateur veut la boucle d'apprentissage) ──
+  // L'advisor est un 2e modèle « reviewer » qui (S2) review le plan et (S1) review
+  // le livrable APRÈS coup, ce qui REMPLIT la mémoire long-terme (lessons → S3 :
+  // réinjectées dans les runs suivants sur tâches similaires). Distinct de
+  // l'auto-correction de l'agent (qui, elle, reste un seul modèle façon Claude
+  // Code). L'utilisateur l'a explicitement redemandé (« il n'appelle jamais
+  // l'advisor / pas de mémoire ») → DÉFAUT ON, désactivable via
+  // `routing.superviseComplex = "false"`. Advisory & non-bloquant (S1 est
+  // fire-and-forget). Anti-récursion : ne jamais superviser le reviewer/planner.
   const superviseRaw = await db.settings.get("routing.superviseComplex");
-  const superviseOn = superviseRaw === "true";
+  const superviseOn = superviseRaw !== "false";
   const isReviewerInvocation = !!agentDefPath && /reviewer|planner/i.test(agentDefPath);
-  // Si l'advisor EST activé : on ne supervise pas le bavardage trivial (« merci »,
-  // salutation) — resolveThinking("auto") classe casual (false) vs substantiel
-  // (true) ; un agent custom explicite reste supervisé. L'ordre des `&&` court-
-  // circuite resolveThinking quand l'advisor est OFF (défaut) → zéro calcul inutile.
+  // On ne supervise pas le bavardage trivial (« merci », salutation) —
+  // resolveThinking("auto") classe casual (false) vs substantiel (true) ; un
+  // agent custom explicite reste supervisé. L'ordre des `&&` court-circuite
+  // resolveThinking si l'utilisateur a explicitement coupé l'advisor.
   const wantSupervise =
     superviseOn &&
     !isReviewerInvocation &&
-    (!!agentDefPath || resolveThinking("auto", task));
+    (!!agentDefPath || resolveThinking("auto", userText));
 
   // Si l'advisor est demandé mais qu'aucun reviewer n'est configuré, on le DIT
   // dans le fil — sauter en silence laissait l'utilisateur croire que l'advisor

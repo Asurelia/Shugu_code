@@ -729,6 +729,9 @@ pub async fn agent_spawn(
     // Mode Plan → lecture seule. Le sélecteur de chat envoie `mode: "plan"` ;
     // tout le reste (agent / Atelier / Studio) reste en exécution complète.
     let read_only_for_task = args.mode.as_deref() == Some("plan");
+    // Mémoire de conversation : le chemin chat passe la conv pour recharger les
+    // tours précédents dans l'historique de l'agent.
+    let conversation_id_for_task = args.conversation_id.clone();
     tauri::async_runtime::spawn(async move {
         runner::run_agent_task(
             app_for_task,
@@ -748,6 +751,7 @@ pub async fn agent_spawn(
             // sur la machine, le filet de sécurité est git (onglet Git de l'app).
             system_prompt_override_for_task, // None ⇒ seed_prompt ; Some ⇒ .md custom
             read_only_for_task, // Plan mode ⇒ outils mutants retirés + refusés
+            conversation_id_for_task, // recharge les tours précédents de la conv
         )
         .await;
     });
@@ -863,6 +867,7 @@ pub async fn agent_atelier_run(
             Some(ws_for_task), // workspace_override — the throwaway creation dir
             Some(runner::ATELIER_PROMPT.to_string()),
             false, // read_only — l'Atelier doit écrire/exécuter (build→test→learn)
+            None,  // conversation_id — l'Atelier n'est pas lié à une conversation
         )
         .await;
         // The creation dir is intentionally left on disk so the preview pane can
@@ -994,6 +999,7 @@ pub async fn agent_grounded_run(
             None, // workspace_override — the REAL open workspace
             Some(system_prompt),
             false, // read_only — Grounded Run écrit/exécute sur le vrai projet
+            None,  // conversation_id — Grounded Run n'est pas lié à une conversation
         )
         .await;
     });
