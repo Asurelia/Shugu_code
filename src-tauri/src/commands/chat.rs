@@ -587,6 +587,14 @@ pub(crate) async fn call_openai_compat_structured(
         body["tools"] = tools.unwrap_or_else(tools_json_openai);
         body["tool_choice"] = serde_json::json!("auto");
     }
+    // Recherche NATIVE OpenAI : les modèles `*-search-preview` cherchent le web
+    // quand `web_search_options` est présent (résultats fondus dans le texte
+    // final — aucun changement de parsing SSE). Inoffensif sur les modèles qui
+    // ne reconnaissent pas le champ. Gate sur le nom de modèle (le choix d'un
+    // modèle « search » EST le consentement de l'utilisateur).
+    if crate::commands::search::openai_model_has_native_search(model) {
+        body["web_search_options"] = serde_json::json!({});
+    }
 
     // Local OpenAI-compat servers (llama.cpp, LM Studio, vLLM, …) often
     // don't accept ANY `Authorization` header. Send the Bearer only when we
@@ -810,6 +818,18 @@ fn chat_tool_label(name: &str, args: &serde_json::Value) -> String {
         }
         "fs_write_file" => format!("✏️ a écrit `{p}`"),
         "fs_edit" => format!("✏️ a modifié `{p}`"),
+        "web_search" => {
+            let q = args["query"].as_str().unwrap_or("");
+            format!("🌐 a cherché « {q} »")
+        }
+        "web_fetch" => {
+            let u = args["url"].as_str().unwrap_or("");
+            format!("🌐 a lu {u}")
+        }
+        "code_search" => {
+            let q = args["query"].as_str().unwrap_or("");
+            format!("🧭 recherche sémantique « {q} »")
+        }
         // BLOCKER 1 — libellé propre pour un outil MCP : `🔌 server__tool`.
         name if name.starts_with("mcp__") => {
             match crate::commands::mcp::split_namespaced(name) {
@@ -914,6 +934,21 @@ async fn run_chat_tool_loop(
                 crate::commands::mcp::enabled_tools_json(app, &mgr, protocol).await;
             if let Some(a) = arr.as_array_mut() {
                 a.extend(mcp_tools);
+            }
+            // Recherche NATIVE (miroir du runner) : sur Claude récent + réglage ON,
+            // remplace notre `web_search` client par l'outil serveur Anthropic
+            // (on garde `web_fetch` client). Blocs serveur ignorés par le parseur.
+            let prefer_native = crate::commands::mcp::read_setting(app, "search.preferNative")
+                .as_deref()
+                != Some("false");
+            if prefer_native
+                && protocol == "anthropic"
+                && crate::commands::search::model_supports_native_search("anthropic", model)
+            {
+                if let Some(a) = arr.as_array_mut() {
+                    a.retain(|t| t["name"].as_str() != Some("web_search"));
+                    a.extend(crate::commands::search::anthropic_server_web_tools());
+                }
             }
             Some(arr)
         } else {
@@ -1036,7 +1071,54 @@ async fn run_chat_tool_loop(
             // sont routés vers le manager MCP AVANT les outils fs workspace. Ils
             // ne dépendent pas du workspace et n'alimentent PAS le journal
             // d'annulation (qui ne concerne que les écritures fs locales).
-            let (content, is_error) = if tc.name.starts_with("mcp__") {
+            let (content, is_error) = if tc.name == "web_search" {
+                // Recherche web (lecture seule) — async via le client reqwest.
+                let query = args["query"].as_str().unwrap_or("").trim();
+                let max = args["max_results"].as_u64().unwrap_or(5).clamp(1, 10) as usize;
+                if query.is_empty() {
+                    ("web_search: champ requis manquant : query".to_string(), true)
+                } else {
+                    crate::commands::search::web_search(client, query, max).await
+                }
+            } else if tc.name == "web_fetch" {
+                // Lecture d'une page (lecture seule) — async.
+                let url = args["url"].as_str().unwrap_or("").trim();
+                let max_chars =
+                    args["max_chars"].as_u64().unwrap_or(48_000).clamp(500, 200_000) as usize;
+                if url.is_empty() {
+                    ("web_fetch: champ requis manquant : url".to_string(), true)
+                } else {
+                    crate::commands::search::web_fetch(client, url, max_chars).await
+                }
+            } else if tc.name == "code_search" {
+                // Recherche sémantique sur l'index vectoriel (lecture seule).
+                let query = args["query"].as_str().unwrap_or("").trim();
+                let k = args["k"].as_u64().unwrap_or(8).clamp(1, 20) as u32;
+                if query.is_empty() {
+                    ("code_search: champ requis manquant : query".to_string(), true)
+                } else {
+                    match crate::commands::vector::vec_search_internal(app, "code", query, k) {
+                        Ok(hits) if hits.is_empty() => (
+                            "aucun résultat sémantique — l'index n'est peut-être pas encore construit. \
+                             Utilise fs_search (littéral/regex) à la place."
+                                .to_string(),
+                            false,
+                        ),
+                        Ok(hits) => (
+                            format!(
+                                "{} résultats (proximité croissante, `path#Lstart-end` — lis-les avec fs_read_file) :\n{}",
+                                hits.len(),
+                                hits.iter()
+                                    .map(|h| format!("  {:.3}  {}", h.distance, h.id))
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                            ),
+                            false,
+                        ),
+                        Err(e) => (format!("code_search a échoué : {e}"), true),
+                    }
+                }
+            } else if tc.name.starts_with("mcp__") {
                 let mgr = app.state::<crate::commands::mcp::McpManager>();
                 crate::commands::mcp::mcp_execute(app, &mgr, &tc.name, &args).await
             } else {

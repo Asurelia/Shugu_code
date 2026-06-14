@@ -1121,6 +1121,37 @@ pub(crate) fn delete_file_inner(root: &Path, rel: &str) -> Result<(), String> {
     std::fs::remove_file(&target).map_err(|e| format!("remove_file: {e}"))
 }
 
+/// Renomme / déplace un fichier workspace-relatif `from` → `to`. Path-guard
+/// SYMÉTRIQUE : la source passe par `safe_resolve` (doit exister et être
+/// contenue), la destination par `safe_resolve_for_write` (peut ne pas exister
+/// encore — même garde `..`/absolu/null-byte + containment que l'écriture). Crée
+/// les dossiers parents de la destination. Refuse d'écraser une destination
+/// existante (le modèle doit supprimer/éditer explicitement) — évite une perte
+/// de données silencieuse. Renvoie le nombre d'octets déplacés (pour le message).
+pub(crate) fn rename_inner(root: &Path, from: &str, to: &str) -> Result<u64, String> {
+    let src = safe_resolve(root, from)?;
+    if !src.is_file() {
+        return Err(format!("{from} n'est pas un fichier régulier (déplacement de dossier non supporté)"));
+    }
+    let dst = safe_resolve_for_write(root, to)?;
+    if dst.exists() {
+        return Err(format!(
+            "la destination {to} existe déjà — supprime-la ou choisis un autre nom (pas d'écrasement silencieux)"
+        ));
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all: {e}"))?;
+    }
+    let size = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
+    // `rename` est atomique sur le même volume ; sur volumes différents il peut
+    // échouer (EXDEV) → repli copy+remove pour rester robuste cross-device.
+    if let Err(e) = std::fs::rename(&src, &dst) {
+        std::fs::copy(&src, &dst).map_err(|e2| format!("rename a échoué ({e}) et la copie aussi ({e2})"))?;
+        std::fs::remove_file(&src).map_err(|e3| format!("copié vers {to} mais suppression de {from} impossible: {e3}"))?;
+    }
+    Ok(size)
+}
+
 /// List the immediate children of a workspace-relative directory as a
 /// JSON string. Returns `[{"name":"foo","is_dir":true}, ...]`.
 ///
@@ -1211,6 +1242,53 @@ mod tests {
             result.unwrap_err().contains("null byte"),
             "error should mention null byte"
         );
+        cleanup(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // rename_inner tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rename_inner_moves_file_and_removes_source() {
+        let root = make_temp_dir("rename_ok");
+        // Départ propre : un run précédent peut avoir laissé la destination, ce
+        // que le refus d'écrasement de rename_inner détecterait à tort.
+        let _ = fs::remove_dir_all(root.join("sub"));
+        fs::write(root.join("a.txt"), b"hello").unwrap();
+        let r = rename_inner(&root, "a.txt", "sub/b.txt");
+        assert!(r.is_ok(), "expected Ok, got {:?}", r);
+        assert!(!root.join("a.txt").exists(), "source should be gone");
+        assert_eq!(fs::read_to_string(root.join("sub/b.txt")).unwrap(), "hello");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn rename_inner_rejects_traversal_destination() {
+        let root = make_temp_dir("rename_traverse");
+        fs::write(root.join("a.txt"), b"x").unwrap();
+        let r = rename_inner(&root, "a.txt", "../escape.txt");
+        assert!(r.is_err(), "expected Err for ../escape destination");
+        assert!(root.join("a.txt").exists(), "source must be untouched on guard failure");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn rename_inner_refuses_overwrite() {
+        let root = make_temp_dir("rename_overwrite");
+        fs::write(root.join("a.txt"), b"from").unwrap();
+        fs::write(root.join("b.txt"), b"to").unwrap();
+        let r = rename_inner(&root, "a.txt", "b.txt");
+        assert!(r.is_err(), "expected Err — must not overwrite existing destination");
+        assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "to");
+        cleanup(&root);
+    }
+
+    #[test]
+    fn rename_inner_missing_source_errors() {
+        let root = make_temp_dir("rename_missing");
+        let r = rename_inner(&root, "nope.txt", "x.txt");
+        assert!(r.is_err(), "expected Err for missing source");
         cleanup(&root);
     }
 

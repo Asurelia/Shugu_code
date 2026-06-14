@@ -391,6 +391,7 @@ export function InterfaceSettings() {
             desc="Le chat répond avec la voix de Shugu (chaleureuse, directe, honnête) au lieu du ton neutre du modèle. S'applique à toutes les conversations."
           />
           <CockpitRow />
+          <NativeSearchRow />
         </div>
 
         <div className="setting-section">
@@ -580,6 +581,42 @@ function CockpitRow() {
     <SettingRow
       label="Cockpit (chat + IDE)"
       desc="Affiche la vue Chat comme un cockpit : chat à gauche, éditeur/révision en panneau droit redimensionnable. Désactiver ramène la vue chat simple."
+    >
+      <Switch on={on} onChange={change} />
+    </SettingRow>
+  );
+}
+
+/**
+ * Réglage `search.preferNative` (défaut ON). Quand le modèle actif a sa propre
+ * recherche web serveur (Claude récent, GPT search-preview), l'agent utilise
+ * CET outil natif plutôt que notre recherche client. Désactiver force toujours
+ * notre recherche client (Brave/Tavily/DuckDuckGo) — utile pour éviter la
+ * facturation de la recherche serveur Anthropic. Lu côté Rust dans le runner.
+ */
+function NativeSearchRow() {
+  const [on, setOn] = useState(true); // défaut ON (absent = ON)
+
+  useEffect(() => {
+    let alive = true;
+    void db.settings.get("search.preferNative").then((v) => {
+      if (alive) setOn(v !== "false");
+    });
+    return () => { alive = false; };
+  }, []);
+
+  const change = (v: boolean) => {
+    setOn(v);
+    void (async () => {
+      await db.settings.set("search.preferNative", v ? "true" : "false");
+      await queryClient.invalidateQueries({ queryKey: ["settings", "search.preferNative"] });
+    })();
+  };
+
+  return (
+    <SettingRow
+      label="Recherche native du modèle"
+      desc="Si le modèle a sa propre recherche web (Claude, GPT search-preview…), l'agent l'utilise directement. Sinon il passe par notre recherche (Brave/Tavily/DuckDuckGo). À noter : la recherche serveur d'Anthropic est facturée par requête."
     >
       <Switch on={on} onChange={change} />
     </SettingRow>

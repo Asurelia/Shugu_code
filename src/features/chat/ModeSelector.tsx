@@ -4,7 +4,8 @@
 // un VRAI sélecteur de mode, façon Claude Code, mais adapté au pivot Shugu
 // « exec directe + filet git » (pas de système de permissions) :
 //
-//   • Chat  💬 — conversation pure : un appel LLM, AUCUN outil (rapide).
+//   • Chat  💬 — lecture + recherche : web_search / web_fetch / code_search +
+//                lecture fs, JAMAIS d'écriture ni d'exécution (rapide, sûr).
 //   • Plan  📋 — lecture seule : l'agent explore + propose un plan, sans rien
 //                modifier ni exécuter (enforcement read_only côté runner Rust).
 //   • Agent ⚡ — défaut : l'agent complet lit / écrit / lance / vérifie.
@@ -26,7 +27,7 @@ interface ModeDef {
 // Ordre d'affichage = du plus léger au plus puissant (Chat → Plan → Agent),
 // pour que la « montée en capacité » se lise de haut en bas dans le popover.
 const MODES: ModeDef[] = [
-  { id: "chat", icon: "chat", label: "Chat", desc: "Conversation pure — aucun outil, réponses rapides." },
+  { id: "chat", icon: "chat", label: "Chat", desc: "Lecture & recherche — web, fetch, code. Aucune écriture ni exécution." },
   { id: "plan", icon: "list", label: "Plan", desc: "Lecture seule — explore et propose un plan, sans rien modifier." },
   { id: "agent", icon: "agent", label: "Agent", desc: "Exécution directe — lit, écrit, lance, vérifie (git = filet)." },
 ];
