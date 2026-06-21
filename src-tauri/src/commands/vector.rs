@@ -11,6 +11,35 @@
 //! SECURITY: collection names are validated against an allowlist before being
 //! interpolated into table identifiers (SQL-injection prevention for the
 //! identifier position). All user-supplied values are bound parameters.
+//!
+//! CONCURRENCY (AM-5) — multi-agent safety on a SHARED database.
+//! ------------------------------------------------------------------
+//! `shugu.db` is opened by THREE independent SQLite handles in the same
+//! process:
+//!   1. this module's `VEC_CONN`        (vector tables + `agent_memory`),
+//!   2. `agents::get_conn`'s `AGENTS_CONN` (agent rows/events/skills/usage),
+//!   3. tauri-plugin-sql's sqlx pool    (the migrated relational schema).
+//! When several agents run in parallel they drive these handles concurrently.
+//!
+//! Each rusqlite handle sits behind its OWN `Mutex`, so a Mutex only serialises
+//! access WITHIN one handle — it does NOT serialise the OTHER two handles or
+//! the sqlx pool. SQLite itself is the cross-handle arbiter: in WAL mode any
+//! number of readers proceed concurrently, but only ONE writer holds the write
+//! lock at a time. A second writer that finds the database write-locked gets
+//! `SQLITE_BUSY` ("database is locked").
+//!
+//! The fix this module guarantees for its OWN connection:
+//!   * WAL journal mode — readers never block the writer and vice-versa, and we
+//!     VERIFY the pragma actually took (some filesystems silently downgrade it).
+//!   * `busy_timeout` = 5000 ms — when another handle holds the write lock, this
+//!     connection now WAITS (polling) up to 5 s instead of failing immediately,
+//!     turning a hard "database is locked" error into bounded back-pressure.
+//!   * `synchronous = NORMAL` — the durable, corruption-safe setting under WAL;
+//!     fewer fsyncs than FULL, so the writer releases the lock sooner.
+//! Compound writes that touch TWO tables (`memory_remember` writes both the
+//! vec0 row and its `agent_memory` payload; `vec_delete`/`vec_clear` purge both)
+//! run inside a single IMMEDIATE transaction so the pair is atomic — a crash or
+//! a losing race can never leave an orphaned vector or a tombstone half-applied.
 
 use rusqlite::{ffi::sqlite3_auto_extension, params, Connection};
 use serde::Serialize;
@@ -23,6 +52,12 @@ use tauri::Manager;
 
 /// Embedding dimension for `AllMiniLML6V2` (384-dimensional model).
 const EMBED_DIM: usize = 384;
+
+/// How long a write blocked by another handle's write lock waits before giving
+/// up with `SQLITE_BUSY`. 5 s comfortably covers a contended embed+insert or a
+/// WAL checkpoint by another agent; longer would risk hanging the UI thread on
+/// a genuine deadlock, shorter would re-surface spurious "database is locked".
+const BUSY_TIMEOUT_MS: u32 = 5_000;
 
 /// Allowed collection names — these become SQL table-name identifiers.
 ///
@@ -50,6 +85,53 @@ fn register_vec_extension() {
             sqlite_vec::sqlite3_vec_init as *const (),
         )));
     });
+}
+
+// ---------------------------------------------------------------------------
+// Connection hardening for concurrent multi-agent access (AM-5)
+// ---------------------------------------------------------------------------
+
+/// Apply the concurrency pragmas to a freshly opened connection and VERIFY that
+/// WAL actually took effect.
+///
+/// Returns the journal mode SQLite reports back (lower-case, e.g. `"wal"`), so
+/// callers/tests can assert the file is genuinely in WAL and not a silent
+/// downgrade (`delete`/`truncate`) — which would re-introduce the writer-blocks-
+/// reader contention WAL is meant to remove.
+///
+/// `busy_timeout` and `synchronous` are set with plain `pragma_update` /
+/// `execute_batch` because they cannot fail meaningfully on a valid handle; WAL
+/// is set via `query_row` so we read the resulting mode in the same round-trip.
+fn configure_connection(conn: &Connection) -> Result<String, String> {
+    // busy_timeout FIRST: every subsequent statement (including the WAL switch
+    // itself, which briefly needs the write lock) benefits from the wait.
+    conn.busy_timeout(std::time::Duration::from_millis(BUSY_TIMEOUT_MS as u64))
+        .map_err(|e| format!("busy_timeout pragma: {e}"))?;
+
+    // WAL — `PRAGMA journal_mode=WAL` RETURNS the new mode as a result row, so
+    // we read it back to confirm the switch instead of assuming it worked.
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+        .map_err(|e| format!("WAL pragma: {e}"))?;
+    let mode = mode.to_lowercase();
+
+    // synchronous=NORMAL is the recommended durability level UNDER WAL: it still
+    // guarantees no corruption on OS crash (only the last in-flight txn can be
+    // lost on power loss), while issuing far fewer fsyncs than FULL — so the
+    // write lock is released sooner and contending agents wait less.
+    conn.execute_batch("PRAGMA synchronous=NORMAL;")
+        .map_err(|e| format!("synchronous pragma: {e}"))?;
+
+    if mode != "wal" {
+        // Don't hard-fail: an in-memory or network-mounted DB legitimately can't
+        // do WAL. Log loudly so the degraded-concurrency case is visible, and
+        // the busy_timeout still gives us back-pressure instead of hard errors.
+        eprintln!(
+            "[vector] WARNING: journal_mode is '{mode}', not 'wal' — concurrent \
+             access will rely on busy_timeout ({BUSY_TIMEOUT_MS} ms) alone"
+        );
+    }
+    Ok(mode)
 }
 
 // ---------------------------------------------------------------------------
@@ -97,9 +179,15 @@ fn get_conn(app: &tauri::AppHandle) -> Result<&'static Mutex<Connection>, String
     let conn = Connection::open(&db_path)
         .map_err(|e| format!("rusqlite open {}: {e}", db_path.display()))?;
 
-    // WAL for concurrent access alongside the plugin's sqlx connection.
-    conn.execute_batch("PRAGMA journal_mode=WAL;")
-        .map_err(|e| format!("WAL pragma: {e}"))?;
+    // AM-5 — harden for concurrent multi-agent access: WAL (verified) +
+    // busy_timeout (wait instead of "database is locked") + synchronous=NORMAL.
+    // Done BEFORE any DDL so the CREATE statements below already benefit from
+    // the busy_timeout if another handle is mid-write at startup.
+    let mode = configure_connection(&conn)?;
+    static MODE_LOG_ONCE: OnceLock<()> = OnceLock::new();
+    MODE_LOG_ONCE.get_or_init(|| {
+        eprintln!("[vector] connection journal_mode={mode}, busy_timeout={BUSY_TIMEOUT_MS}ms");
+    });
 
     // Create vec0 virtual tables for every allowed collection.
     for name in ALLOWED_COLLECTIONS {
@@ -297,19 +385,26 @@ pub fn vec_delete(
     id: String,
 ) -> Result<(), String> {
     validate_collection(&collection)?;
-    let guard = get_conn(&app)?.lock().map_err(|e| format!("lock: {e}"))?;
+    let mut guard = get_conn(&app)?.lock().map_err(|e| format!("lock: {e}"))?;
     let sql = format!("DELETE FROM vec_{collection} WHERE id = ?1");
-    guard
-        .execute(&sql, params![id])
+    // AM-5 — the embedding and its payload are deleted as one atomic unit (single
+    // IMMEDIATE transaction) so a concurrent recall on another handle never sees
+    // a half-deleted state: either both the vector and its agent_memory row are
+    // gone, or neither is. For non-`memory` collections the second statement is
+    // skipped, so this is still a single-statement transaction.
+    let tx = guard
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("vec_delete begin: {e}"))?;
+    tx.execute(&sql, params![id])
         .map_err(|e| format!("vec_delete: {e}"))?;
     // AM-2 — keep the `memory` side table in lockstep: deleting the embedding
     // must also drop its payload row so a recall never resurrects a tombstoned
     // memory. No-op for other collections (no matching id in agent_memory).
     if collection == "memory" {
-        guard
-            .execute("DELETE FROM agent_memory WHERE id = ?1", params![id])
+        tx.execute("DELETE FROM agent_memory WHERE id = ?1", params![id])
             .map_err(|e| format!("vec_delete agent_memory: {e}"))?;
     }
+    tx.commit().map_err(|e| format!("vec_delete commit: {e}"))?;
     Ok(())
 }
 
@@ -319,17 +414,22 @@ pub fn vec_delete(
 #[tauri::command(async)]
 pub fn vec_clear(app: tauri::AppHandle, collection: String) -> Result<(), String> {
     validate_collection(&collection)?;
-    let guard = get_conn(&app)?.lock().map_err(|e| format!("lock: {e}"))?;
+    let mut guard = get_conn(&app)?.lock().map_err(|e| format!("lock: {e}"))?;
     let sql = format!("DELETE FROM vec_{collection}");
-    guard
-        .execute(&sql, [])
+    // AM-5 — purge the vec0 table and (for `memory`) its payload side table in a
+    // single atomic IMMEDIATE transaction, so a concurrent reindex/recall never
+    // observes the embeddings cleared while the payload rows still linger.
+    let tx = guard
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("vec_clear begin: {e}"))?;
+    tx.execute(&sql, [])
         .map_err(|e| format!("vec_clear: {e}"))?;
     // AM-2 — clearing the memory collection also wipes its payload side table.
     if collection == "memory" {
-        guard
-            .execute("DELETE FROM agent_memory", [])
+        tx.execute("DELETE FROM agent_memory", [])
             .map_err(|e| format!("vec_clear agent_memory: {e}"))?;
     }
+    tx.commit().map_err(|e| format!("vec_clear commit: {e}"))?;
     Ok(())
 }
 
@@ -383,20 +483,29 @@ pub(crate) fn memory_remember(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let guard = get_conn(app)?.lock().map_err(|e| format!("lock: {e}"))?;
-    guard
-        .execute(
-            "INSERT OR REPLACE INTO vec_memory(id, embedding) VALUES (?1, ?2)",
-            params![id, blob],
-        )
-        .map_err(|e| format!("memory_remember vec: {e}"))?;
-    guard
-        .execute(
-            "INSERT OR REPLACE INTO agent_memory(id, kind, role, conversation_id, text, ts) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, kind, role, conversation_id, trimmed, now],
-        )
-        .map_err(|e| format!("memory_remember payload: {e}"))?;
+    let mut guard = get_conn(app)?.lock().map_err(|e| format!("lock: {e}"))?;
+    // AM-5 — the embedding row and its payload row are TWO tables that must move
+    // together. An IMMEDIATE transaction takes the write lock up front (so a
+    // concurrent writer on another handle waits on busy_timeout rather than
+    // deadlocking mid-pair) and makes the two INSERTs atomic: a crash or rollback
+    // can never leave a vec_memory row whose agent_memory payload is missing
+    // (which `memory_recall` would silently skip — a vanished memory).
+    let tx = guard
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("memory_remember begin: {e}"))?;
+    tx.execute(
+        "INSERT OR REPLACE INTO vec_memory(id, embedding) VALUES (?1, ?2)",
+        params![id, blob],
+    )
+    .map_err(|e| format!("memory_remember vec: {e}"))?;
+    tx.execute(
+        "INSERT OR REPLACE INTO agent_memory(id, kind, role, conversation_id, text, ts) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![id, kind, role, conversation_id, trimmed, now],
+    )
+    .map_err(|e| format!("memory_remember payload: {e}"))?;
+    tx.commit()
+        .map_err(|e| format!("memory_remember commit: {e}"))?;
     Ok(id)
 }
 
@@ -451,4 +560,250 @@ pub fn memory_search(
     k: u32,
 ) -> Result<Vec<MemoryHit>, String> {
     memory_recall(&app, &query, k.clamp(1, 50))
+}
+
+// ---------------------------------------------------------------------------
+// Tests — AM-5 concurrency safety
+//
+// These tests exercise the ACTUAL concurrency mechanism (the pragma config in
+// `configure_connection` + the IMMEDIATE-transaction compound-write pattern)
+// against a real on-disk `shugu.db`. They deliberately do NOT go through the
+// Tauri command layer (which needs an AppHandle): the command bodies are thin
+// wrappers, and the property under test — "two independent connections to the
+// same file don't error with 'database is locked'" — lives entirely in the
+// connection configuration, which is what these tests pin down.
+//
+// `vec0` virtual tables require the sqlite-vec extension; `configure_connection`
+// and the transaction semantics are extension-independent, so the tests use a
+// plain table mirroring the `(vec_memory, agent_memory)` two-table pattern to
+// keep them hermetic (no model download, no extension registration needed).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    /// Monotonic-ish unique tag so parallel test cases never collide on a path.
+    fn unique_tag(name: &str) -> String {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{name}_{now}_{n}")
+    }
+
+    fn temp_db(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("shugu_vec_test_{}", unique_tag(tag)));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("shugu.db")
+    }
+
+    /// Open a connection configured EXACTLY as `get_conn` does in production.
+    fn open_configured(path: &std::path::Path) -> (Connection, String) {
+        let conn = Connection::open(path).unwrap();
+        let mode = configure_connection(&conn).expect("configure_connection must succeed");
+        (conn, mode)
+    }
+
+    /// Create the two-table shape that `memory_remember` writes to, mirroring the
+    /// `(vec_memory, agent_memory)` pair without needing the sqlite-vec extension.
+    fn create_pair_schema(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS vec_memory (id TEXT PRIMARY KEY, embedding BLOB NOT NULL);
+             CREATE TABLE IF NOT EXISTS agent_memory (
+                 id TEXT PRIMARY KEY, kind TEXT NOT NULL, role TEXT NOT NULL,
+                 conversation_id TEXT, text TEXT NOT NULL, ts INTEGER NOT NULL);",
+        )
+        .unwrap();
+    }
+
+    /// The compound write `memory_remember` performs, distilled to the
+    /// transaction mechanics (no embedding model needed).
+    fn remember_pair(conn: &mut Connection, id: &str, text: &str) -> Result<(), String> {
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| format!("begin: {e}"))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO vec_memory(id, embedding) VALUES (?1, ?2)",
+            params![id, vec![0u8, 1, 2, 3]],
+        )
+        .map_err(|e| format!("vec insert: {e}"))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO agent_memory(id, kind, role, conversation_id, text, ts) \
+             VALUES (?1, 'fact', 'tester', NULL, ?2, 0)",
+            params![id, text],
+        )
+        .map_err(|e| format!("payload insert: {e}"))?;
+        tx.commit().map_err(|e| format!("commit: {e}"))
+    }
+
+    /// `configure_connection` must put a real file in WAL and report it back.
+    #[test]
+    fn configure_connection_enables_wal_and_busy_timeout() {
+        let db = temp_db("wal");
+        let (conn, mode) = open_configured(&db);
+        assert_eq!(mode, "wal", "on-disk DB must be in WAL mode");
+
+        // The pragma is observable on the live connection.
+        let live: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(live.to_lowercase(), "wal");
+
+        // busy_timeout is reflected back by `PRAGMA busy_timeout` (ms).
+        let bt: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bt, BUSY_TIMEOUT_MS as i64, "busy_timeout must be applied");
+
+        // synchronous=NORMAL maps to integer 1.
+        let sync: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync, 1, "synchronous must be NORMAL (1) under WAL");
+
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    /// The compound write is atomic: a forced failure mid-pair (here: a rollback
+    /// triggered by a constraint we provoke) leaves NEITHER row, never a half.
+    #[test]
+    fn compound_write_is_atomic() {
+        let db = temp_db("atomic");
+        let (mut conn, _) = open_configured(&db);
+        create_pair_schema(&conn);
+
+        // Happy path: both rows land together.
+        remember_pair(&mut conn, "m1", "hello").unwrap();
+        let vec_n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vec_memory", [], |r| r.get(0))
+            .unwrap();
+        let pay_n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent_memory", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((vec_n, pay_n), (1, 1), "both tables in lockstep");
+
+        // Failure path: a transaction whose second statement errors must roll the
+        // first one back — no orphaned vec_memory row survives.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        tx.execute(
+            "INSERT OR REPLACE INTO vec_memory(id, embedding) VALUES ('m2', x'00')",
+            [],
+        )
+        .unwrap();
+        // Force an error: NOT NULL violation on agent_memory.text.
+        let bad = tx.execute(
+            "INSERT INTO agent_memory(id, kind, role, text, ts) VALUES ('m2','fact','t', NULL, 0)",
+            [],
+        );
+        assert!(bad.is_err(), "NULL into NOT NULL must fail");
+        drop(tx); // dropping without commit rolls back
+
+        let vec_n2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vec_memory", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vec_n2, 1, "rolled-back vec_memory insert left no orphan");
+
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    /// THE AM-5 TEST: many threads, TWO independent connections to the SAME file
+    /// (mimicking VEC_CONN vs AGENTS_CONN), writing concurrently. With WAL +
+    /// busy_timeout configured, NOT ONE write may fail with "database is locked",
+    /// and every committed row must be present and consistent across both tables.
+    #[test]
+    fn concurrent_writers_two_connections_no_lock_errors() {
+        let db = temp_db("concurrent");
+
+        // Seed schema on a primary connection (the "VEC_CONN" analogue).
+        {
+            let (conn, mode) = open_configured(&db);
+            assert_eq!(mode, "wal");
+            create_pair_schema(&conn);
+        }
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 40;
+
+        // Shared Mutex<Connection> #1 — the VEC_CONN analogue, shared by half the
+        // threads (serialised within itself, exactly like production).
+        let conn_a = Arc::new(Mutex::new({
+            let (c, _) = open_configured(&db);
+            c
+        }));
+        // Shared Mutex<Connection> #2 — a SEPARATE connection (AGENTS_CONN
+        // analogue). SQLite, not the Mutex, arbitrates between A and B: this is
+        // the exact cross-handle contention AM-5 is about.
+        let conn_b = Arc::new(Mutex::new({
+            let (c, _) = open_configured(&db);
+            c
+        }));
+
+        let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut handles = Vec::new();
+
+        for t in 0..THREADS {
+            // Even threads drive connection A, odd threads drive connection B —
+            // so writes genuinely contend ACROSS two handles, not just within one.
+            let conn = if t % 2 == 0 {
+                Arc::clone(&conn_a)
+            } else {
+                Arc::clone(&conn_b)
+            };
+            let errors = Arc::clone(&errors);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..PER_THREAD {
+                    let id = format!("t{t}_i{i}");
+                    let mut guard = conn.lock().unwrap();
+                    if let Err(e) = remember_pair(&mut guard, &id, &format!("text-{id}")) {
+                        // The whole point: with busy_timeout this branch must
+                        // stay empty. "database is locked" here = AM-5 regression.
+                        errors.lock().unwrap().push(e);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let errs = errors.lock().unwrap();
+        assert!(
+            errs.is_empty(),
+            "concurrent writers across two connections must not error (busy_timeout \
+             should absorb contention); got {} error(s), first: {:?}",
+            errs.len(),
+            errs.first()
+        );
+
+        // Consistency: every (id) committed to vec_memory has its agent_memory
+        // payload, and the counts match the total work issued.
+        let (conn, _) = open_configured(&db);
+        let expected = (THREADS * PER_THREAD) as i64;
+        let vec_n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vec_memory", [], |r| r.get(0))
+            .unwrap();
+        let pay_n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent_memory", [], |r| r.get(0))
+            .unwrap();
+        let orphans: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vec_memory v \
+                 LEFT JOIN agent_memory a ON a.id = v.id WHERE a.id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vec_n, expected, "all vec rows committed");
+        assert_eq!(pay_n, expected, "all payload rows committed");
+        assert_eq!(orphans, 0, "no vec row left without its payload (atomic pairs)");
+
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
 }
