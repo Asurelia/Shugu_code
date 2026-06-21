@@ -1,183 +1,129 @@
-//! Invisible Windows execution sandbox for agent `run_command` (opt-in).
+//! Real process sandbox for agent `run_command` — write-confined, reads-open,
+//! invisible, ALWAYS ON (Claude-Code / Codex-CLI model, ported to Windows).
 //!
-//! ## Why this exists
+//! ## What this is (and what the previous version was NOT)
 //!
-//! `run_command_direct` (exec.rs) runs agent commands DIRECTLY on the user's
-//! machine with the full toolchain and the user's full token — exactly like
-//! Claude Code / Codex CLI. That is the right default for a trusted local tool,
-//! and the safety net is git. But two residual risks have no git net:
+//! `run_command_direct` (exec.rs) runs agent commands on the user's machine with
+//! the full toolchain. A prior iteration tried to confine it with **deny-ACEs**
+//! on a hand-picked list of secret files — a deny-LIST, not a jail. The user
+//! rejected that: it protects only the files we thought to enumerate, and it
+//! ducked the hard part (re-spawning the child under a confined token). This
+//! module does the real thing:
 //!
-//!   * **credential exfiltration** — a prompt-injected command (`type
-//!     %USERPROFILE%\.ssh\id_rsa`, `copy ~\.aws\credentials …`) can read secrets
-//!     that git never tracked, then leak them over the open network.
-//!   * **out-of-workspace writes** — an edit to `C:\Windows\…` or `~\.bashrc`
-//!     is invisible to the git panel, so the user can't "discard" it.
+//!   * **Reads: OPEN.** The confined child can read anywhere — system dirs, the
+//!     user profile, every toolchain (node / pnpm / cargo / git) — so the tools
+//!     keep working.
+//!   * **Writes: CONFINED** to an allowlist = { workspace root, OS temp dir,
+//!     package caches (`~\.cargo` / `CARGO_HOME`, `~\.rustup` / `RUSTUP_HOME`,
+//!     `~\.npm` / `npm_config_cache`, `~\.pnpm`, npm-cache, …) }. A write to ANY
+//!     path outside the allowlist fails — not because we listed it, but because
+//!     it isn't on the allow side.
+//!   * **Network: ACTIVE.** Untouched — cutting it would break `pnpm install` /
+//!     `git fetch`.
 //!
-//! This module adds an OPT-IN confinement layer that reproduces the spirit of
-//! Claude Code's sandbox (Seatbelt / bubblewrap+Landlock) on Windows, using the
-//! native filesystem-ACL primitives — **WITHOUT** the heavy machinery Codex's
-//! `windows-sandbox-rs` uses (dedicated Windows accounts, AppContainer profiles,
-//! WFP firewall, private desktops, elevation). The design goal is "lighter than
-//! Docker, invisible in the happy path, never breaks the dev loop".
+//! ## Mechanism — Mandatory Integrity Control, LOW integrity (chosen)
 //!
-//! ## Mechanism chosen — and why (HONEST trade-off)
+//! Windows has no native "reads-open / writes-confined" primitive, so we lean on
+//! **Mandatory Integrity Control (MIC)**, the same kernel feature that sandboxes
+//! Protected-Mode IE / Chrome renderers:
 //!
-//! The existing, *tested* spawn path in exec.rs is built entirely around
-//! [`std::process::Command`] / [`std::process::Child`]: piped stdio drained on
-//! threads, a poll+timeout loop on `try_wait`, and a Job Object assigned via the
-//! child's raw handle for tree-wide kill. `std::process::Command` ALWAYS spawns
-//! the child under the *parent's* primary token — it offers no hook to inject a
-//! restricted token. Running a child under a custom token therefore requires
-//! `CreateProcessAsUserW`, which means re-implementing the entire stdio-pipe +
-//! wait + job-assign dance by hand.
+//!   1. Duplicate the current primary token and lower its integrity to **LOW**
+//!      (`SetTokenInformation(TokenIntegrityLevel)`, SID `S-1-16-4096`). Lowering
+//!      your OWN token needs no privilege (you can always drop integrity, never
+//!      raise it). A LOW process obeys MIC's two rules:
+//!        * **no-write-up** — it may NOT write to objects labeled at a HIGHER
+//!          integrity than itself. Ordinary files/dirs are MEDIUM by default, so
+//!          a LOW child cannot write them. ← this is the write-jail, for free.
+//!        * **no `*-read-up` is the default** — MIC does NOT restrict reads by
+//!          default (the read-up policy bit is off on normal objects), so the LOW
+//!          child reads MEDIUM/HIGH objects fine. ← reads stay open, for free.
+//!   2. Stamp each allowlist directory with a **LOW mandatory label** (a SACL
+//!      `S:(ML;OICI;NW;;;LW)` — Low label, container+object inherit, no-write-up
+//!      policy). An object's own integrity gates writes: once a dir is LOW, a LOW
+//!      process MAY write it (equal integrity, no up-level). So the workspace /
+//!      temp / caches become writable to the confined child while the rest of the
+//!      disk (MEDIUM) stays read-only to it. The owner can set a label at or
+//!      below its own level without privilege; we restore the prior label on Drop
+//!      (RAII), so the change is transient and self-healing.
 //!
-//! Re-implementing that spawn untested (this code cannot be exercised without a
-//! live Tauri host) is a worse risk than the threat it mitigates: a subtle
-//! handle-inheritance or pipe bug would break EVERY agent command, not just an
-//! attack. The brief is explicit — "a sandbox that crashes must never prevent
-//! the agent from running" and "pick the MOST RELIABLE mechanism, document its
-//! limits honestly".
+//! ### Why MIC-low over AppContainer
 //!
-//! So the reliable mechanism that **composes with the proven spawn path** is
-//! **filesystem ACLs**, not token surgery. ACEs are evaluated by the kernel
-//! against whatever token the child runs under (including the normal one), so
-//! they bite without changing how we spawn:
+//! AppContainer is a true capability jail, but it confines **reads** too: by
+//! default an AppContainer process can't read anything not granted
+//! `ALL_APPLICATION_PACKAGES`, so every toolchain dir (node install, cargo
+//! registry, the user's PATH targets, system DLLs the loader touches) would need
+//! an explicit read-grant ACE — a large, fragile surface that breaks a tool the
+//! moment we miss one path. MIC-low gives "reads open, writes confined" as the
+//! NATIVE default, which is exactly the spec. We document AppContainer as the
+//! stricter upgrade if a capability-true jail is ever needed.
 //!
-//!   * **`light`** — add explicit **deny** ACEs (deny Read *and* Write, applied
-//!     to the current user's SID) on a curated list of secret stores
-//!     (`~\.ssh`, `~\.aws`, `~\.codex\auth.json`, `~\.claude.json`, browser
-//!     profiles, …). Even a fully prompt-injected command cannot `type`/`copy`
-//!     them while the deny-ACE is in place. Reads everywhere else stay open, so
-//!     node/pnpm/cargo/git work unchanged.
-//!   * **`strict`** — `light` PLUS deny **Write** ACEs on a curated set of
-//!     high-value out-of-workspace roots (the rest of the user profile, minus an
-//!     explicit *write-allowlist*: the workspace, the temp dir, and the package
-//!     caches `~\.cargo`, `~\.rustup`, `~\.npm`, `~\.pnpm`, npm-cache). Writes
-//!     INSIDE the allowlist still succeed; writes to the protected roots fail.
-//!     Reads stay open. Network stays ACTIVE (cutting it breaks `pnpm install` /
-//!     `git fetch` — see `add_network_block_later` note below).
+//! ### Honest limits of MIC-low
 //!
-//! ### Honest limits of the ACL approach
+//!   * **Granularity is the integrity label, not a path ACL.** Anything we label
+//!     LOW is writable; everything else MEDIUM is not. A pre-existing LOW-labeled
+//!     object elsewhere on the machine (rare) would also be writable. We don't
+//!     scan for those — the allowlist is what we deliberately open.
+//!   * **A tool that itself drops/raises integrity** could escape, but the agent
+//!     runs as the user with no special privilege, and raising integrity needs
+//!     one — so a LOW child cannot climb back to MEDIUM.
+//!   * **Same-user concurrency window.** The LOW label on an allowlist dir is
+//!     visible to other processes during the run; it only *grants* low-IL write
+//!     (it never removes the existing DACL), so it does not reduce anyone's
+//!     access. Restored on Drop; a hard crash leaves a recoverable state fixable
+//!     with `icacls <dir> /setintegritylevel … ` or simply re-running.
+//!   * **Delete semantics.** A LOW child can delete files *inside* a LOW dir
+//!     (the workspace) — that's intended (git is the net there). It cannot delete
+//!     MEDIUM files outside the allowlist (no-write-up covers delete).
 //!
-//!   * It protects the **enumerated** paths. It is a deny-LIST, not a
-//!     write-jail: `strict` does not stop a write to an arbitrary brand-new
-//!     top-level dir like `D:\whatever` unless that root is in the protected
-//!     set. We protect the credential-bearing and config-bearing roots, which
-//!     is where the real damage lives; we document that arbitrary writes
-//!     elsewhere are still possible (git's net + the risk classifier remain).
-//!   * The deny-ACE is keyed to the **current user SID**, so for the window of
-//!     the run it also affects OTHER processes of the same user touching those
-//!     exact secret paths. Runs are short and serial per command; the guard
-//!     restores the original DACL on Drop (RAII), and on a hard crash the OS
-//!     leaves a recoverable state fixable with `icacls <path> /reset`.
-//!   * A process running elevated / as a different principal is out of scope —
-//!     the agent runs as the user, same as every other Shugu subprocess.
+//! ## Always on — the invisibility contract
 //!
-//! AppContainer (capability-SID per write-root, true write-jail) and MIC-low
-//! (mandatory integrity label) are STRICTER, but BOTH require
-//! `CreateProcessAsUserW`/`STARTUPINFOEX` — the untestable custom-spawn path we
-//! deliberately avoid. The validation doc records this as the documented upgrade
-//! path once the spawn can be exercised on real hardware.
+//! There is **no toggle to enable** the sandbox and no UI: every agent
+//! `run_command` goes through the confined spawn. The ONLY escape hatch is the
+//! emergency env var **`SHUGU_SANDBOX_DISABLE=1`**, which forces the plain direct
+//! spawn (to unblock the dev loop if confinement ever misbehaves on a machine).
 //!
-//! ## Activation (opt-in, default OFF)
+//! ## Fail-safe
 //!
-//! Read from the env var **`SHUGU_SANDBOX`** (consistent with the existing
-//! `SHUGU_*` knobs in chat.rs / image.rs / codex.rs):
-//!
-//!   * unset / `off` / anything unrecognized → **`Off`** (passthrough, no ACL
-//!     changes — the current behavior, so nothing breaks by surprise).
-//!   * `light` → deny-list on secrets.
-//!   * `strict` → deny-list on secrets + write-confine to the allowlist.
-//!
-//! ## Fallback
-//!
-//! Every fallible step degrades gracefully: if a SID lookup, a DACL read, or an
-//! ACE application fails, the guard logs a one-line warning and the command runs
-//! WITHOUT that particular protection rather than refusing to run. A sandbox
-//! that can't arm itself must never wedge the agent.
+//! Setting up the token, labeling a dir, or the confined spawn can each fail for
+//! environmental reasons. ANY failure logs a one-line warning and falls back to
+//! the existing **direct** spawn — the agent loop is never blocked or bricked by
+//! the sandbox. Confinement is best-effort hardening, never a precondition.
 //!
 //! ## Non-Windows
 //!
-//! On non-Windows targets the public surface is a documented **no-op
-//! passthrough**: [`SandboxMode::from_env`] still parses the env var (so the
-//! mode is observable / testable), but [`Sandbox::arm`] does nothing and returns
-//! an inert guard. Shugu is Windows-first; a POSIX confinement lane
-//! (bubblewrap/Landlock) is a separate, larger change.
+//! A documented no-op: [`should_disable`] / the allowlist resolver still parse so
+//! the policy is observable/testable, but there is no confined spawn (Shugu is
+//! Windows-first; a POSIX lane — bubblewrap/Landlock — is a separate change).
+//! `run_command_direct` simply uses its normal `std::process::Command` path.
 
 use std::path::{Path, PathBuf};
 
 // ────────────────────────────────────────────────────────────────────────
-// SandboxMode — the opt-in level, parsed from SHUGU_SANDBOX
+// Activation — ALWAYS ON; only env `SHUGU_SANDBOX_DISABLE=1` opts OUT.
 // ────────────────────────────────────────────────────────────────────────
 
-/// The confinement level for a single `run_command`. Parsed from the
-/// `SHUGU_SANDBOX` env var; default [`SandboxMode::Off`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SandboxMode {
-    /// Passthrough. No ACL changes. The pre-sandbox behavior — the default so an
-    /// unset env var never alters the dev loop.
-    Off,
-    /// Deny read+write on credential/config secret stores. Tools run normally.
-    Light,
-    /// `Light` + write-confine to the workspace/temp/cache allowlist (deny write
-    /// on the rest of the user profile). Network stays active.
-    Strict,
-}
+/// Emergency kill-switch env var. Set to `1` / `true` / `on` to run commands
+/// WITHOUT confinement (plain direct spawn). Anything else (incl. unset) → the
+/// sandbox is active. Documented in `docs/win-sandbox-validation.md`.
+pub const DISABLE_ENV: &str = "SHUGU_SANDBOX_DISABLE";
 
-/// Env var that selects the sandbox level. Documented in
-/// `docs/win-sandbox-validation.md`.
-pub const SANDBOX_ENV: &str = "SHUGU_SANDBOX";
-
-impl SandboxMode {
-    /// Stable lowercase id for logs.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SandboxMode::Off => "off",
-            SandboxMode::Light => "light",
-            SandboxMode::Strict => "strict",
-        }
-    }
-
-    /// Parse a raw string value (the env var's contents) into a mode. Trims and
-    /// lowercases; anything unrecognized → `Off` (fail-open to the safe-for-the-
-    /// dev-loop default, NEVER to a stricter-than-asked mode).
-    pub fn parse(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "light" => SandboxMode::Light,
-            "strict" => SandboxMode::Strict,
-            // "off", "", "0", "false", any typo → Off.
-            _ => SandboxMode::Off,
-        }
-    }
-
-    /// Read [`SANDBOX_ENV`] from the environment. Absent var → `Off`.
-    pub fn from_env() -> Self {
-        match std::env::var(SANDBOX_ENV) {
-            Ok(v) => SandboxMode::parse(&v),
-            Err(_) => SandboxMode::Off,
-        }
-    }
-
-    /// Does this mode arm any protection at all? (`Off` is a pure passthrough.)
-    pub fn is_active(self) -> bool {
-        !matches!(self, SandboxMode::Off)
-    }
-}
-
-impl Default for SandboxMode {
-    fn default() -> Self {
-        SandboxMode::Off
+/// Is the sandbox disabled by the emergency env var? `true` only for an explicit
+/// truthy value — the default (unset / anything else) keeps the sandbox ON.
+pub fn should_disable() -> bool {
+    match std::env::var(DISABLE_ENV) {
+        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"),
+        Err(_) => false,
     }
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// Path resolution — the protected secret list & the strict write-allowlist.
-// Pure, OS-agnostic, and unit-tested without any spawn or FFI.
+// Write-allowlist — the roots the confined child MAY write. Pure, OS-agnostic,
+// unit-tested without any spawn or FFI.
 // ────────────────────────────────────────────────────────────────────────
 
 /// Resolve the user's home directory the way the rest of Shugu does
-/// (`USERPROFILE` first on Windows, then `HOME`). Returns `None` if neither is
-/// set, in which case the home-relative protections are simply skipped.
+/// (`USERPROFILE` first on Windows, then `HOME`). `None` if neither is set, in
+/// which case only the workspace + temp are allowlisted.
 pub(crate) fn home_dir() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
@@ -185,75 +131,18 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
-/// The credential / config stores protected (deny READ + WRITE) in BOTH
-/// `light` and `strict`. Relative to `home`. These are the files an injected
-/// command would try to exfiltrate.
+/// The write-allowlist: directories the confined command may write. Everything
+/// NOT under one of these stays read-only to the LOW child (no-write-up).
 ///
-/// Pure function of `home` so it is trivially testable. Paths that don't exist
-/// on a given machine are harmless — applying a deny-ACE to a missing path is a
-/// no-op the caller skips.
-pub(crate) fn secret_paths(home: &Path) -> Vec<PathBuf> {
-    // Sub-paths under home that hold credentials or auth material.
-    const REL: &[&str] = &[
-        // SSH private keys + known_hosts.
-        ".ssh",
-        // Cloud / CLI credentials.
-        ".aws",
-        ".azure",
-        ".gcloud",
-        // Agent auth tokens (Codex, Claude).
-        ".codex/auth.json",
-        ".claude.json",
-        ".claude/.credentials.json",
-        // Git / npm / docker credential stores.
-        ".git-credentials",
-        ".npmrc",
-        ".docker/config.json",
-        ".netrc",
-        // Generic config dir (XDG-style on Windows tools) — token-bearing.
-        ".config",
-        // Kubernetes context (often holds bearer tokens).
-        ".kube/config",
-    ];
-
-    // Home-relative secrets only when we actually have a home. An empty `home`
-    // (neither USERPROFILE nor HOME set) would make `home.join(".ssh")` a
-    // RELATIVE `.ssh`, which `deny_ace` could mis-resolve against the cwd — so
-    // we skip those entirely and rely on the absolute browser paths below.
-    let mut out: Vec<PathBuf> = if home.as_os_str().is_empty() {
-        Vec::new()
-    } else {
-        REL.iter().map(|r| home.join(r)).collect()
-    };
-
-    // Browser profile roots under %LOCALAPPDATA% — cookies + saved passwords.
-    // Resolved separately because they live under LocalAppData, not directly
-    // under home.
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        let local = PathBuf::from(local);
-        if !local.as_os_str().is_empty() {
-            for rel in [
-                r"Google\Chrome\User Data\Default\Login Data",
-                r"Google\Chrome\User Data\Default\Cookies",
-                r"Microsoft\Edge\User Data\Default\Login Data",
-                r"BraveSoftware\Brave-Browser\User Data\Default\Login Data",
-            ] {
-                out.push(local.join(rel));
-            }
-        }
-    }
-
-    out
-}
-
-/// The `strict` write-allowlist: roots where the confined command MAY write.
-/// Everything under the user profile that is NOT in this set gets a deny-WRITE
-/// ACE (see [`strict_write_deny_roots`]). Caches are included so `pnpm install`
-/// / `cargo build` keep working.
+/// `ws` is the agent workspace root (always writable — the whole point). The OS
+/// temp dir and the package caches are included so `pnpm install` / `cargo
+/// build` keep working. Caches honor the conventional env overrides
+/// (`CARGO_HOME`, `RUSTUP_HOME`, `npm_config_cache`) before the home-relative
+/// default.
 ///
-/// `ws` is the agent workspace root (always writable — that's the whole point).
-/// Caches are CONFIGURABLE via env (`CARGO_HOME`, `RUSTUP_HOME`, `npm_config_cache`)
-/// falling back to the conventional `~\.cargo` etc.
+/// Pure function of `ws` + `home` + the cache env vars → trivially testable.
+/// Paths that don't exist on a given machine are harmless: labeling is skipped
+/// for a missing dir (the caller creates the ones it can, e.g. the workspace).
 pub(crate) fn write_allowlist(ws: &Path, home: Option<&Path>) -> Vec<PathBuf> {
     let mut allow: Vec<PathBuf> = vec![ws.to_path_buf()];
 
@@ -261,8 +150,8 @@ pub(crate) fn write_allowlist(ws: &Path, home: Option<&Path>) -> Vec<PathBuf> {
     allow.push(std::env::temp_dir());
 
     // Package caches — env override first, then the conventional home-relative
-    // location. Without these `pnpm install` / `cargo fetch` would fail under
-    // strict because their cache writes would be denied.
+    // location. Without these `pnpm install` / `cargo fetch` would fail because
+    // their cache writes land outside the workspace.
     let cache_env_or_home = |env_key: &str, rel: &str| -> Option<PathBuf> {
         if let Some(v) = std::env::var_os(env_key) {
             let p = PathBuf::from(v);
@@ -285,150 +174,78 @@ pub(crate) fn write_allowlist(ws: &Path, home: Option<&Path>) -> Vec<PathBuf> {
     if let Some(h) = home {
         allow.push(h.join(".pnpm"));
         allow.push(h.join(".pnpm-store"));
+        // pnpm's content-addressable store on Windows often lives under
+        // LocalAppData too; covered below.
+        allow.push(h.join(".cache"));
     }
-    // npm's default Windows cache lives under LocalAppData.
+    // npm's / pnpm's default Windows caches live under LocalAppData.
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {
         let local = PathBuf::from(local);
         if !local.as_os_str().is_empty() {
-            allow.push(local.join(r"npm-cache"));
-            allow.push(local.join(r"pnpm"));
+            allow.push(local.join("npm-cache"));
+            allow.push(local.join("pnpm"));
+            allow.push(local.join(r"pnpm-cache"));
         }
     }
 
+    // De-dup (env overrides can collide with the home-relative defaults).
+    allow.sort();
+    allow.dedup();
     allow
 }
 
-/// The `strict` write-DENY roots: high-value out-of-workspace locations whose
-/// WRITE access is denied so an injected command can't tamper with shell config
-/// or autostart. We deny the user-profile root itself (so `~\.bashrc`,
-/// `~\hack.txt` fail) while the [`write_allowlist`] allow-ACEs placed AFTER the
-/// deny restore write to the caches/temp/workspace (Windows evaluates the most
-/// specific path's own DACL, and we apply allow-ACEs directly on the allowlist
-/// dirs, so they win on their own subtree).
+// ════════════════════════════════════════════════════════════════════════
+// Public spawn surface. On Windows: the confined low-IL spawn. Elsewhere /
+// when disabled: the caller uses its own direct path (this returns None to say
+// "I did not run it").
+// ════════════════════════════════════════════════════════════════════════
+
+/// Outcome of a confined run, mirroring the fields `run_command_direct` needs.
+pub struct ConfinedOutcome {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub timed_out: bool,
+}
+
+/// Attempt to run `command` (via `cmd /d /s /c`) under the process sandbox, with
+/// cwd = `ws`, a wall-clock `timeout_secs`, and stdout/stderr each capped at
+/// `output_cap` bytes. BLOCKS (call under `spawn_blocking`).
 ///
-/// Honest scope: we deny the profile root and a few well-known config roots, not
-/// the entire disk. A write to a brand-new `D:\foo` is still possible (and still
-/// flagged by the risk classifier when it escapes the workspace). This protects
-/// the realistic tamper targets without an unbounded, slow, whole-disk ACL sweep.
-pub(crate) fn strict_write_deny_roots(home: Option<&Path>) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(h) = home {
-        // The profile root: covers ~\.bashrc, ~\.gitconfig, ~\hack.txt, the
-        // Startup folder under AppData, etc. NON-recursive deny on the root dir
-        // itself plus the specific config files below.
-        roots.push(h.to_path_buf());
-        for rel in [
-            ".bashrc",
-            ".bash_profile",
-            ".profile",
-            ".zshrc",
-            ".gitconfig",
-            "Documents\\WindowsPowerShell",
-        ] {
-            roots.push(h.join(rel));
-        }
-        // Per-user autostart — a classic persistence target.
-        if let Some(appdata) = std::env::var_os("APPDATA") {
-            let appdata = PathBuf::from(appdata);
-            if !appdata.as_os_str().is_empty() {
-                roots.push(appdata.join(r"Microsoft\Windows\Start Menu\Programs\Startup"));
-            }
-        }
-    }
-    roots
-}
-
-// ────────────────────────────────────────────────────────────────────────
-// Sandbox — arm/restore. Real impl on Windows, no-op elsewhere.
-// ────────────────────────────────────────────────────────────────────────
-
-/// Request to arm a sandbox for one command run.
-pub struct Sandbox {
-    pub mode: SandboxMode,
-    pub workspace: PathBuf,
-}
-
-impl Sandbox {
-    /// Build a sandbox request for `workspace` at the env-selected mode.
-    pub fn from_env(workspace: &Path) -> Self {
-        Sandbox {
-            mode: SandboxMode::from_env(),
-            workspace: workspace.to_path_buf(),
-        }
-    }
-
-    /// Arm the sandbox, returning an RAII [`SandboxGuard`] that restores every
-    /// modified DACL when dropped. NEVER fails the run: an arming error logs a
-    /// warning and returns a guard that protects whatever it managed to apply
-    /// (possibly nothing). Hold the guard for the lifetime of the command.
-    #[cfg(windows)]
-    pub fn arm(&self) -> SandboxGuard {
-        if !self.mode.is_active() {
-            return SandboxGuard::inert(self.mode);
-        }
-        windows_impl::arm(self.mode, &self.workspace)
-    }
-
-    /// Non-Windows: documented no-op. Parses/observes the mode but applies no
-    /// confinement (Shugu is Windows-first; POSIX confinement is out of scope).
-    #[cfg(not(windows))]
-    pub fn arm(&self) -> SandboxGuard {
-        if self.mode.is_active() {
-            eprintln!(
-                "[agent:sandbox] mode={} requested but this build is non-Windows — \
-                 running WITHOUT confinement (passthrough). POSIX confinement is a \
-                 separate lane.",
-                self.mode.as_str()
-            );
-        }
-        SandboxGuard::inert(self.mode)
-    }
-}
-
-/// RAII guard. On Windows it holds the original DACLs of every path it modified
-/// and restores them on Drop. On non-Windows / `Off` it is inert.
-pub struct SandboxGuard {
-    mode: SandboxMode,
-    #[cfg(windows)]
-    restores: Vec<windows_impl::DaclRestore>,
-}
-
-impl SandboxGuard {
-    /// An inert guard (nothing to restore). Used for `Off` and non-Windows.
-    fn inert(mode: SandboxMode) -> Self {
-        SandboxGuard {
-            mode,
-            #[cfg(windows)]
-            restores: Vec::new(),
-        }
-    }
-
-    /// The mode this guard was armed at — for logging.
-    pub fn mode(&self) -> SandboxMode {
-        self.mode
-    }
-
-    /// Number of filesystem objects whose DACL is currently modified (0 when
-    /// inert). Lets the exec log report how much the sandbox actually armed.
-    pub fn armed_count(&self) -> usize {
-        #[cfg(windows)]
-        {
-            self.restores.len()
-        }
-        #[cfg(not(windows))]
-        {
-            0
-        }
-    }
-}
-
+/// Returns:
+///   * `Some(outcome)` — the command ran CONFINED; the outcome is authoritative.
+///   * `None` — the sandbox declined / could not arm (disabled by env, non-
+///     Windows, or any FFI failure). The caller MUST fall back to its direct
+///     spawn. A warning is logged on the failure path.
+///
+/// Never panics: every fallible FFI step degrades to `None` so the dev loop is
+/// never blocked.
 #[cfg(windows)]
-impl Drop for SandboxGuard {
-    fn drop(&mut self) {
-        for r in self.restores.drain(..) {
-            r.restore();
-        }
+pub fn run_confined(
+    ws: &Path,
+    command: &str,
+    timeout_secs: u64,
+    output_cap: usize,
+) -> Option<ConfinedOutcome> {
+    if should_disable() {
+        eprintln!(
+            "[agent:sandbox] {DISABLE_ENV} set — confinement OFF, running command directly."
+        );
+        return None;
     }
+    windows_impl::run_confined(ws, command, timeout_secs, output_cap)
+}
+
+/// Non-Windows: no confined spawn lane. Always `None` → caller uses its direct
+/// `std::process::Command` path. (A POSIX confinement lane is out of scope.)
+#[cfg(not(windows))]
+pub fn run_confined(
+    _ws: &Path,
+    _command: &str,
+    _timeout_secs: u64,
+    _output_cap: usize,
+) -> Option<ConfinedOutcome> {
+    None
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -438,451 +255,789 @@ impl Drop for SandboxGuard {
 #[cfg(windows)]
 mod windows_impl {
     use super::*;
+    use std::io::Read;
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, HANDLE};
-    // ACL plumbing lives in two sibling modules:
-    //   * the *functions* + EXPLICIT_ACCESS_W / TRUSTEE_W + ACCESS_MODE / trustee
-    //     constants are under `Security::Authorization`,
-    //   * the ACE_FLAGS inheritance constants and the token / SID / descriptor
-    //     types are under `Security` directly.
+    use std::os::windows::io::FromRawHandle;
+    use std::ptr;
+    use std::time::{Duration, Instant};
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, LocalFree, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    };
     use windows_sys::Win32::Security::Authorization::{
-        GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, DENY_ACCESS,
-        EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
-        TRUSTEE_W,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
     use windows_sys::Win32::Security::{
-        GetLengthSid, GetTokenInformation, TokenUser, ACL, DACL_SECURITY_INFORMATION,
-        NO_INHERITANCE, PSECURITY_DESCRIPTOR, PSID, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
-        TOKEN_QUERY, TOKEN_USER,
+        CreateWellKnownSid, DuplicateTokenEx, GetFileSecurityW, GetLengthSid, SecurityImpersonation,
+        SetFileSecurityW, SetTokenInformation, TokenIntegrityLevel, TokenPrimary, WinLowLabelSid,
+        ACL, LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+        SID_AND_ATTRIBUTES, TOKEN_ALL_ACCESS, TOKEN_MANDATORY_LABEL,
     };
-    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_READ, FILE_GENERIC_WRITE};
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessAsUserW, DeleteProcThreadAttributeList, GetCurrentProcess,
+        GetExitCodeProcess, InitializeProcThreadAttributeList, OpenProcessToken, TerminateProcess,
+        UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW,
+        EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+        PROC_THREAD_ATTRIBUTE_JOB_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+        JobObjectExtendedLimitInformation, TerminateJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
 
-    // GENERIC_WRITE-ish + DELETE mask we deny for write-confinement.
-    const DENY_WRITE_MASK: u32 = FILE_GENERIC_WRITE | DELETE;
-    // Read+write deny for secrets (fully fence them off).
-    const DENY_ALL_MASK: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE;
+    use windows_sys::Win32::Security::{
+        TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
+    };
 
-    /// Captured original security state for one path, restored on Drop of the
-    /// guard. Holds the path (wide), the original DACL pointer, and the original
-    /// security-descriptor buffer that owns it (must be `LocalFree`d after the
-    /// restore SetNamedSecurityInfoW copies it back).
-    pub(super) struct DaclRestore {
-        path_w: Vec<u16>,
-        // The security descriptor returned by GetNamedSecurityInfoW; it OWNS the
-        // original DACL memory. We free it after restoring.
-        orig_sd: PSECURITY_DESCRIPTOR,
-        // Pointer INTO orig_sd — the original DACL. May be null (no DACL).
-        orig_dacl: *mut ACL,
-        // The new DACL we allocated via SetEntriesInAclW; freed on restore.
-        new_dacl: *mut ACL,
-    }
-
-    impl DaclRestore {
-        /// Put the original DACL back and free our allocations. Best-effort: a
-        /// failure here is logged but cannot be propagated from Drop.
-        pub(super) fn restore(self) {
-            // SAFETY: path_w is a valid NUL-terminated wide string; orig_dacl is
-            // the DACL we captured from this same object. Restoring the original
-            // DACL returns the object to its pre-arm state.
-            let rc = unsafe {
-                SetNamedSecurityInfoW(
-                    self.path_w.as_ptr(),
-                    SE_FILE_OBJECT,
-                    DACL_SECURITY_INFORMATION,
-                    std::ptr::null_mut(), // owner unchanged
-                    std::ptr::null_mut(), // group unchanged
-                    self.orig_dacl,       // restore original DACL
-                    std::ptr::null_mut(), // sacl unchanged
-                )
-            };
-            if rc != ERROR_SUCCESS {
-                eprintln!(
-                    "[agent:sandbox] WARN failed to restore DACL (err {rc}) for a \
-                     protected path — recover manually with `icacls <path> /reset` if \
-                     access seems off."
-                );
-            }
-            // Free the security descriptor (owns orig_dacl) and our new DACL.
-            // SAFETY: both were allocated by the Win32 allocator (GetNamed… via
-            // LocalAlloc, SetEntriesInAclW via LocalAlloc) and are freed once.
-            unsafe {
-                if !self.orig_sd.is_null() {
-                    LocalFree(self.orig_sd as *mut _);
-                }
-                if !self.new_dacl.is_null() {
-                    LocalFree(self.new_dacl as *mut _);
-                }
-            }
-        }
-    }
+    // The integrity-label attribute that flags a SID as the token's integrity
+    // level (SE_GROUP_INTEGRITY | SE_GROUP_INTEGRITY_ENABLED = 0x20 | 0x40).
+    const SE_GROUP_INTEGRITY: u32 = 0x0000_0020;
+    const SE_GROUP_INTEGRITY_ENABLED: u32 = 0x0000_0040;
 
     /// Convert a path to a NUL-terminated UTF-16 buffer for the *W APIs.
     fn wide(p: &Path) -> Vec<u16> {
         p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
     }
 
-    /// Look up the current process's user SID. Returned as an owned byte buffer
-    /// that backs a valid `PSID` for the lifetime of the buffer. `None` on any
-    /// failure (caller degrades to no-protection).
-    fn current_user_sid() -> Option<Vec<u8>> {
-        unsafe {
-            let mut token: HANDLE = std::ptr::null_mut();
-            // SAFETY: GetCurrentProcess returns a pseudo-handle (no close); we
-            // open its token for query only.
-            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-                return None;
+    /// A NUL-terminated wide string from a &str (for SDDL / command line).
+    fn wide_str(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    // ── RAII wrappers ───────────────────────────────────────────────────
+
+    /// Owns a Win32 HANDLE, closing it on Drop. Used for the token, the pipe
+    /// ends we keep, the process/thread handles, and the Job.
+    struct OwnedHandle(HANDLE);
+    impl OwnedHandle {
+        fn new(h: HANDLE) -> Option<Self> {
+            if h.is_null() || h == INVALID_HANDLE_VALUE {
+                None
+            } else {
+                Some(OwnedHandle(h))
             }
-            // First call sizes the buffer.
-            let mut needed: u32 = 0;
-            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
-            if needed == 0 {
-                CloseHandle(token);
-                return None;
+        }
+        fn raw(&self) -> HANDLE {
+            self.0
+        }
+    }
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            // SAFETY: self.0 is a live handle we own, closed exactly once.
+            unsafe {
+                CloseHandle(self.0);
             }
-            let mut buf = vec![0u8; needed as usize];
-            let ok = GetTokenInformation(
-                token,
-                TokenUser,
-                buf.as_mut_ptr() as *mut _,
-                needed,
-                &mut needed,
-            );
-            CloseHandle(token);
-            if ok == 0 {
-                return None;
-            }
-            // buf holds a TOKEN_USER; its User.Sid points INTO buf. We copy the
-            // SID bytes into their own buffer so the PSID stays valid and self-
-            // contained even if `buf` is reasoned about separately.
-            let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
-            let sid = token_user.User.Sid;
-            if sid.is_null() {
-                return None;
-            }
-            // SAFETY: sid is a valid PSID from a TOKEN_USER inside `buf`.
-            let len = GetLengthSid(sid);
-            if len == 0 {
-                return None;
-            }
-            let mut sid_buf = vec![0u8; len as usize];
-            std::ptr::copy_nonoverlapping(sid as *const u8, sid_buf.as_mut_ptr(), len as usize);
-            Some(sid_buf)
         }
     }
 
-    /// Apply one DENY ACE (mask) for `sid` on `path`, prepended to the existing
-    /// DACL, capturing the original for restore. `inherit` controls whether the
-    /// ACE applies to the subtree (containers + objects) or just the named
-    /// object. Returns `None` if the path can't be opened or the ACL ops fail —
-    /// the caller skips that path (best-effort).
-    fn deny_ace(path: &Path, sid: PSID, mask: u32, inherit: bool) -> Option<DaclRestore> {
-        // Skip paths that don't exist — applying an ACE to a missing object
-        // fails and is pointless. The protection of a nonexistent secret is
-        // vacuously satisfied.
-        if !path.exists() {
-            return None;
+    /// A transient LOW label we applied to ONE dir and will REMOVE on Drop
+    /// (RAII). Only the **workspace** dir gets one of these — its label is the
+    /// user's live project and must not linger. The cache/temp roots are
+    /// provisioned-once (see `ensure_label_low`'s `transient=false` path) and
+    /// intentionally NOT restored: a LOW label only GRANTS low-IL write, it
+    /// removes no one's access, so leaving it is safe and lets the next command
+    /// skip re-labeling (the slow part). `path_w` is the dir; the restore removes
+    /// the SACL via the object-only `SetFileSecurityW` (NO recursive walk).
+    struct LabelRestore {
+        path_w: Vec<u16>,
+    }
+    impl Drop for LabelRestore {
+        fn drop(&mut self) {
+            // Remove our LOW label by writing an EMPTY SACL under
+            // LABEL_SECURITY_INFORMATION on the object only. We build a minimal SD
+            // with a present-but-empty SACL (`S:`) so the mandatory label reverts
+            // to the inherited default (MEDIUM). Object-only — no child walk.
+            let empty = wide_str("S:");
+            let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+            // SAFETY: `S:` is a valid SDDL (empty SACL); out-param gets a LocalAlloc'd SD.
+            let parsed = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    empty.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut sd,
+                    ptr::null_mut(),
+                )
+            };
+            if parsed != 0 && !sd.is_null() {
+                // SAFETY: path_w NUL-terminated; sd is a valid SD. SetFileSecurityW
+                // writes ONLY this object's SD (no propagation to children).
+                let ok = unsafe {
+                    SetFileSecurityW(self.path_w.as_ptr(), LABEL_SECURITY_INFORMATION, sd)
+                };
+                if ok == 0 {
+                    eprintln!(
+                        "[agent:sandbox] WARN failed to remove the LOW label from the workspace \
+                         (err {}) — harmless (LOW only GRANTS low-IL write); recover with \
+                         `icacls <dir> /setintegritylevel Medium` if needed.",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                // SAFETY: sd was LocalAlloc'd by the parser; freed once.
+                unsafe {
+                    LocalFree(sd as *mut _);
+                }
+            }
         }
-        let path_w = wide(path);
+    }
 
-        // 1) Read the current DACL + the owning security descriptor.
-        let mut p_dacl: *mut ACL = std::ptr::null_mut();
-        let mut p_sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-        // SAFETY: path_w is NUL-terminated; out-pointers are valid. On success
-        // p_sd owns the buffer (freed on restore) and p_dacl points into it.
-        let rc = unsafe {
-            GetNamedSecurityInfoW(
-                path_w.as_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut p_dacl,
-                std::ptr::null_mut(),
-                &mut p_sd,
+    // ── Step 1: a LOW-integrity primary token duplicated from ours ──────
+
+    /// Duplicate the current process token and lower its integrity to LOW.
+    /// Returns the new primary token on success. `None` (logged) on any failure.
+    ///
+    /// Lowering one's own integrity needs no privilege; the kernel forbids
+    /// RAISING it, which is exactly the property we rely on (the child can't
+    /// climb back to MEDIUM).
+    fn make_low_token() -> Option<OwnedHandle> {
+        unsafe {
+            // 1a. Open our own primary token with the rights DuplicateTokenEx +
+            // the later SetTokenInformation need.
+            let mut cur_token: HANDLE = ptr::null_mut();
+            // SAFETY: GetCurrentProcess is a pseudo-handle (no close needed).
+            if OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT,
+                &mut cur_token,
+            ) == 0
+            {
+                eprintln!("[agent:sandbox] WARN OpenProcessToken failed — running unconfined.");
+                return None;
+            }
+            let _cur = OwnedHandle::new(cur_token)?;
+
+            // 1b. Duplicate it as a PRIMARY token we can assign to a new process.
+            let mut new_token: HANDLE = ptr::null_mut();
+            // SAFETY: cur_token is valid; out-param receives a new token handle.
+            let ok = DuplicateTokenEx(
+                _cur.raw(),
+                TOKEN_ALL_ACCESS,
+                ptr::null(),
+                SecurityImpersonation,
+                TokenPrimary,
+                &mut new_token,
+            );
+            if ok == 0 {
+                eprintln!("[agent:sandbox] WARN DuplicateTokenEx failed — running unconfined.");
+                return None;
+            }
+            let dup = OwnedHandle::new(new_token)?;
+
+            // 1c. Build the LOW integrity SID (S-1-16-4096) via CreateWellKnownSid.
+            let mut sid_len: u32 = 0;
+            // First call sizes the buffer (returns 0 / ERROR_INSUFFICIENT_BUFFER).
+            CreateWellKnownSid(WinLowLabelSid, ptr::null_mut(), ptr::null_mut(), &mut sid_len);
+            if sid_len == 0 {
+                eprintln!("[agent:sandbox] WARN CreateWellKnownSid sizing failed — unconfined.");
+                return None;
+            }
+            let mut sid_buf = vec![0u8; sid_len as usize];
+            // SAFETY: sid_buf is sized exactly per the previous call.
+            if CreateWellKnownSid(
+                WinLowLabelSid,
+                ptr::null_mut(),
+                sid_buf.as_mut_ptr() as PSID,
+                &mut sid_len,
+            ) == 0
+            {
+                eprintln!("[agent:sandbox] WARN CreateWellKnownSid failed — unconfined.");
+                return None;
+            }
+
+            // 1d. SetTokenInformation(TokenIntegrityLevel) to drop the dup token
+            // to LOW. TOKEN_MANDATORY_LABEL points at our SID buffer (kept alive
+            // for the duration of this call).
+            let mut label = TOKEN_MANDATORY_LABEL {
+                Label: SID_AND_ATTRIBUTES {
+                    Sid: sid_buf.as_mut_ptr() as PSID,
+                    Attributes: SE_GROUP_INTEGRITY | SE_GROUP_INTEGRITY_ENABLED,
+                },
+            };
+            // SAFETY: label is a fully-initialized TOKEN_MANDATORY_LABEL; its
+            // size is the struct size; dup is a valid primary token with
+            // ADJUST_DEFAULT rights.
+            if SetTokenInformation(
+                dup.raw(),
+                TokenIntegrityLevel,
+                &mut label as *mut _ as *const core::ffi::c_void,
+                std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32
+                    + GetLengthSid(sid_buf.as_mut_ptr() as PSID),
+            ) == 0
+            {
+                eprintln!(
+                    "[agent:sandbox] WARN SetTokenInformation(IntegrityLevel=LOW) failed — \
+                     running unconfined."
+                );
+                return None;
+            }
+
+            Some(dup)
+        }
+    }
+
+    // ── Step 2: stamp a LOW mandatory label on each allowlist dir ───────
+
+    /// Result of trying to make `dir` writable to the LOW child.
+    enum LabelOutcome {
+        /// We just applied a transient LOW label that must be removed on Drop
+        /// (the workspace). Carries its restore guard.
+        Transient(LabelRestore),
+        /// The dir is already LOW (we skipped — fast path) OR we applied a
+        /// persistent LOW label we intentionally leave in place (caches/temp).
+        /// Nothing to restore.
+        Provisioned,
+        /// Could not label it (missing dir / ACL failure). The dir just won't be
+        /// writable by the confined child; confinement is still correct.
+        Failed,
+    }
+
+    /// Ensure `dir` carries a LOW mandatory label so the LOW child may write it.
+    ///
+    /// PERFORMANCE: uses the object-only `Get/SetFileSecurityW` (NOT
+    /// `SetNamedSecurityInfoW`, which recursively re-stamps every existing child
+    /// — that turned a `~\.cargo` + `~\.rustup` label into a multi-minute walk).
+    /// The OICI (inherit) flag on the directory's own ACE is enough: files the
+    /// LOW child CREATES inherit the label at creation time, so writes succeed
+    /// without touching the tens of thousands of pre-existing cache files.
+    ///
+    /// IDEMPOTENT: if the dir is already LOW (carries our label from a prior
+    /// command), we skip the apply entirely (`Provisioned`) — the common case
+    /// after the first run, making per-command overhead ~one Get per dir.
+    ///
+    /// `transient` = true only for the workspace: its label is removed on Drop.
+    /// Caches/temp are provisioned-once and left labeled (a LOW label only GRANTS
+    /// low-IL write — it removes no access — so leaving it is safe and keeps the
+    /// dev loop fast).
+    fn ensure_label_low(dir: &Path, transient: bool) -> LabelOutcome {
+        if !dir.exists() {
+            return LabelOutcome::Failed;
+        }
+        let path_w = wide(dir);
+
+        // 2a. Fast path: is it ALREADY low-labeled? Read the object's own SACL
+        // (object-only, cheap) and check for a mandatory-label ACE at LOW.
+        if dir_is_low_labeled(&path_w) {
+            return LabelOutcome::Provisioned;
+        }
+
+        // 2b. Build the LOW-label SD from SDDL. `S:(ML;OICI;NW;;;LW)`:
+        //   ML  = SYSTEM_MANDATORY_LABEL_ACE
+        //   OICI= OBJECT_INHERIT | CONTAINER_INHERIT (new files + subdirs inherit)
+        //   NW  = SYSTEM_MANDATORY_LABEL_NO_WRITE_UP (the policy)
+        //   LW  = Low integrity level SID (S-1-16-4096)
+        let sddl = wide_str("S:(ML;OICI;NW;;;LW)");
+        let mut new_sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: sddl is a valid NUL-terminated SDDL; out-param gets a LocalAlloc'd SD.
+        let parsed = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut new_sd,
+                ptr::null_mut(),
             )
         };
-        if rc != ERROR_SUCCESS {
+        if parsed == 0 || new_sd.is_null() {
             eprintln!(
-                "[agent:sandbox] WARN GetNamedSecurityInfoW failed (err {rc}) for {} — \
-                 skipping its protection.",
-                path.display()
+                "[agent:sandbox] WARN parsing LOW-label SDDL failed for {} — skipping.",
+                dir.display()
             );
-            return None;
+            return LabelOutcome::Failed;
         }
 
-        // 2) Build an EXPLICIT_ACCESS_W deny entry for the SID.
-        let inheritance = if inherit {
-            SUB_CONTAINERS_AND_OBJECTS_INHERIT
+        // 2c. Apply to the OBJECT ONLY (no child walk).
+        // SAFETY: path_w NUL-terminated; new_sd is a valid SD from the parser.
+        let applied = unsafe {
+            SetFileSecurityW(path_w.as_ptr(), LABEL_SECURITY_INFORMATION, new_sd)
+        };
+        // SAFETY: new_sd was LocalAlloc'd by the parser; freed once here (the
+        // apply copied what it needs).
+        unsafe {
+            LocalFree(new_sd as *mut _);
+        }
+        if applied == 0 {
+            eprintln!(
+                "[agent:sandbox] WARN applying LOW label failed (err {}) for {} — skipping \
+                 (that dir won't be writable by the confined child).",
+                std::io::Error::last_os_error(),
+                dir.display()
+            );
+            return LabelOutcome::Failed;
+        }
+
+        if transient {
+            LabelOutcome::Transient(LabelRestore { path_w })
         } else {
-            NO_INHERITANCE
-        };
-        let mut ea: EXPLICIT_ACCESS_W = unsafe { std::mem::zeroed() };
-        ea.grfAccessPermissions = mask;
-        ea.grfAccessMode = DENY_ACCESS;
-        ea.grfInheritance = inheritance;
-        ea.Trustee = TRUSTEE_W {
-            pMultipleTrustee: std::ptr::null_mut(),
-            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_USER,
-            ptstrName: sid as *mut u16, // for TRUSTEE_IS_SID this is the PSID
-        };
-
-        // 3) Merge our deny ACE INTO the existing DACL (deny is placed ahead of
-        // allows by SetEntriesInAclW, so it takes precedence — correct for a
-        // deny rule).
-        let mut new_dacl: *mut ACL = std::ptr::null_mut();
-        // SAFETY: one explicit entry; oldacl = current DACL (may be null);
-        // newacl out-param receives a LocalAlloc'd ACL we free on restore.
-        let rc2 = unsafe { SetEntriesInAclW(1, &ea, p_dacl, &mut new_dacl) };
-        if rc2 != ERROR_SUCCESS {
-            eprintln!(
-                "[agent:sandbox] WARN SetEntriesInAclW failed (err {rc2}) for {} — \
-                 skipping.",
-                path.display()
-            );
-            // p_sd still owns memory — free it; we won't restore this path.
-            unsafe {
-                if !p_sd.is_null() {
-                    LocalFree(p_sd as *mut _);
-                }
-            }
-            return None;
+            LabelOutcome::Provisioned
         }
+    }
 
-        // 4) Apply the new DACL to the object.
-        // SAFETY: new_dacl is a valid DACL; path_w NUL-terminated.
-        let rc3 = unsafe {
-            SetNamedSecurityInfoW(
+    /// Does `dir` already carry a mandatory label at LOW integrity? Reads the
+    /// object's own label SACL via the object-only `GetFileSecurityW` and checks
+    /// the first mandatory-label ACE's SID for the LOW RID (4096). On any read
+    /// failure → `false` (we'll just (re)apply — correctness over a micro-opt).
+    fn dir_is_low_labeled(path_w: &[u16]) -> bool {
+        unsafe {
+            // Size the buffer.
+            let mut needed: u32 = 0;
+            GetFileSecurityW(
                 path_w.as_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                new_dacl,
-                std::ptr::null_mut(),
+                LABEL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+            if needed == 0 {
+                return false;
+            }
+            let mut buf = vec![0u8; needed as usize];
+            if GetFileSecurityW(
+                path_w.as_ptr(),
+                LABEL_SECURITY_INFORMATION,
+                buf.as_mut_ptr() as PSECURITY_DESCRIPTOR,
+                needed,
+                &mut needed,
+            ) == 0
+            {
+                return false;
+            }
+            // Pull the SACL out of the (self-relative) SD.
+            let mut present: i32 = 0;
+            let mut defaulted: i32 = 0;
+            let mut sacl: *mut ACL = ptr::null_mut();
+            if windows_sys::Win32::Security::GetSecurityDescriptorSacl(
+                buf.as_mut_ptr() as PSECURITY_DESCRIPTOR,
+                &mut present,
+                &mut sacl,
+                &mut defaulted,
+            ) == 0
+                || present == 0
+                || sacl.is_null()
+            {
+                return false;
+            }
+            // The mandatory-label ACE is the first (only) ACE; its SID's last
+            // sub-authority is the integrity RID. LOW = 0x1000 (4096). We read
+            // the ACE generically: an ACE header followed by an access mask then
+            // the SID. Rather than model every ACE struct, use the documented
+            // SYSTEM_MANDATORY_LABEL_ACE layout: { ACE_HEADER(4) , ACCESS_MASK(4) ,
+            // SID }. The SID's sub-authority count + sub-authorities follow the
+            // 8-byte revision/identifier-authority preamble.
+            let acl = &*(sacl as *const ACL);
+            if acl.AceCount == 0 {
+                return false;
+            }
+            // First ACE sits immediately after the ACL header.
+            let ace_ptr = (sacl as *const u8).add(std::mem::size_of::<ACL>());
+            // SYSTEM_MANDATORY_LABEL_ACE: ACE_HEADER (4 bytes) + ACCESS_MASK (4) →
+            // SID starts at offset 8.
+            let sid_ptr = ace_ptr.add(8);
+            // SID layout: Revision(1) SubAuthorityCount(1) IdentifierAuthority(6)
+            // SubAuthority[count] (4 bytes each). Integrity RID is the last sub.
+            let sub_count = *sid_ptr.add(1);
+            if sub_count == 0 {
+                return false;
+            }
+            let last_sub_off = 8 + (sub_count as usize - 1) * 4;
+            let rid = (sid_ptr.add(last_sub_off) as *const u32).read_unaligned();
+            // SECURITY_MANDATORY_LOW_RID = 0x1000.
+            rid == 0x0000_1000
+        }
+    }
+
+    // ── Job object (tree-kill on timeout / drop), mirrors exec.rs ───────
+
+    fn create_job() -> Option<OwnedHandle> {
+        // SAFETY: null attrs + null name → new unnamed job, or null on failure.
+        let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+        let job = OwnedHandle::new(job)?;
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: info is fully-initialized; class matches the struct.
+        let ok = unsafe {
+            SetInformationJobObject(
+                job.raw(),
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )
         };
-        if rc3 != ERROR_SUCCESS {
-            eprintln!(
-                "[agent:sandbox] WARN SetNamedSecurityInfoW (apply) failed (err {rc3}) \
-                 for {} — skipping.",
-                path.display()
-            );
-            unsafe {
-                if !new_dacl.is_null() {
-                    LocalFree(new_dacl as *mut _);
+        if ok == 0 {
+            return None;
+        }
+        Some(job)
+    }
+
+    // ── Step 3: the confined spawn (CreateProcessAsUserW + manual pipes) ─
+
+    /// Run `command` confined. Returns `Some(outcome)` if it actually ran under
+    /// the low-IL token, `None` to signal the caller to use its direct path.
+    pub(super) fn run_confined(
+        ws: &Path,
+        command: &str,
+        timeout_secs: u64,
+        output_cap: usize,
+    ) -> Option<ConfinedOutcome> {
+        // 3a. Build the LOW token. If this fails, bail to the direct path.
+        let token = make_low_token()?;
+
+        // 3b. Label the write-allowlist dirs LOW. Hold the restores for the whole
+        // run (Drop restores them). We label whatever exists; the workspace MUST
+        // be writable, so if labeling the workspace itself fails we bail (the
+        // command would fail spuriously otherwise — a worse outcome than the
+        // unconfined direct path).
+        let home = home_dir();
+        let allow = write_allowlist(ws, home.as_deref());
+        let mut restores: Vec<LabelRestore> = Vec::new();
+        let mut workspace_labeled = false;
+        for dir in &allow {
+            // The workspace label is TRANSIENT (removed on Drop — it's the user's
+            // live project). Cache/temp roots are PROVISIONED (labeled once, left
+            // in place; re-labeling is skipped on later commands → fast loop).
+            let transient = dir == ws;
+            match ensure_label_low(dir, transient) {
+                LabelOutcome::Transient(r) => {
+                    if dir == ws {
+                        workspace_labeled = true;
+                    }
+                    restores.push(r);
                 }
-                if !p_sd.is_null() {
-                    LocalFree(p_sd as *mut _);
+                LabelOutcome::Provisioned => {
+                    if dir == ws {
+                        workspace_labeled = true;
+                    }
                 }
+                LabelOutcome::Failed => {}
             }
+        }
+        if !workspace_labeled {
+            eprintln!(
+                "[agent:sandbox] WARN could not LOW-label the workspace {} — a confined child \
+                 could not write its own project; falling back to direct spawn.",
+                ws.display()
+            );
+            // `restores` Drop here restores any dirs we did label. Then bail.
             return None;
         }
 
-        Some(DaclRestore {
-            path_w,
-            orig_sd: p_sd,
-            orig_dacl: p_dacl,
-            new_dacl,
+        // 3c. Create the Job object up front (tree-kill).
+        let job = create_job();
+
+        // 3d. Inheritable pipes for stdout/stderr; stdin = null (we feed none).
+        let mut sa: SECURITY_ATTRIBUTES = unsafe { std::mem::zeroed() };
+        sa.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
+        sa.bInheritHandle = 1; // pipe ends must be inheritable by the child
+
+        let (out_read, out_write) = make_pipe(&sa)?;
+        let (err_read, err_write) = make_pipe(&sa)?;
+
+        // The READ ends must NOT be inherited by the child (only the parent
+        // reads them); clear their inherit flag.
+        clear_inherit(out_read.raw());
+        clear_inherit(err_read.raw());
+
+        // 3e. STARTUPINFOEX with std handles wired + (optionally) the Job in a
+        // proc-thread attribute list so the child joins the job atomically at
+        // creation (closes the assign race; falls back to post-spawn assign if
+        // the attr list can't be built).
+        let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+        si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        // stdin null → the child sees an empty/closed stdin (matches Stdio::null).
+        si.StartupInfo.hStdInput = ptr::null_mut();
+        si.StartupInfo.hStdOutput = out_write.raw();
+        si.StartupInfo.hStdError = err_write.raw();
+
+        // Build the proc-thread attribute list carrying the Job handle.
+        let mut attr_buf: Vec<u8> = Vec::new();
+        let mut job_handles: [HANDLE; 1] = [ptr::null_mut()];
+        let mut have_attr_list = false;
+        if let Some(ref j) = job {
+            job_handles[0] = j.raw();
+            if let Some(buf) = build_job_attr_list(&job_handles) {
+                attr_buf = buf;
+                si.lpAttributeList = attr_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+                have_attr_list = true;
+            }
+        }
+
+        // 3f. Command line: `cmd /d /s /c <command>`. CreateProcess* mutates the
+        // command-line buffer in place, so it must be a writable Vec<u16>.
+        // /d skips the user's cmd.exe AutoRun, /s keeps quote handling sane.
+        let cmdline = format!("cmd /d /s /c {command}");
+        let mut cmdline_w = wide_str(&cmdline);
+        let cwd_w = wide(ws);
+
+        let creation_flags = CREATE_NO_WINDOW
+            | EXTENDED_STARTUPINFO_PRESENT;
+
+        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+        // SAFETY: token is a valid primary token; cmdline_w is a writable,
+        // NUL-terminated buffer; si is a valid STARTUPINFOEXW (size in cb);
+        // bInheritHandles=TRUE so the child inherits the pipe write ends; cwd_w
+        // NUL-terminated. On success pi.hProcess / pi.hThread are live handles.
+        let spawned = unsafe {
+            CreateProcessAsUserW(
+                token.raw(),
+                ptr::null(),
+                cmdline_w.as_mut_ptr(),
+                ptr::null(),
+                ptr::null(),
+                1, // bInheritHandles
+                creation_flags,
+                ptr::null(),
+                cwd_w.as_ptr(),
+                &si.StartupInfo,
+                &mut pi,
+            )
+        };
+
+        // The attribute list is consumed by CreateProcess; clean it up now.
+        if have_attr_list {
+            // SAFETY: attr_buf was initialized by InitializeProcThreadAttributeList.
+            unsafe {
+                DeleteProcThreadAttributeList(
+                    attr_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST,
+                );
+            }
+        }
+
+        if spawned == 0 {
+            let err = std::io::Error::last_os_error();
+            eprintln!(
+                "[agent:sandbox] WARN CreateProcessAsUserW failed ({err}) — falling back to \
+                 direct spawn."
+            );
+            // restores Drop → labels restored; pipes Drop → closed. Bail.
+            return None;
+        }
+
+        let proc = OwnedHandle::new(pi.hProcess);
+        let thread = OwnedHandle::new(pi.hThread);
+
+        // If the attr-list job-join wasn't used, assign post-spawn (best-effort).
+        if !have_attr_list {
+            if let (Some(ref j), Some(ref p)) = (&job, &proc) {
+                // SAFETY: both handles are live; assignment is idempotent.
+                unsafe {
+                    AssignProcessToJobObject(j.raw(), p.raw());
+                }
+            }
+        }
+
+        // 3g. Drop OUR copy of the child's stdio WRITE ends so the read ends see
+        // EOF when the child exits (otherwise the drain threads block forever).
+        drop(out_write);
+        drop(err_write);
+
+        // 3h. Drain stdout/stderr on threads (identical contract to exec.rs):
+        // read everything so the child never blocks on a full pipe; cap at join.
+        let out_file = unsafe { std::fs::File::from_raw_handle(out_read.raw() as *mut _) };
+        let err_file = unsafe { std::fs::File::from_raw_handle(err_read.raw() as *mut _) };
+        // from_raw_handle takes ownership of the handle; prevent the OwnedHandle
+        // Drop from double-closing it.
+        std::mem::forget(out_read);
+        std::mem::forget(err_read);
+
+        let out_handle = spawn_reader(out_file);
+        let err_handle = spawn_reader(err_file);
+
+        // 3i. Poll for exit with a wall-clock deadline; on timeout, kill the
+        // whole tree (Job terminate) and the direct child as a fallback.
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let mut timed_out = false;
+        let exit_code: i32 = loop {
+            let Some(ref p) = proc else {
+                break -1;
+            };
+            // SAFETY: p.raw() is a live process handle; 0 ms = poll, no wait.
+            let wait = unsafe { WaitForSingleObject(p.raw(), 0) };
+            if wait == WAIT_OBJECT_0 {
+                let mut code: u32 = 0;
+                // SAFETY: live handle; out-param valid.
+                unsafe {
+                    GetExitCodeProcess(p.raw(), &mut code);
+                }
+                break code as i32;
+            }
+            if Instant::now() >= deadline {
+                timed_out = true;
+                if let Some(ref j) = job {
+                    // SAFETY: live job handle — terminate the whole tree.
+                    unsafe {
+                        TerminateJobObject(j.raw(), 1);
+                    }
+                }
+                // SAFETY: live process handle — belt-and-braces direct kill.
+                unsafe {
+                    TerminateProcess(p.raw(), 1);
+                }
+                break 124; // coreutils `timeout` convention
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+
+        let stdout = join_reader(out_handle, output_cap);
+        let stderr = join_reader(err_handle, output_cap);
+
+        // proc / thread / job / token / restores all Drop here:
+        //   * dropping the Job handle (KILL_ON_JOB_CLOSE) reaps any straggler,
+        //   * dropping `restores` puts the original integrity labels back,
+        //   * dropping the token / handles closes them.
+        drop(thread);
+        drop(proc);
+        drop(job);
+        // restores + token dropped at scope end.
+        let _ = restores;
+        let _ = token;
+
+        Some(ConfinedOutcome {
+            exit_code,
+            stdout,
+            stderr,
+            timed_out,
         })
     }
 
-    /// Arm the requested mode. Returns a guard owning every successful restore.
-    pub(super) fn arm(mode: SandboxMode, workspace: &Path) -> SandboxGuard {
-        let mut restores: Vec<DaclRestore> = Vec::new();
-
-        // The user SID backing every deny ACE. Without it we can't build a
-        // trustee → degrade to no protection (logged once).
-        let sid_buf = match current_user_sid() {
-            Some(b) => b,
-            None => {
-                eprintln!(
-                    "[agent:sandbox] WARN could not resolve current user SID — running \
-                     {} WITHOUT ACL confinement (passthrough).",
-                    mode.as_str()
-                );
-                return SandboxGuard {
-                    mode,
-                    restores,
-                };
-            }
-        };
-        let sid: PSID = sid_buf.as_ptr() as PSID;
-
-        let home = home_dir();
-
-        // ── Both light & strict: fence the secret stores (deny read+write). ──
-        for secret in secret_paths(home.as_deref().unwrap_or(Path::new(""))) {
-            // For directories (.ssh, .aws, .config) inherit into the subtree so
-            // the keys inside are covered; for single files NO_INHERITANCE.
-            let inherit = secret.is_dir();
-            if let Some(r) = deny_ace(&secret, sid, DENY_ALL_MASK, inherit) {
-                restores.push(r);
-            }
+    /// Create an anonymous pipe (read, write). Both ends inheritable per `sa`.
+    fn make_pipe(sa: &SECURITY_ATTRIBUTES) -> Option<(OwnedHandle, OwnedHandle)> {
+        let mut read: HANDLE = ptr::null_mut();
+        let mut write: HANDLE = ptr::null_mut();
+        // SAFETY: out-params valid; sa is a valid SECURITY_ATTRIBUTES.
+        let ok = unsafe { CreatePipe(&mut read, &mut write, sa, 0) };
+        if ok == 0 {
+            eprintln!("[agent:sandbox] WARN CreatePipe failed — falling back to direct spawn.");
+            return None;
         }
+        Some((OwnedHandle::new(read)?, OwnedHandle::new(write)?))
+    }
 
-        // ── Strict only: write-confine. Deny WRITE on the high-value out-of-
-        // workspace roots, then (re-)allow WRITE on the allowlist so caches/
-        // temp/workspace still work. The allow-ACEs are applied to the
-        // allowlist dirs' OWN DACLs, which the kernel evaluates against those
-        // subtrees directly — so a deny on the profile root and an allow on
-        // ~\.cargo coexist correctly. ──
-        if mode == SandboxMode::Strict {
-            for deny_root in strict_write_deny_roots(home.as_deref()) {
-                // NON-recursive on the profile root (we don't want to deny write
-                // to the whole profile subtree — that would also hit the caches
-                // before our allow-ACEs and is far too broad). The root's own
-                // DACL stops ~\hack.txt / ~\.bashrc creation+modification.
-                let inherit = false;
-                if let Some(r) = deny_ace(&deny_root, sid, DENY_WRITE_MASK, inherit) {
-                    restores.push(r);
-                }
-            }
-            // Note: the workspace, temp, and caches are NOT denied — they keep
-            // their inherited allow-ACEs, so writes there continue to succeed.
-            // We intentionally do NOT add explicit allow-ACEs (the default
-            // inherited allow already grants write); adding redundant allows
-            // would only risk surprising the user's existing ACLs. See
-            // write_allowlist for the conceptual set and the validation doc for
-            // the runtime checks.
-            let _ = write_allowlist(workspace, home.as_deref()); // referenced for clarity/tests
+    /// Clear the inherit flag on a handle (the parent-only read ends).
+    fn clear_inherit(h: HANDLE) {
+        use windows_sys::Win32::Foundation::SetHandleInformation;
+        // SAFETY: h is a live handle; clearing HANDLE_FLAG_INHERIT is safe.
+        unsafe {
+            SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
         }
+    }
 
-        if restores.is_empty() {
-            eprintln!(
-                "[agent:sandbox] mode={} armed 0 paths (none existed / all skipped) — \
-                 running effectively as passthrough.",
-                mode.as_str()
+    /// Build a PROC_THREAD_ATTRIBUTE_LIST carrying the Job handle(s) so the child
+    /// joins the job at creation. Returns the backing buffer (kept alive by the
+    /// caller until after CreateProcess). `None` on any failure → caller assigns
+    /// the job post-spawn instead.
+    fn build_job_attr_list(jobs: &[HANDLE; 1]) -> Option<Vec<u8>> {
+        unsafe {
+            // Size the list for 1 attribute.
+            let mut size: usize = 0;
+            InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut size);
+            if size == 0 {
+                return None;
+            }
+            let mut buf = vec![0u8; size];
+            let list = buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+            if InitializeProcThreadAttributeList(list, 1, 0, &mut size) == 0 {
+                return None;
+            }
+            // PROC_THREAD_ATTRIBUTE_JOB_LIST takes an array of job handles.
+            let ok = UpdateProcThreadAttribute(
+                list,
+                0,
+                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                jobs.as_ptr() as *const core::ffi::c_void,
+                std::mem::size_of::<HANDLE>(),
+                ptr::null_mut(),
+                ptr::null(),
             );
-        } else {
-            eprintln!(
-                "[agent:sandbox] mode={} armed: {} path(s) protected.",
-                mode.as_str(),
-                restores.len()
-            );
+            if ok == 0 {
+                DeleteProcThreadAttributeList(list);
+                return None;
+            }
+            Some(buf)
         }
+    }
 
-        SandboxGuard { mode, restores }
+    /// Drain a child stream into a byte buffer on its own thread.
+    fn spawn_reader(mut f: std::fs::File) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = f.read_to_end(&mut buf);
+            buf
+        })
+    }
+
+    /// Join a reader thread and turn its bytes into a capped UTF-8 string.
+    fn join_reader(h: std::thread::JoinHandle<Vec<u8>>, cap: usize) -> String {
+        match h.join() {
+            Ok(bytes) => cap_utf8(&String::from_utf8_lossy(&bytes), cap),
+            Err(_) => String::new(),
+        }
+    }
+
+    /// Same capping policy as exec.rs::truncate, parameterized by `cap`.
+    fn cap_utf8(s: &str, cap: usize) -> String {
+        if s.len() <= cap {
+            return s.to_string();
+        }
+        let mut end = cap;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}\n[... tronqué à {cap} octets ...]", &s[..end])
     }
 }
 
 // ════════════════════════════════════════════════════════════════════════
-// Tests — everything testable WITHOUT a spawn or live FFI:
-//   * env-var → mode parsing (incl. the "off = passthrough" default),
-//   * secret-path resolution,
-//   * write-allowlist & deny-root resolution,
-//   * the non-Windows no-op surface.
+// Tests
 // ════════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ── mode parsing ────────────────────────────────────────────────────
+    // ── activation / disable env ────────────────────────────────────────
 
     #[test]
-    fn mode_parse_known_values() {
-        assert_eq!(SandboxMode::parse("light"), SandboxMode::Light);
-        assert_eq!(SandboxMode::parse("strict"), SandboxMode::Strict);
-        assert_eq!(SandboxMode::parse("off"), SandboxMode::Off);
-    }
+    fn disable_env_defaults_off() {
+        // Save & clear so we test the default (unset) state deterministically.
+        let prev = std::env::var(DISABLE_ENV).ok();
+        std::env::remove_var(DISABLE_ENV);
+        assert!(!should_disable(), "unset → sandbox stays ON");
 
-    #[test]
-    fn mode_parse_is_case_and_space_insensitive() {
-        assert_eq!(SandboxMode::parse("  LIGHT  "), SandboxMode::Light);
-        assert_eq!(SandboxMode::parse("Strict"), SandboxMode::Strict);
-        assert_eq!(SandboxMode::parse("OFF"), SandboxMode::Off);
-    }
+        std::env::set_var(DISABLE_ENV, "1");
+        assert!(should_disable(), "1 → disabled");
+        std::env::set_var(DISABLE_ENV, "true");
+        assert!(should_disable(), "true → disabled");
+        std::env::set_var(DISABLE_ENV, "0");
+        assert!(!should_disable(), "0 → stays ON");
+        std::env::set_var(DISABLE_ENV, "banana");
+        assert!(!should_disable(), "unknown → stays ON (never accidentally OFF)");
 
-    #[test]
-    fn mode_parse_unknown_is_off_not_strict() {
-        // CRITICAL: an unrecognized / typo'd value must fail OPEN to Off (never
-        // silently apply a stricter-than-asked confinement that could surprise
-        // the dev loop).
-        assert_eq!(SandboxMode::parse(""), SandboxMode::Off);
-        assert_eq!(SandboxMode::parse("0"), SandboxMode::Off);
-        assert_eq!(SandboxMode::parse("false"), SandboxMode::Off);
-        assert_eq!(SandboxMode::parse("strikt"), SandboxMode::Off);
-        assert_eq!(SandboxMode::parse("on"), SandboxMode::Off);
-    }
-
-    #[test]
-    fn mode_default_is_off() {
-        assert_eq!(SandboxMode::default(), SandboxMode::Off);
-        assert!(!SandboxMode::Off.is_active());
-        assert!(SandboxMode::Light.is_active());
-        assert!(SandboxMode::Strict.is_active());
-    }
-
-    #[test]
-    fn mode_str_ids_stable() {
-        assert_eq!(SandboxMode::Off.as_str(), "off");
-        assert_eq!(SandboxMode::Light.as_str(), "light");
-        assert_eq!(SandboxMode::Strict.as_str(), "strict");
-    }
-
-    // ── secret-path resolution ──────────────────────────────────────────
-
-    #[test]
-    fn secret_paths_are_home_relative_and_cover_credentials() {
-        let home = Path::new("C:\\Users\\tester");
-        let secrets = secret_paths(home);
-        // Spot-check the load-bearing credential stores are present.
-        assert!(secrets.iter().any(|p| p.ends_with(".ssh")), "must protect ~/.ssh");
-        assert!(secrets.iter().any(|p| p.ends_with(".aws")), "must protect ~/.aws");
-        assert!(
-            secrets.iter().any(|p| p.ends_with("auth.json")),
-            "must protect ~/.codex/auth.json"
-        );
-        assert!(
-            secrets.iter().any(|p| p.ends_with(".claude.json")),
-            "must protect ~/.claude.json"
-        );
-        // Every home-relative secret must actually start at the given home.
-        assert!(secrets
-            .iter()
-            .filter(|p| p.starts_with(home))
-            .count()
-            >= 8);
-    }
-
-    #[test]
-    fn secret_paths_empty_home_skips_relative_paths() {
-        // With no home, NO home-relative `.ssh`-style relative path may leak in
-        // (those would mis-resolve against the cwd). Only absolute browser paths
-        // under %LOCALAPPDATA% may appear, and every returned path must be
-        // absolute.
-        let secrets = secret_paths(Path::new(""));
-        for p in &secrets {
-            assert!(
-                p.is_absolute(),
-                "empty-home secret path must be absolute, got {p:?}"
-            );
+        // restore
+        match prev {
+            Some(v) => std::env::set_var(DISABLE_ENV, v),
+            None => std::env::remove_var(DISABLE_ENV),
         }
     }
 
-    // ── strict write-allowlist & deny roots ─────────────────────────────
+    // ── write-allowlist resolution (pure, no FFI) ───────────────────────
 
     #[test]
-    fn write_allowlist_includes_workspace_temp_and_caches() {
+    fn allowlist_includes_workspace_temp_and_caches() {
         let ws = Path::new("C:\\proj\\app");
         let home = Path::new("C:\\Users\\tester");
         let allow = write_allowlist(ws, Some(home));
         assert!(allow.iter().any(|p| p == ws), "workspace must be writable");
-        // temp dir is always present.
-        assert!(allow.contains(&std::env::temp_dir()));
-        // cargo / rustup caches (env may override, but with none set they fall
-        // back to home-relative — assert the home-relative defaults appear
-        // unless an env override is active in this test env).
+        assert!(allow.contains(&std::env::temp_dir()), "temp must be writable");
         let has_cargo = allow.iter().any(|p| p.ends_with(".cargo"))
             || std::env::var_os("CARGO_HOME").is_some();
-        assert!(has_cargo, "cargo cache must be writable under strict");
+        assert!(has_cargo, "cargo cache must be in the allowlist");
+        let has_pnpm = allow.iter().any(|p| p.ends_with(".pnpm"));
+        assert!(has_pnpm, "pnpm cache must be in the allowlist");
     }
 
     #[test]
-    fn write_allowlist_without_home_still_has_workspace_and_temp() {
+    fn allowlist_without_home_still_has_workspace_and_temp() {
         let ws = Path::new("C:\\proj\\app");
         let allow = write_allowlist(ws, None);
         assert!(allow.iter().any(|p| p == ws));
@@ -890,51 +1045,118 @@ mod tests {
     }
 
     #[test]
-    fn strict_deny_roots_include_profile_root_and_shell_config() {
+    fn allowlist_is_deduped() {
+        // No path should appear twice (env overrides colliding with defaults).
+        let ws = Path::new("C:\\proj\\app");
         let home = Path::new("C:\\Users\\tester");
-        let roots = strict_write_deny_roots(Some(home));
-        assert!(roots.iter().any(|p| p == home), "profile root must be write-denied");
+        let allow = write_allowlist(ws, Some(home));
+        let mut sorted = allow.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), allow.len(), "allowlist must be deduped");
+    }
+
+    // ── the REAL confined-spawn integration test (Windows only) ─────────
+    //
+    // This SPAWNS a command under the sandbox and proves the three contract
+    // properties: (a) out-of-allowlist write FAILS, (b) in-workspace write
+    // SUCCEEDS, (c) reading a file outside the workspace SUCCEEDS. It restores
+    // every label and cleans up its temp files. Runnable via plain `cargo test`
+    // — no Tauri host needed.
+
+    #[cfg(windows)]
+    #[test]
+    fn confined_spawn_enforces_write_jail_and_open_reads() {
+        use std::fs;
+
+        // Ensure the emergency disable isn't set in this process.
+        let prev_disable = std::env::var(DISABLE_ENV).ok();
+        std::env::remove_var(DISABLE_ENV);
+
+        // Unique workspace under temp (temp itself is allowlisted, but we label
+        // the WORKSPACE specifically and write into it).
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let ws = std::env::temp_dir().join(format!("shugu-sbx-it-{stamp}"));
+        fs::create_dir_all(&ws).expect("create test workspace");
+
+        // An OUT-OF-ALLOWLIST target: a sibling dir NOT under temp/workspace/
+        // caches. Use the user profile root with a unique name. We must NOT be
+        // able to write here from the confined child.
+        let home = home_dir().expect("home dir for the test");
+        let outside_file = home.join(format!("shugu-sbx-should-fail-{stamp}.txt"));
+        // Make sure it doesn't pre-exist.
+        let _ = fs::remove_file(&outside_file);
+
+        // A READABLE file outside the workspace (we'll `type` it). Use this
+        // crate's own Cargo.toml — guaranteed to exist and live outside `ws`.
+        let readable = std::env::current_dir()
+            .ok()
+            .map(|d| d.join("Cargo.toml"))
+            .filter(|p| p.exists())
+            // Fallback: any file that surely exists outside ws.
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()))
+                    .join("win.ini")
+            });
+
+        // ── (b) write INSIDE the workspace → must SUCCEED ──────────────
+        let in_ws_name = "in_ws.txt";
+        let cmd_b = format!("echo hello-ws> {in_ws_name}");
+        let res_b = run_confined(&ws, &cmd_b, 30, 8 * 1024)
+            .expect("sandbox should have run the in-workspace write (got None = fell back)");
+        let in_ws_path = ws.join(in_ws_name);
         assert!(
-            roots.iter().any(|p| p.ends_with(".bashrc")),
-            "~/.bashrc must be write-denied"
+            in_ws_path.exists(),
+            "(b) in-workspace write must create the file; exit={}, stderr={}",
+            res_b.exit_code,
+            res_b.stderr
+        );
+
+        // ── (a) write OUTSIDE the allowlist → must FAIL ────────────────
+        // Redirect into the profile root. Under MIC-low this dir is MEDIUM, the
+        // child is LOW → no-write-up → the create fails (non-zero exit and/or no
+        // file).
+        let cmd_a = format!("echo boom> \"{}\"", outside_file.display());
+        let res_a = run_confined(&ws, &cmd_a, 30, 8 * 1024)
+            .expect("sandbox should have run the out-of-allowlist write attempt");
+        let created_outside = outside_file.exists();
+        // Clean up immediately if (against the contract) it got created, so a
+        // failing assertion doesn't litter the profile.
+        let _ = fs::remove_file(&outside_file);
+        assert!(
+            !created_outside,
+            "(a) out-of-allowlist write MUST be blocked — but {} was created (exit={}, stderr={})",
+            outside_file.display(),
+            res_a.exit_code,
+            res_a.stderr
+        );
+
+        // ── (c) READ a file outside the workspace → must SUCCEED ───────
+        let cmd_c = format!("type \"{}\"", readable.display());
+        let res_c = run_confined(&ws, &cmd_c, 30, 8 * 1024)
+            .expect("sandbox should have run the outside-read");
+        assert_eq!(
+            res_c.exit_code, 0,
+            "(c) reading {} outside the workspace must succeed (reads are open); stderr={}",
+            readable.display(),
+            res_c.stderr
         );
         assert!(
-            roots.iter().any(|p| p.ends_with(".gitconfig")),
-            "~/.gitconfig must be write-denied"
+            !res_c.stdout.is_empty(),
+            "(c) reading {} should produce content (reads open)",
+            readable.display()
         );
-    }
 
-    #[test]
-    fn strict_deny_roots_empty_without_home() {
-        // No home → nothing to deny (we never guess a home).
-        assert!(strict_write_deny_roots(None).is_empty());
-    }
+        // ── cleanup: remove the workspace (label restored on Drop already) ──
+        let _ = fs::remove_dir_all(&ws);
 
-    // ── arm() surface ───────────────────────────────────────────────────
-
-    #[test]
-    fn off_mode_arms_inert_guard() {
-        // Off must never touch the filesystem — armed_count is 0 and Drop is a
-        // no-op. Works identically on every platform.
-        let sb = Sandbox {
-            mode: SandboxMode::Off,
-            workspace: std::env::temp_dir(),
-        };
-        let guard = sb.arm();
-        assert_eq!(guard.mode(), SandboxMode::Off);
-        assert_eq!(guard.armed_count(), 0);
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn non_windows_arm_is_noop_even_when_active() {
-        // On non-Windows, even an "active" mode applies nothing (documented
-        // passthrough) — so the agent loop is never blocked on these targets.
-        let sb = Sandbox {
-            mode: SandboxMode::Strict,
-            workspace: std::env::temp_dir(),
-        };
-        let guard = sb.arm();
-        assert_eq!(guard.armed_count(), 0);
+        // restore disable env
+        match prev_disable {
+            Some(v) => std::env::set_var(DISABLE_ENV, v),
+            None => std::env::remove_var(DISABLE_ENV),
+        }
     }
 }

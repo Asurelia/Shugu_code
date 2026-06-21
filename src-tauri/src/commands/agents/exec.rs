@@ -193,22 +193,24 @@ pub(super) fn run_command_direct(
     let cwd = strip_verbatim(ws);
     let risk = classify_command(command, policy);
 
-    // Opt-in execution sandbox (default OFF via `SHUGU_SANDBOX`). Armed BEFORE
-    // the spawn so the confinement is in place the instant the child starts, and
-    // the returned RAII guard is held in `_sandbox` for the WHOLE run — its Drop
-    // (after the wait loop, when this function returns) restores every modified
-    // DACL. Arming never fails the run: a sandbox that can't arm logs a warning
-    // and the command runs unconfined (see sandbox.rs). On non-Windows this is a
-    // documented no-op. We bind it to a named variable (not `_`) so it is NOT
-    // dropped immediately — `let _ = …` would restore the DACLs before the child
-    // even spawns.
-    let _sandbox = super::sandbox::Sandbox::from_env(&cwd).arm();
-    if _sandbox.mode().is_active() {
-        eprintln!(
-            "[agent:exec] sandbox mode={} armed={} path(s)",
-            _sandbox.mode().as_str(),
-            _sandbox.armed_count()
-        );
+    // Real process sandbox (ALWAYS ON — Claude-Code model). The command runs in
+    // a write-confined / reads-open low-integrity child: it can read anywhere
+    // (so node/pnpm/cargo/git work) but can only WRITE the workspace + temp +
+    // package caches. Network stays active. The ONLY opt-out is the emergency
+    // env `SHUGU_SANDBOX_DISABLE=1`. `run_confined` returns `Some(outcome)` when
+    // it actually ran the command confined; it returns `None` when the sandbox
+    // declined or could not arm (disabled, non-Windows, or any FFI failure) — in
+    // which case we fall through to the proven direct spawn below so the dev loop
+    // is never blocked. See sandbox.rs for the mechanism + honest limits.
+    if let Some(out) = super::sandbox::run_confined(&cwd, command, timeout_secs, OUTPUT_CAP) {
+        log_exec(command, &cwd, policy, &risk, out.exit_code, out.timed_out);
+        return ExecResult {
+            exit_code: out.exit_code,
+            stdout: out.stdout,
+            stderr: out.stderr,
+            timed_out: out.timed_out,
+            risk,
+        };
     }
 
     #[cfg(windows)]

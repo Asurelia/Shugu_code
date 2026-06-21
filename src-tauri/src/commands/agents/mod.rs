@@ -87,14 +87,16 @@ pub(crate) mod exec;
 /// pre-flight a command string too.
 pub(crate) mod policy;
 
-/// Opt-in Windows execution sandbox (default OFF) — confines `run_command` via
-/// native filesystem ACLs without the heavy machinery (dedicated accounts,
-/// AppContainer, WFP) Codex's sandbox uses. `light` deny-fences credential
-/// stores (`~\.ssh`, `~\.aws`, agent auth tokens, browser profiles); `strict`
-/// adds a write-deny on out-of-workspace tamper targets while keeping the
-/// workspace/temp/cache write-allowlist. Selected by `SHUGU_SANDBOX`
-/// (off|light|strict). On non-Windows it is a documented no-op passthrough.
-/// See `docs/win-sandbox-validation.md` for the runtime checklist.
+/// Real process sandbox for `run_command` (ALWAYS ON — Claude-Code model). The
+/// command runs in a write-confined / reads-open LOW-integrity child spawned via
+/// `CreateProcessAsUserW`: it can READ anywhere (so node/pnpm/cargo/git work) but
+/// can only WRITE the workspace + OS temp + package caches (a LOW mandatory label
+/// is stamped on those dirs; everything else stays MEDIUM and rejects the LOW
+/// child's writes via no-write-up). Network stays active. No toggle, no UI — the
+/// only opt-out is the emergency env `SHUGU_SANDBOX_DISABLE=1`. Any setup failure
+/// falls back to the proven direct spawn so the dev loop is never blocked. On
+/// non-Windows it is a documented no-op (the direct path runs). See
+/// `docs/win-sandbox-validation.md` for the mechanism + runtime checklist.
 pub(crate) mod sandbox;
 
 /// Skill library (Voyager / Hermes) — the agent saves reusable skills it learns
