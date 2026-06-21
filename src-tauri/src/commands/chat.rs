@@ -272,6 +272,177 @@ pub(crate) fn resolve_key(protocol: &str, api_key: &Option<String>) -> Result<St
 }
 
 // ---------------------------------------------------------------------------
+// SSRF allowlist for the `custom` provider base_url
+//
+// The `custom` protocol takes a user-supplied `base_url` that is used VERBATIM
+// in an outbound HTTP request from the Rust backend (which, unlike the webview,
+// is not constrained by the app CSP). A malicious or careless config value can
+// therefore be pointed at internal infrastructure — a cloud metadata endpoint
+// (169.254.169.254), a service bound to loopback, or another host on the
+// private LAN — turning the chat command into a Server-Side Request Forgery
+// pivot. We refuse such targets by default.
+//
+// Policy (custom protocol only — the built-in anthropic/openai/ollama paths are
+// untouched):
+//   * Reject when the host is a loopback / private / link-local / CGNAT /
+//     unique-local / unspecified IP literal, or the name "localhost" (and the
+//     IPv6 loopback name). Both raw IPv4/IPv6 literals AND IPv4-mapped IPv6
+//     (`::ffff:a.b.c.d`) are classified.
+//   * Allow public IPs and ordinary hostnames. We deliberately do NOT resolve
+//     DNS here: a name → private-IP rebind is a TOCTOU we cannot win at this
+//     layer (the resolved address can change between our check and reqwest's
+//     connect), and blocking on a *speculative* resolution would break
+//     legitimate public hosts behind split-horizon DNS. Hostname targets are
+//     the user's own configured provider; the literal-IP guard covers the
+//     realistic SSRF-pivot shapes.
+//   * Explicit override: set `SHUGU_CUSTOM_ALLOW_PRIVATE=1` to permit private /
+//     loopback targets (the common case being a self-hosted OpenAI-compatible
+//     server on the LAN or localhost that the user runs ON PURPOSE).
+//   * Scheme: only `http` / `https` are accepted. A non-TLS `http://` target is
+//     allowed but logged with a warning — local servers legitimately speak
+//     plain HTTP, so this is advisory, not fatal.
+// ---------------------------------------------------------------------------
+
+/// Environment override that re-enables private/loopback `custom` base URLs.
+const CUSTOM_ALLOW_PRIVATE_ENV: &str = "SHUGU_CUSTOM_ALLOW_PRIVATE";
+
+/// True when the user opted in to private/loopback custom endpoints.
+fn custom_allow_private() -> bool {
+    matches!(
+        std::env::var(CUSTOM_ALLOW_PRIVATE_ENV).ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("on")
+    )
+}
+
+/// Classify an [`std::net::IpAddr`] as non-routable / internal for SSRF
+/// purposes. Covers, across both families:
+///   * loopback (127.0.0.0/8, ::1)
+///   * unspecified (0.0.0.0, ::)
+///   * IPv4 private (10/8, 172.16/12, 192.168/16) + link-local (169.254/16)
+///     + CGNAT shared address space (100.64/10)
+///   * IPv6 unique-local (fc00::/7) + link-local (fe80::/10)
+///   * IPv4-mapped IPv6 (`::ffff:a.b.c.d`) — re-classified via the embedded v4.
+fn is_internal_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                // 100.64.0.0/10 — Carrier-Grade NAT (shared address space,
+                // RFC 6598). `Ipv4Addr::is_shared` is unstable, so test the
+                // /10 prefix by hand: first octet 100, second octet 64..=127.
+                || (v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1]))
+        }
+        IpAddr::V6(v6) => {
+            // IPv4-mapped addresses (`::ffff:a.b.c.d`, the 64:ff9b-free
+            // ::ffff:0:0/96 block) embed a v4 address; classify by that embedded
+            // address so `::ffff:127.0.0.1` is caught just like `127.0.0.1`.
+            // (`Ipv6Addr::to_ipv4` is intentionally NOT used — it is deprecated
+            // because it also matches the deprecated IPv4-compatible range and
+            // misclassifies `::1`.)
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_internal_ip(IpAddr::V4(v4));
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // fe80::/10 link-local.
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                // fc00::/7 unique-local.
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
+/// Validate a `custom`-protocol `base_url` against the SSRF allowlist.
+///
+/// Returns `Ok(())` when the URL may be requested, or `Err(message)` with a
+/// user-facing explanation (including the override hint) when it must be
+/// blocked. Emits an `eprintln!` warning for non-TLS `http://` targets. See the
+/// module section comment above for the full policy.
+pub(crate) fn validate_custom_base_url(base_url: &str) -> Result<(), String> {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return Err("custom provider base_url is empty".to_string());
+    }
+
+    // `reqwest::Url` is `url::Url` re-exported — parse with the dependency we
+    // already pull in (no new crate).
+    let parsed = reqwest::Url::parse(trimmed)
+        .map_err(|e| format!("custom provider base_url is not a valid URL: {e}"))?;
+
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!(
+            "custom provider base_url must use http or https (got {scheme:?})"
+        ));
+    }
+
+    let allow_private = custom_allow_private();
+
+    // Host classification. We read the host as a string (the `url` crate is a
+    // transitive-only dependency, so we deliberately avoid naming `url::Host`)
+    // and decide IP-literal vs domain ourselves via `IpAddr::from_str`. The
+    // brackets that `host_str()` keeps around IPv6 literals are stripped just
+    // below before parsing.
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "custom provider base_url has no host".to_string())?;
+
+    // `host_str()` keeps the surrounding brackets for IPv6 literals
+    // (`[::1]`, `[::ffff:127.0.0.1]`). Strip them before attempting to parse the
+    // host as an IP; otherwise the literal falls through to the domain branch
+    // and bypasses the IP classification entirely.
+    let ip_candidate = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+
+    if let Ok(ip) = ip_candidate.parse::<std::net::IpAddr>() {
+        // Literal IP target — apply the full internal-range classification.
+        if !allow_private && is_internal_ip(ip) {
+            return Err(blocked_host_message(host));
+        }
+    } else {
+        // Domain target — block only the canonical loopback names by string
+        // match (they never appear as IP literals but resolve to loopback
+        // everywhere). Public/private hostname resolution is intentionally NOT
+        // performed here (see the policy note above).
+        let lower = host.to_ascii_lowercase();
+        let is_loopback_name = lower == "localhost"
+            || lower.ends_with(".localhost")
+            || lower == "ip6-localhost"
+            || lower == "ip6-loopback";
+        if !allow_private && is_loopback_name {
+            return Err(blocked_host_message(host));
+        }
+    }
+
+    // Advisory (non-fatal) warning for cleartext transport. Local servers
+    // legitimately speak plain HTTP, so we never block on this — we just make
+    // the cleartext hop visible in the logs.
+    if scheme == "http" {
+        eprintln!(
+            "[chat:custom] WARNING base_url uses cleartext http (no TLS): {trimmed} — \
+             API keys and prompts travel unencrypted to this host"
+        );
+    }
+
+    Ok(())
+}
+
+/// Shared "blocked" error body, including the opt-out hint.
+fn blocked_host_message(host: &str) -> String {
+    format!(
+        "custom provider base_url points at a private/loopback host ({host}) — blocked to \
+         prevent SSRF. Set {CUSTOM_ALLOW_PRIVATE_ENV}=1 to allow self-hosted/LAN endpoints."
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Shared line-buffered stream reader
 // ---------------------------------------------------------------------------
 
@@ -1296,6 +1467,14 @@ pub async fn chat_send(
     let client = streaming_client()?;
     let protocol_str = protocol.as_str();
 
+    // SSRF guard — the `custom` protocol routes a user-supplied base_url into an
+    // outbound backend request (not constrained by the webview CSP). Reject
+    // private/loopback targets unless explicitly allowed. The built-in
+    // anthropic/openai/ollama paths use trusted/known endpoints and are exempt.
+    if protocol_str == "custom" {
+        validate_custom_base_url(&base_url)?;
+    }
+
     // Register an abort flag for this conversation (if we have an ID).
     // The flag is shared between the streaming loop and the abort command.
     let abort_flag: Option<Arc<AtomicBool>> = conversation_id.as_ref().map(|id| {
@@ -1486,6 +1665,11 @@ pub async fn fim_complete(
             "FIM completion not supported for protocol '{protocol}' — use an openai-compatible FIM endpoint"
         ));
     }
+    // Same SSRF guard as chat_send: the `custom` FIM path also sends to a
+    // user-supplied base_url from the backend.
+    if protocol == "custom" {
+        validate_custom_base_url(&base_url)?;
+    }
     let key = resolve_key(&protocol, &api_key)?;
     let base = base_url.trim_end_matches('/');
     let url = if base.ends_with("/v1") {
@@ -1529,4 +1713,110 @@ pub async fn fim_complete(
         .unwrap_or("")
         .to_string();
     Ok(text)
+}
+
+#[cfg(test)]
+mod ssrf_tests {
+    use super::{is_internal_ip, validate_custom_base_url};
+    use std::net::IpAddr;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().expect("test ip literal")
+    }
+
+    #[test]
+    fn classifies_loopback_and_private_v4_as_internal() {
+        for s in [
+            "127.0.0.1",
+            "127.1.2.3",
+            "10.0.0.1",
+            "172.16.5.5",
+            "172.31.255.254",
+            "192.168.1.1",
+            "169.254.169.254", // cloud metadata
+            "100.64.0.1",      // CGNAT
+            "0.0.0.0",
+        ] {
+            assert!(is_internal_ip(ip(s)), "{s} should be internal");
+        }
+    }
+
+    #[test]
+    fn classifies_public_v4_as_external() {
+        for s in ["8.8.8.8", "1.1.1.1", "52.10.20.30", "172.32.0.1", "100.128.0.1"] {
+            assert!(!is_internal_ip(ip(s)), "{s} should be external");
+        }
+    }
+
+    #[test]
+    fn classifies_v6_internal_including_mapped() {
+        for s in [
+            "::1",                 // loopback
+            "::",                  // unspecified
+            "fe80::1",             // link-local
+            "fc00::1",             // unique-local
+            "fdff::1",             // unique-local
+            "::ffff:127.0.0.1",    // v4-mapped loopback
+            "::ffff:192.168.0.1",  // v4-mapped private
+            "::ffff:169.254.169.254",
+        ] {
+            assert!(is_internal_ip(ip(s)), "{s} should be internal");
+        }
+    }
+
+    #[test]
+    fn classifies_public_v6_as_external() {
+        for s in ["2606:4700:4700::1111", "2001:4860:4860::8888", "::ffff:8.8.8.8"] {
+            assert!(!is_internal_ip(ip(s)), "{s} should be external");
+        }
+    }
+
+    // NOTE: these URL tests assume the default (override env UNSET). They never
+    // mutate the process environment, so they stay deterministic under the
+    // parallel test runner.
+
+    #[test]
+    fn blocks_loopback_name_and_localhost_subdomains() {
+        for u in [
+            "http://localhost:8090/v1",
+            "https://LocalHost/v1",
+            "http://api.localhost:1234",
+            "http://ip6-localhost",
+        ] {
+            assert!(validate_custom_base_url(u).is_err(), "{u} should be blocked");
+        }
+    }
+
+    #[test]
+    fn blocks_private_and_metadata_ip_literals() {
+        for u in [
+            "http://127.0.0.1:8080",
+            "http://10.1.2.3/v1",
+            "https://192.168.0.10",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]:8080/v1",
+            "http://[::ffff:127.0.0.1]:9000",
+        ] {
+            assert!(validate_custom_base_url(u).is_err(), "{u} should be blocked");
+        }
+    }
+
+    #[test]
+    fn allows_public_hosts_and_ips() {
+        for u in [
+            "https://api.openai.com/v1",
+            "https://my-provider.example.com",
+            "https://8.8.8.8/v1",
+            "http://example.com", // public host over http: allowed (warned, not blocked)
+        ] {
+            assert!(validate_custom_base_url(u).is_ok(), "{u} should be allowed");
+        }
+    }
+
+    #[test]
+    fn rejects_non_http_schemes_and_empty() {
+        for u in ["", "ftp://example.com", "file:///etc/passwd", "not a url"] {
+            assert!(validate_custom_base_url(u).is_err(), "{u:?} should be rejected");
+        }
+    }
 }
