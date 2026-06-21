@@ -770,6 +770,14 @@ pub fn run() {
             commands::codex::codex_usage_window,
             commands::codex::codex_usage_recent,
             commands::codex::codex_limit_recent,
+            // AM-4 — Codex version isolation: detect the installed Codex CLI
+            // version so a JSONL/event-schema drift is observable (the tolerant
+            // exec parser in codex.rs degrades gracefully on top of this).
+            commands::codex::codex_version,
+            // AM-4 — schema-drift health check: runs a minimal read-only
+            // `codex exec --json` and reports whether Shugu still recognizes the
+            // event schema (early warning before a Codex upgrade breaks chat).
+            commands::codex::codex_exec_probe,
             // Design Studio — project snapshots (Projets tab).
             commands::studio::studio_project_upsert_auto,
             commands::studio::studio_project_save_as,

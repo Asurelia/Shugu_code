@@ -70,6 +70,25 @@ pub async fn models_discover_external(
     base_url: String,
     api_key: Option<String>,
 ) -> Result<Vec<String>, String> {
+    // SSRF guard — `models_discover_external` takes a user-supplied `base_url`
+    // and issues an outbound backend GET, exactly the same pivot surface as
+    // `chat_send` (the Rust client is not constrained by the webview CSP). A
+    // careless or malicious `custom` provider config could point this at a
+    // cloud metadata endpoint (169.254.169.254), a loopback-bound service, or a
+    // private-LAN host and read the probe result back through the discovery UI.
+    //
+    // We reuse the SAME policy + helper as chat.rs (`validate_custom_base_url`):
+    // it blocks loopback / private / link-local / CGNAT / unique-local /
+    // metadata IP literals and the loopback hostnames, honoring the
+    // `SHUGU_CUSTOM_ALLOW_PRIVATE=1` opt-out for legitimately self-hosted/LAN
+    // endpoints. Scoped to the `custom` protocol only — the built-in
+    // anthropic/openai/ollama paths target trusted or local-by-design endpoints
+    // (Ollama's default `http://localhost:11434` would otherwise be blocked),
+    // mirroring chat.rs's exemption of those three exactly.
+    if protocol == "custom" {
+        crate::commands::chat::validate_custom_base_url(&base_url)?;
+    }
+
     // One-shot client: this command is called a few times per discovery
     // cycle (every 60 s at most), not in a hot loop — no point pooling.
     let client = reqwest::Client::builder()
@@ -173,4 +192,56 @@ async fn parse_ollama_tags(resp: reqwest::Response) -> Result<Vec<String>, Strin
         .iter()
         .filter_map(|item| item.get("name").and_then(|v| v.as_str()).map(String::from))
         .collect())
+}
+
+#[cfg(test)]
+mod ssrf_discovery_tests {
+    use super::models_discover_external;
+
+    // The SSRF guard runs BEFORE the reqwest client is built, so a blocked
+    // `custom` target returns the validation Err without touching the network —
+    // these tests are deterministic and offline. They mirror the policy proven
+    // exhaustively in chat.rs's `ssrf_tests`; here we only assert the command
+    // wires the guard in for the `custom` protocol and short-circuits.
+
+    async fn block(url: &str) {
+        let res =
+            models_discover_external("custom".to_string(), url.to_string(), None).await;
+        assert!(
+            res.is_err(),
+            "custom discovery to {url} should be blocked by the SSRF guard"
+        );
+        let msg = res.unwrap_err();
+        assert!(
+            msg.contains("SSRF")
+                || msg.contains("http or https")
+                || msg.contains("valid URL")
+                || msg.contains("is empty"),
+            "blocked {url} should report the SSRF/validation reason, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_discovery_blocks_loopback_and_private_targets() {
+        // Same shapes chat.rs blocks: loopback name, loopback/private/metadata
+        // IP literals, IPv6 loopback + v4-mapped loopback.
+        for u in [
+            "http://localhost:8090/v1",
+            "http://127.0.0.1:8080",
+            "http://10.1.2.3/v1",
+            "https://192.168.0.10",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]:8080/v1",
+            "http://[::ffff:127.0.0.1]:9000",
+        ] {
+            block(u).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_discovery_rejects_bad_scheme_and_empty_base_url() {
+        for u in ["", "ftp://example.com", "file:///etc/passwd", "not a url"] {
+            block(u).await;
+        }
+    }
 }
