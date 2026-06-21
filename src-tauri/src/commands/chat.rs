@@ -376,7 +376,14 @@ fn is_internal_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// Validate a `custom`-protocol `base_url` against the SSRF allowlist.
+/// Validate a provider `base_url` against the SSRF allowlist.
+///
+/// Originally written for the `custom` chat protocol, this is the single source
+/// of truth for the policy and is reused by
+/// [`crate::commands::models::models_discover_external`] to guard the
+/// anthropic/openai/custom discovery probes — each fires a backend request at a
+/// user-supplied `base_url`, so they share the exact same SSRF-pivot shape.
+/// Kept `pub(crate)` so the chat and discovery call sites can't drift apart.
 ///
 /// Returns `Ok(())` when the URL may be requested, or `Err(message)` with a
 /// user-facing explanation (including the override hint) when it must be
