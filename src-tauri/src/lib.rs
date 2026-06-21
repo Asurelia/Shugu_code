@@ -741,6 +741,8 @@ pub fn run() {
             commands::vector::vec_search,
             commands::vector::vec_delete,
             commands::vector::vec_clear,
+            // AM-2 — orchestrated-memory search surface (recall facts + episodes).
+            commands::vector::memory_search,
             commands::model_bundle::model_bundle_catalog,
             commands::model_bundle::model_bundle_status,
             commands::model_bundle::model_bundle_download,

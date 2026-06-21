@@ -92,6 +92,36 @@ pub(crate) struct AdvisorConfig {
 /// Bounds the token cost (M3 has 1M context, but lighter models don't).
 const MAX_HISTORY_MESSAGES: u32 = 30;
 
+// ────────────────────────────────────────────────────────────────────
+// AM-2 — Orchestrated memory tuning constants
+// ────────────────────────────────────────────────────────────────────
+
+/// How many memories the `recall()` hook injects before a turn. Small — the
+/// point is the few MOST relevant facts/episodes, not a context dump.
+const RECALL_TOP_K: u32 = 4;
+
+/// A recalled memory farther than this cosine-ish distance is dropped as noise.
+/// AllMiniLML6V2 distances cluster well below this for genuine matches; the gate
+/// keeps an empty/young index from injecting irrelevant rows.
+const RECALL_MAX_DISTANCE: f32 = 1.15;
+
+/// Per-recalled-memory text budget (Unicode scalar values, not bytes — French
+/// text is multi-byte). Keeps the injected block bounded.
+const RECALL_SNIPPET_CHARS: usize = 600;
+
+/// COMPACTION threshold: once the live history (excluding the leading system
+/// blocks) holds at least this many turns, the oldest are summarised into an
+/// episodic memory and replaced by that single summary. Sits a few turns under
+/// the model's practical comfort zone so we compact BEFORE bloat, not after a
+/// hard drop. Mirrors `MAX_HISTORY_MESSAGES` (the reload cap) but applies to the
+/// LIVE loop, which grows unbounded as tools fire.
+const COMPACTION_TRIGGER_TURNS: usize = 28;
+
+/// How many of the OLDEST turns to fold into one episodic summary when
+/// compaction fires. Leaves the recent tail verbatim (the model needs fresh
+/// detail) while the old head becomes a durable, recallable episode.
+const COMPACTION_FOLD_TURNS: usize = 16;
+
 /// Recharge les `limit` derniers messages NON supprimés de la conversation et
 /// les mappe en `AgentMessage::Text`, en ordre chronologique (ancien→récent).
 /// Miroir EXACT du mapping chat-direct (chat-sync.ts) : role "ai" → "assistant",
@@ -180,6 +210,244 @@ fn load_conversation_history(app: &AppHandle, conversation_id: &str, limit: u32)
         history.remove(0);
     }
     history
+}
+
+// ────────────────────────────────────────────────────────────────────
+// AM-2 — Orchestrated memory: recall (before) · remember (after) · compaction
+//
+// These three hooks turn the flat tool-use loop into a memory-aware one:
+//   - `recall_block`  builds a system block of the most relevant past facts +
+//                     episodes for the current task, injected before the loop.
+//   - `remember_run`  extracts the salient result after the run and writes it
+//                     to the `memory` vector collection for future recall.
+//   - `maybe_compact` summarises the oldest live turns into one episodic memory
+//                     when history outgrows its window — instead of dropping
+//                     them, it KEEPS a recallable summary in context.
+//
+// Every hook is best-effort and INFALLIBLE-FRIENDLY: any failure degrades to a
+// no-op so a memory hiccup never breaks the agent loop (zero-regression rule,
+// same contract as skills/lessons injection).
+// ────────────────────────────────────────────────────────────────────
+
+/// Build the `recall()` system block: search the `memory` collection for the
+/// `RECALL_TOP_K` entries most relevant to `task`, filter by distance, and
+/// render them as a compact, role-prefixed block. Returns `(block, count)` —
+/// `("", 0)` when nothing relevant (empty index, all hits too far, or any
+/// error). Never panics, never blocks.
+fn recall_block(app: &AppHandle, task: &str) -> (String, usize) {
+    if task.trim().is_empty() {
+        return (String::new(), 0);
+    }
+    let hits = match crate::commands::vector::memory_recall(app, task, RECALL_TOP_K) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("[memory] recall failed, skipping injection: {e}");
+            return (String::new(), 0);
+        }
+    };
+    let relevant: Vec<crate::commands::vector::MemoryHit> = hits
+        .into_iter()
+        .filter(|h| h.distance <= RECALL_MAX_DISTANCE)
+        .collect();
+    if relevant.is_empty() {
+        return (String::new(), 0);
+    }
+    let count = relevant.len();
+    let mut block = String::from(
+        "[Mémoire — rappels de sessions passées]\n\
+         Des faits et résumés pertinents pour cette tâche ont été retrouvés dans ta mémoire. \
+         Utilise-les si utiles ; ignore-les s'ils ne s'appliquent pas.\n\n",
+    );
+    for h in &relevant {
+        let label = match h.kind.as_str() {
+            "episode" => "Résumé épisodique",
+            _ => "Fait",
+        };
+        let snippet: String = h.text.chars().take(RECALL_SNIPPET_CHARS).collect();
+        block.push_str(&format!("### {label}\n{snippet}\n\n"));
+    }
+    (block, count)
+}
+
+/// `remember()` — write the salient result of a finished run into episodic/fact
+/// memory so a future run can recall it. We store the final OUTPUT, prefixed
+/// with the task it answered (so the embedding captures both the question and
+/// the answer). Best-effort: logs and returns on any failure. Skips trivial
+/// outputs (empty or a bare error sentinel) — nothing worth remembering.
+fn remember_run(
+    app: &AppHandle,
+    role: &str,
+    conversation_id: Option<&str>,
+    task: &str,
+    output: &str,
+) {
+    let out = output.trim();
+    // Don't memorialise the "budget exhausted" sentinel or empty answers.
+    if out.is_empty() || out.starts_with('⚠') {
+        return;
+    }
+    let task_line = task.trim();
+    let text = if task_line.is_empty() {
+        out.to_string()
+    } else {
+        // Keep the stored fact bounded; the embedding is computed on this text.
+        let task_snip: String = task_line.chars().take(280).collect();
+        let out_snip: String = out.chars().take(1600).collect();
+        format!("Tâche : {task_snip}\nRésultat : {out_snip}")
+    };
+    if let Err(e) =
+        crate::commands::vector::memory_remember(app, "fact", role, conversation_id, &text)
+    {
+        eprintln!("[memory] remember failed (non-fatal): {e}");
+    }
+}
+
+/// Render a slice of history turns into a plain-text transcript the summariser
+/// (and the episodic-memory embedding) can read. Tool calls/results are
+/// flattened to short lines so the summary captures WHAT happened without the
+/// full payloads.
+fn transcript_excerpt(turns: &[AgentMessage]) -> String {
+    let mut s = String::new();
+    for m in turns {
+        match m {
+            AgentMessage::Text { role, content } => {
+                if role == "system" {
+                    continue; // seed/skills/lessons — not part of the episode
+                }
+                let c: String = content.chars().take(800).collect();
+                s.push_str(&format!("{role}: {c}\n"));
+            }
+            AgentMessage::AssistantWithTools { content, tool_calls } => {
+                if !content.trim().is_empty() {
+                    let c: String = content.chars().take(400).collect();
+                    s.push_str(&format!("assistant: {c}\n"));
+                }
+                for tc in tool_calls {
+                    let args: String = tc.arguments.chars().take(160).collect();
+                    s.push_str(&format!("  → tool {}({args})\n", tc.name));
+                }
+            }
+            AgentMessage::ToolResults(results) => {
+                for r in results {
+                    let head: String = r.content.chars().take(200).collect();
+                    let tag = if r.is_error { "error" } else { "ok" };
+                    s.push_str(&format!("  ← {} [{tag}]: {head}\n", r.name));
+                }
+            }
+            AgentMessage::UserImage { text, .. } => {
+                let t: String = text.chars().take(120).collect();
+                s.push_str(&format!("user(image): {t}\n"));
+            }
+        }
+    }
+    s
+}
+
+/// COMPACTION — when the live history outgrows `COMPACTION_TRIGGER_TURNS`, fold
+/// the oldest `COMPACTION_FOLD_TURNS` (after the leading system blocks) into ONE
+/// episodic summary, write that summary to memory, and REPLACE the folded turns
+/// with a single recap message kept in context. This is the key AM-2 fix: old
+/// turns are RESUMED, not dropped at a hard limit.
+///
+/// `summarise` is the async closure that turns the transcript excerpt into a
+/// summary (an LLM sub-call). It is invoked at most once per compaction. On any
+/// failure (summary errored/empty) we DON'T mutate history — better to keep the
+/// full (bloated) history one more turn than to silently lose context.
+///
+/// Returns `true` when a compaction actually happened (history mutated).
+async fn maybe_compact<F, Fut>(
+    app: &AppHandle,
+    history: &mut Vec<AgentMessage>,
+    agent_id: &str,
+    role: &str,
+    conversation_id: Option<&str>,
+    summarise: F,
+) -> bool
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    // Count the leading system blocks (seed + skills + lessons + recall): they
+    // are NEVER folded — they're the agent's standing context. Everything after
+    // is a real dialogue turn eligible for compaction.
+    let head = history
+        .iter()
+        .take_while(|m| matches!(m, AgentMessage::Text { role, .. } if role == "system"))
+        .count();
+    let dialogue_len = history.len().saturating_sub(head);
+    if dialogue_len < COMPACTION_TRIGGER_TURNS {
+        return false;
+    }
+    // Fold a bounded slab of the OLDEST dialogue turns; keep the recent tail.
+    let fold = COMPACTION_FOLD_TURNS.min(dialogue_len.saturating_sub(4));
+    if fold == 0 {
+        return false;
+    }
+    let fold_start = head;
+    let fold_end = head + fold;
+
+    // A compacted slab MUST NOT end on an assistant turn that opened tool_calls
+    // without its matching tool results in the SAME slab — otherwise the kept
+    // tail would start with orphan ToolResults (no preceding tool_use → provider
+    // 400). Walk the cut point back until it lands AFTER a complete pair (i.e.
+    // the next kept message is not a ToolResults, and the last folded one is not
+    // an AssistantWithTools).
+    let mut cut = fold_end;
+    while cut > fold_start + 1 {
+        let last_folded = &history[cut - 1];
+        let next_kept = history.get(cut);
+        let dangling_call = matches!(last_folded, AgentMessage::AssistantWithTools { .. });
+        let orphan_result = matches!(next_kept, Some(AgentMessage::ToolResults(_)));
+        if dangling_call || orphan_result {
+            cut -= 1;
+        } else {
+            break;
+        }
+    }
+    if cut <= fold_start + 1 {
+        return false; // couldn't find a clean cut — skip this round
+    }
+
+    let excerpt = transcript_excerpt(&history[fold_start..cut]);
+    if excerpt.trim().is_empty() {
+        return false;
+    }
+    let summary = match summarise(excerpt).await {
+        Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
+        Ok(_) => return false,
+        Err(e) => {
+            eprintln!("[memory] compaction summary failed (keeping full history): {e}");
+            return false;
+        }
+    };
+
+    // Persist the episode to memory so it's recallable in FUTURE runs too.
+    if let Err(e) =
+        crate::commands::vector::memory_remember(app, "episode", role, conversation_id, &summary)
+    {
+        eprintln!("[memory] compaction episode write failed (non-fatal): {e}");
+    }
+
+    // Replace the folded slab with ONE recap message kept in context. role=user
+    // so it slots in legally between the system head and the kept dialogue tail
+    // (and coalesces cleanly with Anthropic alternation downstream).
+    let recap = AgentMessage::Text {
+        role: "user".to_string(),
+        content: format!(
+            "[Mémoire — résumé des tours précédents (compactés pour tenir en contexte)]\n{summary}"
+        ),
+    };
+    let folded = cut - fold_start;
+    history.splice(fold_start..cut, std::iter::once(recap));
+    let _ = persist_and_emit(
+        app,
+        &AgentEvent::MemoryCompacted {
+            agent_id: agent_id.to_string(),
+            role: role.to_string(),
+            folded,
+        },
+    );
+    true
 }
 
 // web_search / web_fetch vivent désormais dans `commands::search` (moteur
@@ -540,6 +808,9 @@ pub(super) async fn run_agent_task(
         let prior = load_conversation_history(&app, cid, MAX_HISTORY_MESSAGES);
         history.extend(prior);
     }
+    // AM-2 — keep a copy of the seed task before it moves into history; the
+    // `remember()` hook (after the run) labels the stored result with it.
+    let remember_task = task.clone();
     history.push(AgentMessage::Text {
         role: "user".to_string(),
         content: task,
@@ -576,6 +847,7 @@ pub(super) async fn run_agent_task(
             workspace_override,
             read_only,
             advisor.as_ref(),
+            conversation_id.as_deref(),
         ) => r,
         _ = abort.notified() => {
             mark_killed(&app, &agent_id);
@@ -603,6 +875,16 @@ pub(super) async fn run_agent_task(
                     );
                 }
             }
+            // AM-2 — remember() hook: write the salient result of this run into
+            // the orchestrated `memory` collection so a future run can recall it.
+            // Best-effort; runs BEFORE `output` is moved into the Complete event.
+            remember_run(
+                &app,
+                &role,
+                conversation_id.as_deref(),
+                &remember_task,
+                &output,
+            );
             let _ = persist_and_emit(
                 &app,
                 &AgentEvent::Complete {
@@ -664,6 +946,10 @@ pub(super) async fn tool_use_loop(
     // Modèle conseiller distinct pour l'outil `advisor` (v2). `None` ⇒ le
     // conseiller est le modèle de l'exécuteur (auto-consultation).
     advisor: Option<&AdvisorConfig>,
+    // AM-2 — conversation this run belongs to (chat delegation passes it; Atelier
+    // / Grounded leave it None). Scopes the memories written by remember/compaction
+    // so a future run in the SAME chat can recall them with conversation context.
+    conversation_id: Option<&str>,
 ) -> Result<(String, String), String> {
     // Stall-detection state: repeated identical tool-call signatures and
     // consecutive tool-error rounds are the two cheap "stuck" signals, recorded
@@ -727,6 +1013,32 @@ pub(super) async fn tool_use_loop(
                 agent_id: agent_id.to_string(),
                 role: role.to_string(),
                 count: lessons_count,
+            },
+        );
+    }
+
+    // AM-2 — recall() hook: BEFORE the first turn, search the orchestrated
+    // `memory` collection for facts + episodic summaries relevant to this task
+    // and inject them as a system block. Inserted at the same head position as
+    // skills/lessons (a system message AFTER the user turn is rejected by
+    // Anthropic). This is the half that makes long-session knowledge resurface
+    // instead of evaporating; `remember_run` + compaction are the write halves.
+    let (recall_block_text, recall_count) = recall_block(app, &task_text);
+    if !recall_block_text.is_empty() {
+        let pos = history.len().min(1);
+        history.insert(
+            pos,
+            AgentMessage::Text {
+                role: "system".to_string(),
+                content: recall_block_text,
+            },
+        );
+        let _ = persist_and_emit(
+            app,
+            &AgentEvent::MemoryRecalled {
+                agent_id: agent_id.to_string(),
+                role: role.to_string(),
+                count: recall_count,
             },
         );
     }
@@ -1236,6 +1548,20 @@ pub(super) async fn tool_use_loop(
         // du texte.
         prune_user_images(history, 2);
 
+        // AM-2 — COMPACTION: once the live history outgrows its window, summarise
+        // the oldest turns into one episodic memory (written to the `memory`
+        // collection AND kept in context as a recap) instead of letting the
+        // history grow unbounded — the orchestrated replacement for the old
+        // silent 30-message drop. The summariser is a tool-less LLM sub-call on
+        // the SAME model; on any failure the history is left intact (the closure
+        // errors → maybe_compact no-ops). Awaited inline — the loop is already
+        // inside the abort `tokio::select!`, so a kill still wins at the next
+        // turn boundary.
+        let _ = maybe_compact(app, history, agent_id, role, conversation_id, |excerpt| {
+            summarise_turns(client, protocol, base_url, model, api_key, chat_template_kwargs, excerpt)
+        })
+        .await;
+
         iteration += 1;
     }
 
@@ -1499,6 +1825,79 @@ async fn consult_advisor(
         }
         Err(e) => (format!("advisor call failed: {e} — proceed with your own judgement."), true),
     }
+}
+
+/// System prompt for the COMPACTION summariser (AM-2). It turns a transcript
+/// excerpt of older turns into a dense, factual recap that preserves anything a
+/// continuation would need — decisions made, files touched, command results,
+/// open threads — while shedding verbosity. Plain text, no tools.
+const COMPACTION_SYSTEM_PROMPT: &str = "You are a CONTEXT COMPACTOR for a coding agent. You are given a transcript excerpt of the OLDEST turns of an in-progress task — they are about to be removed from the live context to make room. Write a DENSE factual summary that lets the agent continue WITHOUT having read the originals.\n\nPreserve, concisely:\n- the goal / sub-goals established so far,\n- concrete decisions and the rationale,\n- files created or edited (paths) and what changed,\n- commands run and their OUTCOME (pass/fail, key errors),\n- facts discovered about the project,\n- anything still OPEN or unverified.\n\nDrop: chit-chat, repeated boilerplate, full file contents, full command output. Output ONLY the summary as compact prose or terse bullet lines — no preamble, no meta-commentary.";
+
+/// COMPACTION summariser — a tool-less LLM sub-call that condenses a transcript
+/// excerpt into an episodic summary. Mirrors `consult_advisor`'s provider
+/// dispatch (no streaming, no tools). Returns `Err` on any provider failure so
+/// `maybe_compact` leaves the history intact rather than losing turns to a bad
+/// summary.
+#[allow(clippy::too_many_arguments)]
+async fn summarise_turns(
+    client: &reqwest::Client,
+    protocol: &str,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+    chat_template_kwargs: &Option<serde_json::Value>,
+    excerpt: String,
+) -> Result<String, String> {
+    let summary_history = vec![
+        AgentMessage::Text {
+            role: "system".to_string(),
+            content: COMPACTION_SYSTEM_PROMPT.to_string(),
+        },
+        AgentMessage::Text {
+            role: "user".to_string(),
+            content: format!("Transcript excerpt to compact:\n\n{excerpt}"),
+        },
+    ];
+    let mut sink = |_kind: &str, _chunk: &str| {};
+    let turn = match protocol {
+        "anthropic" => {
+            let (messages, system) = build_anthropic_native(&summary_history);
+            chat::call_anthropic_structured(
+                client, base_url, model, messages, system, api_key,
+                /* with_tools */ false,
+                /* tools */ None,
+                /* abort */ None,
+                &mut sink,
+            )
+            .await
+        }
+        "openai" | "custom" => {
+            let messages = build_openai_messages(&summary_history);
+            chat::call_openai_compat_structured(
+                client, base_url, model, messages, api_key, protocol, chat_template_kwargs,
+                /* with_tools */ false,
+                /* tools */ None,
+                /* abort */ None,
+                &mut sink,
+            )
+            .await
+        }
+        "ollama" => {
+            let messages: Vec<ChatMessage> = summary_history
+                .iter()
+                .filter_map(|m| match m {
+                    AgentMessage::Text { role, content } => Some(ChatMessage {
+                        role: role.clone(),
+                        content: content.clone(),
+                    }),
+                    _ => None,
+                })
+                .collect();
+            chat::call_ollama(client, base_url, model, &messages, None, &mut sink).await
+        }
+        other => return Err(format!("compaction: unsupported protocol '{other}'")),
+    };
+    turn.map(|t| t.content.trim().to_string())
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1939,5 +2338,53 @@ mod tests {
         if let AgentMessage::UserImage { text, .. } = &h[0] {
             assert!(text.contains("retiré"));
         }
+    }
+
+    // ── AM-2 : compaction transcript excerpt (pure, no I/O) ───────────
+    #[test]
+    fn transcript_excerpt_skips_system_and_flattens_tools() {
+        let h = vec![
+            AgentMessage::Text { role: "system".into(), content: "SEED PROMPT".into() },
+            AgentMessage::Text { role: "user".into(), content: "build a todo app".into() },
+            AgentMessage::AssistantWithTools {
+                content: "reading".into(),
+                tool_calls: vec![tc("c1", "fs_read_file", r#"{"path":"a.ts"}"#)],
+            },
+            AgentMessage::ToolResults(vec![tr("c1", "fs_read_file", false, "FILE CONTENTS")]),
+            AgentMessage::Text { role: "assistant".into(), content: "done".into() },
+        ];
+        let ex = transcript_excerpt(&h);
+        // System block is NOT part of the episode.
+        assert!(!ex.contains("SEED PROMPT"));
+        // User + assistant turns are present.
+        assert!(ex.contains("user: build a todo app"));
+        assert!(ex.contains("assistant: reading"));
+        assert!(ex.contains("assistant: done"));
+        // Tool call + result are flattened to short lines.
+        assert!(ex.contains("→ tool fs_read_file"));
+        assert!(ex.contains("← fs_read_file [ok]"));
+    }
+
+    #[test]
+    fn transcript_excerpt_marks_tool_errors() {
+        let h = vec![AgentMessage::ToolResults(vec![tr(
+            "c1",
+            "run_command",
+            true,
+            "exit 1: boom",
+        )])];
+        let ex = transcript_excerpt(&h);
+        assert!(ex.contains("← run_command [error]"));
+        assert!(ex.contains("boom"));
+    }
+
+    #[test]
+    fn transcript_excerpt_truncates_long_content() {
+        // 2000-char assistant message → flattened line caps the content at 400.
+        let long = "x".repeat(2000);
+        let h = vec![AgentMessage::Text { role: "user".into(), content: long }];
+        let ex = transcript_excerpt(&h);
+        // "user: " prefix + at most 800 chars for a Text turn + newline.
+        assert!(ex.len() < 900, "excerpt should be bounded, got {}", ex.len());
     }
 }

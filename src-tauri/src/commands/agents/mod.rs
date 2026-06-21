@@ -299,6 +299,27 @@ pub enum AgentEvent {
         role: String,
         count: usize,
     },
+    /// AM-2 — orchestrated-memory RECALL. Emitted when the `recall()` hook
+    /// injected past facts/episodes (from the `memory` vector collection)
+    /// relevant to this task into the agent's context. `count` = how many
+    /// memories were surfaced, so the UI can show a "🧠 N souvenir(s) rappelé(s)"
+    /// badge. Distinct from `LessonsInjected` (validated reviews) — these are the
+    /// agent's own remembered facts + compaction summaries.
+    MemoryRecalled {
+        agent_id: String,
+        role: String,
+        count: usize,
+    },
+    /// AM-2 — history COMPACTION. Emitted when the loop summarised its oldest
+    /// turns into one episodic memory (written to the `memory` collection) and
+    /// replaced them with a single recap, to stay within context. `folded` =
+    /// how many turns were collapsed into the summary, so the UI can show a
+    /// "🗜 N tours compactés" note instead of the old silent 30-message drop.
+    MemoryCompacted {
+        agent_id: String,
+        role: String,
+        folded: usize,
+    },
     /// A file write performed by the agent (fs_write_file / fs_edit). Carries the
     /// PRE-write content (`before`) so the chat can show a diff vs HEAD and offer
     /// an "Annuler" that restores it — exactly like the chat-direct path's
@@ -337,6 +358,8 @@ impl AgentEvent {
             AgentEvent::Error { .. } => "error",
             AgentEvent::SkillLearned { .. } => "skillLearned",
             AgentEvent::LessonsInjected { .. } => "lessonsInjected",
+            AgentEvent::MemoryRecalled { .. } => "memoryRecalled",
+            AgentEvent::MemoryCompacted { .. } => "memoryCompacted",
             AgentEvent::Write { .. } => "write",
             AgentEvent::Screenshot { .. } => "screenshot",
         }
@@ -355,6 +378,8 @@ impl AgentEvent {
             | AgentEvent::Error { agent_id, .. }
             | AgentEvent::SkillLearned { agent_id, .. }
             | AgentEvent::LessonsInjected { agent_id, .. }
+            | AgentEvent::MemoryRecalled { agent_id, .. }
+            | AgentEvent::MemoryCompacted { agent_id, .. }
             | AgentEvent::Write { agent_id, .. }
             | AgentEvent::Screenshot { agent_id, .. } => agent_id,
         }
