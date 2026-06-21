@@ -10,6 +10,8 @@ import { LspStatusIndicator } from "./LspStatusIndicator";
 import { ShortcutsSettings, InterfaceSettings } from "@/features/settings/settings-extras";
 import { MascotCalibration } from "@/features/settings/MascotCalibration";
 import { ConnectionsView, ProfileView } from "@/features/panels/panels";
+// Lane OPÉRABILITÉ — Storage / Backup / Diagnostics centers (section « ops »).
+import { OpsView } from "@/features/ops/OpsView";
 import { db } from "@/lib/db";
 import { queryClient } from "@/lib/queryClient";
 import { reindexWorkspace } from "@/features/fs/workspaceIndexer";
@@ -411,6 +413,7 @@ export function SettingsView({ section }: { section: string }) {
   if (section === 'interface') return <InterfaceSettings/>;
   if (section === 'mascot') return <MascotCalibration/>;
   if (section === 'privacy') return <SettingsPrivacy/>;
+  if (section === 'ops') return <OpsView/>;
   if (section === 'about') return <SettingsAbout/>;
   // Connections + Profile previously fell through to <SettingsGeneral/> here,
   // which is why the sidebar would highlight the entry but the panel showed
