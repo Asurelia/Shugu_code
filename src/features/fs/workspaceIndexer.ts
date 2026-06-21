@@ -117,7 +117,14 @@ export async function reindexWorkspace(): Promise<number> {
   try {
     await vecClear("code");
   } catch (err) {
+    // SURFACE the failure (AM-2): a silent vecClear means the rebuild keeps stale
+    // whole-file ids — the user must know the reindex couldn't start clean.
     console.warn("[workspaceIndexer] vecClear failed:", err);
+    pushToast(
+      `Réindexation : impossible de purger l'index existant — ${errMsg(err)}. Le rebuild peut garder des entrées périmées.`,
+      "error",
+      8000,
+    );
   }
   let count = 0;
   indexInFlight = (async () => {
@@ -173,6 +180,15 @@ async function runIndex(force = false): Promise<number> {
     // Yield to the event loop between files so the renderer thread can keep
     // up with chat streaming, fs watcher events, and Tauri IPC traffic. The
     // indexer is background work — slow + responsive UI > fast + frozen UI.
+    //
+    // AM-2 — surface failures instead of swallowing them. We DON'T toast per
+    // file (that would spam on a transient embed-model hiccup); we ACCUMULATE
+    // the failure count + the first error message and surface ONE summary toast
+    // after the walk. A few skipped files is normal (unreadable/binary edge
+    // cases); a large fraction failing means the index is degraded and the user
+    // must know (e.g. the fastembed model never loaded).
+    let failures = 0;
+    let firstError = "";
     for (let i = 0; i < paths.length; i++) {
       const path = paths[i];
       try {
@@ -187,6 +203,8 @@ async function runIndex(force = false): Promise<number> {
           count++;
         }
       } catch (err) {
+        failures++;
+        if (!firstError) firstError = errMsg(err);
         console.warn("[workspaceIndexer] skipping", path, err);
       }
       // Yield every 5 files to keep the UI responsive.
@@ -195,10 +213,45 @@ async function runIndex(force = false): Promise<number> {
       }
     }
 
+    // 4b. Surface accumulated per-file failures. A small number (< 5% AND ≤ 10)
+    // is treated as benign noise (odd unreadable files) and only logged; a
+    // larger share means the index is meaningfully degraded → an error toast so
+    // the user knows semantic search will be incomplete.
+    if (failures > 0) {
+      const significant = failures > 10 && failures > paths.length * 0.05;
+      pushToast(
+        `Indexation du code : ${failures} fichier(s) sur ${paths.length} n'ont pas pu être indexés` +
+          (firstError ? ` (ex : ${firstError})` : "") +
+          `. La recherche sémantique peut être incomplète.`,
+        significant ? "error" : "info",
+        significant ? 9000 : 5000,
+      );
+    }
+
     // 5. Stamp the settings key so we don't re-index until the TTL expires.
     await db.settings.set(settingKey, String(Date.now()));
   } catch (err) {
+    // SURFACE the top-level failure (AM-2). This catch fires when the file walk
+    // itself throws (fsListFiles), or db.settings access fails — a TOTAL index
+    // failure that previously left the user with a silently empty/stale index
+    // and no signal. A toast makes "semantic search isn't working" visible.
     console.warn("[workspaceIndexer] indexWorkspace failed:", err);
+    pushToast(
+      `Indexation du code échouée : ${errMsg(err)}. La recherche sémantique du code est indisponible.`,
+      "error",
+      9000,
+    );
   }
   return count;
+}
+
+/** Normalise an unknown caught value into a short, human-readable message. */
+function errMsg(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  try {
+    return String(err);
+  } catch {
+    return "erreur inconnue";
+  }
 }
