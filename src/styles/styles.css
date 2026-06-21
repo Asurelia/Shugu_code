@@ -203,6 +203,8 @@ body {
   border: 1px solid rgba(255,255,255,0.06);
   border-radius: 999px;
   font-size: 12px;
+  font-family: inherit;
+  text-align: left;
   color: var(--on-surface-variant);
   cursor: pointer;
   transition: border-color 180ms ease, background 180ms ease;
@@ -463,7 +465,7 @@ body {
   color: var(--on-surface-variant);
   background: transparent; border: 1px solid rgba(255,255,255,0.08);
   border-radius: 999px; cursor: pointer;
-  transition: all 160ms ease;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease, box-shadow 160ms ease, transform 160ms ease, opacity 160ms ease;
 }
 .side-new:hover { color: var(--on-surface); border-color: rgba(224,142,254,0.4); }
 
@@ -471,12 +473,17 @@ body {
 
 .side-item {
   display: flex; align-items: center; gap: 10px;
+  width: 100%;
   padding: 8px 10px;
   border-radius: 10px;
   cursor: pointer;
   margin-bottom: 2px;
   color: var(--on-surface-variant);
   font-size: 13px;
+  font-family: inherit;
+  text-align: left;
+  background: transparent;
+  border: 0;
   transition: background 140ms ease, color 140ms ease;
   position: relative;
 }
@@ -588,7 +595,7 @@ body {
   font-family: var(--font-display);
   font-size: 12px; font-weight: 600; letter-spacing: 0.02em;
   cursor: pointer;
-  transition: all 180ms ease;
+  transition: background-color 180ms ease, border-color 180ms ease, color 180ms ease, box-shadow 180ms ease, transform 180ms ease, opacity 180ms ease;
   backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturation));
 }
 .lgb:hover { background: rgba(255,255,255,0.09); border-color: rgba(255,255,255,0.2); transform: translateY(-1px); }
@@ -830,7 +837,7 @@ body {
   font-family: var(--font-mono); font-size: 10px;
   color: var(--on-surface-variant);
   cursor: pointer;
-  transition: all 160ms ease;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease, box-shadow 160ms ease, transform 160ms ease, opacity 160ms ease;
 }
 .ratio-btn.on {
   color: #1a0a24;
@@ -864,7 +871,7 @@ body {
   font-size: 11px;
   color: var(--on-surface-variant);
   cursor: pointer;
-  transition: all 160ms ease;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease, box-shadow 160ms ease, transform 160ms ease, opacity 160ms ease;
 }
 .style-chip.on { color: var(--primary); border-color: rgba(224,142,254,0.45); background: rgba(224,142,254,0.10); }
 .style-chip:hover:not(.on) { color: var(--on-surface); border-color: rgba(255,255,255,0.18); }
@@ -995,7 +1002,7 @@ body {
   border-radius: 8px 8px 0 0;
   margin-top: 6px;
   position: relative;
-  transition: all 160ms ease;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease, box-shadow 160ms ease, transform 160ms ease, opacity 160ms ease;
 }
 .ide-tab:hover { color: var(--on-surface); background: rgba(255,255,255,0.04); }
 .ide-tab.active {
@@ -1363,7 +1370,7 @@ body {
   background: rgba(255,255,255,0.08);
   border: 1px solid rgba(255,255,255,0.06);
   cursor: pointer;
-  transition: all 220ms ease;
+  transition: background-color 220ms ease, border-color 220ms ease, color 220ms ease, box-shadow 220ms ease, transform 220ms ease, opacity 220ms ease;
   flex-shrink: 0;
 }
 .switch::after {
@@ -1389,7 +1396,7 @@ body {
   background: rgba(10, 10, 18, 0.5);
   border: 1px solid rgba(255,255,255,0.05);
   cursor: pointer;
-  transition: all 160ms ease;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease, box-shadow 160ms ease, transform 160ms ease, opacity 160ms ease;
 }
 .model-card:hover { border-color: rgba(255,255,255,0.15); }
 .model-card.on { border-color: rgba(224,142,254,0.4); background: rgba(224,142,254,0.06); }
@@ -1468,7 +1475,7 @@ body {
   border-radius: 10px;
   cursor: pointer;
   color: var(--on-surface);
-  transition: all 100ms ease;
+  transition: background-color 100ms ease, border-color 100ms ease, color 100ms ease, box-shadow 100ms ease, transform 100ms ease, opacity 100ms ease;
 }
 .palette-item:hover, .palette-item.active {
   background: linear-gradient(90deg, rgba(224,142,254,0.18), rgba(253,108,156,0.06));
@@ -1677,6 +1684,7 @@ body {
 .side-toast {
   position: absolute;
   left: 10px; right: 10px; bottom: 10px;
+  width: auto;
   padding: 8px 12px;
   background: rgba(48, 12, 24, 0.92);
   border: 1px solid rgba(255, 106, 138, 0.4);
@@ -1684,6 +1692,7 @@ body {
   color: var(--danger);
   font-size: 11.5px;
   font-family: var(--font-mono);
+  text-align: left;
   cursor: pointer;
   z-index: 5;
   box-shadow: 0 8px 18px rgba(0, 0, 0, 0.45);
@@ -2139,5 +2148,89 @@ body {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   Accessibility baseline — focus-visible & reduced motion (a11y-pass)
+   Added by lane2/a11y-pass per docs/ui-ux-gap-audit P2 :
+   - focus ring visible for every interactive control (incl. controls
+     that strip native outline without their own focus replacement) ;
+   - global prefers-reduced-motion guard wrapping decorative animations
+     (aurora, spinners, pulses, float, shimmer…) and long transitions.
+   ══════════════════════════════════════════════════════════════ */
+
+/* Keyboard focus ring : applies to native focusables and any element
+   carrying an interactive role. Uses outline (not box-shadow) so it is
+   never clipped by overflow:hidden ancestors. */
+a:focus-visible,
+button:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+input:focus-visible,
+summary:focus-visible,
+[tabindex]:focus-visible,
+[role="button"]:focus-visible,
+[role="tab"]:focus-visible,
+[role="link"]:focus-visible,
+[role="menuitem"]:focus-visible,
+[role="option"]:focus-visible,
+[role="switch"]:focus-visible,
+[contenteditable]:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Remove the legacy double-outline on mouse interaction while keeping the
+   keyboard ring (browsers that support :focus-visible only). */
+a:focus:not(:focus-visible),
+button:focus:not(:focus-visible),
+select:focus:not(:focus-visible),
+[tabindex]:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* Range slider : outline:none is stripped above; give the thumb a ring. */
+.slider:focus-visible::-webkit-slider-thumb {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+.slider:focus-visible::-moz-range-thumb {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+/* CodeMirror strips its own outline (.cm-editor.cm-focused { outline:none }).
+   Re-expose a visible ring on keyboard focus of the editor surface. */
+.cm-editor.cm-focused:focus-visible,
+.cm-editor:focus-within {
+  outline: 2px solid rgba(224, 142, 254, 0.45);
+  outline-offset: -2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* Neutralise decorative + looping animations and shorten transitions
+     for users who requested reduced motion. Keeps layout/opacity end
+     states intact (animation-fill-mode handled by `both`). */
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* Fully stop the always-on ambient motion so nothing drifts/pulses. */
+  .aurora .blob,
+  .float-avatar-orbit,
+  .chibi-peek,
+  .pin-dot,
+  .cx-act-dot,
+  .design-shimmer,
+  .shortcut-ring,
+  .task-sweep {
+    animation: none !important;
+  }
 }
 

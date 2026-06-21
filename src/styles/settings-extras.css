@@ -34,7 +34,7 @@
   border-radius: 7px;
   padding: 4px 8px;
   cursor: pointer;
-  transition: all 160ms ease;
+  transition: background-color 160ms ease, border-color 160ms ease, color 160ms ease, box-shadow 160ms ease, transform 160ms ease, opacity 160ms ease;
   min-width: 100px;
 }
 .shortcut-trigger:hover { border-color: rgba(224,142,254,0.35); background: rgba(224,142,254,0.06); }

@@ -198,11 +198,11 @@ export function ConnectionsView() {
             )}
             {tab === "models" && customModels.map((c: any) => <ConnCard key={c.id} c={c}/>)}
             {tab === "models" && (
-              <div className="conn-add-card" onClick={() => setAdding(true)}>
-                <span className="plus"><Icon name="plus" size={18}/></span>
+              <button type="button" className="conn-add-card" onClick={() => setAdding(true)} aria-label="Add custom provider">
+                <span className="plus" aria-hidden="true"><Icon name="plus" size={18}/></span>
                 <div className="t">Add custom provider</div>
                 <div className="s">OpenAI-compatible endpoint, vLLM, LM Studio, Together AI, custom router…</div>
-              </div>
+              </button>
             )}
           </div>
           {tab === "models" && <RoutingSection />}
