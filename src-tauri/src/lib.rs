@@ -782,6 +782,16 @@ pub fn run() {
             commands::git::git_worktree_add,
             commands::git::git_worktree_remove,
             commands::git::git_numstat,
+            // Lane rattrapage — worktrees d'agent isolés (modèle git-worktrees.json).
+            commands::worktree::shugu_worktree_create,
+            commands::worktree::shugu_worktree_list,
+            commands::worktree::shugu_worktree_cleanup,
+            commands::worktree::shugu_worktree_size,
+            // Lane rattrapage — snapshots de tour (refs/shugu/turn/<id>).
+            commands::snapshot::shugu_snapshot_checkpoint,
+            commands::snapshot::shugu_snapshot_revert,
+            commands::snapshot::shugu_snapshot_list,
+            commands::snapshot::shugu_snapshot_delete,
             // Onglet "Prévisu" — détection de serveur de dev (TCP probe).
             commands::preview::preview_detect_server,
             // Définitions d'agents portables (format Claude Code .md).
