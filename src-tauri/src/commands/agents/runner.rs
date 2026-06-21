@@ -1267,6 +1267,16 @@ pub(super) async fn tool_use_loop(
                     } else {
                         search::web_search(client, query, max).await
                     };
+                    // AM-3 : les résultats web sont du contenu EXTERNE non fiable
+                    // (vecteur d'injection classique) — on les clôture en bloc
+                    // DONNÉES via le même contrat que tools.rs/mcp.rs. Les erreurs
+                    // (champ manquant / échec réseau) sont des messages construits
+                    // par Shugu, laissés tels quels.
+                    let content = if is_error {
+                        content
+                    } else {
+                        super::tools::wrap_untrusted("web", &content)
+                    };
                     acc.push(ToolResult {
                         id: tc.id.clone(),
                         name: tc.name.clone(),
@@ -1284,6 +1294,12 @@ pub(super) async fn tool_use_loop(
                         ("web_fetch: missing required field: url".to_string(), true)
                     } else {
                         search::web_fetch(client, url, max_chars).await
+                    };
+                    // AM-3 : page web = contenu EXTERNE non fiable → clôture DONNÉES.
+                    let content = if is_error {
+                        content
+                    } else {
+                        super::tools::wrap_untrusted("web", &content)
                     };
                     acc.push(ToolResult {
                         id: tc.id.clone(),
