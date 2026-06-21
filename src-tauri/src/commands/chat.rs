@@ -93,11 +93,12 @@ fn parse_data_url(s: &str) -> Option<(String, String)> {
 // `conversationId`) onto snake_case Rust parameter names, so no rename
 // attribute is needed.
 //
-// SECURITY NOTE: For the `custom` protocol the `base_url` value is
-// user-supplied and is used directly in an outbound HTTP request — a known
-// SSRF surface. This is acceptable for a desktop app where the user configures
-// their own providers, but a future improvement should validate against an
-// allowlist of user-approved origins before sending.
+// SECURITY NOTE: For the anthropic/openai/custom protocols the `base_url` value
+// is user-supplied and used directly (VERBATIM) in an outbound HTTP request — a
+// known SSRF surface. It is validated against the loopback/private allowlist
+// before sending (see `validate_custom_base_url` and its call sites in
+// `chat_send`, `fim_complete`, and `models::models_discover_external`); set
+// `SHUGU_CUSTOM_ALLOW_PRIVATE=1` to opt into self-hosted/LAN endpoints.
 
 // ---------------------------------------------------------------------------
 // Streaming delta event emitted to the frontend via `chat://delta`.
@@ -1689,11 +1690,16 @@ pub async fn chat_send(
     let client = streaming_client()?;
     let protocol_str = protocol.as_str();
 
-    // SSRF guard — the `custom` protocol routes a user-supplied base_url into an
-    // outbound backend request (not constrained by the webview CSP). Reject
-    // private/loopback targets unless explicitly allowed. The built-in
-    // anthropic/openai/ollama paths use trusted/known endpoints and are exempt.
-    if protocol_str == "custom" {
+    // SSRF guard — chat_send routes a user-supplied base_url into an outbound
+    // backend request (the Rust client is not constrained by the webview CSP).
+    // base_url is used VERBATIM for anthropic (`{base}/v1/messages`), openai and
+    // custom (`call_openai_compat`) — there is NO hardcoded official endpoint —
+    // so all three are SSRF surfaces, and the `protocol` field is itself
+    // frontend-controlled (a custom-only guard would be one relabel away from
+    // bypass). Guard anthropic/openai/custom; exempt ollama (localhost:11434 by
+    // design) and codex (no HTTP base_url). Honors SHUGU_CUSTOM_ALLOW_PRIVATE=1.
+    // Mirrors models::models_discover_external.
+    if matches!(protocol_str, "anthropic" | "openai" | "custom") {
         validate_custom_base_url(&base_url)?;
     }
 
@@ -1812,9 +1818,11 @@ pub async fn chat_send(
                     let fb_base_url = fallback_base_url.as_deref().unwrap_or(base_url.as_str());
                     let fb_api_key = fallback_api_key.as_deref().or(api_key.as_deref());
 
-                    // Re-run the SSRF guard for a custom fallback base_url: the
-                    // fallback endpoint is just as user-supplied as the primary.
-                    if fb_protocol == "custom" {
+                    // Re-run the SSRF guard for the fallback target: its base_url
+                    // is just as user-supplied as the primary's and may differ.
+                    // Same broadened scope as the primary guard above
+                    // (anthropic/openai/custom; ollama + codex exempt).
+                    if matches!(fb_protocol, "anthropic" | "openai" | "custom") {
                         if let Err(e) = validate_custom_base_url(fb_base_url) {
                             // Surface the ORIGINAL primary error plus why the
                             // fallback couldn't be tried — never hide the cause.
@@ -1945,9 +1953,11 @@ pub async fn fim_complete(
             "FIM completion not supported for protocol '{protocol}' — use an openai-compatible FIM endpoint"
         ));
     }
-    // Same SSRF guard as chat_send: the `custom` FIM path also sends to a
-    // user-supplied base_url from the backend.
-    if protocol == "custom" {
+    // Same SSRF guard as chat_send. fim_complete only supports openai + custom
+    // (anything else is rejected above), and BOTH funnel a user-supplied
+    // base_url into the backend request — so guard both, not just custom.
+    // Honors SHUGU_CUSTOM_ALLOW_PRIVATE=1.
+    if matches!(protocol.as_str(), "openai" | "custom") {
         validate_custom_base_url(&base_url)?;
     }
     let key = resolve_key(&protocol, &api_key)?;
@@ -2176,6 +2186,47 @@ mod ssrf_tests {
     fn rejects_non_http_schemes_and_empty() {
         for u in ["", "ftp://example.com", "file:///etc/passwd", "not a url"] {
             assert!(validate_custom_base_url(u).is_err(), "{u:?} should be rejected");
+        }
+    }
+
+    // Wiring test: `fim_complete` applies the SAME guard for BOTH of its
+    // supported protocols (openai + custom). Pre-fix only `custom` was guarded,
+    // so an `openai`-labelled provider pointed at loopback/metadata bypassed the
+    // check — this proves the broadened guard fires before any network I/O.
+    // `chat_send` shares the identical helper at the same point but takes a
+    // `tauri::AppHandle` + abort registry, so it can't be invoked from a plain
+    // unit test; its guard is covered by the validator tests above + this wiring
+    // proof. Default env (override UNSET); no env mutation → runner-safe.
+    #[tokio::test]
+    async fn fim_complete_blocks_private_targets_for_openai_and_custom() {
+        use super::fim_complete;
+        for proto in ["openai", "custom"] {
+            for url in [
+                "http://127.0.0.1:8080",
+                "http://169.254.169.254/latest/meta-data",
+                "http://localhost:8090/v1",
+                "http://[::1]:8080/v1",
+            ] {
+                let res = fim_complete(
+                    "x".to_string(),
+                    "m".to_string(),
+                    proto.to_string(),
+                    url.to_string(),
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+                assert!(res.is_err(), "{proto} fim to {url} must be blocked");
+                let err = res.unwrap_err();
+                assert!(
+                    err.contains("SSRF")
+                        || err.contains("http or https")
+                        || err.contains("valid URL")
+                        || err.contains("is empty"),
+                    "{proto} {url}: expected SSRF/validation error, got: {err}"
+                );
+            }
         }
     }
 }
