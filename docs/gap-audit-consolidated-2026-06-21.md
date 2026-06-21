@@ -36,10 +36,15 @@ Ces points ne sont couverts par **aucune** des 4 analyses précédentes.
 - Permissions : `auto` / `plan` / `bypassPermissions`. Extensions **DXT/MCPB** signées + double host MCP (utilityProcess in-process + multi-transport stdio/SSE/HTTP/WS). Secrets DPAPI.
 - **Fait notable** : Claude Code a tourné sur **ce repo** (`cwd:"F:\\Dev\\shugu_code"`, `model:"claude-opus-4-8[1m]"`, `effort:"xhigh"`) — les worktrees `claude/*` orphelins viennent de là.
 
-### Codex (app v0.142.0-alpha.1, cœur Rust mono-binaire 317 Mo)
-- `codex.exe` Rust contient TOUT : boucle submit/event, outils, **system prompt embarqué (~21 k car.)**, sandbox, MCP client+serveur, `app-server` websocket.
-- **Sandbox Windows** (crate `windows-sandbox-rs`, **PAS AppContainer**) : 2 **comptes Windows jetables** (`CodexSandboxOffline/Online`) + token restreint (`CreateRestrictedToken`) + Job object + desktop privé + **firewall WFP** (réseau coupé offline) + ACLs dynamiques + capability-SID par workspace-root. Provisionné **élevé** (`codex-windows-sandbox-setup.exe`). ⚠️ **Plus lourd que Docker** → ne pas copier intégralement.
-- Multi-agent **natif** (`fork_thread`/`handoff_thread`, graphe `thread_spawn_edges`). Plugins/skills marketplace. Computer-use (`cua_node` + `@oai/sky`). **Pipeline mémoire dédié** (`memories_1.sqlite`, `goals_1.sqlite`). Persistance JSONL rollouts + SQLite. Auth `chatgpt` (JWT OAuth **en clair** sur disque).
+### Codex (app desktop MSIX **v26.616.32156**, modèle `gpt-5.5`/xhigh — RE local **vérifié sur disque 2026-06-21, preuves PE**)
+- **Deux Codex coexistent** : le **CLI open-source** `@openai/codex` (npm `0.125.0`, lanceur Node `codex.js` → binaire Rust par plateforme `@openai/codex-win32-x64`) ET l'**app desktop packagée MSIX/Store** (`C:\Program Files\WindowsApps\OpenAI.Codex_26.608.1337.0_x64…`) dont le cœur est `codex.exe` Rust **245 Mo** (boucle submit/event, outils, system prompt embarqué, sandbox, MCP client+serveur, `app-server`).
+- **Sandbox Windows = identité OS + DACL NTFS + WFP** (PAS intégrité, PAS AppContainer, **PAS** restricted-token comme primitive principale — *l'audit précédent disait `CreateRestrictedToken`, faux : les imports PE montrent `CreateProcessAsUserW`*) :
+  - `codex-windows-sandbox-setup.exe` (élevé) crée **2 comptes locaux dédiés** `CodexSandboxOffline`/`Online` (`NetUserAdd`) + un **groupe sandbox** (`NetLocalGroupAdd`/`AddMembers`) ; mots de passe **chiffrés DPAPI** dans `.sandbox-secrets/sandbox_users.json` (pas en clair).
+  - **DACL NTFS** (`SetNamedSecurityInfoW`) : **write-ACE** sur les write-roots (workspace + `Temp`) pour le groupe sandbox + un **capability-SID** ; **read-ACE sélectif** (« read-acl-only mode », ex. `.claude.json`, `.mcp.json`). ⇒ **lectures FERMÉES par défaut** (compte distinct = zéro accès au profil utilisateur), ouvertes au cas par cas.
+  - **Réseau** : `FwpmEngineOpen`/`FwpmFilterAdd` (**WFP**) + `INetFwRule` → compte *offline* **coupé du réseau**, *online* autorisé. `[windows] sandbox = "elevated"`.
+  - **Exécution** : `codex-command-runner.exe` (copié versionné dans `.sandbox-bin/`, ici `0.138.0-alpha.7`) lance chaque commande via **`CreateProcessAsUserW`** AS le compte choisi (+ `AdjustTokenPrivileges`). ⚠️ Provisioning lourd (élévation, comptes, DPAPI, WFP, helper) **mais invisible à l'usage** ; ce n'est PAS Docker.
+- **Plateforme** (bien au-delà d'un CLI) : **marketplace de plugins** (`figma`, `github`, `google-calendar`, `documents/spreadsheets/presentations`, `pdf`, `browser`), **computer-use** (`runtimes/cua_node/**/@oai/sky/bin/windows/codex-computer-use.exe`, pipe nommé, clients browser **SHA-256-pinned**), **JS REPL natif comme serveur MCP** (`node_repl.exe`), **LSP via `@mizchi/lsmcp`** (typescript-language-server), **trust par projet** (`[projects.*] trust_level="trusted"` — dont `f:\dev\shugu_code`).
+- **Persistance** `~/.codex` : `goals_1.sqlite`, `memories_1.sqlite`, `logs_2.sqlite` (WAL), `state_5.sqlite`, `sessions/`+`archived_sessions/`+`session_index.jsonl`, `skills/`, **`rules/default.rules`** = **règles d'auto-allow apprises** (`prefix_rule(pattern=[…], decision="allow")` → mémorise tes approbations de commandes entre sessions). Auth `chatgpt` JWT OAuth (`auth.json`).
 
 ### OpenCode Desktop (v1.17.9, Electron + SolidJS)
 - Front Electron ↔ **serveur agent bundlé** (`utilityProcess`/sidecar) parlant **HTTP+SSE loopback authentifié** (password UUID + Basic auth + CORS `oc://`). Même serveur que la CLI → zéro duplication.
@@ -57,7 +62,7 @@ Ces points ne sont couverts par **aucune** des 4 analyses précédentes.
 |---|---|---|---|---|:--:|---|
 | Cœur agent / boucle | CLI stream-json | Rust mono-binaire | serveur TS | **boucle Rust `runner.rs`** ✅ | 🟢 | garder |
 | Front ↔ cœur | spawn stream-json | app-server ws | HTTP+SSE loopback | **IPC Tauri + events** ✅ | 🟢 | garder |
-| Exécution / sandbox | microVM Hyper-V | comptes+WFP+token | aucun OS | **direct, git seul** | 🔴 | confinement OS *léger* (token restreint+Job+net-off), PAS Docker/comptes |
+| Exécution / sandbox | microVM Hyper-V | **comptes dédiés+DACL+WFP** (`CreateProcessAsUserW`) | aucun OS | **MIC-low livré** (writes confinés ; reads/réseau ouverts) | 🟠 | OK comme 1er pas léger ; v2 = comptes+DACL+WFP si reads-deny / net-gate voulus |
 | Permissions / auto | auto/plan/bypass | policy×sandbox | allow/ask/deny mémo. | **plan-mode seul** | 🔴 | risk-gate (pause *seulement* sur dangereux) |
 | Revert / rollback | worktree merge | `apply`/fork | snapshots `<sha>` | **git utilisateur** | 🟠 | auto-snapshot + revert 1-clic |
 | Mémoire / compaction | compaction + worktree | pipeline mémoire dédié | event-sourcing | **skills/lessons ✅, vecteur dormant, pas de compaction** | 🟠 | bus mémoire + hooks recall/remember + compaction→épisodique |
@@ -86,7 +91,7 @@ Ces points ne sont couverts par **aucune** des 4 analyses précédentes.
 > « Copier de qui / éviter quoi » calibré par le RE réel.
 
 ### P0 — Fondation de confiance (sécurité fluide, SANS Docker ni prompts permanents)
-- **P0-a (backend)** : `ExecutionPolicy` (ReadOnly/WorkspaceWrite/FullLocal) + `CommandRisk` (risk-gate : pause *seulement* sur dangereux) + kill process-tree Windows (Job Object). *Copier d'OpenCode (`rules/default.rules` allow-prefix). Éviter le sandbox-comptes de Codex.*
+- **P0-a (backend)** : `ExecutionPolicy` (ReadOnly/WorkspaceWrite/FullLocal) + `CommandRisk` (risk-gate : pause *seulement* sur dangereux) + kill process-tree Windows (Job Object). *Copier le **modèle d'auto-allow appris de Codex** (`~/.codex/rules/default.rules` : `prefix_rule(…, decision="allow")` mémorise tes approbations entre sessions) + la mémorisation `allow/ask/deny` d'OpenCode. Le sandbox-comptes de Codex (`CreateProcessAsUserW`+DACL+WFP) = option **forte** ; on a livré le **MIC-low** (writes-only) comme 1er pas léger.*
 - **P0-b (backend)** : auto-snapshot avant chaque tour + revert 1-clic. *Copier d'OpenCode (`snapshot/<sha>`).*
 - **P0-c (UI)** : `ExecutionProfileBadge` permanent + risk card avant `Grounded Run` + contrat Ask/Plan/Act par message. *Copier de Codex (worktree/permissions visibles).*
 - **P0-d (config)** : CSP stricte + capabilities granulaires (retirer `shell/fs:default`).
@@ -111,7 +116,7 @@ Ces points ne sont couverts par **aucune** des 4 analyses précédentes.
 | Finding | RE profond | Audit RE | Audit UI/UX | Matrice globale | Ce doc |
 |---|:--:|:--:|:--:|:--:|:--:|
 | Archi des 3 références (interne réelle) | ✅ | | | | |
-| Calibrage sandbox (léger vs comptes) | ✅ | | | | |
+| Calibrage sandbox (comptes+DACL+WFP, preuves PE) | ✅ | | | | ✅ vérifié 2026-06-21 |
 | exec direct / git seul | ✅ | ✅ | | | |
 | `csp:null` / capabilities larges | | ✅ | | partiel | ✅ vérifié |
 | 6 worktrees orphelins / 57 Go | | ✅ | | ✅ | ✅ vérifié |
