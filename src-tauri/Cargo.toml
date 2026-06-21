@@ -111,6 +111,21 @@ keyring = { version = "3", features = ["windows-native"] }
 # de privilèges (contrairement aux symlinks Windows qui exigent le mode
 # développeur ou UAC). Côté Unix on utilise `std::os::unix::fs::symlink`.
 junction = "1"
+# Job Object FFI (agents/exec.rs) — un timeout/kill du processus parent NE
+# tue PAS ses descendants sur Windows (un `cargo test` lance rustc, un dev
+# server lance node…). On assigne l'enfant à un Job Object configuré
+# `KILL_ON_JOB_CLOSE` : fermer le handle du Job (ou TerminateJobObject)
+# tue TOUTE l'arborescence d'un coup. `windows-sys` 0.59 est déjà dans
+# l'arbre de dépendances (tiré transitivement) — pas de nouveau download.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    # `CreateJobObjectW` takes `*const SECURITY_ATTRIBUTES` in its signature,
+    # which lives behind `Win32_Security` — required for the JobObjects fns to
+    # resolve even though we pass a null attrs pointer.
+    "Win32_Security",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
