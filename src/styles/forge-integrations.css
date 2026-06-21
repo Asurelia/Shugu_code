@@ -130,7 +130,7 @@
   font-family: var(--font-display); font-weight: 500; font-size: 12.5px;
   color: var(--on-surface-variant);
   background: transparent; border: 1px solid transparent; cursor: pointer;
-  text-align: left; transition: all 130ms ease;
+  text-align: left; transition: background-color 130ms ease, border-color 130ms ease, color 130ms ease, box-shadow 130ms ease, transform 130ms ease, opacity 130ms ease;
 }
 .ctx-launch-item:hover {
   background: rgba(224,142,254,0.08);
@@ -302,9 +302,12 @@
 .ctx-sources-list { display: flex; flex-direction: column; gap: 2px; }
 .ctx-source {
   display: flex; align-items: center; gap: 8px;
+  width: 100%;
   padding: 7px 8px; border-radius: 8px;
   cursor: pointer; transition: background 130ms ease;
   color: var(--on-surface-variant);
+  background: transparent; border: 0;
+  font-family: inherit; text-align: left;
 }
 .ctx-source:hover { background: rgba(255,255,255,0.04); color: var(--on-surface); }
 .ctx-source svg { color: var(--tertiary); flex-shrink: 0; }
@@ -376,7 +379,7 @@
   font-family: var(--font-display); font-weight: 600; font-size: 10.5px;
   color: var(--on-surface-variant);
   background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08);
-  transition: all 130ms ease;
+  transition: background-color 130ms ease, border-color 130ms ease, color 130ms ease, box-shadow 130ms ease, transform 130ms ease, opacity 130ms ease;
 }
 .ctx-git-fullbtn:hover { color: var(--primary); border-color: rgba(224,142,254,0.28); }
 .ctx-git-section { display: flex; flex-direction: column; gap: 6px; }
@@ -392,9 +395,11 @@
 .ctx-git-files { display: flex; flex-direction: column; gap: 1px; }
 .ctx-git-file {
   display: flex; align-items: center; gap: 8px;
+  width: 100%;
   padding: 5px 6px; border-radius: 7px;
   font-family: var(--font-mono); font-size: 11.5px; color: var(--on-surface-variant);
   cursor: pointer; transition: background 130ms ease;
+  background: transparent; border: 0; text-align: left;
 }
 .ctx-git-file:hover { background: rgba(255,255,255,0.04); color: var(--on-surface); }
 .ctx-git-file .dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }

@@ -353,13 +353,15 @@ function GitRecap({
             {files.slice(0, 8).map((f) => {
               const n = numByPath.get(f.name);
               return (
-                <div
+                <button
+                  type="button"
                   key={f.name}
                   className="ctx-git-file"
                   onClick={() => onOpenFile(f.name)}
                   title={"Ouvrir " + f.name}
+                  aria-label={"Ouvrir " + f.name}
                 >
-                  <span className={"dot " + f.st} />
+                  <span className={"dot " + f.st} aria-hidden="true" />
                   <span className="name">{f.name}</span>
                   {n && (n.a > 0 || n.r > 0) && (
                     <span className="nums">
@@ -367,7 +369,7 @@ function GitRecap({
                       <span className="rem">−{n.r}</span>
                     </span>
                   )}
-                </div>
+                </button>
               );
             })}
             {files.length > 8 && <div className="ctx-env-sub">+{files.length - 8} de plus…</div>}
@@ -663,12 +665,12 @@ function SourcesCard({ convId, onOpenFile }: { convId: string; onOpenFile: (path
           const name = seg.pop() ?? s.path;
           const dir = seg.join("/");
           return (
-            <div key={s.path} className="ctx-source" onClick={() => onOpenFile(s.path)} title={"Ouvrir " + s.path}>
+            <button type="button" key={s.path} className="ctx-source" onClick={() => onOpenFile(s.path)} title={"Ouvrir " + s.path} aria-label={"Ouvrir " + s.path}>
               <Icon name="file" size={12} />
               <span className="ctx-source-name">{name}</span>
               {dir && <span className="ctx-source-dir">{dir}</span>}
               <span className="ctx-source-kinds">{kindTags(s.kind)}</span>
-            </div>
+            </button>
           );
         })}
       </div>

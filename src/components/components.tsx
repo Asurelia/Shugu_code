@@ -150,11 +150,11 @@ export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettin
       </div>
       {menu}
       <div className="tb-spacer"></div>
-      <div className="tb-search" onClick={onSearch}>
+      <button type="button" className="tb-search" onClick={onSearch} aria-label="Search files, commands, generations">
         <Icon name="search" size={13}/>
         <span>Search files, commands, generations…</span>
         <span className="kbd">⌘K</span>
-      </div>
+      </button>
       <div className="tb-spacer"></div>
       {/* Portal target for the chat ContextBubble trigger (ChatView portals its
           small context icon-button here so it sits with History/Bell/Settings).
@@ -225,27 +225,27 @@ export function SideHistory({ items, active, onPick, onNew }: any) {
       <div className="side-list scroll">
         <div className="side-section-label">Today</div>
         {items.slice(0, 3).map((c: any) => (
-          <div key={c.id} className={"side-item" + (c.id === active ? " active" : "")} onClick={() => onPick(c.id)}>
+          <button type="button" key={c.id} className={"side-item" + (c.id === active ? " active" : "")} onClick={() => onPick(c.id)} aria-current={c.id === active ? "true" : undefined} aria-label={c.title}>
             <Icon name="chat" size={13} className="ico"/>
             <span className="label">{c.title}</span>
             <span className="meta">{c.time}</span>
-          </div>
+          </button>
         ))}
         <div className="side-section-label">Yesterday</div>
         {items.slice(3, 6).map((c: any) => (
-          <div key={c.id} className={"side-item" + (c.id === active ? " active" : "")} onClick={() => onPick(c.id)}>
+          <button type="button" key={c.id} className={"side-item" + (c.id === active ? " active" : "")} onClick={() => onPick(c.id)} aria-current={c.id === active ? "true" : undefined} aria-label={c.title}>
             <Icon name="chat" size={13} className="ico"/>
             <span className="label">{c.title}</span>
             <span className="meta">{c.time}</span>
-          </div>
+          </button>
         ))}
         <div className="side-section-label">Older</div>
         {items.slice(6).map((c: any) => (
-          <div key={c.id} className={"side-item" + (c.id === active ? " active" : "")} onClick={() => onPick(c.id)}>
+          <button type="button" key={c.id} className={"side-item" + (c.id === active ? " active" : "")} onClick={() => onPick(c.id)} aria-current={c.id === active ? "true" : undefined} aria-label={c.title}>
             <Icon name="chat" size={13} className="ico"/>
             <span className="label">{c.title}</span>
             <span className="meta">{c.time}</span>
-          </div>
+          </button>
         ))}
       </div>
     </aside>
@@ -435,9 +435,9 @@ export function SideFiles({ active, onPick }: any) {
         document.body
       )}
       {error && (
-        <div className="side-toast" onClick={() => setError(null)} title="Click to dismiss">
+        <button type="button" className="side-toast" onClick={() => setError(null)} title="Click to dismiss" role="alert" aria-label={`Error: ${error}. Click to dismiss`}>
           {error}
-        </div>
+        </button>
       )}
     </aside>
   );
@@ -480,16 +480,30 @@ export function FileNode({
       <div
         className={"side-item" + (!isDir && node.path === active ? " active" : "")}
         style={{ paddingLeft: pad }}
+        role="button"
+        tabIndex={isRenaming ? -1 : 0}
+        aria-label={isDir ? `Folder ${node.name}` : `File ${node.name}`}
+        aria-expanded={isDir ? isOpen : undefined}
+        aria-current={!isDir && node.path === active ? "true" : undefined}
         onClick={() => {
           if (isRenaming) return;
           if (isDir) onToggleExpanded(node.path);
           else onPick(node.path);
+        }}
+        onKeyDown={(e) => {
+          if (isRenaming) return;
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            if (isDir) onToggleExpanded(node.path);
+            else onPick(node.path);
+          }
         }}
         onContextMenu={(e) => onContextMenu(node, e)}
       >
         {isDir
           ? <span
               className="file-chevron"
+              aria-hidden="true"
               onClick={(e) => { e.stopPropagation(); onToggleExpanded(node.path); }}
             >{isOpen ? "▾" : "▸"}</span>
           : <span className="file-chevron-spacer" />}
@@ -762,11 +776,11 @@ export function SideGallery({ folders, active, onPick }: any) {
       </div>
       <div className="side-list scroll">
         {folders.map((f: any) => (
-          <div key={f.id} className={"side-item" + (f.id === active ? " active" : "")} onClick={() => onPick(f.id)}>
+          <button type="button" key={f.id} className={"side-item" + (f.id === active ? " active" : "")} onClick={() => onPick(f.id)} aria-current={f.id === active ? "true" : undefined} aria-label={f.name}>
             <Icon name="gallery" size={13} className="ico"/>
             <span className="label">{f.name}</span>
             <span className="meta">{f.count}</span>
-          </div>
+          </button>
         ))}
       </div>
     </aside>
@@ -783,18 +797,18 @@ export function SideAgents({ agents, active, onPick }: any) {
       <div className="side-list scroll">
         <div className="side-section-label">Running</div>
         {agents.filter((a: any) => a.status === 'running').map((a: any) => (
-          <div key={a.id} className={"side-item" + (a.id === active ? " active" : "")} onClick={() => onPick(a.id)}>
-            <span className="ico" style={{display:'inline-flex',alignItems:'center',justifyContent:'center',width:14,height:14,fontSize:11}}>{a.icon}</span>
+          <button type="button" key={a.id} className={"side-item" + (a.id === active ? " active" : "")} onClick={() => onPick(a.id)} aria-current={a.id === active ? "true" : undefined} aria-label={a.name}>
+            <span className="ico" style={{display:'inline-flex',alignItems:'center',justifyContent:'center',width:14,height:14,fontSize:11}} aria-hidden="true">{a.icon}</span>
             <span className="label">{a.name}</span>
-            <span className="meta" style={{color:'var(--tertiary)'}}>●</span>
-          </div>
+            <span className="meta" style={{color:'var(--tertiary)'}} aria-hidden="true">●</span>
+          </button>
         ))}
         <div className="side-section-label">Idle</div>
         {agents.filter((a: any) => a.status !== 'running').map((a: any) => (
-          <div key={a.id} className={"side-item" + (a.id === active ? " active" : "")} onClick={() => onPick(a.id)}>
-            <span className="ico" style={{display:'inline-flex',alignItems:'center',justifyContent:'center',width:14,height:14,fontSize:11}}>{a.icon}</span>
+          <button type="button" key={a.id} className={"side-item" + (a.id === active ? " active" : "")} onClick={() => onPick(a.id)} aria-current={a.id === active ? "true" : undefined} aria-label={a.name}>
+            <span className="ico" style={{display:'inline-flex',alignItems:'center',justifyContent:'center',width:14,height:14,fontSize:11}} aria-hidden="true">{a.icon}</span>
             <span className="label">{a.name}</span>
-          </div>
+          </button>
         ))}
       </div>
     </aside>
@@ -822,9 +836,9 @@ export function SideSettings({ section, setSection }: any) {
       </div>
       <div className="side-list scroll">
         {sections.map(s => (
-          <div key={s.id} className={"side-item" + (s.id === section ? " active" : "")} onClick={() => setSection(s.id)}>
+          <button type="button" key={s.id} className={"side-item" + (s.id === section ? " active" : "")} onClick={() => setSection(s.id)} aria-current={s.id === section ? "true" : undefined} aria-label={s.label}>
             <span className="label">{s.label}</span>
-          </div>
+          </button>
         ))}
       </div>
     </aside>
