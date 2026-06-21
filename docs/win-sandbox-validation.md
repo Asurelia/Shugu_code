@@ -1,181 +1,203 @@
-# Windows exec sandbox — runtime validation checklist
+# Windows exec sandbox — mechanism + runtime validation checklist
 
-> Status: **implemented + unit-tested, NOT yet runtime-validated** (the spawn
-> path can only be exercised with a live Tauri host + a running agent, which the
-> implementing agent could not do). This document is the checklist YOU run to
-> promote the feature from *partial* to *green*.
+> Status: **implemented, unit + integration tested in-process**. The confined
+> spawn is exercised by a real `cargo test` (`confined_spawn_enforces_write_jail_and_open_reads`)
+> that spawns a command under the sandbox and proves the three contract
+> properties (out-of-allowlist write blocked, workspace write allowed, outside
+> read allowed). What remains is **runtime toolchain compat** validation (does
+> `pnpm install` / `cargo build` / `git fetch` work under the sandbox in the live
+> app) — section 3 below.
 
 The sandbox confines the agent's `run_command` tool (the `run_command_direct`
-path in `src-tauri/src/commands/agents/exec.rs`). It is **opt-in** and **OFF by
-default** — nothing changes until you set the env var.
+path in `src-tauri/src/commands/agents/exec.rs`). It is **always on** and
+**invisible** — there is no toggle and no UI. The only opt-out is an emergency
+env var.
 
 ---
 
-## 1. Mechanism, in one paragraph
+## 1. Mechanism — Mandatory Integrity Control, LOW integrity
 
-The sandbox is built on **native Windows filesystem ACLs** (deny-ACEs keyed to
-your user SID), applied just before the command spawns and **automatically
-restored** when the command finishes (RAII guard in `sandbox.rs`). It was chosen
-over AppContainer / MIC-low **on purpose**: those two are stricter but require
-re-implementing the process spawn with `CreateProcessAsUserW` + `STARTUPINFOEX`,
-which would replace the existing, tested `std::process::Command` spawn (piped
-stdio, poll/timeout loop, Job-Object tree-kill). An untestable hand-rolled spawn
-is a worse risk than the threat it mitigates — so the ACL approach was taken
-because it **composes** with the proven spawn path. See the upgrade note at the
-bottom for how to move to AppContainer later.
+Every agent command runs in a **write-confined / reads-open low-integrity
+child**, spawned via `CreateProcessAsUserW` (not `std::process::Command`, which
+can't inject a custom token). Two steps:
+
+1. **A LOW-integrity primary token.** We duplicate the current process token and
+   lower its integrity to **LOW** (`SetTokenInformation(TokenIntegrityLevel)`,
+   SID `S-1-16-4096`). Lowering your own token needs no privilege; the kernel
+   forbids RAISING it. A LOW process obeys Mandatory Integrity Control:
+   - **no-write-up** — it cannot write objects labeled HIGHER than itself.
+     Ordinary files/dirs are MEDIUM, so a LOW child cannot write them. ← the
+     write-jail, native.
+   - **reads are NOT restricted** — MIC's read-up restriction is off on normal
+     objects, so the LOW child reads MEDIUM/HIGH fine. ← reads open, native.
+
+2. **A LOW mandatory label on each write-allowlist dir.** We stamp
+   `S:(ML;OICI;NW;;;LW)` (Low label, container+object inherit, no-write-up) on
+   the workspace + temp + caches. An object's own integrity gates writes: once a
+   dir is LOW, the LOW child MAY write it (equal level). The rest of the disk
+   stays MEDIUM → read-only to the child.
+
+### Why this over AppContainer
+
+AppContainer confines **reads** too (everything needs an explicit
+`ALL_APPLICATION_PACKAGES` read-grant), so every toolchain dir would need an ACE
+and a single miss breaks a tool. MIC-low gives "reads open, writes confined" as
+the native default — exactly the spec. AppContainer remains the documented
+stricter upgrade if a capability-true jail is ever required.
+
+### Performance — why it doesn't slow the dev loop
+
+Labeling uses the **object-only** `SetFileSecurityW`, NOT `SetNamedSecurityInfoW`
+(which recursively re-stamps every existing child — that made labeling
+`~\.cargo` + `~\.rustup`, ~87k files, a 7-minute walk). The directory's own
+inheritable (OICI) ACE is enough: files the child CREATES inherit the LOW label
+at creation. Labels are also **idempotent** (skip if the dir is already LOW) and
+the cache/temp labels are **provisioned once** (left in place; a LOW label only
+GRANTS low-IL write, it removes no access). Net result: the full integration
+test (3 confined spawns, each labeling every allowlist dir) runs in **~0.18 s**
+even after the cache labels are reset.
+
+### Honest limits
+
+- **Granularity is the integrity label, not a path ACL.** Anything labeled LOW is
+  writable; everything MEDIUM is not. A pre-existing LOW object elsewhere (rare)
+  would also be writable — we don't scan for those.
+- **Same-user concurrency window.** The LOW label on an allowlist dir is visible
+  to other processes during a run; it only GRANTS low-IL write, so it reduces no
+  one's access. The workspace label is removed on completion (RAII); cache/temp
+  labels persist (benign).
+- **Delete semantics.** A LOW child can delete files *inside* the workspace
+  (intended — git is the net). It cannot delete MEDIUM files outside the
+  allowlist (no-write-up covers delete).
+- **Privilege.** The agent runs as the user; an attacker who could already run
+  elevated code is out of scope (a LOW child cannot raise its own integrity).
+
+### Fail-safe
+
+Token setup, labeling, and the confined spawn can each fail for environmental
+reasons. ANY failure logs a one-line warning and falls back to the existing
+**direct** `std::process::Command` spawn — the agent loop is never blocked.
 
 ---
 
-## 2. Activation
+## 2. Activation — always on; one emergency opt-out
 
-The level is read from the **`SHUGU_SANDBOX`** environment variable (same family
-as `SHUGU_CUSTOM_*`, `SHUGU_CODEX_BIN`, etc.):
+There is **no enable toggle**. The sandbox wraps every agent `run_command`. The
+only escape hatch is:
 
-| `SHUGU_SANDBOX` | Mode      | Effect                                                              |
-|-----------------|-----------|--------------------------------------------------------------------|
-| *unset* / `off` | **Off**   | Passthrough. No ACL changes. The pre-sandbox behavior (default).   |
-| `light`         | **Light** | Deny **read+write** on credential/config secret stores.            |
-| `strict`        | **Strict**| Light + deny **write** on out-of-workspace tamper targets.         |
-| anything else   | **Off**   | Unknown value fails OPEN to Off (never silently stricter).         |
-
-Set it for the Shugu process (the value is read per command, at spawn time):
+| `SHUGU_SANDBOX_DISABLE` | Effect                                                       |
+|-------------------------|--------------------------------------------------------------|
+| *unset* / `0` / anything| **Sandbox ON** (confined spawn). The default.                |
+| `1` / `true` / `on`/`yes`| **Sandbox OFF** — plain direct spawn (emergency unblock).   |
 
 ```powershell
-# PowerShell — set for the current session, then launch Shugu from it
-$env:SHUGU_SANDBOX = "light"     # or "strict", or "off"
-# … launch the app (pnpm tauri dev / the built exe) from THIS shell …
+# Emergency only — disable confinement for the current session, then launch Shugu
+$env:SHUGU_SANDBOX_DISABLE = "1"
+# … launch the app from THIS shell …
 ```
 
-Confirm it armed by watching the dev log (stderr) — each confined command emits:
+Watch the dev log (stderr) to confirm behavior:
 
 ```
-[agent:exec] sandbox mode=light armed=N path(s)
-[agent:sandbox] mode=light armed: N path(s) protected.
+# disabled:
+[agent:sandbox] SHUGU_SANDBOX_DISABLE set — confinement OFF, running command directly.
+# a fallback (setup failed → direct spawn), e.g.:
+[agent:sandbox] WARN CreateProcessAsUserW failed (...) — falling back to direct spawn.
 ```
 
-`armed=0` means none of the protected paths existed on your machine (e.g. you
-have no `~\.ssh`) — that is expected and harmless, the protection is vacuous.
+No warning line = the command ran confined (the silent happy path).
 
 ---
 
-## 3. Validation matrix — run these by having the AGENT execute the commands
+## 3. Runtime validation matrix — run these via the AGENT's `run_command`
 
-> Run each via the agent's `run_command` (or the in-app exec surface), **not** a
-> plain terminal — the sandbox only wraps the agent's exec path. Use a throwaway
-> workspace with a committed git tree so you can discard freely.
+> Use a throwaway workspace with a committed git tree so you can discard freely.
+> Run each via the agent's `run_command` (or the in-app exec surface), not a
+> plain terminal — the sandbox only wraps the agent's exec path.
 
-### 3a. Mode OFF (default) — nothing is confined
+### 3a. Write-jail (the core contract)
 
-| # | `SHUGU_SANDBOX` | Command (run via agent)                         | Expected                       |
-|---|-----------------|-------------------------------------------------|--------------------------------|
-| 1 | *unset*         | `pnpm -v`                                        | prints version (exit 0)        |
-| 2 | *unset*         | `type %USERPROFILE%\.ssh\id_rsa` (if you have one)| **succeeds** (no confinement)  |
-| 3 | *unset*         | `echo x > %USERPROFILE%\shugu-sbx-test.txt`      | **succeeds** (then delete it)  |
+| # | Command (run via agent)                              | Expected                                          |
+|---|------------------------------------------------------|---------------------------------------------------|
+| 1 | `echo x > .\in-workspace.txt`                        | **succeeds** — workspace is writable              |
+| 2 | `echo x > %TEMP%\shugu-sbx-tmp.txt`                  | **succeeds** — temp is in the allowlist           |
+| 3 | `echo x > %USERPROFILE%\shugu-hack.txt`              | **FAILS** "Access is denied" (profile is MEDIUM)  |
+| 4 | `echo x >> %USERPROFILE%\.bashrc`                    | **FAILS** "Access is denied"                      |
+| 5 | `echo x > C:\Windows\Temp\shugu.txt`                 | **FAILS** "Access is denied"                      |
 
-Mode OFF must behave exactly as before — this is the "never break the dev loop"
-guarantee.
+### 3b. Reads stay open
 
-### 3b. Mode LIGHT — secrets fenced, tools unaffected
+| # | Command (run via agent)                              | Expected                                          |
+|---|------------------------------------------------------|---------------------------------------------------|
+| 6 | `type %USERPROFILE%\.gitconfig` (if present)         | **succeeds** — reads are open                      |
+| 7 | `dir %USERPROFILE%`                                  | **succeeds** — listing is a read                   |
+| 8 | `type C:\Windows\win.ini`                            | **succeeds** — system reads open                   |
 
-Set `$env:SHUGU_SANDBOX = "light"` and relaunch Shugu from that shell.
+### 3c. Toolchain compatibility (the remaining unknown — VALIDATE THIS)
 
-| # | Command (run via agent)                              | Expected                                  |
-|---|------------------------------------------------------|-------------------------------------------|
-| 4 | `pnpm -v`                                             | **succeeds** (exit 0) — tools still work  |
-| 5 | `cargo --version`                                    | **succeeds**                              |
-| 6 | `git status`                                         | **succeeds** (reads are open)             |
-| 7 | `type %USERPROFILE%\.ssh\id_rsa`                      | **FAILS** "Access is denied"              |
-| 8 | `type %USERPROFILE%\.aws\credentials`                | **FAILS** "Access is denied"              |
-| 9 | `copy %USERPROFILE%\.ssh\id_rsa .\stolen.txt`        | **FAILS** "Access is denied"              |
-|10 | `dir %USERPROFILE%\.ssh`                              | **FAILS** to list (deny is on the dir)    |
-|11 | `echo x > %USERPROFILE%\shugu-sbx-test.txt`          | **succeeds** (light does NOT confine writes) — delete it |
+| # | Command (run via agent)                              | Expected                                          |
+|---|------------------------------------------------------|---------------------------------------------------|
+| 9 | `node -v` / `pnpm -v` / `cargo --version`            | **succeeds** — toolchains read fine               |
+|10 | `pnpm install` (in a JS project)                     | **succeeds** — cache + node_modules writes allowed |
+|11 | `cargo build`                                        | **succeeds** — `~\.cargo` / target writes allowed |
+|12 | `git status` / `git fetch` / `git pull`             | **succeeds** — reads open, network active         |
 
-After the command returns, verify the protection was lifted: in a normal
-terminal, `type %USERPROFILE%\.ssh\id_rsa` should work again (DACL restored on
-guard Drop). If it still fails, run `icacls "%USERPROFILE%\.ssh" /reset /t` to
-recover (this should not be necessary unless Shugu crashed mid-command).
+> If a toolchain step FAILS with "Access is denied", a cache root it writes is
+> missing from the allowlist (`write_allowlist` in `sandbox.rs`). Add it there
+> (honor any env override the tool uses), or set `SHUGU_SANDBOX_DISABLE=1` to
+> unblock while you patch it. `node_modules` lives INSIDE the workspace, so
+> `pnpm install`'s package writes are covered by the workspace label; the global
+> store/cache writes are what the allowlist must cover.
 
-### 3c. Mode STRICT — writes confined to the allowlist
+### 3d. Robustness
 
-Set `$env:SHUGU_SANDBOX = "strict"` and relaunch.
-
-| # | Command (run via agent)                              | Expected                                      |
-|---|------------------------------------------------------|-----------------------------------------------|
-|12 | `pnpm install` (in a JS project)                     | **succeeds** — cache writes allowed           |
-|13 | `cargo build`                                        | **succeeds** — `~\.cargo` writes allowed      |
-|14 | `echo x > .\in-workspace.txt`                        | **succeeds** — workspace is writable          |
-|15 | `echo x > %TEMP%\shugu-sbx-tmp.txt`                  | **succeeds** — temp is in the allowlist       |
-|16 | `echo x > %USERPROFILE%\hack.txt`                    | **FAILS** "Access is denied" (profile root)   |
-|17 | `echo x >> %USERPROFILE%\.bashrc`                    | **FAILS** "Access is denied"                  |
-|18 | `echo x > %USERPROFILE%\.gitconfig`                  | **FAILS** "Access is denied"                  |
-|19 | `type %USERPROFILE%\.ssh\id_rsa`                     | **FAILS** (light protections still apply)     |
-|20 | `git fetch` / `git pull`                             | **succeeds** — network is NOT cut             |
-
-### 3d. Fallback / robustness
-
-| # | Scenario                                              | Expected                                              |
-|---|-------------------------------------------------------|-------------------------------------------------------|
-|21 | `SHUGU_SANDBOX=strict`, no `~\.ssh` etc. on machine   | command runs; log shows `armed=` a smaller count; no error |
-|22 | `SHUGU_SANDBOX=banana` (typo)                          | treated as **Off** — no confinement, dev loop intact  |
-|23 | Kill Shugu mid-command (Task Manager) during step 16  | DACL may remain; recover with `icacls <path> /reset`  |
+| # | Scenario                                                   | Expected                                                |
+|---|------------------------------------------------------------|---------------------------------------------------------|
+|13 | `SHUGU_SANDBOX_DISABLE=1`                                   | commands run unconfined; the disable log line appears   |
+|14 | A long command exceeding the per-command timeout           | killed tree-wide (Job Object), exit 124 — same as before|
+|15 | Kill Shugu mid-command (Task Manager)                      | the workspace may stay LOW-labeled; harmless. Recover with `icacls <dir> /setintegritylevel Medium` |
 
 ---
 
 ## 4. What is protected — honest scope
 
-### Protected in **light** (and strict)
-Deny **read + write** (so even `type`/`copy` fail) on, relative to your home:
-`~\.ssh`, `~\.aws`, `~\.azure`, `~\.gcloud`, `~\.codex\auth.json`,
-`~\.claude.json`, `~\.claude\.credentials.json`, `~\.git-credentials`,
-`~\.npmrc`, `~\.docker\config.json`, `~\.netrc`, `~\.config`, `~\.kube\config`,
-plus browser login/cookie stores under `%LOCALAPPDATA%` (Chrome, Edge, Brave).
-
-### Additionally protected in **strict**
-Deny **write** (non-recursive on the profile root, so the caches below still
-work) on: the user-profile root (`~\hack.txt`, etc.), `~\.bashrc`,
-`~\.bash_profile`, `~\.profile`, `~\.zshrc`, `~\.gitconfig`,
-`~\Documents\WindowsPowerShell`, and the per-user Startup folder.
-
-### Writable in **strict** (the allowlist)
-The workspace root, the system temp dir, and package caches: `~\.cargo`
+### Writable (the allowlist)
+The workspace root, the OS temp dir, and package caches: `~\.cargo`
 (or `CARGO_HOME`), `~\.rustup` (or `RUSTUP_HOME`), `~\.npm`
-(or `npm_config_cache`), `~\.pnpm`, `~\.pnpm-store`,
-`%LOCALAPPDATA%\npm-cache`, `%LOCALAPPDATA%\pnpm`.
+(or `npm_config_cache`), `~\.pnpm`, `~\.pnpm-store`, `~\.cache`,
+`%LOCALAPPDATA%\npm-cache`, `%LOCALAPPDATA%\pnpm`, `%LOCALAPPDATA%\pnpm-cache`.
 
-### NOT protected — be honest about the gaps
-- **Arbitrary writes outside the enumerated deny set.** `strict` is a deny-LIST
-  of the realistic tamper/persistence targets, not a whole-disk write-jail. A
-  write to a brand-new `D:\whatever` still succeeds (a whole-disk ACL sweep would
-  be slow and dangerous). The `CommandRisk` classifier still flags out-of-
-  workspace writes, and git still nets workspace changes.
-- **Arbitrary deletes outside the workspace.** An `rm`/`del` of some unprotected
-  out-of-workspace path is not blocked (the risk classifier flags `rm -rf`, but
-  the ACL layer does not jail deletes broadly).
-- **Network.** Left fully active in every mode — cutting it would break
-  `pnpm install` / `git fetch`. See the upgrade note for how to add an opt-in
-  network block later.
-- **Same-user concurrency window.** The deny-ACE is keyed to your user SID, so
-  while a confined command runs, OTHER processes of yours touching those exact
-  secret paths are also denied. Commands are short and serial, and the DACL is
-  restored on completion.
-- **Privilege.** The agent runs as you; an attacker who could already run
-  elevated code is out of scope.
+### Read-only to the confined child (everything else)
+The whole rest of the disk is MEDIUM and the LOW child cannot write it: the user
+profile root, `~\.ssh` / `~\.aws` / agent auth tokens, `C:\Windows`, Program
+Files, other drives, etc. Note this is a **write-jail by integrity**, not a
+read-deny — secrets are still READABLE (reads are open, by design, so tools
+work). The protection here is against **out-of-workspace WRITES** (tampering /
+persistence), which git's net cannot cover; credential *exfiltration* over the
+network is a separate concern the risk classifier flags but this layer does not
+block (cutting network breaks `pnpm install` / `git fetch`).
+
+### NOT covered — be honest
+- **Reading secrets.** Reads are open by design. An injected command can still
+  `type %USERPROFILE%\.ssh\id_rsa`. The risk classifier flags exfiltration
+  patterns (`curl … | sh`, out-of-workspace copies) but does not block reads.
+- **Writes to a pre-existing LOW-labeled object** elsewhere on the machine (rare;
+  we don't scan).
+- **Network.** Fully active in every mode (cutting it breaks installs/fetch).
 
 ---
 
 ## 5. Upgrade path (future, optional)
 
-To move from "deny-list ACLs" to a true **write-jail** (Claude-Code parity), the
-mechanism is **AppContainer**: derive a capability SID per write-root, grant it
-on the allowlist dirs, and spawn the child with that AppContainer token via
-`CreateProcessAsUserW` + `STARTUPINFOEX` (`PROC_THREAD_ATTRIBUTE_SECURITY_-
-CAPABILITIES`). That requires re-implementing the spawn (stdio pipes + job
-assignment) — do it behind the same `SHUGU_SANDBOX=strict` flag, keep the ACL
-path as the fallback, and validate with this same matrix. The `windows-sys`
-features needed (`Win32_Security_Isolation`, `Win32_System_Threading` proc-thread
-attributes) are a small Cargo.toml addition.
-
-To add an **opt-in network block** (e.g. `SHUGU_SANDBOX=strict-nonet`): the
-lightest reliable lever is a per-run WFP filter or a restricted-token with the
-network-capability SID removed under AppContainer. Keep it OFF by default so
-`pnpm install` / `git fetch` keep working unless explicitly opted in.
+- **Capability-true jail** → AppContainer: derive a capability SID per write-root,
+  grant read on the toolchain dirs (`ALL_APPLICATION_PACKAGES`), and spawn with
+  the AppContainer token via the same `CreateProcessAsUserW` + `STARTUPINFOEX`
+  plumbing already in `sandbox.rs`. Heavier (every toolchain read needs a grant),
+  stricter. Keep the MIC-low path as the fallback.
+- **Read-deny on secrets** (block exfiltration too) → layer the previous
+  deny-ACE approach on the credential stores ON TOP of the integrity jail, OR run
+  under AppContainer (no read grant on `~\.ssh` ⇒ no read). Both narrow what tools
+  can read, so validate the toolchain matrix (3c) carefully after.
+- **Opt-in network block** (`SHUGU_SANDBOX=strict-nonet`) → a per-run WFP filter
+  or an AppContainer token without the network-capability SID. OFF by default so
+  installs/fetch keep working.

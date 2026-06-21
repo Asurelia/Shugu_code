@@ -132,18 +132,24 @@ windows-sys = { version = "0.59", features = [
     # which lives behind `Win32_Security` — required for the JobObjects fns to
     # resolve even though we pass a null attrs pointer. `Win32_Security` also
     # carries the token/SID/ACE primitives the exec sandbox uses
-    # (CreateRestrictedToken family, GetTokenInformation, GetLengthSid, the
-    # ACE_FLAGS inheritance constants, TOKEN_USER / PSID / ACL types).
+    # (DuplicateTokenEx, SetTokenInformation, CreateWellKnownSid,
+    # ConvertStringSidToSidW, GetTokenInformation, the TOKEN_* access masks,
+    # TOKEN_MANDATORY_LABEL / SID_AND_ATTRIBUTES, SECURITY_IMPERSONATION_LEVEL,
+    # TOKEN_TYPE, PSID / ACL / PSECURITY_DESCRIPTOR types).
     "Win32_Security",
-    # Exec sandbox (agents/sandbox.rs) — the ACL builder/applier:
-    #   * `Win32_Security_Authorization` → Get/SetNamedSecurityInfoW,
-    #     SetEntriesInAclW, EXPLICIT_ACCESS_W / TRUSTEE_W, SE_FILE_OBJECT and the
-    #     DENY_ACCESS / TRUSTEE_IS_* constants used to deny-fence secret stores
-    #     and write-confine out-of-workspace paths.
-    #   * `Win32_Storage_FileSystem` → FILE_GENERIC_READ / FILE_GENERIC_WRITE /
-    #     DELETE access masks composed into the deny ACEs.
+    # Real process sandbox (agents/sandbox.rs) — the low-IL confined spawn:
+    #   * `Win32_Security_Authorization` → Get/SetNamedSecurityInfoW (apply the
+    #     LOW mandatory-label SACL to the write-allowlist dirs),
+    #     ConvertStringSecurityDescriptorToSecurityDescriptorW (parse the
+    #     `S:(ML;…;LW)` SDDL into a SACL), SE_FILE_OBJECT,
+    #     LABEL_SECURITY_INFORMATION.
+    #   * `Win32_Storage_FileSystem` → access-mask constants.
+    #   * `Win32_System_Pipes` → CreatePipe + SetHandleInformation, used to wire
+    #     the confined child's stdio by hand (CreateProcessAsUserW gives no
+    #     std::process::Command pipe plumbing, so we rebuild it).
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
