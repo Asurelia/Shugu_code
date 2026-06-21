@@ -164,7 +164,7 @@ async fn git_dir(root: &Path) -> Result<PathBuf, String> {
 // Internal checkpoint / revert (testable, no AppHandle)
 // ---------------------------------------------------------------------------
 
-async fn checkpoint_inner(root: &Path, turn_id: &str) -> Result<Snapshot, String> {
+pub(crate) async fn checkpoint_inner(root: &Path, turn_id: &str) -> Result<Snapshot, String> {
     validate_turn_id(turn_id)?;
 
     // Confirm we are in a repo.

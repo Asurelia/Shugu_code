@@ -816,6 +816,29 @@ pub(super) async fn run_agent_task(
         content: task,
     });
 
+    // Lot 0 — auto-checkpoint du working-tree AVANT que l'agent agisse, pour que
+    // l'utilisateur puisse annuler tout le run d'un clic (« laisse tourner, annule
+    // si moche »). Ref fantôme refs/shugu/turn/<agent_id> — ne touche jamais
+    // l'index/HEAD/branches de l'utilisateur (cf. snapshot.rs). Sauté pour le
+    // dossier jetable de l'Atelier (workspace_override Some) et les runs Plan
+    // (read_only, aucune mutation). Best-effort : un échec (pas de workspace, pas
+    // un dépôt git) est loggé et le run continue — un checkpoint ne doit JAMAIS
+    // bloquer un agent. Récupérable via `shugu_snapshot_list`, annulable via
+    // `shugu_snapshot_revert` (turn_id = agent_id).
+    if workspace_override.is_none() && !read_only {
+        if let Some(root) = get_workspace_root(&app) {
+            if root.join(".git").exists() {
+                match crate::commands::snapshot::checkpoint_inner(&root, &agent_id).await {
+                    Ok(snap) => eprintln!(
+                        "[agents] checkpoint {} (turn_id={})",
+                        snap.ref_name, snap.turn_id
+                    ),
+                    Err(e) => eprintln!("[agents] checkpoint ignoré: {e}"),
+                }
+            }
+        }
+    }
+
     // Client borné (lot timeouts) : connect 15 s + 300 s de silence max entre
     // deux chunks — un provider mort ne pend plus l'agent indéfiniment.
     let client = match chat::streaming_client() {
