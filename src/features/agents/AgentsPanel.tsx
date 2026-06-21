@@ -34,6 +34,11 @@ import { useSkillsList, invalidateSkills } from "./skillsQueries";
 import { resolveProvider, type Protocol } from "@/lib/providers";
 import { loadProviderConfig, getConfig, getProviderEnabled } from "@/lib/credentials";
 import { useActiveModel } from "@/features/chat/chat-sync";
+import {
+  ExecutionProfileCard,
+  ConfirmDialog,
+  InlineNotice,
+} from "@/components/trust";
 
 // Resolve the active model → provider routing (protocol / baseUrl / key), exactly
 // like the chat delegate flow: the key stays in the keychain, never cleartext.
@@ -172,15 +177,23 @@ function AgentRowItem({
   onSelect: (id: string | null) => void;
 }) {
   return (
-    <div
+    // Trust-UX (Lane 5) — vrai <button> sémantique (était un div onClick) : la
+    // ligne est une action (sélectionner/déselectionner l'agent), donc elle doit
+    // être focusable au clavier et annoncée comme bouton-bascule.
+    <button
+      type="button"
+      aria-pressed={isSelected}
       onClick={() => onSelect(isSelected ? null : row.id)}
       style={{
         display: "flex",
         alignItems: "center",
         gap: 8,
+        width: "100%",
+        textAlign: "left",
         padding: "6px 8px",
         borderRadius: 6,
         cursor: "pointer",
+        font: "inherit",
         background: isSelected ? "rgba(124, 58, 237, 0.08)" : "transparent",
         border: isSelected
           ? "1px solid rgba(124, 58, 237, 0.35)"
@@ -210,7 +223,7 @@ function AgentRowItem({
       >
         {fmtAge(row.createdAt)}
       </span>
-    </div>
+    </button>
   );
 }
 
@@ -684,6 +697,10 @@ export function AgentsPanel() {
   const [groundedLaunching, setGroundedLaunching] = useState(false);
   const [groundedErr, setGroundedErr] = useState<string | null>(null);
   const [execCap, setExecCap] = useState<ExecCapability | null>(null);
+  // Trust-UX (Lane 5) — quand le filet git est absent/partiel, un Grounded Run
+  // exécute de vraies commandes SANS garantie de pouvoir tout annuler. On demande
+  // une confirmation explicite avant de lancer dans ce cas (sinon lancement direct).
+  const [confirmRiskyRun, setConfirmRiskyRun] = useState(false);
 
   // Probe the git safety net once on mount (exec directe : toujours possible,
   // le préflight ne sert qu'à afficher un avertissement NON bloquant quand le
@@ -741,7 +758,11 @@ export function AgentsPanel() {
   // Exec directe : seul "aucun projet ouvert" bloque (ready=false). Un filet
   // git absent/partiel n'empêche PAS le lancement — il affiche un warning.
   const execReady = execCap?.ready !== false;
-  const launchGrounded = async () => {
+  // Le filet git est solide quand le préflight ne renvoie AUCUN warning.
+  const safetyNetOk = execReady && !execCap?.warning;
+
+  // Lance réellement le Grounded Run (après confirmation si nécessaire).
+  const doLaunchGrounded = async () => {
     const t = groundedTask.trim();
     if (!t || groundedLaunching || !execReady) return;
     setGroundedLaunching(true);
@@ -763,6 +784,19 @@ export function AgentsPanel() {
     } finally {
       setGroundedLaunching(false);
     }
+  };
+
+  // Point d'entrée du bouton : si le filet git manque, on confirme d'abord
+  // (l'exécution est réelle et potentiellement non réversible sans filet) ;
+  // sinon on lance directement.
+  const requestLaunchGrounded = () => {
+    const t = groundedTask.trim();
+    if (!t || groundedLaunching || !execReady) return;
+    if (!safetyNetOk) {
+      setConfirmRiskyRun(true);
+      return;
+    }
+    void doLaunchGrounded();
   };
 
   // Top-level filtering: only show ROOT agents (no parent). Sub-agents
@@ -877,76 +911,37 @@ export function AgentsPanel() {
       )}
 
       {/* Grounded Run — exec DIRECTE sur le vrai projet (pivot 2026-06-10).
-          L'agent lit → écrit → lance les tests → corrige → relance, avec la
-          vraie toolchain de la machine. Le filet de sécurité est git : les
-          changements sont suivis et annulables dans l'onglet Git. */}
-      <div
-        style={{
-          marginBottom: 12,
-          padding: 10,
-          borderRadius: 8,
-          background: "rgba(74, 222, 128, 0.06)",
-          border: "1px solid rgba(74, 222, 128, 0.22)",
-        }}
+          Trust-UX (Lane 5) : le bloc vert « ça a l'air safe » devient une CARTE
+          DE RISQUE explicite. Le tier est « Exécution » (rouge) — un Grounded Run
+          lance de vraies commandes et écrit sur le disque ; le vert n'est plus le
+          message principal. Le filet git est affiché honnêtement (solide = vert,
+          absent = avertissement) AVANT le lancement, et un lancement sans filet
+          demande une confirmation explicite. */}
+      <ExecutionProfileCard
+        title="Grounded Run — l'agent code ET teste sur le vrai projet"
+        glyph="🌱"
+        risk="exec"
+        summary={
+          <>
+            L'agent travaille <b>directement sur ton projet</b> avec la vraie toolchain
+            (pnpm, node, cargo…), lance les tests, corrige sur les <b>échecs réels</b> et
+            relance jusqu'au vert. Le filet de sécurité, c'est <b>git</b> : chaque
+            modification apparaît dans l'onglet <b>Git</b>, où tu peux l'examiner et l'annuler.
+          </>
+        }
+        safetyNet={
+          execReady
+            ? {
+                ok: safetyNetOk,
+                message: safetyNetOk
+                  ? "Filet git actif — chaque modification de ce run est réversible dans l'onglet Git."
+                  : execCap?.warning ??
+                    "Pas de dépôt git détecté — les modifications de ce run ne pourront pas être annulées en un clic.",
+                onRecheck: () => void refreshPreflight(),
+              }
+            : undefined
+        }
       >
-        <div
-          style={{
-            fontSize: 11,
-            fontWeight: 700,
-            color: "var(--success, #4ade80)",
-            marginBottom: 4,
-          }}
-        >
-          🌱 Grounded Run — l'agent code ET teste sur le vrai projet
-        </div>
-        <div
-          style={{
-            fontSize: 10.5,
-            color: "var(--on-surface-muted)",
-            lineHeight: 1.5,
-            marginBottom: 8,
-          }}
-        >
-          L'agent travaille <b>directement sur ton projet</b> avec la vraie toolchain
-          (pnpm, node, cargo…), lance les tests, corrige sur les <b>échecs réels</b> et
-          relance jusqu'au vert. Le filet de sécurité, c'est <b>git</b> : chaque
-          modification apparaît dans l'onglet <b>Git</b>, où tu peux l'examiner et
-          l'annuler.
-        </div>
-
-        {/* Préflight filet git — avertissement NON bloquant (pas de repo /
-            changements non commités) avec un bouton pour re-vérifier après
-            un commit ou un git init. */}
-        {execCap?.warning ? (
-          <div
-            style={{
-              fontSize: 10,
-              color: "var(--warn, #fbbf24)",
-              marginBottom: 8,
-              display: "flex",
-              alignItems: "flex-start",
-              gap: 6,
-            }}
-          >
-            <span style={{ whiteSpace: "pre-wrap", flex: 1 }}>⚠ {execCap.warning}</span>
-            <button
-              onClick={() => void refreshPreflight()}
-              style={{
-                fontSize: 9,
-                padding: "2px 8px",
-                borderRadius: 4,
-                background: "transparent",
-                color: "var(--on-surface-muted)",
-                border: "1px solid rgba(150,150,150,0.3)",
-                cursor: "pointer",
-                flexShrink: 0,
-              }}
-            >
-              Revérifier
-            </button>
-          </div>
-        ) : null}
-
         <textarea
           value={groundedTask}
           onChange={(e) => setGroundedTask(e.target.value)}
@@ -961,7 +956,7 @@ export function AgentsPanel() {
             borderRadius: 6,
             background: "var(--surface, #14141f)",
             color: "var(--on-surface, #ddd)",
-            border: "1px solid rgba(74, 222, 128, 0.25)",
+            border: "1px solid rgba(255,255,255,0.12)",
             fontFamily: "inherit",
           }}
         />
@@ -978,40 +973,76 @@ export function AgentsPanel() {
             borderRadius: 6,
             background: "var(--surface, #14141f)",
             color: "var(--on-surface, #ddd)",
-            border: "1px solid rgba(74, 222, 128, 0.18)",
+            border: "1px solid rgba(255,255,255,0.08)",
             fontFamily: "var(--font-mono)",
           }}
         />
-        <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap" }}>
+        <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
           <button
-            onClick={() => void launchGrounded()}
+            type="button"
+            onClick={requestLaunchGrounded}
             disabled={groundedLaunching || !groundedTask.trim() || !execReady}
             title={
               !execReady
                 ? execCap?.warning ?? "Ouvre un dossier d'abord"
-                : "Lancer un Grounded Run sur le projet ouvert"
+                : safetyNetOk
+                  ? "Lancer un Grounded Run sur le projet ouvert"
+                  : "Lancer sans filet git — une confirmation sera demandée"
             }
             style={{
               fontSize: 10,
-              padding: "4px 12px",
-              borderRadius: 4,
-              background: "rgba(74, 222, 128, 0.18)",
-              color: "var(--success, #4ade80)",
-              border: "1px solid rgba(74, 222, 128, 0.45)",
+              fontWeight: 700,
+              padding: "5px 14px",
+              borderRadius: 6,
+              // Le bouton porte la couleur du TIER (exécution = danger), pas un
+              // vert rassurant : on lance une exécution réelle.
+              background: "rgba(255, 106, 138, 0.16)",
+              color: "var(--danger, #ff6a8a)",
+              border: "1px solid rgba(255, 106, 138, 0.45)",
               cursor:
                 groundedLaunching || !groundedTask.trim() || !execReady ? "default" : "pointer",
               opacity: groundedLaunching || !groundedTask.trim() || !execReady ? 0.5 : 1,
+              fontFamily: "inherit",
             }}
           >
-            {groundedLaunching ? "Lancement…" : "🌱 Grounded Run"}
+            {groundedLaunching ? "Lancement…" : "🌱 Lancer (exécution réelle)"}
           </button>
         </div>
         {groundedErr && (
-          <div style={{ marginTop: 6, fontSize: 10, color: "var(--error, #ff6b6b)" }}>
-            {groundedErr}
+          <div style={{ marginTop: 8 }}>
+            <InlineNotice tone="danger">{groundedErr}</InlineNotice>
           </div>
         )}
-      </div>
+      </ExecutionProfileCard>
+
+      {/* Confirmation avant un Grounded Run SANS filet git (actions potentiellement
+          non réversibles). Lancement direct quand le filet est solide. */}
+      <ConfirmDialog
+        open={confirmRiskyRun}
+        tone="danger"
+        title="Lancer sans filet de sécurité ?"
+        body={
+          <>
+            <p style={{ margin: "0 0 8px" }}>
+              {execCap?.warning ??
+                "Aucun dépôt git n'a été détecté dans ce projet."}
+            </p>
+            <p style={{ margin: 0 }}>
+              Ce Grounded Run va <b>écrire des fichiers</b> et <b>exécuter de vraies
+              commandes</b>. Sans dépôt git, ses modifications ne pourront pas être
+              annulées en un clic. Tu peux <code>git init</code> + un premier commit
+              pour activer le filet, puis « Revérifier ».
+            </p>
+          </>
+        }
+        confirmLabel="Lancer quand même"
+        cancelLabel="Annuler"
+        onConfirm={() => {
+          setConfirmRiskyRun(false);
+          void doLaunchGrounded();
+        }}
+        onCancel={() => setConfirmRiskyRun(false)}
+      />
 
       {isLoading ? (
         <div
