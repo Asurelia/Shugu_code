@@ -552,6 +552,17 @@ pub fn run() {
         // LOT 3 — LSP server registry (un LspSession par langId).
         .manage(commands::lsp::LspServerRegistry::default())
         .setup(|app| {
+            // Lane OPÉRABILITÉ — backup AUTOMATIQUE pré-migration.
+            //
+            // tauri-plugin-sql applique ses migrations LAZILY (au premier
+            // `db.load()` côté front), pas au boot : à ce point la base sur
+            // disque est ENCORE à sa version précédente. On compare donc la
+            // version de schéma sur disque (`MAX(version)` de `_sqlx_migrations`)
+            // à la cible et, si une migration est en attente, on dépose un
+            // snapshot atomique horodaté AVANT que le front ne déclenche la
+            // migration. Best-effort : une erreur ici n'empêche jamais le boot.
+            let _ = commands::backup::auto_backup_before_migration(app.handle());
+
             // Debug instrumentation — relay JS uncaught errors into stdout.
             //
             // WebView2 crashes wipe the DevTools console: when the page dies,
@@ -841,6 +852,15 @@ pub fn run() {
             // Lane 6 — inventaire + import MCP multi-source (Claude Desktop / Codex / OpenCode).
             commands::mcp::mcp_inventory,
             commands::mcp::mcp_import_server,
+            // Lane OPÉRABILITÉ — backup / restore atomique + intégrité.
+            commands::backup::shugu_export_data,
+            commands::backup::shugu_import_data,
+            commands::backup::shugu_db_integrity_check,
+            commands::backup::shugu_backup_now,
+            // Lane OPÉRABILITÉ — Storage Center (ventilation des tailles).
+            commands::storage::shugu_storage_breakdown,
+            // Lane OPÉRABILITÉ — Diagnostics Center (bundle redacté).
+            commands::diagnostics::shugu_diag_bundle,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
