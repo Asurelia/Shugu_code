@@ -141,6 +141,19 @@ export interface ConversationSource {
   ts: number;
 }
 
+/** Un fait que la mascotte retient sur l'utilisateur (V16 migration). */
+export interface MascotMemoryRow {
+  id: string;
+  category: string;
+  key: string;
+  value: string;
+  source: string;        // 'user' | 'extracted'
+  confidence: number;
+  validated: number;     // 0 | 1
+  created_at: number;
+  updated_at: number;
+}
+
 // ---------------------------------------------------------------------------
 // Shape mappers: UI <-> Row
 // The UI shape used by ChatSidebar/SEED_CONVOS differs from the DDL row.
@@ -732,6 +745,49 @@ const sources = {
 };
 
 // ---------------------------------------------------------------------------
+// mascotMemory  (V16 migration — faits appris sur l'utilisateur)
+// ---------------------------------------------------------------------------
+
+const mascotMemory = {
+  async list(category?: string, validatedOnly = false): Promise<MascotMemoryRow[]> {
+    const dbh = await getDb();
+    const where: string[] = [];
+    const args: unknown[] = [];
+    if (category) { args.push(category); where.push(`category = $${args.length}`); }
+    if (validatedOnly) where.push("validated = 1");
+    const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
+    return dbh.select(
+      `SELECT * FROM mascot_memory ${clause} ORDER BY category, updated_at DESC`,
+      args
+    ) as Promise<MascotMemoryRow[]>;
+  },
+
+  async upsert(row: MascotMemoryRow): Promise<void> {
+    const dbh = await getDb();
+    await dbh.execute(
+      `INSERT OR REPLACE INTO mascot_memory
+         (id, category, key, value, source, confidence, validated, created_at, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [row.id, row.category, row.key, row.value, row.source,
+       row.confidence, row.validated, row.created_at, row.updated_at]
+    );
+  },
+
+  async remove(id: string): Promise<void> {
+    const dbh = await getDb();
+    await dbh.execute("DELETE FROM mascot_memory WHERE id = $1", [id]);
+  },
+
+  async setValidated(id: string, updatedAt: number): Promise<void> {
+    const dbh = await getDb();
+    await dbh.execute(
+      "UPDATE mascot_memory SET validated = 1, confidence = 1.0, updated_at = $1 WHERE id = $2",
+      [updatedAt, id]
+    );
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Public repository facade
 // ---------------------------------------------------------------------------
 
@@ -745,6 +801,7 @@ export const db = {
   settings,
   reviews,
   sources,
+  mascotMemory,
 
   /**
    * Wipe all user-generated data from the local SQLite database.

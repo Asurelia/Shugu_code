@@ -403,6 +403,27 @@ CREATE TABLE IF NOT EXISTS message_sources (
 CREATE INDEX IF NOT EXISTS idx_message_sources_conv ON message_sources(conversation_id);
 ";
 
+// V16 — mémoire persistante de la mascotte (socle « mascotte centrale »).
+//
+// Faits que Shugu retient de l'utilisateur. `source`='user' (saisi à la main,
+// validated=1 d'office) vs 'extracted' (déduit par un futur extracteur LLM,
+// validated=0 jusqu'à validation dans le panneau « Ce que Shugu sait de toi »).
+const MIGRATION_V16: &str = "
+CREATE TABLE IF NOT EXISTS mascot_memory (
+  id         TEXT    PRIMARY KEY,
+  category   TEXT    NOT NULL DEFAULT 'general',
+  key        TEXT    NOT NULL,
+  value      TEXT    NOT NULL,
+  source     TEXT    NOT NULL DEFAULT 'user',
+  confidence REAL    NOT NULL DEFAULT 1.0,
+  validated  INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mascot_memory_cat       ON mascot_memory(category);
+CREATE INDEX IF NOT EXISTS idx_mascot_memory_validated ON mascot_memory(validated);
+";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = vec![
@@ -494,6 +515,12 @@ pub fn run() {
             version: 15,
             description: "message_sources",
             sql: MIGRATION_V15,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 16,
+            description: "mascot_memory",
+            sql: MIGRATION_V16,
             kind: MigrationKind::Up,
         },
     ];

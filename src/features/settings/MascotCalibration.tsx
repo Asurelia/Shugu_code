@@ -13,6 +13,7 @@ import {
   type ChibiCalibration,
 } from "@/features/mascot/calibration";
 import { SettingRow } from "@/features/code/views-code";
+import { MascotMemoryPanel } from "./MascotMemoryPanel";
 
 export function MascotCalibration() {
   const [cal, setCal] = React.useState<ChibiCalibration>(() => loadCalibration());
@@ -96,6 +97,8 @@ export function MascotCalibration() {
             État courant : L={cal.left} · R={cal.right} · T={cal.top} · B={cal.bottom} · threshold={cal.snapThreshold}
           </div>
         </div>
+
+        <MascotMemoryPanel />
       </div>
     </div>
   );
