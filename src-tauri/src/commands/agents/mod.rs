@@ -87,6 +87,16 @@ pub(crate) mod exec;
 /// pre-flight a command string too.
 pub(crate) mod policy;
 
+/// Opt-in Windows execution sandbox (default OFF) — confines `run_command` via
+/// native filesystem ACLs without the heavy machinery (dedicated accounts,
+/// AppContainer, WFP) Codex's sandbox uses. `light` deny-fences credential
+/// stores (`~\.ssh`, `~\.aws`, agent auth tokens, browser profiles); `strict`
+/// adds a write-deny on out-of-workspace tamper targets while keeping the
+/// workspace/temp/cache write-allowlist. Selected by `SHUGU_SANDBOX`
+/// (off|light|strict). On non-Windows it is a documented no-op passthrough.
+/// See `docs/win-sandbox-validation.md` for the runtime checklist.
+pub(crate) mod sandbox;
+
 /// Skill library (Voyager / Hermes) — the agent saves reusable skills it learns
 /// (`skill_save` tool) and loads them into context on future runs. Persistent,
 /// per-role, compounding learning.
