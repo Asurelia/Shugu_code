@@ -1,0 +1,9 @@
+{
+  "id": "cli-wordcount",
+  "title": "Build a word-count CLI",
+  "category": "from-scratch",
+  "tags": ["js", "from-scratch", "cli"],
+  "prompt": "Create a Node CLI `wc.js` that reads a file path from `process.argv[2]`, reads that file, and prints exactly three space-separated numbers followed by a newline: `<lines> <words> <bytes>` (like `wc`). Lines = number of newline characters. Words = whitespace-separated tokens. Bytes = byte length of the file. If no path is given or the file is missing, print an error to stderr and exit with code 1. There is a `verify.test.js` that spawns your CLI on a sample file and checks the output; make `node --test verify.test.js` pass. Do NOT modify the test file or `sample.txt`.",
+  "verify": "node --test verify.test.js",
+  "verifyTimeoutSecs": 60
+}

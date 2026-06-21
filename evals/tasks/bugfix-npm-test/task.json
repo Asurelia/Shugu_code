@@ -1,0 +1,9 @@
+{
+  "id": "bugfix-npm-test",
+  "title": "Fix a failing project (npm test)",
+  "category": "bugfix",
+  "tags": ["js", "bugfix", "npm"],
+  "prompt": "This project has a `package.json` whose `test` script runs the test suite. Running it currently fails. The bug is in `src/calc.js` — the function `average(nums)` divides by the wrong quantity. Read the failing test output, fix `src/calc.js`, and make the project's own check pass. The verification command is `npm test`. Do NOT modify the test file.",
+  "verify": "npm test",
+  "verifyTimeoutSecs": 120
+}
