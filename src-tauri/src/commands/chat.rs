@@ -301,8 +301,12 @@ pub(crate) fn resolve_key(protocol: &str, api_key: &Option<String>) -> Result<St
 // private LAN — turning the chat command into a Server-Side Request Forgery
 // pivot. We refuse such targets by default.
 //
-// Policy (custom protocol only — the built-in anthropic/openai/ollama paths are
-// untouched):
+// Policy — applied wherever a user-supplied base_url is funnelled into an
+// outbound backend request. The chat call sites (`chat_send`, `fim_complete`)
+// apply it to the `custom` protocol; the same `validate_custom_base_url` is
+// reused by `models::models_discover_external` for the anthropic/openai/custom
+// discovery probes. The `ollama` path stays exempt everywhere (it defaults to
+// `localhost:11434`, which the guard would otherwise block):
 //   * Reject when the host is a loopback / private / link-local / CGNAT /
 //     unique-local / unspecified IP literal, or the name "localhost" (and the
 //     IPv6 loopback name). Both raw IPv4/IPv6 literals AND IPv4-mapped IPv6
@@ -376,7 +380,14 @@ fn is_internal_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// Validate a `custom`-protocol `base_url` against the SSRF allowlist.
+/// Validate a provider `base_url` against the SSRF allowlist.
+///
+/// Originally written for the `custom` chat protocol, this is the single source
+/// of truth for the policy and is reused by
+/// [`crate::commands::models::models_discover_external`] to guard the
+/// anthropic/openai/custom discovery probes — each fires a backend request at a
+/// user-supplied `base_url`, so they share the exact same SSRF-pivot shape.
+/// Kept `pub(crate)` so the chat and discovery call sites can't drift apart.
 ///
 /// Returns `Ok(())` when the URL may be requested, or `Err(message)` with a
 /// user-facing explanation (including the override hint) when it must be

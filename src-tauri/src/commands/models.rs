@@ -81,11 +81,23 @@ pub async fn models_discover_external(
     // it blocks loopback / private / link-local / CGNAT / unique-local /
     // metadata IP literals and the loopback hostnames, honoring the
     // `SHUGU_CUSTOM_ALLOW_PRIVATE=1` opt-out for legitimately self-hosted/LAN
-    // endpoints. Scoped to the `custom` protocol only — the built-in
-    // anthropic/openai/ollama paths target trusted or local-by-design endpoints
-    // (Ollama's default `http://localhost:11434` would otherwise be blocked),
-    // mirroring chat.rs's exemption of those three exactly.
-    if protocol == "custom" {
+    // endpoints.
+    //
+    // Scope: anthropic / openai / custom — every protocol that funnels a
+    // user-supplied `base_url` into the request. This is deliberately BROADER
+    // than chat.rs's custom-only guard, for reasons specific to this command:
+    //   * `openai` and `custom` share one match arm below (both take an
+    //     arbitrary base_url), and the `anthropic` arm does too — there is no
+    //     trusted/default endpoint to fall back on here.
+    //   * the `protocol` discriminator is itself attacker-controlled, so a
+    //     custom-only guard would be one relabel (`custom` → `openai`) away from
+    //     a full bypass — and per the header note above, a custom provider often
+    //     arrives here already labelled `openai`.
+    // `ollama` is the sole exemption: it targets `http://localhost:11434` by
+    // design, and guarding it would break the default local-Ollama discovery
+    // flow. The guard runs FIRST — before the client is built and before the
+    // anthropic key check — so a blocked target never opens a socket.
+    if matches!(protocol.as_str(), "anthropic" | "openai" | "custom") {
         crate::commands::chat::validate_custom_base_url(&base_url)?;
     }
 
@@ -199,17 +211,27 @@ mod ssrf_discovery_tests {
     use super::models_discover_external;
 
     // The SSRF guard runs BEFORE the reqwest client is built, so a blocked
-    // `custom` target returns the validation Err without touching the network —
-    // these tests are deterministic and offline. They mirror the policy proven
-    // exhaustively in chat.rs's `ssrf_tests`; here we only assert the command
-    // wires the guard in for the `custom` protocol and short-circuits.
+    // target returns the validation Err without touching the network — the
+    // `block` cases below are deterministic and offline. They mirror the policy
+    // proven exhaustively in chat.rs's `ssrf_tests`; here we assert the command
+    // wires the guard in for EVERY base_url-consuming protocol
+    // (anthropic / openai / custom) and short-circuits, while `ollama` stays
+    // exempt. These assume `SHUGU_CUSTOM_ALLOW_PRIVATE` is UNSET (the default)
+    // and never mutate the process env, so they stay deterministic under the
+    // parallel test runner.
 
-    async fn block(url: &str) {
-        let res =
-            models_discover_external("custom".to_string(), url.to_string(), None).await;
+    /// Every protocol whose arm funnels a user-supplied base_url into the probe
+    /// and is therefore guarded. `ollama` is intentionally absent.
+    const GUARDED: [&str; 3] = ["anthropic", "openai", "custom"];
+
+    /// Assert that discovery for `protocol` → `url` is rejected by the SSRF
+    /// guard (validation error, no network hop). `None` api_key also proves the
+    /// guard fires ahead of the anthropic key-presence check.
+    async fn block(protocol: &str, url: &str) {
+        let res = models_discover_external(protocol.to_string(), url.to_string(), None).await;
         assert!(
             res.is_err(),
-            "custom discovery to {url} should be blocked by the SSRF guard"
+            "{protocol} discovery to {url} should be blocked by the SSRF guard"
         );
         let msg = res.unwrap_err();
         assert!(
@@ -217,31 +239,69 @@ mod ssrf_discovery_tests {
                 || msg.contains("http or https")
                 || msg.contains("valid URL")
                 || msg.contains("is empty"),
-            "blocked {url} should report the SSRF/validation reason, got: {msg}"
+            "blocked {protocol} {url} should report the SSRF/validation reason, got: {msg}"
         );
     }
 
     #[tokio::test]
-    async fn custom_discovery_blocks_loopback_and_private_targets() {
+    async fn discovery_blocks_loopback_and_private_targets() {
         // Same shapes chat.rs blocks: loopback name, loopback/private/metadata
-        // IP literals, IPv6 loopback + v4-mapped loopback.
-        for u in [
-            "http://localhost:8090/v1",
-            "http://127.0.0.1:8080",
-            "http://10.1.2.3/v1",
-            "https://192.168.0.10",
-            "http://169.254.169.254/latest/meta-data",
-            "http://[::1]:8080/v1",
-            "http://[::ffff:127.0.0.1]:9000",
-        ] {
-            block(u).await;
+        // IP literals, IPv6 loopback + v4-mapped loopback. Checked across every
+        // guarded protocol so relabelling the provider can't bypass the guard.
+        for proto in GUARDED {
+            for u in [
+                "http://localhost:8090/v1",
+                "http://127.0.0.1:8080",
+                "http://10.1.2.3/v1",
+                "https://192.168.0.10",
+                "http://169.254.169.254/latest/meta-data",
+                "http://[::1]:8080/v1",
+                "http://[::ffff:127.0.0.1]:9000",
+            ] {
+                block(proto, u).await;
+            }
         }
     }
 
     #[tokio::test]
-    async fn custom_discovery_rejects_bad_scheme_and_empty_base_url() {
-        for u in ["", "ftp://example.com", "file:///etc/passwd", "not a url"] {
-            block(u).await;
+    async fn discovery_rejects_bad_scheme_and_empty_base_url() {
+        for proto in GUARDED {
+            for u in ["", "ftp://example.com", "file:///etc/passwd", "not a url"] {
+                block(proto, u).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ollama_discovery_is_exempt_from_guard() {
+        use tokio::time::{timeout, Duration};
+        // ollama targets localhost by design — the guard must NOT fire for it,
+        // or the default local-Ollama discovery flow breaks. We prove the guard
+        // let it through by observing the call reach the NETWORK layer: a guarded
+        // protocol would return the SSRF block error synchronously, long before
+        // any socket work. We connect to 127.0.0.1:1 (a reserved port nothing
+        // listens on). Two acceptable outcomes, both proving the exemption:
+        //   * the connect is refused fast (RST, the usual loopback case) → the
+        //     call returns a transport error, which is NOT the block message;
+        //   * the SYN is silently dropped (some firewalled CI hosts) → the call
+        //     is still running at the 5 s bound, which itself proves the guard
+        //     did not short-circuit. The cap stops the suite inheriting the 30 s
+        //     reqwest timeout.
+        match timeout(
+            Duration::from_secs(5),
+            models_discover_external("ollama".to_string(), "http://127.0.0.1:1".to_string(), None),
+        )
+        .await
+        {
+            Ok(res) => {
+                let msg = res.expect_err("no ollama server on 127.0.0.1:1");
+                assert!(
+                    !msg.contains("blocked to prevent SSRF"),
+                    "ollama must bypass the SSRF guard, but it was blocked: {msg}"
+                );
+            }
+            // Still connecting at the 5 s bound → the guard did not block → exempt.
+            Err(_elapsed) => {}
         }
     }
 }
