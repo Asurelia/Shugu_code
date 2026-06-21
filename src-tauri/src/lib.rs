@@ -799,6 +799,9 @@ pub fn run() {
             commands::mcp::mcp_add_server,
             commands::mcp::mcp_remove_server,
             commands::mcp::mcp_call_tool,
+            // Lane 6 — inventaire + import MCP multi-source (Claude Desktop / Codex / OpenCode).
+            commands::mcp::mcp_inventory,
+            commands::mcp::mcp_import_server,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

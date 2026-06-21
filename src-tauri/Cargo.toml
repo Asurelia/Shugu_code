@@ -99,6 +99,13 @@ rmcp = { version = "1", features = ["client", "transport-child-process", "transp
 xcap = "0.9.6"
 image = "0.25.6"
 
+# Lane 6 — import MCP multi-source. Le parseur TOML lit (en lecture seule) le
+# `~/.codex/config.toml` de Codex (`[mcp_servers.*]`). Version "0.8" déjà
+# résolue dans Cargo.lock (dep transitive) → ajout direct sans nouvelle
+# résolution. On lit via `toml::Value` (pas de derive) pour tolérer les champs
+# inconnus de la config Codex (model, plugins, projects, marketplaces…).
+toml = "0.8"
+
 # keyring v3 has NO default features — without an explicit platform feature
 # it compiles but provides no real backend (a fall-through "sample" store
 # that silently accepts writes and reads but never persists across processes).

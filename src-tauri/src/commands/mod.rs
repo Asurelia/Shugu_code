@@ -16,6 +16,7 @@ pub mod grep;
 pub mod llama;
 pub mod lsp;
 pub mod mcp;
+pub mod mcp_sources;
 pub mod model_bundle;
 pub mod preview;
 pub mod search;
