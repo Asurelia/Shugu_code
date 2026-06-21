@@ -193,6 +193,24 @@ pub(super) fn run_command_direct(
     let cwd = strip_verbatim(ws);
     let risk = classify_command(command, policy);
 
+    // Opt-in execution sandbox (default OFF via `SHUGU_SANDBOX`). Armed BEFORE
+    // the spawn so the confinement is in place the instant the child starts, and
+    // the returned RAII guard is held in `_sandbox` for the WHOLE run — its Drop
+    // (after the wait loop, when this function returns) restores every modified
+    // DACL. Arming never fails the run: a sandbox that can't arm logs a warning
+    // and the command runs unconfined (see sandbox.rs). On non-Windows this is a
+    // documented no-op. We bind it to a named variable (not `_`) so it is NOT
+    // dropped immediately — `let _ = …` would restore the DACLs before the child
+    // even spawns.
+    let _sandbox = super::sandbox::Sandbox::from_env(&cwd).arm();
+    if _sandbox.mode().is_active() {
+        eprintln!(
+            "[agent:exec] sandbox mode={} armed={} path(s)",
+            _sandbox.mode().as_str(),
+            _sandbox.armed_count()
+        );
+    }
+
     #[cfg(windows)]
     let mut cmd = {
         let mut c = Command::new("cmd");
