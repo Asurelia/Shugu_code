@@ -144,6 +144,11 @@ struct ChatDeltaCoalescer {
     kind: &'static str,
     acc: String,
     window_start: std::time::Instant,
+    /// True once ANY visible chunk (content or reasoning) has been pushed. Read
+    /// by the failover guard in `chat_send`: once the user has seen streamed
+    /// output from the primary provider, silently retrying on a fallback would
+    /// duplicate / corrupt what's on screen, so failover is suppressed.
+    emitted: bool,
 }
 
 impl ChatDeltaCoalescer {
@@ -156,13 +161,27 @@ impl ChatDeltaCoalescer {
             kind: "content",
             acc: String::new(),
             window_start: std::time::Instant::now(),
+            emitted: false,
         }
+    }
+
+    /// Whether any visible chunk has been buffered or emitted so far. Drives the
+    /// "nothing on screen yet ⇒ safe to fail over" decision in `chat_send`.
+    fn has_emitted(&self) -> bool {
+        self.emitted
     }
 
     /// Accumulate one chunk; emits the merged buffer when the kind changes
     /// (content ↔ reasoning must not interleave inside one delta) or when the
     /// current window is older than [`Self::FLUSH_INTERVAL`].
     fn push(&mut self, kind: &str, chunk: &str) {
+        // `tool_use_block` signal chunks carry no visible text (empty `chunk`),
+        // so they must NOT mark the stream as "emitted" — otherwise a turn that
+        // only streamed a tool-args indicator before erroring would wrongly
+        // suppress failover. Only real content/reasoning text counts.
+        if !chunk.is_empty() && (kind == "content" || kind == "reasoning") {
+            self.emitted = true;
+        }
         let delta_kind: &'static str = if kind == "reasoning" { "reasoning" } else { "content" };
         if self.kind != delta_kind {
             self.flush();
@@ -1401,6 +1420,179 @@ async fn run_chat_tool_loop(
 }
 
 // ---------------------------------------------------------------------------
+// Legacy single-call dispatch + opt-in provider failover
+// ---------------------------------------------------------------------------
+
+/// One provider's connection parameters for the legacy single-call path.
+/// Used for BOTH the primary and (when configured) the fallback target so the
+/// same dispatch body runs verbatim against either.
+struct SingleCallTarget<'a> {
+    protocol: &'a str,
+    base_url: &'a str,
+    model: &'a str,
+    api_key: Option<&'a str>,
+}
+
+/// Run ONE legacy (non-tool-loop) chat turn against a single provider target,
+/// streaming tokens through `on_chunk`. Factored out of `chat_send` so the
+/// identical body can be driven first against the primary provider and then,
+/// only when the strict failover predicate allows, against a configured
+/// fallback. Behavior for the primary is byte-identical to the previous inline
+/// `match protocol_str { … }`.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_single_call(
+    app: &tauri::AppHandle,
+    client: &reqwest::Client,
+    target: &SingleCallTarget<'_>,
+    messages: &[ChatMessage],
+    chat_template_kwargs: &Option<serde_json::Value>,
+    img_ref: Option<&str>,
+    reasoning_effort: Option<&str>,
+    abort_flag: Option<Arc<AtomicBool>>,
+    on_chunk: &mut (dyn FnMut(&str, &str) + Send),
+) -> Result<String, String> {
+    // `api_key` resolution mirrors the primary path: an explicit non-empty key
+    // wins, otherwise `resolve_key` falls back to the env/empty rules.
+    let api_key_owned = target.api_key.map(|s| s.to_string());
+    let turn_result: Result<AssistantTurn, String> = match target.protocol {
+        "anthropic" => {
+            let key = resolve_key(target.protocol, &api_key_owned)?;
+            call_anthropic(
+                client, target.base_url, target.model, messages, &key,
+                /* with_tools */ false, img_ref, abort_flag, on_chunk,
+            )
+            .await
+        }
+        "openai" | "custom" => {
+            let key = resolve_key(target.protocol, &api_key_owned)?;
+            call_openai_compat(
+                client, target.base_url, target.model, messages, &key, target.protocol,
+                chat_template_kwargs, /* with_tools */ false, img_ref, abort_flag, on_chunk,
+            )
+            .await
+            .map(|mut turn| {
+                if turn.content.trim().is_empty() && !turn.tool_calls.is_empty() {
+                    turn.content =
+                        crate::commands::chat_minimax::summarize_tool_calls(&turn.tool_calls);
+                }
+                turn
+            })
+        }
+        "ollama" => {
+            call_ollama(client, target.base_url, target.model, messages, abort_flag, on_chunk).await
+        }
+        "codex" => {
+            let prompt = build_codex_prompt(messages);
+            crate::commands::codex::codex_chat_turn(
+                app, &prompt, Some(target.model), reasoning_effort, on_chunk,
+            )
+            .await
+            .map(|content| AssistantTurn { content, tool_calls: Vec::new() })
+        }
+        other => Err(format!("unsupported protocol: {}", other)),
+    };
+    turn_result.map(|turn| turn.content)
+}
+
+/// Decide whether a primary-provider failure is eligible for an automatic
+/// fallback retry. The policy is deliberately CONSERVATIVE — failover must
+/// never surprise the user, so it fires ONLY when ALL of these hold:
+///
+///   * `emitted == false` — nothing was streamed to the UI yet. Once the user
+///     has seen tokens from the primary, retrying on another provider would
+///     duplicate / interleave output. (This is also why failover is scoped to
+///     the legacy single-call path and never the tool loop, where partial
+///     file writes may already have happened.)
+///   * the request was NOT user-aborted — `chat_abort` surfaces as an early
+///     `Ok` (graceful truncation), not an `Err`, but we also guard the flag
+///     directly so a race never triggers a fallback the user just cancelled.
+///   * the error is a TRANSPORT or SERVER fault (connection refused/reset/
+///     timeout, DNS failure, or an HTTP 5xx), NOT a client/auth error. A 4xx
+///     (bad key, bad model, bad request) will fail identically on the fallback
+///     and must be shown to the user instead of silently swapped.
+fn failover_is_eligible(err: &str, emitted: bool, abort_flag: &Option<Arc<AtomicBool>>) -> bool {
+    if emitted {
+        return false;
+    }
+    if let Some(flag) = abort_flag {
+        if flag.load(Ordering::Relaxed) {
+            return false;
+        }
+    }
+    error_is_retryable(err)
+}
+
+/// Classify a dispatch error string as a retryable transport/server fault
+/// (eligible for failover) vs a permanent client error (not).
+///
+/// The provider call sites format their errors as free text, so we match on
+/// stable substrings:
+///   * Our own helpers surface upstream HTTP status as `"... API error {status}: ..."`
+///     / `"HTTP {status}: ..."` — a 5xx in that text ⇒ retryable, a 4xx ⇒ not.
+///   * reqwest transport errors stringify with recognizable phrases
+///     (connect/timed out/connection refused/reset/dns) ⇒ retryable.
+fn error_is_retryable(err: &str) -> bool {
+    let low = err.to_lowercase();
+
+    // Explicit 4xx client errors are NEVER retryable — a fallback can't fix a
+    // bad key/model/request, and silently swapping hides the real cause.
+    // Detect a 3-digit 4xx status appearing anywhere in the message.
+    if contains_status_class(&low, '4') {
+        return false;
+    }
+    // Explicit 5xx server errors ⇒ retry on the fallback.
+    if contains_status_class(&low, '5') {
+        return true;
+    }
+
+    // No HTTP status present ⇒ treat recognizable transport faults as retryable.
+    // These are the reqwest / hyper / std::io phrasings for a peer that's down,
+    // slow, or unresolvable — exactly what a configured fallback exists for.
+    const TRANSPORT_MARKERS: [&str; 9] = [
+        "timed out",
+        "timeout",
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "connect error",
+        "dns error",
+        "failed to lookup",
+        "error sending request",
+    ];
+    TRANSPORT_MARKERS.iter().any(|m| low.contains(m))
+}
+
+/// True iff `low` contains a 3-digit HTTP status whose first digit is
+/// `class_digit` (e.g. '4' for 4xx, '5' for 5xx). We scan for the digit
+/// followed by two more digits, bounded so we don't match inside a longer
+/// number (a 4-digit token like "5000" is not an HTTP status). This avoids a
+/// regex dependency for a tiny, well-defined check.
+fn contains_status_class(low: &str, class_digit: char) -> bool {
+    let bytes = low.as_bytes();
+    let target = class_digit as u8;
+    for i in 0..bytes.len() {
+        if bytes[i] != target {
+            continue;
+        }
+        // Need exactly three consecutive ASCII digits starting here.
+        if i + 3 > bytes.len() {
+            break;
+        }
+        let trio = &bytes[i..i + 3];
+        if !trio.iter().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        // Reject if flanked by another digit (part of a longer number).
+        let prev_is_digit = i > 0 && bytes[i - 1].is_ascii_digit();
+        let next_is_digit = i + 3 < bytes.len() && bytes[i + 3].is_ascii_digit();
+        if !prev_is_digit && !next_is_digit {
+            return true;
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Public command
 // ---------------------------------------------------------------------------
 
@@ -1419,13 +1611,23 @@ async fn run_chat_tool_loop(
 /// (removed from the registry) before `chat_send` returns, regardless of
 /// success, abort, or error.
 ///
+/// Optional opt-in provider failover (AM-4 follow-up): the frontend may pass
+/// `fallback_model` (+ optionally `fallback_protocol` / `fallback_base_url` /
+/// `fallback_api_key`). When present AND the PRIMARY provider fails with a
+/// transport/5xx error BEFORE streaming any token, `chat_send` transparently
+/// retries the SAME message set against the fallback. Absent `fallback_model`
+/// ⇒ no failover (zero behavior change). The retry is suppressed once any text
+/// has reached the UI, on user abort, and on 4xx client errors — see
+/// `failover_is_eligible`. Failover applies to the legacy single-call path
+/// only (never the fs tool loop, whose partial file writes make a silent
+/// provider swap unsafe).
+///
 /// Follow-up TODOs:
 /// - Per-message history: thread `conversation_id` through a message store and
 ///   pass the full history in the `messages` array.
-/// - SSRF allowlist: for `custom` protocol, validate `base_url` against a
-///   user-managed allowlist before making any outbound request.
 /// - Error mid-stream UX: emit a `done: true` delta with an `error` field so
 ///   the frontend can display partial text + an error indicator.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn chat_send(
     app: tauri::AppHandle,
@@ -1452,6 +1654,15 @@ pub async fn chat_send(
     // Absent/None ⇒ legacy single-call path (zero regression).
     read_tools: Option<bool>,
     write_tools: Option<bool>,
+    // Opt-in provider failover (AM-4). `fallback_model` is the trigger: when
+    // None (the default — the JS key is simply absent), no fallback is ever
+    // attempted and behavior is identical to before. When Some, the other three
+    // describe the fallback target; each defaults to the PRIMARY's value when
+    // absent (so e.g. a same-protocol model swap only needs `fallback_model`).
+    fallback_model: Option<String>,
+    fallback_protocol: Option<String>,
+    fallback_base_url: Option<String>,
+    fallback_api_key: Option<String>,
     abort_registry: tauri::State<'_, ChatAbortRegistry>,
 ) -> Result<String, String> {
     let model = if model.is_empty() {
@@ -1485,15 +1696,18 @@ pub async fn chat_send(
         flag
     });
 
-    // Build the chat-channel emit callback. The streaming helpers no
-    // longer emit Tauri events themselves — instead they feed the coalescer
-    // once per chunk with `(kind, chunk)` where kind ∈ {"content",
-    // "reasoning"}. Chunks are merged into ONE `chat://delta` per ~50 ms
-    // window instead of one broadcast per token; the existing useChatStream /
-    // chat-sync listener path is unchanged, it just receives bigger chunks
-    // less often.
+    // Build the chat-channel coalescer. The streaming helpers no longer emit
+    // Tauri events themselves — instead they feed the coalescer once per chunk
+    // with `(kind, chunk)` where kind ∈ {"content", "reasoning"}. Chunks are
+    // merged into ONE `chat://delta` per ~50 ms window instead of one broadcast
+    // per token; the existing useChatStream / chat-sync listener path is
+    // unchanged, it just receives bigger chunks less often.
+    //
+    // The `on_chunk` closure is now created INSIDE each dispatch scope (rather
+    // than once up front) so the failover guard can read `coalescer.has_emitted()`
+    // between the primary call and a possible fallback call without a borrow
+    // conflict.
     let mut coalescer = ChatDeltaCoalescer::new(app.clone(), conversation_id.clone());
-    let mut on_chunk = |kind: &str, chunk: &str| coalescer.push(kind, chunk);
 
     // The chat surface never issues tool calls — always pass with_tools:false
     // so the body stays exactly as Phase 1 had it. The new AssistantTurn
@@ -1540,49 +1754,104 @@ pub async fn chat_send(
         )
         .await
     } else {
-        // ── Legacy single-call path (behavior unchanged) ──────────────────
-        let turn_result: Result<AssistantTurn, String> = match protocol_str {
-            "anthropic" => {
-                let key = resolve_key(protocol_str, &api_key)?;
-                call_anthropic(&client, &base_url, &model, &messages, &key, /* with_tools */ false, img_ref, abort_flag.clone(), &mut on_chunk).await
-            }
-            "openai" | "custom" => {
-                let key = resolve_key(protocol_str, &api_key)?;
-                call_openai_compat(&client, &base_url, &model, &messages, &key, protocol_str, &chat_template_kwargs, /* with_tools */ false, img_ref, abort_flag.clone(), &mut on_chunk)
-                    .await
-                    .map(|mut turn| {
-                        // Outils OFF : MiniMax peut quand même émettre des appels
-                        // d'outils en texte (parsés en tool_calls), qu'on n'exécute
-                        // PAS ici. Si la prose est vide, on pose une note lisible au
-                        // lieu d'un message vide ; les tool_calls sont sinon ignorés.
-                        if turn.content.trim().is_empty() && !turn.tool_calls.is_empty() {
-                            turn.content =
-                                crate::commands::chat_minimax::summarize_tool_calls(&turn.tool_calls);
-                        }
-                        turn
-                    })
-            }
-            "ollama" => {
-                // Ollama vision uses a different shape (a top-level `images` field
-                // of base64 strings, not multimodal content blocks). Out of MVP
-                // scope — image is silently ignored for the ollama path.
-                call_ollama(&client, &base_url, &model, &messages, abort_flag.clone(), &mut on_chunk).await
-            }
-            "codex" => {
-                // Codex (ChatGPT subscription, no API key) over the native app-server.
-                // It takes a SINGLE prompt, so we serialize the non-system turns into a
-                // transcript. ALWAYS read-only here — a chat answer must never mutate
-                // files. `model` + `reasoning_effort` come from the picker and are
-                // passed natively to `turn/start`. Image attachments out of MVP scope.
-                let prompt = build_codex_prompt(&messages);
-                let effort = reasoning_effort.as_deref();
-                crate::commands::codex::codex_chat_turn(&app, &prompt, Some(model.as_str()), effort, &mut on_chunk)
-                    .await
-                    .map(|content| AssistantTurn { content, tool_calls: Vec::new() })
-            }
-            other => Err(format!("unsupported protocol: {}", other)),
+        // ── Legacy single-call path (+ opt-in failover) ───────────────────
+        //
+        // Primary attempt. The `on_chunk` closure lives in this inner scope so
+        // it drops at the end of the block, releasing the `&mut coalescer`
+        // borrow before we read `has_emitted()` for the failover decision.
+        let primary = {
+            let mut on_chunk = |kind: &str, chunk: &str| coalescer.push(kind, chunk);
+            let primary_target = SingleCallTarget {
+                protocol: protocol_str,
+                base_url: &base_url,
+                model: &model,
+                api_key: api_key.as_deref(),
+            };
+            dispatch_single_call(
+                &app,
+                &client,
+                &primary_target,
+                &messages,
+                &chat_template_kwargs,
+                img_ref,
+                reasoning_effort.as_deref(),
+                abort_flag.clone(),
+                &mut on_chunk,
+            )
+            .await
         };
-        turn_result.map(|turn| turn.content)
+
+        match primary {
+            Ok(text) => Ok(text),
+            Err(primary_err) => {
+                // Failover is opt-in (`fallback_model` present) AND strictly
+                // gated: nothing streamed yet, not aborted, retryable error.
+                let eligible = fallback_model.is_some()
+                    && failover_is_eligible(&primary_err, coalescer.has_emitted(), &abort_flag);
+
+                if !eligible {
+                    Err(primary_err)
+                } else {
+                    // Resolve the fallback target — each field defaults to the
+                    // primary's value so a same-endpoint model swap needs only
+                    // `fallback_model`. `unwrap()` on `fallback_model` is safe:
+                    // `eligible` required `fallback_model.is_some()`.
+                    let fb_model = fallback_model.as_deref().unwrap();
+                    let fb_protocol = fallback_protocol.as_deref().unwrap_or(protocol_str);
+                    let fb_base_url = fallback_base_url.as_deref().unwrap_or(base_url.as_str());
+                    let fb_api_key = fallback_api_key.as_deref().or(api_key.as_deref());
+
+                    // Re-run the SSRF guard for a custom fallback base_url: the
+                    // fallback endpoint is just as user-supplied as the primary.
+                    if fb_protocol == "custom" {
+                        if let Err(e) = validate_custom_base_url(fb_base_url) {
+                            // Surface the ORIGINAL primary error plus why the
+                            // fallback couldn't be tried — never hide the cause.
+                            return Err(format!(
+                                "{primary_err} — fallback not attempted (blocked: {e})"
+                            ));
+                        }
+                    }
+
+                    eprintln!(
+                        "[chat] primary provider failed ({protocol_str}/{model}); \
+                         failing over to {fb_protocol}/{fb_model}. cause: {primary_err}"
+                    );
+
+                    let fallback = {
+                        let mut on_chunk = |kind: &str, chunk: &str| coalescer.push(kind, chunk);
+                        let fb_target = SingleCallTarget {
+                            protocol: fb_protocol,
+                            base_url: fb_base_url,
+                            model: fb_model,
+                            api_key: fb_api_key,
+                        };
+                        dispatch_single_call(
+                            &app,
+                            &client,
+                            &fb_target,
+                            &messages,
+                            &chat_template_kwargs,
+                            img_ref,
+                            reasoning_effort.as_deref(),
+                            abort_flag.clone(),
+                            &mut on_chunk,
+                        )
+                        .await
+                    };
+
+                    // On fallback failure, return a combined error so the user
+                    // sees BOTH causes (the primary that triggered failover and
+                    // the fallback that also failed) rather than just the last.
+                    fallback.map_err(|fb_err| {
+                        format!(
+                            "primary ({protocol_str}/{model}) failed: {primary_err}; \
+                             fallback ({fb_protocol}/{fb_model}) also failed: {fb_err}"
+                        )
+                    })
+                }
+            }
+        }
     };
 
     // Stream over (success, abort, or error) — flush any buffered tail before
@@ -1713,6 +1982,85 @@ pub async fn fim_complete(
         .unwrap_or("")
         .to_string();
     Ok(text)
+}
+
+#[cfg(test)]
+mod failover_tests {
+    use super::{
+        contains_status_class, error_is_retryable, failover_is_eligible,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn status_class_detects_4xx_and_5xx_only_as_standalone_status() {
+        // 4xx / 5xx present as a standalone 3-digit token.
+        assert!(contains_status_class("anthropic api error 401: bad key", '4'));
+        assert!(contains_status_class("http 503: upstream down", '5'));
+        assert!(contains_status_class("openai api error 429: rate", '4'));
+        // Not the queried class.
+        assert!(!contains_status_class("http 503: down", '4'));
+        assert!(!contains_status_class("api error 404", '5'));
+        // A longer number is NOT an HTTP status (must not match inside "5000").
+        assert!(!contains_status_class("retry after 5000 ms", '5'));
+        assert!(!contains_status_class("token budget 40000 exceeded", '4'));
+        // No digits at all.
+        assert!(!contains_status_class("connection refused", '5'));
+    }
+
+    #[test]
+    fn retryable_classifies_transport_and_5xx_yes_4xx_no() {
+        // Transport faults (no HTTP status) ⇒ retryable.
+        for e in [
+            "error sending request for url (http://x): connection refused",
+            "operation timed out",
+            "dns error: failed to lookup address information",
+            "connection reset by peer",
+        ] {
+            assert!(error_is_retryable(e), "{e} should be retryable");
+        }
+        // 5xx ⇒ retryable.
+        assert!(error_is_retryable("anthropic API error 500: internal"));
+        assert!(error_is_retryable("HTTP 502: bad gateway"));
+        assert!(error_is_retryable("HTTP 503: service unavailable"));
+        // 4xx ⇒ NOT retryable (a fallback can't fix a bad key/model/request).
+        for e in [
+            "anthropic API error 401: invalid x-api-key",
+            "openai API error 400: bad request",
+            "HTTP 404: model not found",
+            "API error 429: rate limit", // 4xx — user must see it, not silently swap
+        ] {
+            assert!(!error_is_retryable(e), "{e} should NOT be retryable");
+        }
+        // Unknown/opaque error with no markers ⇒ NOT retryable (conservative).
+        assert!(!error_is_retryable("something unexpected happened"));
+    }
+
+    #[test]
+    fn eligible_requires_no_emit_no_abort_and_retryable() {
+        let retryable = "HTTP 503: down";
+        let not_retryable = "HTTP 401: bad key";
+        let no_abort: Option<Arc<AtomicBool>> = None;
+
+        // Happy path: retryable, nothing emitted, not aborted ⇒ eligible.
+        assert!(failover_is_eligible(retryable, false, &no_abort));
+
+        // Already streamed text ⇒ never fail over (would corrupt the UI).
+        assert!(!failover_is_eligible(retryable, true, &no_abort));
+
+        // Non-retryable (4xx) ⇒ not eligible even with nothing emitted.
+        assert!(!failover_is_eligible(not_retryable, false, &no_abort));
+
+        // User abort set ⇒ not eligible.
+        let aborted = Some(Arc::new(AtomicBool::new(true)));
+        assert!(!failover_is_eligible(retryable, false, &aborted));
+
+        // Abort flag present but NOT set ⇒ still eligible.
+        let live = Some(Arc::new(AtomicBool::new(false)));
+        assert!(failover_is_eligible(retryable, false, &live));
+        // (sanity: flag untouched)
+        assert!(!live.unwrap().load(Ordering::Relaxed));
+    }
 }
 
 #[cfg(test)]

@@ -56,7 +56,7 @@ pub struct CodexAuth {
     pub dedicated: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexUsage {
     pub input_tokens: i64,
@@ -442,6 +442,457 @@ fn apply_no_window(cmd: &mut Command) {
 #[cfg(not(windows))]
 fn apply_no_window(_cmd: &mut Command) {}
 
+// ════════════════════════════════════════════════════════════════════════
+// AM-4 — Codex version isolation + tolerant `codex exec --json` parsing
+// ════════════════════════════════════════════════════════════════════════
+//
+// Codex is a single Rust binary whose JSONL event schema has MOVED across
+// closely-spaced releases (0.125 → 0.130 → 0.142 in a matter of days). The
+// app-server path (`codex_chat_turn`) is the primary surface, but the headless
+// `codex exec --json` stream remains a documented fallback contract — and a
+// schema drift in EITHER must degrade, not crash, Shugu.
+//
+// This layer is the version-isolation boundary the audit (AM-4) calls for:
+//   1. `codex_detect_version` — runs `codex --version`, parses + logs the
+//      semver so a drift is observable instead of silent.
+//   2. `CodexExecEvent` — a NORMALIZED event enum produced by a TOLERANT
+//      line parser (`parse_exec_line`) that:
+//        * accepts both the dotted (`thread.started`) and slashed
+//          (`thread/started`) type spellings seen across versions,
+//        * reads text from any of the field names different versions have used
+//          (`text` / `delta` / `message`),
+//        * IGNORES unknown event types and unknown fields rather than failing,
+//        * never panics on malformed JSON — a bad line becomes `Unknown` and is
+//          counted, not fatal.
+//   3. `collect_exec_stream` — drains a full JSONL transcript into
+//      `(assistant_text, usage, unknown_event_count)`, the graceful-degradation
+//      entry point: if the schema drifts so far that NOTHING parses, the caller
+//      gets empty text + the unknown count (a signal to surface "Codex format
+//      changed") instead of a hard error or a crash.
+
+/// A semver-ish Codex version. We keep the raw string (authoritative for
+/// logging) plus the parsed major/minor/patch when extractable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexVersion {
+    /// Raw `codex --version` line, trimmed (e.g. `"codex-cli 0.142.0-alpha.1"`).
+    pub raw: String,
+    pub major: Option<u32>,
+    pub minor: Option<u32>,
+    pub patch: Option<u32>,
+}
+
+/// Extract the first `MAJOR.MINOR.PATCH` triple from arbitrary version output.
+/// Tolerant: `codex --version` has printed `codex-cli 0.142.0-alpha.1`,
+/// `codex 0.125.0`, and bare `0.130.0` across builds — all yield (0, N, 0).
+fn parse_semver_triple(raw: &str) -> (Option<u32>, Option<u32>, Option<u32>) {
+    // Scan for the first run of `\d+\.\d+\.\d+`. No regex crate — hand-scan.
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        // Try to read up to three dot-separated numeric components from `i`.
+        let mut nums: Vec<u32> = Vec::with_capacity(3);
+        let mut j = i;
+        loop {
+            let start = j;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if start == j {
+                break; // no digits — stop
+            }
+            // Parse this component (bounded length keeps it within u32).
+            if let Ok(n) = raw[start..j].parse::<u32>() {
+                nums.push(n);
+            } else {
+                break;
+            }
+            if nums.len() == 3 {
+                break;
+            }
+            // Continue only if the next char is a dot followed by a digit.
+            if j < bytes.len() && bytes[j] == b'.' && j + 1 < bytes.len() && bytes[j + 1].is_ascii_digit() {
+                j += 1; // consume the dot
+            } else {
+                break;
+            }
+        }
+        if nums.len() >= 2 {
+            // Accept a 2- or 3-component version; missing patch ⇒ None.
+            let major = nums.first().copied();
+            let minor = nums.get(1).copied();
+            let patch = nums.get(2).copied();
+            return (major, minor, patch);
+        }
+        // This digit run didn't yield a version — advance past it.
+        i = j.max(i + 1);
+    }
+    (None, None, None)
+}
+
+/// Resolve + run `codex --version` and parse the result. Logs the detected
+/// version (or the failure) so a drift is visible in dev logs. Never spawns
+/// cmd.exe (uses the resolved native binary + the node fallback's prefix args).
+pub async fn codex_detect_version() -> Result<CodexVersion, String> {
+    let cmd = resolve_codex()?;
+    let mut command = Command::new(&cmd.program);
+    for a in &cmd.prefix_args {
+        command.arg(a);
+    }
+    command.arg("--version");
+    apply_no_window(&mut command);
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+
+    let output = command
+        .output()
+        .await
+        .map_err(|e| format!("codex --version spawn failed: {e}"))?;
+
+    // Some builds print the version to stderr; accept either stream.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let raw = {
+        let s = stdout.trim();
+        if s.is_empty() { stderr.trim() } else { s }
+    }
+    .to_string();
+
+    if raw.is_empty() {
+        return Err("codex --version produced no output".to_string());
+    }
+
+    let (major, minor, patch) = parse_semver_triple(&raw);
+    let version = CodexVersion { raw: raw.clone(), major, minor, patch };
+    eprintln!(
+        "[codex] detected version: {raw} (parsed {}.{}.{})",
+        major.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+        minor.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+        patch.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
+    );
+    Ok(version)
+}
+
+/// Tauri command wrapper — surfaces the detected Codex version to the UI
+/// (Connections card) so a user / log can correlate a behavior change with a
+/// Codex upgrade. Returns the parsed [`CodexVersion`].
+#[tauri::command]
+pub async fn codex_version() -> Result<CodexVersion, String> {
+    codex_detect_version().await
+}
+
+/// A NORMALIZED Codex exec event — the stable shape Shugu consumes regardless
+/// of which raw JSONL spelling the installed Codex emits. Unknown events map to
+/// [`CodexExecEvent::Unknown`] (carrying the raw `type` for logging) so the
+/// caller can degrade gracefully instead of erroring.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CodexExecEvent {
+    /// A new thread started (`thread.started` / `thread/started`).
+    ThreadStarted { thread_id: Option<String> },
+    /// A turn started.
+    TurnStarted,
+    /// Streaming text delta from the assistant (any of `delta`/`text`).
+    AgentMessageDelta { text: String },
+    /// A completed assistant message item (`item.completed` with an
+    /// `agent_message` item) — carries the full text.
+    AgentMessage { text: String },
+    /// Streaming reasoning delta (reasoning/thinking trace).
+    ReasoningDelta { text: String },
+    /// Turn completed, with optional usage.
+    TurnCompleted { usage: Option<CodexUsage> },
+    /// Turn or run failed with a message.
+    Failed { message: String },
+    /// A recognizably-shaped but unhandled event. `kind` is the raw `type`.
+    Unknown { kind: String },
+}
+
+/// Normalize an event-type string across version spellings:
+///   * lower-case,
+///   * treat `/` and `.` as the same separator (`thread.started` ==
+///     `thread/started`),
+///   * drop `_` so `agent_message` and `agentmessage` collapse together
+///     (different Codex builds have used both).
+/// Example: `item/agent_message/delta` → `item.agentmessage.delta`.
+fn canonical_event_type(t: &str) -> String {
+    t.trim()
+        .to_ascii_lowercase()
+        .replace('/', ".")
+        .replace('_', "")
+}
+
+/// First non-empty string among the given JSON field names on `v`. Lets one
+/// parser accept the text under whichever key the installed version uses.
+fn first_str_field<'a>(v: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    for k in keys {
+        if let Some(s) = v.get(*k).and_then(|x| x.as_str()) {
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// TOLERANT single-line parser. Returns `None` ONLY for blank lines or lines
+/// that are not JSON objects at all (those are skipped silently — `codex exec`
+/// occasionally interleaves non-JSON banner lines). A JSON object with an
+/// unrecognized `type` yields `Some(Unknown { .. })` so it can be counted.
+///
+/// Robustness contract (AM-4): this function NEVER panics and NEVER returns an
+/// `Err` — schema drift can only ever produce `Unknown`, and missing fields
+/// default to empty/`None`. That is what keeps a Codex format change from
+/// crashing Shugu.
+pub fn parse_exec_line(line: &str) -> Option<CodexExecEvent> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Non-JSON or non-object line ⇒ skip (banner / progress text).
+    let v: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    if !v.is_object() {
+        return None;
+    }
+
+    let raw_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let kind = canonical_event_type(raw_type);
+
+    let event = match kind.as_str() {
+        "thread.started" => CodexExecEvent::ThreadStarted {
+            // Field has been `thread_id` and `threadId` across versions.
+            thread_id: first_str_field(&v, &["thread_id", "threadId"]).map(String::from),
+        },
+        "turn.started" => CodexExecEvent::TurnStarted,
+        // Streaming text delta. Across versions the raw type has been
+        // `item.delta`, `item/agent_message/delta`, `agent_message.delta`, … —
+        // all canonicalize (lower-case, `/`→`.`, `_` dropped) to a string
+        // ending in `agentmessage.delta`, plus the bare `item.delta`. We read
+        // the text from whichever key the version uses.
+        t if t.ends_with("agentmessage.delta") || t == "item.delta" => {
+            let text = first_str_field(&v, &["delta", "text", "message"])
+                .unwrap_or("")
+                .to_string();
+            CodexExecEvent::AgentMessageDelta { text }
+        }
+        // Reasoning/thinking delta.
+        t if t.contains("reasoning") && t.contains("delta") => {
+            let text = first_str_field(&v, &["delta", "text"]).unwrap_or("").to_string();
+            CodexExecEvent::ReasoningDelta { text }
+        }
+        // Completed item — only the `agent_message` item type carries the
+        // assistant's final text we want; other item types (command runs, file
+        // edits) are ignored here (this surface is chat, read-only).
+        "item.completed" => {
+            let item = v.get("item").cloned().unwrap_or(serde_json::Value::Null);
+            let item_type = item.get("type").and_then(|x| x.as_str()).unwrap_or("");
+            if item_type == "agent_message" || item_type == "agentMessage" {
+                let text = first_str_field(&item, &["text", "message", "content"])
+                    .unwrap_or("")
+                    .to_string();
+                CodexExecEvent::AgentMessage { text }
+            } else {
+                CodexExecEvent::Unknown {
+                    kind: format!("item.completed:{item_type}"),
+                }
+            }
+        }
+        "turn.completed" => {
+            // Usage has lived under `usage` at the top level (exec JSONL).
+            let usage = v.get("usage").and_then(parse_turn_usage);
+            CodexExecEvent::TurnCompleted { usage }
+        }
+        "turn.failed" | "error" => {
+            let message = v
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .or_else(|| v.get("message").and_then(|m| m.as_str()))
+                .unwrap_or("codex exec failed")
+                .to_string();
+            CodexExecEvent::Failed { message }
+        }
+        _ => CodexExecEvent::Unknown {
+            kind: if raw_type.is_empty() { "<no-type>".to_string() } else { raw_type.to_string() },
+        },
+    };
+    Some(event)
+}
+
+/// Result of draining a full `codex exec --json` transcript.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CodexExecOutcome {
+    /// Accumulated assistant text (deltas concatenated; a terminal
+    /// `agent_message` item REPLACES the accumulator if it's non-empty and we
+    /// hadn't streamed deltas — older versions emit only the completed item).
+    pub text: String,
+    pub usage: Option<CodexUsage>,
+    /// Error message if the run reported a failure.
+    pub failure: Option<String>,
+    /// How many lines mapped to `Unknown` — a non-zero count after a Codex
+    /// upgrade is the early-warning signal of schema drift.
+    pub unknown_events: usize,
+}
+
+/// Drain a complete JSONL transcript (e.g. the full stdout of `codex exec
+/// --json`) into a normalized [`CodexExecOutcome`]. This is the graceful
+/// degradation entry point: a transcript that no longer parses at all yields an
+/// empty-text outcome with `unknown_events > 0` instead of an error/panic.
+pub fn collect_exec_stream(stdout: &str) -> CodexExecOutcome {
+    let mut out = CodexExecOutcome::default();
+    let mut streamed_any_delta = false;
+    for line in stdout.lines() {
+        let Some(ev) = parse_exec_line(line) else { continue };
+        match ev {
+            CodexExecEvent::AgentMessageDelta { text } => {
+                if !text.is_empty() {
+                    out.text.push_str(&text);
+                    streamed_any_delta = true;
+                }
+            }
+            CodexExecEvent::AgentMessage { text } => {
+                // Older versions emit only the completed item (no deltas). If we
+                // never streamed a delta, adopt the full item text; otherwise the
+                // deltas already built the text and we avoid double-counting.
+                if !streamed_any_delta && !text.is_empty() {
+                    out.text = text;
+                }
+            }
+            CodexExecEvent::TurnCompleted { usage } => {
+                if usage.is_some() {
+                    out.usage = usage;
+                }
+            }
+            CodexExecEvent::Failed { message } => {
+                out.failure = Some(message);
+            }
+            CodexExecEvent::Unknown { .. } => {
+                out.unknown_events += 1;
+            }
+            // ThreadStarted / TurnStarted / ReasoningDelta carry no visible
+            // chat text for this outcome.
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Outcome of a `codex exec --json` schema-drift probe, surfaced to the UI.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexExecProbe {
+    /// Detected Codex version (raw + parsed), if `--version` succeeded.
+    pub version: Option<CodexVersion>,
+    /// Whether the exec stream produced any recognized assistant text.
+    pub produced_text: bool,
+    /// Number of JSONL lines that mapped to `Unknown` — the drift signal.
+    pub unknown_events: usize,
+    /// True when the transcript yielded zero recognized events of ANY kind
+    /// (text, usage, failure) — i.e. the schema drifted beyond recognition.
+    pub schema_unrecognized: bool,
+    /// A failure message reported by the run, if any.
+    pub failure: Option<String>,
+    /// Human-readable verdict for the Connections/Diagnostics card.
+    pub verdict: String,
+}
+
+/// Run a minimal, READ-ONLY `codex exec --json` turn and report whether Shugu's
+/// tolerant parser still recognizes the event schema (AM-4 health check). This
+/// is the real production consumer of `collect_exec_stream` + the version
+/// detector: it lets the UI warn "Codex updated and changed its output format"
+/// BEFORE that drift silently degrades the chat surface.
+///
+/// `prompt` defaults to a tiny deterministic ask when empty. The run is bounded
+/// (2-min backstop) and sandboxed read-only via `codex exec` flags so it can
+/// never mutate files. Never spawns cmd.exe (resolved native binary + node
+/// fallback prefix args), and honors the dedicated/shared CODEX_HOME.
+#[tauri::command]
+pub async fn codex_exec_probe(app: AppHandle, prompt: Option<String>) -> Result<CodexExecProbe, String> {
+    // Best-effort version detection — a failure here is not fatal to the probe
+    // (we still try the exec run), it just leaves `version: None`.
+    let version = codex_detect_version().await.ok();
+
+    let cmd = resolve_codex()?;
+    let ask = prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Reply with the single word: ok");
+
+    let mut command = Command::new(&cmd.program);
+    for a in &cmd.prefix_args {
+        command.arg(a);
+    }
+    // `exec --json` headless stream; read-only sandbox + never-approve so the
+    // probe can neither edit files nor block on an approval prompt.
+    command
+        .arg("exec")
+        .arg("--json")
+        .arg("--sandbox")
+        .arg("read-only")
+        .arg(ask);
+    apply_codex_home(&app, &mut command);
+    apply_no_window(&mut command);
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+
+    let child = command
+        .spawn()
+        .map_err(|e| format!("codex exec spawn failed: {e}"))?;
+
+    // Bound the whole run so a hung Codex can't wedge the probe.
+    let output = tokio::time::timeout(std::time::Duration::from_secs(120), child.wait_with_output())
+        .await
+        .map_err(|_| "codex exec probe timed out (120 s)".to_string())?
+        .map_err(|e| format!("codex exec wait failed: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let outcome = collect_exec_stream(&stdout);
+
+    // "Recognized SOMETHING" = produced text, usage, or a structured failure.
+    // If none of those AND there were unknown lines, the schema drifted past
+    // recognition. If there were no lines at all, the binary errored upstream
+    // (surface stderr in the verdict).
+    let recognized_any =
+        !outcome.text.is_empty() || outcome.usage.is_some() || outcome.failure.is_some();
+    let schema_unrecognized = !recognized_any && outcome.unknown_events > 0;
+
+    let verdict = if schema_unrecognized {
+        format!(
+            "Codex output schema NOT recognized ({} unknown event(s)). Shugu's parser likely \
+             needs an update for this Codex version.",
+            outcome.unknown_events
+        )
+    } else if let Some(f) = &outcome.failure {
+        format!("Codex reported a failure: {f}")
+    } else if recognized_any {
+        if outcome.unknown_events > 0 {
+            format!(
+                "Schema OK (parsed text/usage), but {} unrecognized event(s) seen — minor drift, \
+                 degraded gracefully.",
+                outcome.unknown_events
+            )
+        } else {
+            "Schema OK — all events recognized.".to_string()
+        }
+    } else {
+        let err = String::from_utf8_lossy(&output.stderr);
+        let excerpt: String = err.trim().chars().take(300).collect();
+        format!("No Codex events parsed. stderr: {excerpt}")
+    };
+
+    Ok(CodexExecProbe {
+        version,
+        produced_text: !outcome.text.is_empty(),
+        unknown_events: outcome.unknown_events,
+        schema_unrecognized,
+        failure: outcome.failure,
+        verdict,
+    })
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // CHAT surface — read-only run, streamed via the caller's on_chunk (app-server)
 // ────────────────────────────────────────────────────────────────────────
@@ -797,4 +1248,162 @@ pub async fn codex_logout(app: AppHandle) -> Result<(), String> {
     let srv = crate::commands::codex_app_server::ensure(&app).await?;
     srv.request("account/logout", serde_json::json!({})).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod version_isolation_tests {
+    use super::{
+        canonical_event_type, collect_exec_stream, parse_exec_line, parse_semver_triple,
+        CodexExecEvent,
+    };
+
+    #[test]
+    fn semver_triple_parses_the_known_codex_spellings() {
+        assert_eq!(parse_semver_triple("codex-cli 0.142.0-alpha.1"), (Some(0), Some(142), Some(0)));
+        assert_eq!(parse_semver_triple("codex 0.125.0"), (Some(0), Some(125), Some(0)));
+        assert_eq!(parse_semver_triple("0.130.0"), (Some(0), Some(130), Some(0)));
+        assert_eq!(parse_semver_triple("1.2.3"), (Some(1), Some(2), Some(3)));
+        // Two-component version ⇒ patch is None, still usable.
+        assert_eq!(parse_semver_triple("v2.5 build"), (Some(2), Some(5), None));
+        // No version present ⇒ all None (never panics).
+        assert_eq!(parse_semver_triple("no numbers here"), (None, None, None));
+        assert_eq!(parse_semver_triple(""), (None, None, None));
+    }
+
+    #[test]
+    fn event_type_canonicalization_unifies_separators_and_case() {
+        assert_eq!(canonical_event_type("thread.started"), "thread.started");
+        assert_eq!(canonical_event_type("thread/started"), "thread.started");
+        assert_eq!(canonical_event_type("Turn/Completed"), "turn.completed");
+    }
+
+    #[test]
+    fn parse_line_handles_the_0_125_documented_shape() {
+        // Exactly the JSONL captured in the module header for v0.125.0.
+        assert_eq!(
+            parse_exec_line(r#"{"type":"thread.started","thread_id":"t1"}"#),
+            Some(CodexExecEvent::ThreadStarted { thread_id: Some("t1".into()) })
+        );
+        assert_eq!(
+            parse_exec_line(r#"{"type":"turn.started"}"#),
+            Some(CodexExecEvent::TurnStarted)
+        );
+        assert_eq!(
+            parse_exec_line(
+                r#"{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"hi there"}}"#
+            ),
+            Some(CodexExecEvent::AgentMessage { text: "hi there".into() })
+        );
+        match parse_exec_line(
+            r#"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}"#,
+        ) {
+            Some(CodexExecEvent::TurnCompleted { usage: Some(u) }) => {
+                assert_eq!(u.input_tokens, 10);
+                assert_eq!(u.output_tokens, 5);
+            }
+            other => panic!("expected TurnCompleted with usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_line_tolerates_slashed_types_and_alternate_text_keys() {
+        // Slashed type spelling (a plausible drift) + `delta` text key.
+        assert_eq!(
+            parse_exec_line(r#"{"type":"item/agent_message/delta","delta":"chunk"}"#),
+            Some(CodexExecEvent::AgentMessageDelta { text: "chunk".into() })
+        );
+        // camelCase thread id field.
+        assert_eq!(
+            parse_exec_line(r#"{"type":"thread.started","threadId":"t2"}"#),
+            Some(CodexExecEvent::ThreadStarted { thread_id: Some("t2".into()) })
+        );
+        // Reasoning delta variant.
+        assert_eq!(
+            parse_exec_line(r#"{"type":"item.reasoning.delta","text":"thinking"}"#),
+            Some(CodexExecEvent::ReasoningDelta { text: "thinking".into() })
+        );
+    }
+
+    #[test]
+    fn parse_line_degrades_unknown_and_malformed_without_panicking() {
+        // Unknown event type ⇒ Unknown (carries the raw type), never an error.
+        assert_eq!(
+            parse_exec_line(r#"{"type":"brand.new.event.v2","payload":{"x":1}}"#),
+            Some(CodexExecEvent::Unknown { kind: "brand.new.event.v2".into() })
+        );
+        // Unknown completed-item subtype ⇒ Unknown, not a crash.
+        assert_eq!(
+            parse_exec_line(
+                r#"{"type":"item.completed","item":{"type":"command_execution","cmd":"ls"}}"#
+            ),
+            Some(CodexExecEvent::Unknown { kind: "item.completed:command_execution".into() })
+        );
+        // Missing `type` ⇒ Unknown<no-type>.
+        assert_eq!(
+            parse_exec_line(r#"{"foo":"bar"}"#),
+            Some(CodexExecEvent::Unknown { kind: "<no-type>".into() })
+        );
+        // Non-JSON banner line ⇒ skipped (None), never panics.
+        assert_eq!(parse_exec_line("Codex CLI starting…"), None);
+        assert_eq!(parse_exec_line(""), None);
+        assert_eq!(parse_exec_line("   "), None);
+        // Truncated/garbage JSON ⇒ skipped, never panics.
+        assert_eq!(parse_exec_line(r#"{"type":"turn.started""#), None);
+        // A JSON array (not an object) ⇒ skipped.
+        assert_eq!(parse_exec_line(r#"[1,2,3]"#), None);
+    }
+
+    #[test]
+    fn collect_stream_assembles_deltas_usage_and_counts_drift() {
+        let transcript = concat!(
+            r#"{"type":"thread.started","thread_id":"t1"}"#, "\n",
+            r#"{"type":"turn.started"}"#, "\n",
+            r#"{"type":"item/agent_message/delta","delta":"Hello"}"#, "\n",
+            r#"{"type":"item/agent_message/delta","delta":", world"}"#, "\n",
+            r#"{"type":"some.future.event"}"#, "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":7}}"#, "\n",
+        );
+        let outcome = collect_exec_stream(transcript);
+        assert_eq!(outcome.text, "Hello, world");
+        assert_eq!(outcome.failure, None);
+        assert_eq!(outcome.unknown_events, 1, "the future event should be counted as drift");
+        let usage = outcome.usage.expect("usage should be parsed");
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 7);
+    }
+
+    #[test]
+    fn collect_stream_adopts_completed_item_when_no_deltas() {
+        // Older-version shape: only the completed item, no streaming deltas.
+        let transcript = concat!(
+            r#"{"type":"thread.started","thread_id":"t1"}"#, "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"full answer"}}"#, "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":3,"output_tokens":4}}"#, "\n",
+        );
+        let outcome = collect_exec_stream(transcript);
+        assert_eq!(outcome.text, "full answer");
+        assert_eq!(outcome.unknown_events, 0);
+    }
+
+    #[test]
+    fn collect_stream_total_drift_degrades_to_empty_not_panic() {
+        // Simulate a schema so changed that NOTHING is recognized: graceful
+        // degradation = empty text + unknown_events count, no error/panic.
+        let transcript = concat!(
+            r#"{"type":"v9.alpha.thing","a":1}"#, "\n",
+            r#"{"type":"v9.alpha.other","b":2}"#, "\n",
+        );
+        let outcome = collect_exec_stream(transcript);
+        assert_eq!(outcome.text, "");
+        assert_eq!(outcome.failure, None);
+        assert_eq!(outcome.unknown_events, 2);
+    }
+
+    #[test]
+    fn collect_stream_surfaces_failure_message() {
+        let transcript =
+            r#"{"type":"turn.failed","error":{"message":"upstream exploded"}}"#;
+        let outcome = collect_exec_stream(transcript);
+        assert_eq!(outcome.failure.as_deref(), Some("upstream exploded"));
+    }
 }
