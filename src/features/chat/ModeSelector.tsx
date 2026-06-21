@@ -16,6 +16,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { Icon } from "@/components/components";
 import { useChatMode, type ChatMode } from "./chat-sync";
+import { RiskBadge, modeToRisk, toTrustMode } from "@/components/trust";
 
 interface ModeDef {
   id: ChatMode;
@@ -93,7 +94,16 @@ export function ModeSelector({ className = "" }: { className?: string }) {
             >
               <Icon name={m.icon} size={15} />
               <span className="mode-item-text">
-                <span className="name">{m.label}</span>
+                <span
+                  className="name"
+                  style={{ display: "inline-flex", alignItems: "center", gap: 7 }}
+                >
+                  {m.label}
+                  {/* Trust-UX (Lane 5) — tier de risque explicite par mode : la
+                      couleur (lecture=cyan, exécution=rouge) dit la portée réelle
+                      avant même de lire la description. */}
+                  <RiskBadge level={modeToRisk(toTrustMode(m.id))} size="sm" />
+                </span>
                 <span className="mode-item-desc">{m.desc}</span>
               </span>
               {m.id === mode && <span className="check">✓</span>}

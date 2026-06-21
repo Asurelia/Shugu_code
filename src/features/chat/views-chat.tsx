@@ -16,8 +16,9 @@ import { useQuery } from "@tanstack/react-query";
 import { Icon } from "@/components/components";
 import { invoke } from "@/lib/tauri";
 import { useChatStream } from "./useChatStream";
-import { useMessages, sendChatMessage, useActiveModel } from "./chat-sync";
+import { useMessages, sendChatMessage, useActiveModel, useChatMode } from "./chat-sync";
 import { useEditorSelection } from "./editorSelectionStore";
+import { PermissionBadge, ModeBadge } from "@/components/trust";
 import { useChatToolActivity } from "./chatToolActivityStore";
 import { CaptureButton } from "./CaptureButton";
 import { ModeSelector } from "./ModeSelector";
@@ -101,6 +102,11 @@ export function ChatView({
   const chatStream = useChatStream(activeConv);
   const { data: messages } = useMessages(activeConv);
   const [model, setModel] = useActiveModel(modelProp);
+  // Trust-UX (Lane 5) — the active agent mode drives the permission badge under
+  // the composer: read-only modes (Chat/Plan) get a "private" fact, the full
+  // Agent mode gets a "guarded" (git safety net) fact instead of the old
+  // ambiguous "local" chip.
+  const [chatMode] = useChatMode();
   // Lot A — Task 12 : libellés des tool-calls du tour en cours (« 🔍 a lu … »,
   // « ✏️ a écrit … »), accumulés par le listener root et rendus dans le bloc de
   // streaming ci-dessous. Vidé à la fin du tour (done delta).
@@ -557,10 +563,26 @@ export function ChatView({
           </button>
         )}
         <div className="cx-chip-spacer" />
-        <button className="cx-chip" title="Exécution locale (local-first)">
-          <Icon name="shield" size={11} />
-          local
-        </button>
+        {/* Trust-UX (Lane 5) — remplace l'ancien chip « 🛡 local » ambigu (local =
+            privé ? sandboxé ? peut-toucher-mes-fichiers ?) par un fait de
+            permission PRÉCIS, dépendant du mode :
+              • Chat / Plan (lecture seule) → « Privé · sur ta machine » (rien
+                n'est écrit ni exécuté) ;
+              • Agent (exec directe)        → « Filet git » (les actions sont
+                réversibles dans l'onglet Git). */}
+        {chatMode === "agent" ? (
+          <PermissionBadge
+            kind="guarded"
+            label="Filet git"
+            title="Mode Agent — l'agent peut écrire et exécuter sur ton projet. Chaque modification reste réversible dans l'onglet Git (le filet de sécurité)."
+          />
+        ) : (
+          <PermissionBadge
+            kind="private"
+            label="Privé · sur ta machine"
+            title="Mode lecture seule — l'inférence et tes données restent locales ; aucun fichier n'est modifié ni aucune commande exécutée ce tour-ci."
+          />
+        )}
       </div>
     </>
   );
@@ -987,6 +1009,18 @@ function CxMessage({
     agentRole === "orchestrator" &&
     !/^(📋|🔎)/.test(m.body ?? "");
 
+  // Trust-UX (Lane 5) — mode Ask/Plan/Act affiché dans la bulle agent. La mode
+  // exact n'est PAS persistée sur le message ; on la DÉRIVE honnêtement des
+  // PREUVES du transcript : un run qui a écrit un fichier ou lancé une commande
+  // a forcément tourné en mode Act (agent) ; un run qui n'a fait que lire/chercher
+  // (le runner retire les outils mutants en mode Plan) est étiqueté Plan. C'est du
+  // comportement OBSERVÉ, pas une supposition. Tant que le run n'a encore rien fait
+  // d'observable, on n'affiche pas de badge plutôt que d'en inventer un.
+  const didExec = activity.some((a) => a.icon === "⚙️");
+  const didWrite = writeRecords.length > 0 || activity.some((a) => a.icon === "✍️");
+  const derivedMode: "agent" | "plan" | null =
+    !isAgentRun ? null : didExec || didWrite ? "agent" : activity.length > 0 ? "plan" : null;
+
   if (m.role === "user") {
     return (
       <div className="cx-msg user">
@@ -1012,10 +1046,24 @@ function CxMessage({
         <span className="ts">{m.ts}</span>
         <span className="sep">·</span>
         <span className="pill">{model}</span>
+        {/* Trust-UX (Lane 5) — badge de mode Ask/Plan/Act dérivé des preuves du
+            transcript (voir derivedMode plus haut). Affiché uniquement quand le
+            run a fait quelque chose d'observable. */}
+        {derivedMode && <ModeBadge mode={derivedMode} />}
         {m.viaAgent && m.agentId && (
-          <span className="via-agent" onClick={() => void revealAgent(m.agentId!)} title="Voir la trace de l'orchestrateur">
+          <button
+            type="button"
+            className="via-agent"
+            onClick={() => void revealAgent(m.agentId!)}
+            title="Voir la trace de l'orchestrateur"
+            // Neutralise les défauts <button> (appearance / margin) sans toucher à
+            // la typo : .cx-meta .via-agent impose déjà font/background/border, donc
+            // le bouton reste visuellement identique au chip — mais avec la VRAIE
+            // sémantique d'action cliquable (plus de span onClick).
+            style={{ appearance: "none", margin: 0 }}
+          >
             via orchestrator
-          </span>
+          </button>
         )}
       </div>
 
