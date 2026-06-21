@@ -11,7 +11,7 @@
 // `.lgb-primary`, plus the same inline-style pill idiom used by the llama-server
 // controls for the transport badge. No new design system is introduced.
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { Icon } from "@/components/components";
 import {
   useMcpServers,
@@ -19,9 +19,13 @@ import {
   useMcpTest,
   useMcpAdd,
   useMcpRemove,
+  useMcpInventory,
+  useMcpImport,
   type McpServerStatus,
   type McpToolInfo,
   type McpServerConfig,
+  type InventoryEntry,
+  type McpRisk,
 } from "./queries";
 
 // Per-row outcome of a "Tester" probe: either the discovered tools or an error
@@ -262,7 +266,313 @@ export function McpServersSection() {
           />
         ))}
       </div>
+
+      {/* Inventaire multi-source : ce que les autres outils (Claude Desktop,
+          Codex, OpenCode) ont déjà configuré, importable en un clic. */}
+      <McpInventorySection />
     </div>
+  );
+}
+
+// ─── Inventaire MCP multi-source (Claude Desktop / Codex / OpenCode) ──────────
+//
+// Tableau Source / Nom / Type / Enabled / Tools / Secrets / Risk + badges de
+// provenance, avec import 1-clic (les secrets sont migrés au keychain côté
+// Rust). Les erreurs de parsing des sources externes sont rendues visibles —
+// jamais avalées.
+
+function RiskBadge({ risk }: { risk: McpRisk }) {
+  const map: Record<McpRisk, { bg: string; fg: string; label: string; title: string }> = {
+    low: {
+      bg: "rgba(74, 222, 128, 0.16)",
+      fg: "var(--success, #4ade80)",
+      label: "low",
+      title: "Local, lancé via un runner de paquets connu (npx/uvx…), sans secret en clair.",
+    },
+    medium: {
+      bg: "rgba(255, 180, 60, 0.16)",
+      fg: "#ffb43c",
+      label: "medium",
+      title: "Local mais binaire arbitraire ou shell brut, ou embarque des secrets en clair.",
+    },
+    high: {
+      bg: "rgba(255, 107, 107, 0.16)",
+      fg: "var(--error, #ff6b6b)",
+      label: "high",
+      title: "Transport distant (HTTP/SSE) : tiers réseau + description d'outil non fiable (injection indirecte).",
+    },
+  };
+  const s = map[risk];
+  return (
+    <span
+      title={s.title}
+      style={{
+        fontSize: 9,
+        fontWeight: 700,
+        letterSpacing: 0.5,
+        textTransform: "uppercase",
+        padding: "2px 7px",
+        borderRadius: 99,
+        background: s.bg,
+        color: s.fg,
+      }}
+    >
+      {s.label}
+    </span>
+  );
+}
+
+function ProvenanceBadge({ label }: { label: string }) {
+  return (
+    <span
+      title={`Déclaré dans : ${label}`}
+      style={{
+        fontSize: 9,
+        fontWeight: 700,
+        letterSpacing: 0.4,
+        padding: "2px 7px",
+        borderRadius: 99,
+        background: "rgba(124, 58, 237, 0.16)",
+        color: "var(--primary, #7c3aed)",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {label}
+    </span>
+  );
+}
+
+function McpInventorySection() {
+  const { data: inventory, isLoading, error, refetch, isFetching } = useMcpInventory();
+  const importMut = useMcpImport();
+  const [importing, setImporting] = useState<string | null>(null);
+  // Per-entry outcome of an import: migrated secret keys, or an error string.
+  const [importResults, setImportResults] = useState<Record<string, { migrated: string[] } | { error: string }>>({});
+
+  // Clé d'identité d'une entrée pour le state local (nom + source : une même
+  // déclaration peut apparaître sous deux sources distinctes).
+  const entryKey = (e: InventoryEntry) => `${e.source}:${e.name}`;
+
+  const onImport = async (e: InventoryEntry) => {
+    const k = entryKey(e);
+    setImporting(k);
+    try {
+      // Import projet par défaut (cohérent avec le formulaire d'ajout).
+      const migrated = await importMut.mutateAsync({ name: e.name, config: e.config, global: false });
+      setImportResults((r) => ({ ...r, [k]: { migrated } }));
+    } catch (err) {
+      setImportResults((r) => ({ ...r, [k]: { error: String(err) } }));
+    } finally {
+      setImporting(null);
+    }
+  };
+
+  // External entries = importables. Shugu entries already live in the list above,
+  // but we still surface them in the inventory table to show provenance/risk/
+  // secrets at a glance (read-only rows).
+  const entries = inventory?.entries ?? [];
+  const errors = inventory?.errors ?? [];
+  const externalCount = entries.filter((e) => e.source !== "shugu" && !e.alreadyImported).length;
+
+  return (
+    <div style={{ marginTop: 28, paddingTop: 20, borderTop: "1px solid rgba(255,255,255,0.06)" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+        <h4 style={{ margin: 0, fontSize: 14 }}>Inventaire des sources MCP</h4>
+        <span style={{ flex: 1 }} />
+        <button className="lgb lgb-sm" onClick={() => void refetch()} disabled={isFetching} title="Re-scanner Claude Desktop, Codex et OpenCode">
+          <Icon name="check" size={11} /> {isFetching ? "Scan…" : "Rescanner"}
+        </button>
+      </div>
+      <p className="sub" style={{ marginBottom: 12 }}>
+        Ce que <b>Claude Desktop</b>, <b>Codex</b> et <b>OpenCode</b> ont déjà
+        configuré comme serveurs MCP, lu directement depuis leurs fichiers de
+        config (en lecture seule). Importe une entrée en un clic — ses secrets
+        (tokens, clés) sont déplacés dans le keychain de l'OS, jamais laissés en
+        clair dans <code>.mcp.json</code>.
+        {externalCount > 0 && (
+          <> {externalCount} serveur{externalCount > 1 ? "s" : ""} importable{externalCount > 1 ? "s" : ""}.</>
+        )}
+      </p>
+
+      {isLoading && (
+        <div style={{ fontSize: 12, color: "var(--on-surface-muted)" }}>Scan des sources MCP…</div>
+      )}
+
+      {error && (
+        <div style={{
+          padding: "8px 10px",
+          borderRadius: 6,
+          background: "rgba(255, 107, 107, 0.08)",
+          border: "1px solid rgba(255, 107, 107, 0.25)",
+          fontSize: 11,
+          color: "var(--error, #ff6b6b)",
+          lineHeight: 1.4,
+        }}>
+          ⚠ Impossible de scanner l'inventaire&nbsp;: <code style={{ background: "rgba(0,0,0,0.3)", padding: "1px 4px", borderRadius: 3 }}>{String(error)}</code>
+        </div>
+      )}
+
+      {/* Erreurs de parsing par source — visibles, jamais avalées. */}
+      {errors.map((err, i) => (
+        <div
+          key={`${err.source}-${i}`}
+          style={{
+            margin: "6px 0",
+            padding: "8px 10px",
+            borderRadius: 6,
+            background: "rgba(255, 180, 60, 0.08)",
+            border: "1px solid rgba(255, 180, 60, 0.28)",
+            fontSize: 11,
+            color: "var(--on-surface)",
+            lineHeight: 1.4,
+          }}
+        >
+          ⚠ <b>{err.sourceLabel}</b>&nbsp;: {err.message}
+          {err.path && (
+            <>
+              {" "}
+              <code style={{ background: "rgba(0,0,0,0.3)", padding: "1px 4px", borderRadius: 3 }}>{err.path}</code>
+            </>
+          )}
+        </div>
+      ))}
+
+      {!isLoading && !error && entries.length === 0 && (
+        <div style={{ fontSize: 12, color: "var(--on-surface-muted)", padding: "8px 0" }}>
+          Aucun serveur MCP trouvé dans Claude Desktop, Codex ou OpenCode.
+        </div>
+      )}
+
+      {entries.length > 0 && (
+        <div style={{ overflowX: "auto", marginTop: 6 }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+            <thead>
+              <tr style={{ textAlign: "left", color: "var(--on-surface-muted)" }}>
+                <Th>Source</Th>
+                <Th>Nom</Th>
+                <Th>Type</Th>
+                <Th>Enabled</Th>
+                <Th>Tools</Th>
+                <Th>Secrets</Th>
+                <Th>Risk</Th>
+                <Th>Action</Th>
+              </tr>
+            </thead>
+            <tbody>
+              {entries.map((e) => {
+                const k = entryKey(e);
+                const result = importResults[k];
+                // "Enabled" reflète : Shugu → flag local ; source externe → flag
+                // déclaré dans la source (sourceEnabled), sinon "—".
+                const enabledLabel =
+                  e.source === "shugu"
+                    ? e.enabled ? "oui" : "non"
+                    : e.sourceEnabled == null ? "—" : e.sourceEnabled ? "oui" : "non";
+                const toolsLabel = e.source === "shugu" ? "—" : "?";
+                return (
+                  <tr key={k} style={{ borderTop: "1px solid rgba(255,255,255,0.06)" }}>
+                    <Td><ProvenanceBadge label={e.sourceLabel} /></Td>
+                    <Td>
+                      <code style={{ background: "rgba(0,0,0,0.25)", padding: "1px 5px", borderRadius: 3, color: "var(--on-surface)" }}>{e.name}</code>
+                    </Td>
+                    <Td>
+                      <TransportBadge transport={e.transport} />
+                    </Td>
+                    <Td>{enabledLabel}</Td>
+                    <Td title="Le nombre exact d'outils est connu après connexion (bouton Tester ci-dessus)."><span style={{ opacity: 0.7 }}>{toolsLabel}</span></Td>
+                    <Td>
+                      {e.secretEnvKeys.length === 0 ? (
+                        <span style={{ opacity: 0.5 }}>—</span>
+                      ) : (
+                        <span
+                          title={`Secrets en clair : ${e.secretEnvKeys.join(", ")} — migrés au keychain à l'import.`}
+                          style={{
+                            fontSize: 9,
+                            fontWeight: 700,
+                            padding: "2px 7px",
+                            borderRadius: 99,
+                            background: "rgba(255, 180, 60, 0.16)",
+                            color: "#ffb43c",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          🔑 {e.secretEnvKeys.length}
+                        </span>
+                      )}
+                    </Td>
+                    <Td><RiskBadge risk={e.risk} /></Td>
+                    <Td>
+                      {e.source === "shugu" || e.alreadyImported ? (
+                        <span style={{
+                          fontSize: 9,
+                          fontWeight: 700,
+                          letterSpacing: 0.4,
+                          padding: "2px 7px",
+                          borderRadius: 99,
+                          background: "rgba(74, 222, 128, 0.14)",
+                          color: "var(--success, #4ade80)",
+                          whiteSpace: "nowrap",
+                        }}>
+                          ✓ importé
+                        </span>
+                      ) : result && "migrated" in result ? (
+                        <span
+                          title={
+                            result.migrated.length > 0
+                              ? `Importé. Secrets migrés au keychain : ${result.migrated.join(", ")}.`
+                              : "Importé."
+                          }
+                          style={{
+                            fontSize: 9,
+                            fontWeight: 700,
+                            padding: "2px 7px",
+                            borderRadius: 99,
+                            background: "rgba(74, 222, 128, 0.14)",
+                            color: "var(--success, #4ade80)",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          ✓ importé{result.migrated.length > 0 ? ` · 🔑${result.migrated.length}` : ""}
+                        </span>
+                      ) : result && "error" in result ? (
+                        <span title={result.error} style={{ color: "var(--error, #ff6b6b)", fontSize: 10 }}>
+                          ✗ échec
+                        </span>
+                      ) : (
+                        <button
+                          className="lgb lgb-sm lgb-primary"
+                          onClick={() => void onImport(e)}
+                          disabled={importing === k}
+                          title="Copier ce serveur dans le .mcp.json de Shugu (secrets → keychain)"
+                        >
+                          <Icon name="plus" size={11} /> {importing === k ? "Import…" : "Importer"}
+                        </button>
+                      )}
+                    </Td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Th({ children }: { children: ReactNode }) {
+  return (
+    <th style={{ padding: "6px 10px", fontWeight: 600, fontSize: 10, textTransform: "uppercase", letterSpacing: 0.4, whiteSpace: "nowrap" }}>
+      {children}
+    </th>
+  );
+}
+
+function Td({ children, title }: { children: ReactNode; title?: string }) {
+  return (
+    <td style={{ padding: "7px 10px", verticalAlign: "middle" }} title={title}>
+      {children}
+    </td>
   );
 }
 

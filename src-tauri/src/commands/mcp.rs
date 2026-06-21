@@ -295,7 +295,14 @@ pub async fn connect(app: &AppHandle, mgr: &McpManager, name: &str) -> Result<Ar
                 let mut tcmd = tokio::process::Command::new(&command);
                 tcmd.args(&cfg.args);
                 for (k, v) in &cfg.env {
-                    tcmd.env(k, v);
+                    // Ré-hydratation des secrets migrés au keychain : une valeur
+                    // `${cred:<account>}` est lue depuis le keychain OS au moment
+                    // du spawn (jamais persistée en clair dans `.mcp.json`). Un
+                    // secret introuvable passe la valeur littérale telle quelle
+                    // (le serveur affichera alors une erreur d'auth lisible plutôt
+                    // qu'un comportement silencieux).
+                    let resolved = resolve_secret_value(v);
+                    tcmd.env(k, resolved.as_ref());
                 }
                 // Windows : pas de fenêtre console parasite (réutilise le helper codex).
                 crate::commands::codex::apply_no_window_pub(&mut tcmd);
@@ -353,6 +360,46 @@ pub fn split_namespaced(name: &str) -> Option<(String, String)> {
     let rest = name.strip_prefix("mcp__")?;
     let idx = rest.find("__")?;
     Some((rest[..idx].to_string(), rest[idx + 2..].to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Lane 6 — migration des secrets MCP vers le keychain OS.
+//
+// Modèle : une valeur d'env secrète n'est JAMAIS écrite en clair dans
+// `.mcp.json`. À l'import (`mcp_import_server`), elle est rangée dans le
+// keychain sous un compte `mcp.<server>.env.<KEY>` (service "shugu-forge",
+// le même que `credentials.rs`) et remplacée par le sentinel
+// `${cred:<account>}`. Au lancement (`connect`), `resolve_secret_value`
+// ré-hydrate le sentinel depuis le keychain. Aucune fuite sur disque.
+// ---------------------------------------------------------------------------
+
+/// Même service keychain que `credentials.rs::SERVICE` ("shugu-forge"). Gardé en
+/// dur ici (et non `pub use`) pour que `mcp.rs` n'introduise pas de couplage
+/// hors périmètre vers le module credentials.
+const KEYCHAIN_SERVICE: &str = "shugu-forge";
+
+/// Si `value` est un sentinel `${cred:<account>}`, renvoie le secret lu depuis le
+/// keychain ; sinon (ou si la lecture échoue) renvoie `value` inchangé. Le retour
+/// `Cow` évite une allocation sur le cas courant (valeur littérale).
+pub fn resolve_secret_value(value: &str) -> std::borrow::Cow<'_, str> {
+    let Some(account) = crate::commands::mcp_sources::extract_cred_account(value) else {
+        return std::borrow::Cow::Borrowed(value);
+    };
+    match keyring::Entry::new(KEYCHAIN_SERVICE, account).and_then(|e| e.get_password()) {
+        Ok(secret) => std::borrow::Cow::Owned(secret),
+        // Secret absent/illisible : on garde le sentinel littéral. Le serveur MCP
+        // verra une valeur visiblement fausse → erreur d'auth explicite côté
+        // serveur, jamais un secret silencieusement vide.
+        Err(_) => std::borrow::Cow::Borrowed(value),
+    }
+}
+
+/// Écrit un secret dans le keychain OS (service "shugu-forge", compte `account`).
+/// Écrase toute valeur antérieure.
+fn keychain_set(account: &str, secret: &str) -> Result<(), String> {
+    keyring::Entry::new(KEYCHAIN_SERVICE, account)
+        .and_then(|e| e.set_password(secret))
+        .map_err(|e| format!("keychain {account}: {e}"))
 }
 
 /// Rend les outils MCP de TOUS les serveurs ACTIVÉS au format `tools` du
@@ -631,9 +678,69 @@ pub async fn mcp_call_tool(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Lane 6 — commandes d'inventaire + import multi-source.
+// ---------------------------------------------------------------------------
+
+/// Scanne TOUTES les sources MCP de la machine (Shugu + Claude Desktop + Codex +
+/// OpenCode), normalise, déduplique, classe le risque, repère les secrets — et
+/// renvoie le tout (entrées + erreurs de parsing visibles) pour l'UI inventaire.
+/// Purement lecture seule : ne modifie aucune config externe ni `.mcp.json`.
+#[tauri::command]
+pub fn mcp_inventory(app: AppHandle) -> Result<crate::commands::mcp_sources::McpInventory, String> {
+    Ok(crate::commands::mcp_sources::scan_inventory(&app))
+}
+
+/// Importe un serveur découvert dans le `.mcp.json` de Shugu (projet par défaut,
+/// global si `global`). Migre AU PASSAGE chaque valeur d'env repérée comme
+/// secrète vers le keychain OS (compte `mcp.<server>.env.<KEY>`) et la remplace
+/// dans `.mcp.json` par le sentinel `${cred:<account>}` — aucun secret en clair
+/// sur disque. N'active PAS le serveur (geste explicite séparé via
+/// `mcp_set_enabled`). Renvoie la liste des clés d'env effectivement migrées.
+#[tauri::command]
+pub fn mcp_import_server(
+    app: AppHandle,
+    name: String,
+    config: McpServerConfig,
+    global: bool,
+) -> Result<Vec<String>, String> {
+    use crate::commands::mcp_sources::{cred_account_for, cred_sentinel_for, is_cred_sentinel, is_secret_env_key};
+
+    let mut migrated: Vec<String> = Vec::new();
+    let mut sanitized = config.clone();
+
+    // Parcourt l'env : toute clé secrète dont la valeur est non vide et n'est PAS
+    // déjà un sentinel est rangée au keychain, puis remplacée par le sentinel.
+    for (key, value) in sanitized.env.iter_mut() {
+        if !is_secret_env_key(key) || value.is_empty() || is_cred_sentinel(value) {
+            continue;
+        }
+        let account = cred_account_for(&name, key);
+        keychain_set(&account, value)?;
+        *value = cred_sentinel_for(&account);
+        migrated.push(key.clone());
+    }
+
+    write_server(&app, &name, &sanitized, global)?;
+    migrated.sort();
+    Ok(migrated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_secret_value_passthrough() {
+        // Une valeur littérale (non-sentinel) est renvoyée inchangée, sans
+        // toucher au keychain.
+        assert_eq!(resolve_secret_value("ghp_plain").as_ref(), "ghp_plain");
+        assert_eq!(resolve_secret_value("").as_ref(), "");
+        // Un sentinel pointant un compte inexistant retombe sur la valeur
+        // littérale (pas de panic, pas de secret vide silencieux).
+        let missing = "${cred:mcp.__nonexistent_test__.env.TOKEN}";
+        assert_eq!(resolve_secret_value(missing).as_ref(), missing);
+    }
 
     #[test]
     fn parse_empty_is_empty() {

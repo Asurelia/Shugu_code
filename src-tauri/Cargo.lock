@@ -5933,6 +5933,7 @@ dependencies = [
  "tauri-plugin-shell",
  "tauri-plugin-sql",
  "tokio",
+ "toml 0.8.2",
  "uuid",
  "walkdir",
  "which",
