@@ -274,22 +274,34 @@ mod ssrf_discovery_tests {
 
     #[tokio::test]
     async fn ollama_discovery_is_exempt_from_guard() {
+        use tokio::time::{timeout, Duration};
         // ollama targets localhost by design — the guard must NOT fire for it,
         // or the default local-Ollama discovery flow breaks. We prove the guard
-        // let it through by observing the call reach the network layer:
-        // connecting to 127.0.0.1:1 (a reserved port nothing listens on →
-        // immediate connection refused, no hang) yields a transport error,
-        // never the SSRF block message.
-        let msg = models_discover_external(
-            "ollama".to_string(),
-            "http://127.0.0.1:1".to_string(),
-            None,
+        // let it through by observing the call reach the NETWORK layer: a guarded
+        // protocol would return the SSRF block error synchronously, long before
+        // any socket work. We connect to 127.0.0.1:1 (a reserved port nothing
+        // listens on). Two acceptable outcomes, both proving the exemption:
+        //   * the connect is refused fast (RST, the usual loopback case) → the
+        //     call returns a transport error, which is NOT the block message;
+        //   * the SYN is silently dropped (some firewalled CI hosts) → the call
+        //     is still running at the 5 s bound, which itself proves the guard
+        //     did not short-circuit. The cap stops the suite inheriting the 30 s
+        //     reqwest timeout.
+        match timeout(
+            Duration::from_secs(5),
+            models_discover_external("ollama".to_string(), "http://127.0.0.1:1".to_string(), None),
         )
         .await
-        .expect_err("no ollama server on 127.0.0.1:1");
-        assert!(
-            !msg.contains("blocked to prevent SSRF"),
-            "ollama must bypass the SSRF guard, but it was blocked: {msg}"
-        );
+        {
+            Ok(res) => {
+                let msg = res.expect_err("no ollama server on 127.0.0.1:1");
+                assert!(
+                    !msg.contains("blocked to prevent SSRF"),
+                    "ollama must bypass the SSRF guard, but it was blocked: {msg}"
+                );
+            }
+            // Still connecting at the 5 s bound → the guard did not block → exempt.
+            Err(_elapsed) => {}
+        }
     }
 }

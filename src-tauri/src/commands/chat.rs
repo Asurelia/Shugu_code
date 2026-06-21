@@ -301,8 +301,12 @@ pub(crate) fn resolve_key(protocol: &str, api_key: &Option<String>) -> Result<St
 // private LAN — turning the chat command into a Server-Side Request Forgery
 // pivot. We refuse such targets by default.
 //
-// Policy (custom protocol only — the built-in anthropic/openai/ollama paths are
-// untouched):
+// Policy — applied wherever a user-supplied base_url is funnelled into an
+// outbound backend request. The chat call sites (`chat_send`, `fim_complete`)
+// apply it to the `custom` protocol; the same `validate_custom_base_url` is
+// reused by `models::models_discover_external` for the anthropic/openai/custom
+// discovery probes. The `ollama` path stays exempt everywhere (it defaults to
+// `localhost:11434`, which the guard would otherwise block):
 //   * Reject when the host is a loopback / private / link-local / CGNAT /
 //     unique-local / unspecified IP literal, or the name "localhost" (and the
 //     IPv6 loopback name). Both raw IPv4/IPv6 literals AND IPv4-mapped IPv6
