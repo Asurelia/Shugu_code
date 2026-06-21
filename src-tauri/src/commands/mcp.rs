@@ -429,7 +429,7 @@ pub(crate) fn sanitize_mcp_description(desc: &str) -> String {
     //    n'y a qu'une ligne, mais une description peut commencer par « system: »).
     let trimmed = s.trim_start();
     let lower = trimmed.to_ascii_lowercase();
-    if ["system:", "assistant:", "developer:", "tool:"]
+    if ["system:", "assistant:", "developer:", "tool:", "user:", "human:"]
         .iter()
         .any(|r| lower.starts_with(r))
     {
@@ -526,7 +526,7 @@ fn defang_fence_body(body: &str) -> String {
     let mut rebuilt = String::with_capacity(out.len() + 16);
     for line in out.split_inclusive('\n') {
         let lower = line.trim_start().to_ascii_lowercase();
-        let looks_like_role = ["system:", "assistant:", "developer:", "tool:"]
+        let looks_like_role = ["system:", "assistant:", "developer:", "tool:", "user:", "human:"]
             .iter()
             .any(|r| lower.starts_with(r));
         if looks_like_role {
@@ -692,13 +692,17 @@ pub async fn mcp_execute(
             // suive jamais ce qui s'y trouve comme une consigne. Un résultat en
             // ERREUR n'est PAS clôturé : c'est notre propre message d'infra
             // (de confiance), que le modèle doit lire tel quel.
+            //
+            // REVUE SÉCURITÉ : on clôture AUSSI le cas `is_error`. Pour
+            // `Ok(Ok(res))`, `is_error` ET `content` viennent du serveur MCP
+            // (attaquant) — un serveur hostile peut mettre `isError:true` avec un
+            // payload d'injection dans `content`. Seuls `Ok(Err)` / timeout
+            // ci-dessous sont des messages construits par Shugu (de confiance).
+            // Le drapeau `is_error` est préservé (le modèle voit que l'outil a
+            // échoué) mais son contenu reste des DONNÉES clôturées.
             let (content, is_error) = flatten_tool_result(&res);
-            if is_error {
-                (content, true)
-            } else {
-                let source = format!("mcp:{server}");
-                (wrap_untrusted_mcp(&source, &content), false)
-            }
+            let source = format!("mcp:{server}");
+            (wrap_untrusted_mcp(&source, &content), is_error)
         }
         // BLOCKER 3 — un échec d'appel (erreur protocole OU timeout) laisse une
         // `McpConn` potentiellement morte en cache ; tous les appels suivants la

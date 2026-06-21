@@ -116,7 +116,7 @@ fn defang_untrusted_body(body: &str) -> String {
     for (i, line) in out.split_inclusive('\n').enumerate() {
         let trimmed = line.trim_start();
         let lower = trimmed.to_ascii_lowercase();
-        let looks_like_role = ["system:", "assistant:", "developer:", "tool:"]
+        let looks_like_role = ["system:", "assistant:", "developer:", "tool:", "user:", "human:"]
             .iter()
             .any(|r| lower.starts_with(r));
         if looks_like_role {
