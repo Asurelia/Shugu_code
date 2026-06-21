@@ -496,11 +496,29 @@ pub(crate) fn get_conn(app: &tauri::AppHandle) -> Result<&'static Mutex<Connecti
     let conn = Connection::open(&db_path)
         .map_err(|e| format!("rusqlite open {}: {e}", db_path.display()))?;
 
+    // AM-5 cross-handle concurrency. `busy_timeout` is a PER-CONNECTION
+    // setting, so the hardening on vector.rs's VEC_CONN does NOT cover this
+    // handle. Without it, AGENTS_CONN (a heavy writer: orphan sweep, delta /
+    // screenshot purges, agent rows / events / skills / usage) fails
+    // IMMEDIATELY with SQLITE_BUSY ("database is locked") whenever VEC_CONN or
+    // the sqlx pool holds the WAL write lock (e.g. during a memory_remember
+    // IMMEDIATE transaction). Set it BEFORE the WAL pragma so the journal-mode
+    // switch itself waits instead of erroring. 5000 ms mirrors
+    // vector.rs::BUSY_TIMEOUT_MS — keep the two in sync.
+    conn.busy_timeout(std::time::Duration::from_millis(5000))
+        .map_err(|e| format!("busy_timeout: {e}"))?;
+
     // WAL for concurrent access alongside vector.rs + the plugin's sqlx
     // connection. Idempotent — re-setting the same journal mode is a
     // no-op cost.
     conn.execute_batch("PRAGMA journal_mode=WAL;")
         .map_err(|e| format!("WAL pragma: {e}"))?;
+
+    // synchronous=NORMAL: corruption-safe under WAL with fewer fsyncs, so the
+    // write lock is released sooner under contention (consistent with
+    // vector.rs::configure_connection).
+    conn.execute_batch("PRAGMA synchronous=NORMAL;")
+        .map_err(|e| format!("synchronous pragma: {e}"))?;
 
     // Sweep orphans from a previous crash. Must happen BEFORE the conn is
     // cached so subsequent commands see consistent state.
