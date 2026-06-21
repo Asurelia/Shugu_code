@@ -787,11 +787,21 @@ fn dispatch_inner(
             // Exec directe sur la machine (pivot 2026-06-10) : le filet de
             // sécurité est git (l'utilisateur suit/annule les changements dans
             // l'onglet Git), plus aucun verrou allow_exec ni sandbox Docker.
+            //
+            // Couche gouvernée (P0-a) : la commande est classée (CommandRisk) et
+            // exécutée sous une ExecutionPolicy. La policy effective ici est
+            // TOUJOURS WorkspaceWrite — le mode Plan (ReadOnly) retire/bloque
+            // `run_command` en amont dans runner.rs (is_write_tool), donc tout
+            // appel qui arrive jusqu'ici tourne hors lecture-seule. Le verdict
+            // de risque est SIGNALÉ (non bloquant) : un `[RISK: …]` en tête de
+            // sortie pour que le modèle ET l'UI le voient, jamais un refus — la
+            // fluidité prime, le filet reste git + le kill arbre-de-processus.
             let command = args["command"]
                 .as_str()
                 .ok_or_else(|| "missing required field: command".to_string())?;
             let timeout_secs = args["timeoutSecs"].as_u64().unwrap_or(60).clamp(1, 300);
-            let res = super::exec::run_command_direct(root, command, timeout_secs);
+            let policy = super::policy::ExecutionPolicy::WorkspaceWrite;
+            let res = super::exec::run_command_direct(root, command, timeout_secs, policy);
             // Record the exit code for the skill gate: `skill_save` only persists
             // when the LAST run_command exited 0 (env-verified success). Timeout
             // (sentinel -2) and infra failure (-1) both block saving a skill.
@@ -808,8 +818,19 @@ fn dispatch_inner(
             } else {
                 format!("exit {}", res.exit_code)
             };
+            // Prefix a non-blocking risk banner when the classifier flagged the
+            // command. The model sees the ran-anyway result AND the warning so it
+            // can self-correct (e.g. avoid a force-push next time); the UI parses
+            // the same prefix to show a risk card. Safe commands get no banner.
+            let risk_banner = if res.risk.is_danger() {
+                let detail = res.risk.detail.as_deref().unwrap_or("commande à risque");
+                let reason = res.risk.reason.unwrap_or("danger");
+                format!("[RISK: {reason}] {detail}\n")
+            } else {
+                String::new()
+            };
             Ok(format!(
-                "[{status}]\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                "{risk_banner}[{status}]\n--- stdout ---\n{}\n--- stderr ---\n{}",
                 res.stdout, res.stderr
             ))
         }

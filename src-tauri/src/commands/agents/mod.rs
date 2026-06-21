@@ -79,6 +79,14 @@ mod tools;
 /// preflight half reports whether that net is in place.
 pub(crate) mod exec;
 
+/// Governed-exec layer (P0-a) — `ExecutionPolicy` (the capability envelope of a
+/// run) + `CommandRisk` (a static classifier that flags the irreversible /
+/// exfiltrating tail so the UI can surface a risk card WITHOUT blocking the
+/// loop). The `run_command` dispatch in `tools.rs` calls `classify_command`
+/// before spawning; the Tauri command `agent_classify_command` lets the UI
+/// pre-flight a command string too.
+pub(crate) mod policy;
+
 /// Skill library (Voyager / Hermes) — the agent saves reusable skills it learns
 /// (`skill_save` tool) and loads them into context on future runs. Persistent,
 /// per-role, compounding learning.
@@ -958,6 +966,20 @@ pub async fn agent_exec_preflight(app: tauri::AppHandle) -> Result<exec::ExecCap
     tokio::task::spawn_blocking(move || exec::check_git_safety(root))
         .await
         .map_err(|e| format!("preflight join error: {e}"))
+}
+
+/// Classify a command string against an execution policy WITHOUT running it
+/// (P0-a). The UI calls this to pre-flight a command the user is about to let
+/// an agent run — it returns `{ level, reason?, detail? }` so a risk card can
+/// be shown for `danger` verdicts. Pure/synchronous classifier, so no blocking
+/// work; `read_only` maps to the policy envelope (`true` ⇒ ReadOnly/Plan mode).
+#[tauri::command]
+pub async fn agent_classify_command(
+    command: String,
+    read_only: Option<bool>,
+) -> Result<policy::CommandRisk, String> {
+    let pol = policy::policy_for_run(read_only.unwrap_or(false));
+    Ok(policy::classify_command(&command, pol))
 }
 
 /// Grounded Run — the env-grounded loop DIRECTLY on the user's real project

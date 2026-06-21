@@ -18,12 +18,27 @@
 //! `check_git_safety` is the preflight half: it reports whether the git
 //! safety net is actually in place (repo present, tree committed) so the UI
 //! can show a NON-BLOCKING warning before an agent run. It never refuses.
+//!
+//! ## Process-tree kill (P0-a)
+//!
+//! The wall-clock timeout used to call `child.kill()`, which on Windows only
+//! terminates the *direct* child (`cmd.exe`). Its descendants — the `cargo`
+//! that `cmd` launched, the `rustc`/`node`/dev-server that `cargo` launched —
+//! survived, kept holding file locks and ports, and could wedge the next run.
+//! We now assign the child to a Windows **Job Object** with
+//! `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: `TerminateJobObject` (on timeout) and
+//! dropping the job handle (on normal exit) both tear down the ENTIRE tree
+//! atomically. On non-Windows the existing `child.kill()` is kept (a true
+//! POSIX process-group kill is a separate, larger change and Shugu's target is
+//! Windows-first).
 
 use serde::Serialize;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+use super::policy::{classify_command, CommandRisk, ExecutionPolicy};
 
 /// Hard ceiling on captured output per stream, to protect the LLM context
 /// budget (and the event log) from a runaway test that prints megabytes.
@@ -34,6 +49,111 @@ pub(super) struct ExecResult {
     pub(super) stdout: String,
     pub(super) stderr: String,
     pub(super) timed_out: bool,
+    /// Risk verdict the classifier returned for this command (P0-a). Carried on
+    /// the result so the dispatcher can surface it to the model + the UI without
+    /// re-classifying. `Safe` for the overwhelming majority of commands.
+    pub(super) risk: CommandRisk,
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Windows Job Object — process-tree containment for the timeout kill.
+// ────────────────────────────────────────────────────────────────────────
+
+/// RAII wrapper over a Windows Job Object configured to kill every assigned
+/// process (and their descendants) when the handle closes. Created BEFORE the
+/// child is spawned, the child is assigned to it immediately after spawn, and
+/// the wrapper is held for the lifetime of the run.
+///
+/// Two teardown paths, both tree-wide:
+///   * timeout → [`ProcessTree::terminate`] calls `TerminateJobObject`,
+///   * normal exit / error → `Drop` closes the handle; with
+///     `KILL_ON_JOB_CLOSE` set, Windows reaps any stragglers.
+#[cfg(windows)]
+struct ProcessTree {
+    job: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl ProcessTree {
+    /// Create a job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Returns
+    /// `None` on any FFI failure — the caller degrades to a plain `child.kill()`
+    /// rather than refusing to run (containment is best-effort hardening, never
+    /// a precondition for execution).
+    fn create() -> Option<Self> {
+        use std::ptr;
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, SetInformationJobObject, JobObjectExtendedLimitInformation,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        // SAFETY: CreateJobObjectW with null security attrs + null name returns
+        // a new unnamed job handle, or null on failure (which we check).
+        let job = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+        if job.is_null() {
+            return None;
+        }
+
+        // Configure: when the LAST handle to the job closes, kill every process
+        // still assigned to it (and, transitively, the descendants they spawned
+        // — children inherit the job assignment unless they opt out, which the
+        // standard toolchain never does).
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+        // SAFETY: `info` is a valid, fully-initialized struct of the size we
+        // pass; the class matches the struct type.
+        let ok = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            // SAFETY: `job` is a valid handle we just created.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
+            return None;
+        }
+
+        Some(ProcessTree { job })
+    }
+
+    /// Assign a freshly-spawned child to the job. Best-effort: a failure here
+    /// just means the timeout kill falls back to killing the direct child only.
+    fn assign(&self, child: &Child) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+        let proc_handle = child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+        // SAFETY: `self.job` is a valid job handle; `proc_handle` is the live
+        // process handle owned by `child` (valid until `child` is dropped).
+        unsafe {
+            AssignProcessToJobObject(self.job, proc_handle);
+        }
+    }
+
+    /// Terminate every process in the job (the whole tree) with the given exit
+    /// code. Used on the timeout path.
+    fn terminate(&self) {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        // SAFETY: `self.job` is a valid job handle.
+        unsafe {
+            TerminateJobObject(self.job, 1);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        // Closing the last handle triggers KILL_ON_JOB_CLOSE → any survivors are
+        // reaped. On the normal-exit path the child is already gone, so this is
+        // just handle cleanup; on an error path it also catches stragglers.
+        // SAFETY: `self.job` is a valid handle created in `create`, closed once.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.job);
+        }
+    }
 }
 
 /// Strip the `\\?\` verbatim prefix `canonicalize` adds on Windows — cmd.exe
@@ -47,17 +167,31 @@ fn strip_verbatim(p: &Path) -> std::path::PathBuf {
     }
 }
 
-/// Run `command` through the platform shell, cwd = the agent's workspace.
-/// BLOCKS (call under `spawn_blocking`). Never panics: a spawn failure is
-/// returned as a non-zero result with the reason in `stderr`, so the agent
-/// sees a clean "exec failed" message instead of the run crashing.
+/// Run `command` through the platform shell, cwd = the agent's workspace,
+/// under execution `policy`. BLOCKS (call under `spawn_blocking`). Never
+/// panics: a spawn failure is returned as a non-zero result with the reason in
+/// `stderr`, so the agent sees a clean "exec failed" message instead of the
+/// run crashing.
 ///
 /// Windows: `cmd /d /s /c` — `/d` SKIPS the user's cmd.exe AutoRun (this
 /// machine has one that launches a vault + CLI; spawning it from a background
-/// agent would be both slow and wrong), `/s` keeps quote handling sane.
-/// Unix: `sh -c`.
-pub(super) fn run_command_direct(ws: &Path, command: &str, timeout_secs: u64) -> ExecResult {
+/// agent would be both slow and wrong), `/s` keeps quote handling sane. The
+/// child is assigned to a Job Object so the timeout kill takes the whole
+/// process tree (see module docs). Unix: `sh -c`.
+///
+/// The command is classified ([`CommandRisk`]) and a structured line is logged
+/// (`{cmd, cwd, policy, risk, exit, timedOut}`); the risk verdict rides back on
+/// the result so the dispatcher can flag it to the model + UI. Classification
+/// is ADVISORY — a `Danger` verdict is logged and surfaced, never a refusal
+/// (the loop stays fluid; the safety net is git + the process-tree kill).
+pub(super) fn run_command_direct(
+    ws: &Path,
+    command: &str,
+    timeout_secs: u64,
+    policy: ExecutionPolicy,
+) -> ExecResult {
     let cwd = strip_verbatim(ws);
+    let risk = classify_command(command, policy);
 
     #[cfg(windows)]
     let mut cmd = {
@@ -75,6 +209,12 @@ pub(super) fn run_command_direct(ws: &Path, command: &str, timeout_secs: u64) ->
         c
     };
 
+    // Create the job object BEFORE spawn so we can assign the child the instant
+    // it exists, before it has a chance to fork descendants. Best-effort: a
+    // None here just degrades the timeout kill to the direct child.
+    #[cfg(windows)]
+    let process_tree = ProcessTree::create();
+
     let child = cmd
         .current_dir(&cwd)
         .stdin(Stdio::null())
@@ -85,14 +225,22 @@ pub(super) fn run_command_direct(ws: &Path, command: &str, timeout_secs: u64) ->
     let mut child = match child {
         Ok(c) => c,
         Err(e) => {
+            log_exec(command, &cwd, policy, &risk, -1, false);
             return ExecResult {
                 exit_code: -1,
                 stdout: String::new(),
                 stderr: format!("exécution impossible : {e}"),
                 timed_out: false,
+                risk,
             };
         }
     };
+
+    // Assign the child (and thus its future descendants) to the job.
+    #[cfg(windows)]
+    if let Some(ref tree) = process_tree {
+        tree.assign(&child);
+    }
 
     // Drain stdout/stderr on dedicated threads so a chatty child can't fill
     // the pipe buffer and deadlock against our try_wait polling loop.
@@ -107,31 +255,82 @@ pub(super) fn run_command_direct(ws: &Path, command: &str, timeout_secs: u64) ->
             Ok(None) => {
                 if Instant::now() >= deadline {
                     timed_out = true;
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_tree(&mut child);
+                    #[cfg(windows)]
+                    if let Some(ref tree) = process_tree {
+                        // Terminate the WHOLE tree, not just `cmd.exe`: the
+                        // hung process is usually a descendant (dev server,
+                        // rustc) that `child.kill()` alone would orphan.
+                        tree.terminate();
+                    }
                     break 124; // same convention as coreutils `timeout`
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_tree(&mut child);
+                #[cfg(windows)]
+                if let Some(ref tree) = process_tree {
+                    tree.terminate();
+                }
+                log_exec(command, &cwd, policy, &risk, -1, false);
                 return ExecResult {
                     exit_code: -1,
                     stdout: join_reader(stdout_handle),
                     stderr: format!("wait failed: {e}"),
                     timed_out: false,
+                    risk,
                 };
             }
         }
     };
+
+    log_exec(command, &cwd, policy, &risk, exit_code, timed_out);
 
     ExecResult {
         exit_code,
         stdout: join_reader(stdout_handle),
         stderr: join_reader(stderr_handle),
         timed_out,
+        risk,
     }
+}
+
+/// Kill the direct child and reap it. On Windows the tree-wide kill is handled
+/// separately by the Job Object (`TerminateJobObject`); this still kills the
+/// `cmd.exe` itself. On non-Windows this is the only kill (POSIX process-group
+/// containment is out of scope for this Windows-first lane).
+fn kill_tree(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Structured one-line log of an exec, JSON so it's grep-able and machine-
+/// parseable in the dev log. Fields: `cmd` (capped), `cwd`, `policy`, `risk`
+/// (+ reason when danger), `exit`, `timedOut`. Emitted to stderr (the app's
+/// dev-log sink). Cheap — only formats a short object per command.
+fn log_exec(
+    command: &str,
+    cwd: &Path,
+    policy: ExecutionPolicy,
+    risk: &CommandRisk,
+    exit_code: i32,
+    timed_out: bool,
+) {
+    // Cap the logged command so a giant heredoc can't blow the log line.
+    const CMD_LOG_CAP: usize = 200;
+    let cmd_short: String = command.chars().take(CMD_LOG_CAP).collect();
+    let truncated = command.chars().count() > CMD_LOG_CAP;
+    let payload = serde_json::json!({
+        "cmd": if truncated { format!("{cmd_short}…") } else { cmd_short },
+        "cwd": cwd.to_string_lossy(),
+        "policy": policy.as_str(),
+        "risk": risk.level.as_str(),
+        "riskReason": risk.reason,
+        "exit": exit_code,
+        "timedOut": timed_out,
+    });
+    eprintln!("[agent:exec] {payload}");
 }
 
 /// Collect a child stream into a string on its own thread (cap applied at
@@ -277,18 +476,63 @@ mod tests {
     #[test]
     fn run_echo_captures_stdout() {
         let tmp = std::env::temp_dir();
-        let res = run_command_direct(&tmp, "echo hello-exec", 30);
+        let res = run_command_direct(
+            &tmp,
+            "echo hello-exec",
+            30,
+            ExecutionPolicy::WorkspaceWrite,
+        );
         assert_eq!(res.exit_code, 0, "stderr: {}", res.stderr);
         assert!(res.stdout.contains("hello-exec"));
         assert!(!res.timed_out);
+        // A plain echo must classify as safe.
+        assert!(!res.risk.is_danger());
     }
 
     #[test]
     fn run_nonzero_exit_reported() {
         let tmp = std::env::temp_dir();
-        let res = run_command_direct(&tmp, "exit 3", 30);
+        let res = run_command_direct(&tmp, "exit 3", 30, ExecutionPolicy::WorkspaceWrite);
         assert_eq!(res.exit_code, 3);
         assert!(!res.timed_out);
+    }
+
+    #[test]
+    fn run_carries_risk_verdict() {
+        // run_command_direct RUNS the command regardless of risk (non-blocking)
+        // but the verdict must ride back on the result for the UI/log.
+        let tmp = std::env::temp_dir();
+        let res = run_command_direct(
+            &tmp,
+            "git push --force",
+            30,
+            ExecutionPolicy::WorkspaceWrite,
+        );
+        // (git may or may not be a repo here — we only assert the classifier ran.)
+        assert!(res.risk.is_danger());
+        assert_eq!(res.risk.reason, Some("forcePush"));
+    }
+
+    #[test]
+    fn run_timeout_kills_within_grace() {
+        // A command that sleeps far past the 1s timeout must come back as
+        // timed_out=124 promptly (the Job-Object/kill path), not hang the test.
+        let tmp = std::env::temp_dir();
+        #[cfg(windows)]
+        // `ping -n 10 127.0.0.1` runs ~9s; with a 1s timeout it must be killed.
+        let cmd = "ping -n 10 127.0.0.1";
+        #[cfg(not(windows))]
+        let cmd = "sleep 10";
+        let start = Instant::now();
+        let res = run_command_direct(&tmp, cmd, 1, ExecutionPolicy::WorkspaceWrite);
+        let elapsed = start.elapsed();
+        assert!(res.timed_out, "expected timeout, got exit {}", res.exit_code);
+        assert_eq!(res.exit_code, 124);
+        // Generous upper bound: 1s timeout + polling slack + kill, well under 8s.
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "timeout kill took too long: {elapsed:?}"
+        );
     }
 
     #[test]

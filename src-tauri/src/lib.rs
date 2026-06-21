@@ -728,6 +728,8 @@ pub fn run() {
             commands::agents::agent_atelier_run,
             commands::agents::agent_exec_preflight,
             commands::agents::agent_grounded_run,
+            // P0-a — pre-flight risk classification of a command string.
+            commands::agents::agent_classify_command,
             // Skill library (Voyager / Hermes) — learned reusable skills.
             commands::agents::skills::skills_list,
             commands::agents::skills::skills_clear,
