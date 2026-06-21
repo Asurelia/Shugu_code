@@ -1,0 +1,9 @@
+{
+  "id": "stack-class",
+  "title": "Implement a Stack class to an interface",
+  "category": "from-scratch",
+  "tags": ["js", "from-scratch", "data-structures"],
+  "prompt": "Create `stack.js` (CommonJS) exporting a class `Stack` with: `push(x)` (returns the new size), `pop()` (returns and removes the top, or undefined if empty), `peek()` (returns the top without removing, or undefined), `size()` (number of items), and `isEmpty()` (boolean). Internally use a private array. The test file `verify.test.js` is present and must pass via `node --test verify.test.js`. Do NOT modify the test file.",
+  "verify": "node --test verify.test.js",
+  "verifyTimeoutSecs": 60
+}

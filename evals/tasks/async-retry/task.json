@@ -1,0 +1,9 @@
+{
+  "id": "async-retry",
+  "title": "Implement an async retry helper",
+  "category": "from-scratch",
+  "tags": ["js", "from-scratch", "async"],
+  "prompt": "Create `retry.js` (CommonJS) exporting `async function retry(fn, attempts)`. It calls `fn()` (which returns a promise). If it resolves, return its value. If it rejects, retry up to `attempts` total tries. If all attempts reject, throw the LAST error. `attempts` defaults to 3. Do not add any delay between tries. The test file `verify.test.js` is present and must pass via `node --test verify.test.js`. Do NOT modify the test file.",
+  "verify": "node --test verify.test.js",
+  "verifyTimeoutSecs": 60
+}

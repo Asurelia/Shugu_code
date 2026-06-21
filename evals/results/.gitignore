@@ -1,0 +1,4 @@
+# Timestamped scorecard runs and the rolling "latest" pointer are transient.
+# Only the committed baseline.json is tracked (the reference run for regressions).
+scorecard-*.json
+latest.json

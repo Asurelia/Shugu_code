@@ -16,6 +16,9 @@
     "typecheck": "tsc -b --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:eval": "node evals/run.mjs --self-check",
+    "test:eval:dry": "node evals/run.mjs --dry-run",
+    "test:eval:live": "node evals/run.mjs",
     "convex": "convex",
     "convex:dev": "convex dev"
   },

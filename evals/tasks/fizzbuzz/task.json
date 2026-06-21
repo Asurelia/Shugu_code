@@ -1,0 +1,9 @@
+{
+  "id": "fizzbuzz",
+  "title": "Implement FizzBuzz (from scratch)",
+  "category": "from-scratch",
+  "tags": ["js", "from-scratch"],
+  "prompt": "Create a file `fizzbuzz.js` that exports a function `fizzbuzz(n)`. For 1..n it returns an array where multiples of 3 become \"Fizz\", multiples of 5 become \"Buzz\", multiples of both become \"FizzBuzz\", and every other number becomes its own value as a STRING (e.g. \"1\", \"2\", \"4\"). Use CommonJS: `module.exports = { fizzbuzz }`. There is a test file `verify.test.js` already present — do NOT modify it; make the test pass by running `node --test`.",
+  "verify": "node --test verify.test.js",
+  "verifyTimeoutSecs": 60
+}
