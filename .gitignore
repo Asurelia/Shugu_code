@@ -35,6 +35,15 @@ _design_package.tar
 .playwright-mcp/
 smoke-*.png
 
+# playwright test runner artifacts (e2e smoke gate)
+test-results/
+playwright-report/
+blob-report/
+.playwright/
+
+# throwaway isolated install dir used to verify the lint/e2e gates locally
+.lint-verify/
+
 # Claude Code project instructions — kept local, not versioned
 CLAUDE.md
 

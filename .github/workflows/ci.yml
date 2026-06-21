@@ -1,0 +1,65 @@
+# Shugu Forge — minimal CI (quality-gates lane).
+#
+# Runs the cheap, deterministic gates on every push / PR. Heavier gates
+# (Playwright `test:e2e`, `cargo audit`) are documented in docs/quality-gates.md
+# and left out here on purpose: e2e needs a browser download + full Vite build,
+# and cargo-audit needs the Rust toolchain + a per-runner install. They run
+# locally today and can be promoted to dedicated jobs later.
+#
+# Design notes:
+#   • pnpm + Node, with the store cached for speed.
+#   • `--frozen-lockfile` so CI fails on an out-of-date pnpm-lock.yaml.
+#   • lint is non-blocking-by-policy (the eslint.config.js emits warnings, not
+#     errors, for smells), but a hard ESLint error (dangerous pattern) WILL fail
+#     the job — which is exactly the intent.
+#   • the JS audit is `continue-on-error` so a freshly disclosed upstream CVE
+#     surfaces in logs without red-X-ing unrelated PRs.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref to save minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality-gates:
+    name: lint · typecheck · test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.7.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Unit tests
+        run: pnpm run test
+
+      - name: Dependency audit (JS)
+        run: pnpm run audit:js
+        continue-on-error: true
