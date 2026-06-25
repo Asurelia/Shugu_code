@@ -215,6 +215,83 @@ pub fn classify_command(command: &str, policy: ExecutionPolicy) -> CommandRisk {
     CommandRisk::safe()
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// Learned user rules — override the static classifier (Phase 2, « mode fluide »)
+// ────────────────────────────────────────────────────────────────────────
+
+/// A user-blessed (or user-flagged) command pattern, persisted across sessions
+/// (the DB I/O lives in `command_rules.rs`). `allow == true` SILENCES the risk
+/// flag for matching commands (the user vouched for them — e.g. a `git push
+/// --force` to their own fork); `allow == false` FLAGS a pattern the static
+/// classifier misses. This is Shugu's take on Codex's `rules/default.rules`
+/// learned `prefix_rule(…, decision="allow")`: since exec here is already
+/// non-blocking, a learned allow doesn't remove a prompt (there is none) — it
+/// removes the *risk badge*, keeping the flow clean for commands you trust.
+#[derive(Debug, Clone)]
+pub struct CommandRule {
+    /// Whitespace-token pattern, optionally ending in `*` (e.g. `git push *`,
+    /// `npm run build`, `cargo *`). Matched case-insensitively by token.
+    pub pattern: String,
+    /// `true` → matching commands become `Safe` (flag silenced); `false` →
+    /// `Danger` (a user-defined risk the static classifier doesn't catch).
+    pub allow: bool,
+    /// Optional one-liner shown on the risk card for a `deny` rule.
+    pub detail: Option<String>,
+}
+
+/// Does `command` match a token-pattern? Pattern tokens must equal the command's
+/// leading tokens (case-insensitive); a trailing `*` allows extra trailing
+/// tokens. Without a trailing `*`, the token sequences must match exactly.
+///   `git push *`    → matches `git push --force origin main`
+///   `npm run build` → matches only `npm run build` (exact)
+///   `cargo *`       → matches any `cargo …`
+pub fn command_matches(command: &str, pattern: &str) -> bool {
+    let cmd: Vec<&str> = command.split_whitespace().collect();
+    let pat: Vec<&str> = pattern.split_whitespace().collect();
+    if pat.is_empty() {
+        return false;
+    }
+    let wild = pat.last() == Some(&"*");
+    let fixed: &[&str] = if wild { &pat[..pat.len() - 1] } else { &pat[..] };
+    if wild {
+        if cmd.len() < fixed.len() {
+            return false;
+        }
+    } else if cmd.len() != fixed.len() {
+        return false;
+    }
+    fixed
+        .iter()
+        .zip(cmd.iter())
+        .all(|(p, c)| p.eq_ignore_ascii_case(c))
+}
+
+/// Classify a command, consulting the user's learned rules FIRST. A matching
+/// rule short-circuits the static classifier: `allow` → `Safe`, `deny` →
+/// `Danger`. No match → fall through to [`classify_command`]. Pure and
+/// testable; the caller loads `rules` once per run from the DB.
+pub fn classify_with_rules(
+    command: &str,
+    policy: ExecutionPolicy,
+    rules: &[CommandRule],
+) -> CommandRisk {
+    for r in rules {
+        if command_matches(command, &r.pattern) {
+            return if r.allow {
+                CommandRisk::safe()
+            } else {
+                CommandRisk::danger(
+                    "userRule",
+                    r.detail.clone().unwrap_or_else(|| {
+                        "commande marquée à risque par une règle utilisateur".to_string()
+                    }),
+                )
+            };
+        }
+    }
+    classify_command(command, policy)
+}
+
 // ── individual detectors ────────────────────────────────────────────────
 
 /// `rm -rf …`, `rm -fr`, `rm -r -f`, `del /s`, `del /q /s`, `rmdir /s`,
@@ -761,5 +838,57 @@ mod tests {
         // reason/detail skipped when None.
         assert!(vs.get("reason").is_none());
         assert!(vs.get("detail").is_none());
+    }
+
+    // ── learned user rules (Phase 2) ────────────────────────────────────
+
+    #[test]
+    fn command_matches_token_and_wildcard() {
+        assert!(command_matches("git push --force origin main", "git push *"));
+        assert!(command_matches("npm run build", "npm run build"));
+        assert!(!command_matches("npm run test", "npm run build"));
+        assert!(command_matches("cargo test --release", "cargo *"));
+        // exact (no trailing *) must not match a longer command
+        assert!(!command_matches("npm run build extra", "npm run build"));
+        // case-insensitive by token
+        assert!(command_matches("GIT PUSH -F", "git push *"));
+        // empty pattern / empty command edge cases
+        assert!(!command_matches("", "git *"));
+        assert!(!command_matches("git push", ""));
+    }
+
+    #[test]
+    fn learned_allow_silences_flag_and_deny_adds_one() {
+        // A blessed force-push is downgraded to Safe (the static classifier would
+        // flag it `forcePush`).
+        let rules = vec![CommandRule {
+            pattern: "git push *".to_string(),
+            allow: true,
+            detail: None,
+        }];
+        let r = classify_with_rules("git push --force", ExecutionPolicy::WorkspaceWrite, &rules);
+        assert_eq!(r.level, RiskLevel::Safe, "blessed command must be Safe");
+
+        // A user deny-rule flags something the static set doesn't know about.
+        let rules2 = vec![CommandRule {
+            pattern: "terraform apply *".to_string(),
+            allow: false,
+            detail: Some("prod infra".to_string()),
+        }];
+        let r2 = classify_with_rules(
+            "terraform apply -auto-approve",
+            ExecutionPolicy::WorkspaceWrite,
+            &rules2,
+        );
+        assert!(r2.is_danger());
+        assert_eq!(r2.reason, Some("userRule"));
+        assert_eq!(r2.detail.as_deref(), Some("prod infra"));
+
+        // No matching rule → the static classifier still applies in full.
+        let r3 = classify_with_rules("rm -rf build", ExecutionPolicy::WorkspaceWrite, &[]);
+        assert_eq!(r3.reason, Some("recursiveDelete"));
+        // …and a non-matching rule set doesn't interfere.
+        let r4 = classify_with_rules("rm -rf build", ExecutionPolicy::WorkspaceWrite, &rules);
+        assert_eq!(r4.reason, Some("recursiveDelete"));
     }
 }
