@@ -246,6 +246,187 @@ impl BrowserBackend for PlaywrightShellBackend {
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Backend chromiumoxide (CDP, 100 % Rust — exige un Chrome/Chromium installé)
+// ────────────────────────────────────────────────────────────────────
+
+/// Shim injecté AVANT tout script de page (`evaluate_on_new_document`) : il
+/// capture `console.error/warn`, les erreurs non interceptées et les rejets de
+/// promesse dans `window.__shugu`, qu'on relit ensuite via `evaluate`. Bien
+/// plus robuste (et stable entre versions de chromiumoxide) que l'abonnement
+/// aux events CDP `Runtime.consoleAPICalled`.
+const CDP_SHIM: &str = r#"(() => {
+  if (window.__shugu) return;
+  window.__shugu = { console: [], errors: [] };
+  const fmt = (a) => { try { return typeof a === 'string' ? a : JSON.stringify(a); } catch (_) { return String(a); } };
+  const wrap = (type, orig) => function (...a) { try { window.__shugu.console.push({ type, text: a.map(fmt).join(' ') }); } catch (_) {} return orig.apply(this, a); };
+  console.error = wrap('error', console.error);
+  console.warn = wrap('warning', console.warn);
+  window.addEventListener('error', (e) => { try { window.__shugu.errors.push(String((e && e.message) || e)); } catch (_) {} });
+  window.addEventListener('unhandledrejection', (e) => { try { window.__shugu.errors.push('unhandledrejection: ' + String(e && e.reason)); } catch (_) {} });
+})();"#;
+
+/// État capturé par le shim, relu via `evaluate`.
+#[derive(Deserialize, Default)]
+struct Captured {
+    #[serde(default)]
+    console: Vec<ConsoleMsg>,
+    #[serde(default)]
+    errors: Vec<String>,
+}
+
+struct ChromiumoxideBackend;
+
+impl BrowserBackend for ChromiumoxideBackend {
+    async fn run(&self, spec: &Value, png_path: &Path) -> Result<DriverResult, String> {
+        use chromiumoxide::browser::{Browser, BrowserConfig};
+        use futures_util::StreamExt;
+
+        // Headless par défaut dans chromiumoxide. `LAUNCH_FAILED` est le sentinel
+        // que `browser_test_run` reconnaît pour basculer sur Playwright en "auto".
+        let config = BrowserConfig::builder()
+            .build()
+            .map_err(|e| format!("LAUNCH_FAILED: config navigateur: {e}"))?;
+        let (mut browser, mut handler) = Browser::launch(config)
+            .await
+            .map_err(|e| format!("LAUNCH_FAILED: lancement de Chrome impossible (installé ?) : {e}"))?;
+        // Le Handler doit être pompé en continu, sinon le CDP se fige.
+        let handler_task = tokio::spawn(async move {
+            while let Some(h) = handler.next().await {
+                if h.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let outcome = cdp_inner(&browser, spec, png_path).await;
+        let _ = browser.close().await;
+        handler_task.abort();
+        outcome
+    }
+}
+
+/// Corps du test CDP, isolé pour garantir `browser.close()` même en erreur.
+async fn cdp_inner(
+    browser: &chromiumoxide::Browser,
+    spec: &Value,
+    png_path: &Path,
+) -> Result<DriverResult, String> {
+    use chromiumoxide::page::ScreenshotParams;
+
+    let mut result = DriverResult::default();
+    let url = spec["url"].as_str().unwrap_or("about:blank");
+    let timeout_ms = spec["timeoutMs"].as_u64().unwrap_or(30_000);
+    let require_no_errors = spec["requireNoErrors"].as_bool().unwrap_or(true);
+
+    let page = browser
+        .new_page("about:blank")
+        .await
+        .map_err(|e| format!("new_page: {e}"))?;
+    page.evaluate_on_new_document(CDP_SHIM.to_string())
+        .await
+        .map_err(|e| format!("inject shim: {e}"))?;
+    page.goto(url).await.map_err(|e| format!("goto {url}: {e}"))?;
+    page.wait_for_navigation()
+        .await
+        .map_err(|e| format!("wait navigation: {e}"))?;
+
+    if let Some(sel) = spec["waitSelector"].as_str() {
+        // Tolère un selector jamais présent (timeout) sans tuer le test —
+        // l'assertion correspondante tranchera ensuite.
+        let _ = tokio::time::timeout(Duration::from_millis(timeout_ms), page.find_element(sel)).await;
+    }
+    if let Some(ms) = spec["waitMs"].as_u64() {
+        tokio::time::sleep(Duration::from_millis(ms.min(10_000))).await;
+    }
+    if let Some(actions) = spec["actions"].as_array() {
+        for a in actions {
+            match a["type"].as_str().unwrap_or("") {
+                "click" => {
+                    if let Some(sel) = a["selector"].as_str() {
+                        if let Ok(el) = page.find_element(sel).await {
+                            let _ = el.click().await;
+                        }
+                    }
+                }
+                "fill" => {
+                    if let Some(sel) = a["selector"].as_str() {
+                        if let Ok(el) = page.find_element(sel).await {
+                            let _ = el.click().await;
+                            let _ = el.type_str(a["text"].as_str().unwrap_or("")).await;
+                        }
+                    }
+                }
+                "waitSelector" => {
+                    if let Some(sel) = a["selector"].as_str() {
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(timeout_ms),
+                            page.find_element(sel),
+                        )
+                        .await;
+                    }
+                }
+                "wait" => {
+                    let ms = a["ms"].as_u64().unwrap_or(500).min(10_000);
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    result.final_url = page.url().await.ok().flatten();
+
+    if let Some(sel) = spec["assertSelector"].as_str() {
+        result.assertions.push(AssertionResult {
+            kind: "selector".to_string(),
+            target: sel.to_string(),
+            ok: page.find_element(sel).await.is_ok(),
+        });
+    }
+    if let Some(txt) = spec["assertText"].as_str() {
+        let body = page
+            .evaluate("document.body ? document.body.innerText : ''")
+            .await
+            .ok()
+            .and_then(|e| e.into_value::<String>().ok())
+            .unwrap_or_default();
+        result.assertions.push(AssertionResult {
+            kind: "text".to_string(),
+            target: txt.to_string(),
+            ok: body.contains(txt),
+        });
+    }
+
+    // Console + erreurs capturées par le shim, relues d'un coup.
+    if let Ok(ev) = page
+        .evaluate("JSON.stringify(window.__shugu || {console:[],errors:[]})")
+        .await
+    {
+        if let Ok(s) = ev.into_value::<String>() {
+            if let Ok(cap) = serde_json::from_str::<Captured>(&s) {
+                result.console = cap.console;
+                result.errors = cap.errors;
+            }
+        }
+    }
+
+    if spec.get("screenshotPath").is_some() {
+        if page
+            .save_screenshot(ScreenshotParams::builder().build(), png_path)
+            .await
+            .is_ok()
+        {
+            result.screenshot = Some(png_path.to_string_lossy().into_owned());
+        }
+    }
+
+    let no_errors = result.errors.is_empty() && !result.console.iter().any(|c| c.kind == "error");
+    let assertions_ok = result.assertions.iter().all(|a| a.ok);
+    result.passed = assertions_ok && (if require_no_errors { no_errors } else { true });
+    Ok(result)
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Entrée publique (appelée depuis le fork async du runner)
 // ────────────────────────────────────────────────────────────────────
 
@@ -355,23 +536,34 @@ pub async fn browser_test_run(
         Err(e) => return BrowserOutcome { summary: e, is_error: true, screenshots: vec![] },
     };
 
-    // Sélection backend. Pour l'instant : "auto" et "playwright" → Playwright.
-    // chromiumoxide arrive en Phase 1b (l'enum du schéma sera étendu).
+    // Sélection backend :
+    //   "chromiumoxide" → CDP Rust pur (exige Chrome).
+    //   "playwright"    → driver Node (exige `playwright` côté projet).
+    //   "auto" (défaut) → chromiumoxide d'abord (aucun Node requis), repli
+    //                     Playwright si Chrome est introuvable (LAUNCH_FAILED).
     let engine = args["engine"].as_str().unwrap_or("auto");
-    if engine != "auto" && engine != "playwright" {
-        return BrowserOutcome {
-            summary: format!(
-                "browser_test: engine inconnu {engine:?} — disponibles: \"auto\", \"playwright\""
-            ),
-            is_error: true,
-            screenshots: vec![],
-        };
-    }
-    let backend = PlaywrightShellBackend {
+    let pw = || PlaywrightShellBackend {
         project_root: root.map(|p| p.to_path_buf()),
     };
+    let result: Result<DriverResult, String> = match engine {
+        "playwright" => pw().run(&spec, &png_path).await,
+        "chromiumoxide" => ChromiumoxideBackend.run(&spec, &png_path).await,
+        "auto" => match ChromiumoxideBackend.run(&spec, &png_path).await {
+            Err(e) if e.contains("LAUNCH_FAILED") => pw().run(&spec, &png_path).await,
+            other => other,
+        },
+        other => {
+            return BrowserOutcome {
+                summary: format!(
+                    "browser_test: engine inconnu {other:?} — disponibles: \"auto\", \"chromiumoxide\", \"playwright\""
+                ),
+                is_error: true,
+                screenshots: vec![],
+            }
+        }
+    };
 
-    match backend.run(&spec, &png_path).await {
+    match result {
         Ok(res) => render_outcome(res, &png_path),
         Err(e) => BrowserOutcome { summary: e, is_error: true, screenshots: vec![] },
     }

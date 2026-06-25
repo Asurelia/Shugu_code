@@ -595,8 +595,8 @@ fn agent_tools() -> &'static [ToolDef] {
                         },
                         "engine": {
                             "type": "string",
-                            "enum": ["auto", "playwright"],
-                            "description": "Browser engine (default auto → Playwright)."
+                            "enum": ["auto", "chromiumoxide", "playwright"],
+                            "description": "Browser engine: \"chromiumoxide\" (pure-Rust CDP, needs Chrome installed), \"playwright\" (needs Playwright in the project), or \"auto\" (default — tries Chrome, falls back to Playwright)."
                         },
                         "timeoutMs": {
                             "type": "integer",

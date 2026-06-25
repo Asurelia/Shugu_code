@@ -99,6 +99,14 @@ rmcp = { version = "1", features = ["client", "transport-child-process", "transp
 xcap = "0.9.6"
 image = "0.25.6"
 
+# Lot parité Cursor — backend navigateur CDP 100% Rust (commands/browser.rs).
+# Pilote un Chrome/Chromium local via le Chrome DevTools Protocol — aucun Node
+# ni Playwright requis (l'autre backend, Playwright-via-shell, reste dispo).
+# `default-features = false` + `tokio-runtime` : on tourne déjà sur tokio ;
+# le défaut de la crate viserait async-std. Pas de feature `fetcher-*` : on ne
+# télécharge pas Chrome, on pilote celui de la machine.
+chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }
+
 # Lane 6 — import MCP multi-source. Le parseur TOML lit (en lecture seule) le
 # `~/.codex/config.toml` de Codex (`[mcp_servers.*]`). Version "0.8" déjà
 # résolue dans Cargo.lock (dep transitive) → ajout direct sans nouvelle
