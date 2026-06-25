@@ -1272,6 +1272,7 @@ pub(super) async fn tool_use_loop(
                     || tc.name == "web_search"
                     || tc.name == "web_fetch"
                     || tc.name == "advisor"
+                    || tc.name == "browser_test"
             });
 
         let results: Vec<ToolResult> = if any_async {
@@ -1359,6 +1360,42 @@ pub(super) async fn tool_use_loop(
                         id: tc.id.clone(),
                         name: tc.name.clone(),
                         is_error,
+                        content,
+                    });
+                } else if tc.name == "browser_test" {
+                    // Outil navigateur (façon Cursor 2.0) : navigateur headless qui
+                    // ouvre l'app de l'utilisateur, exécute des actions, lit la
+                    // console + le DOM et capture. Vérification READ-ONLY → dispo
+                    // aussi en mode Plan (comme web_fetch/capture_screen). Le contenu
+                    // (console/DOM) est EXTERNE non fiable → clôture DONNÉES (AM-3).
+                    let args: serde_json::Value =
+                        serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
+                    let root_opt = workspace_root.as_ref().map(|p| p.as_path());
+                    let outcome = crate::commands::browser::browser_test_run(
+                        app, root_opt, agent_id, &args,
+                    )
+                    .await;
+                    // Chaque capture devient un event Screenshot pour la timeline du fil.
+                    for (path, thumb) in &outcome.screenshots {
+                        let _ = super::persist_and_emit(
+                            app,
+                            &super::AgentEvent::Screenshot {
+                                agent_id: agent_id.to_string(),
+                                tool_call_id: tc.id.clone(),
+                                path: path.clone(),
+                                thumb_data_url: thumb.clone(),
+                            },
+                        );
+                    }
+                    let content = if outcome.is_error {
+                        outcome.summary
+                    } else {
+                        super::tools::wrap_untrusted("browser", &outcome.summary)
+                    };
+                    acc.push(ToolResult {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        is_error: outcome.is_error,
                         content,
                     });
                 } else if tc.name.starts_with("mcp__") {

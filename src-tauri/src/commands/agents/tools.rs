@@ -539,6 +539,73 @@ fn agent_tools() -> &'static [ToolDef] {
                     "properties": {}
                 }),
             },
+            ToolDef {
+                name: "browser_test",
+                description: "Launch a HEADLESS BROWSER, open a URL (typically your app's dev \
+                              server, e.g. http://localhost:5173), optionally interact, then VERIFY \
+                              it actually works: assert a selector/text is present, collect the \
+                              console + page errors, and take a screenshot. Use it AFTER starting a \
+                              dev server (run_command) to confirm the UI you built renders with no \
+                              console errors — then fix and re-test. Requires Playwright in the \
+                              project (npm i -D playwright && npx playwright install chromium).",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "Absolute http(s) URL to open, e.g. \"http://localhost:5173\"."
+                        },
+                        "waitSelector": {
+                            "type": "string",
+                            "description": "Optional CSS selector to wait for after load (proof the app mounted)."
+                        },
+                        "waitMs": {
+                            "type": "integer",
+                            "description": "Optional extra wait in ms after load (max 10000)."
+                        },
+                        "assertSelector": {
+                            "type": "string",
+                            "description": "Optional CSS selector that MUST exist for the test to pass."
+                        },
+                        "assertText": {
+                            "type": "string",
+                            "description": "Optional text that MUST appear in the page body for the test to pass."
+                        },
+                        "requireNoErrors": {
+                            "type": "boolean",
+                            "description": "If true (default), any console error or page error fails the test."
+                        },
+                        "screenshot": {
+                            "type": "boolean",
+                            "description": "Capture a screenshot (default true) — it appears in the run timeline."
+                        },
+                        "actions": {
+                            "type": "array",
+                            "description": "Optional ordered interactions to perform before asserting.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "type": { "type": "string", "enum": ["click", "fill", "wait", "waitSelector"] },
+                                    "selector": { "type": "string", "description": "CSS selector (for click/fill/waitSelector)." },
+                                    "text": { "type": "string", "description": "Text to type (for fill)." },
+                                    "ms": { "type": "integer", "description": "Milliseconds (for wait)." }
+                                },
+                                "required": ["type"]
+                            }
+                        },
+                        "engine": {
+                            "type": "string",
+                            "enum": ["auto", "playwright"],
+                            "description": "Browser engine (default auto → Playwright)."
+                        },
+                        "timeoutMs": {
+                            "type": "integer",
+                            "description": "Per-operation timeout in ms (default 30000, max 60000)."
+                        }
+                    },
+                    "required": ["url"]
+                }),
+            },
         ]
     })
 }
