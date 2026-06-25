@@ -995,7 +995,13 @@ fn dispatch_inner(
                 .ok_or_else(|| "missing required field: command".to_string())?;
             let timeout_secs = args["timeoutSecs"].as_u64().unwrap_or(60).clamp(1, 300);
             let policy = super::policy::ExecutionPolicy::WorkspaceWrite;
-            let res = super::exec::run_command_direct(root, command, timeout_secs, policy);
+            // Phase 2 — règles apprises (best-effort, vide si DB indisponible) :
+            // une règle `allow` retire le badge de risque sur une commande bénie,
+            // une `deny` flague un motif que le classifieur statique ne connaît
+            // pas. Appliquées AVANT les détecteurs statiques dans run_command_direct.
+            let rules = super::command_rules::load_for_classify(app);
+            let res =
+                super::exec::run_command_direct(root, command, timeout_secs, policy, &rules);
             // Record the exit code for the skill gate: `skill_save` only persists
             // when the LAST run_command exited 0 (env-verified success). Timeout
             // (sentinel -2) and infra failure (-1) both block saving a skill.

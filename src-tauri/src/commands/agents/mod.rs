@@ -104,6 +104,13 @@ pub(crate) mod sandbox;
 /// per-role, compounding learning.
 pub(crate) mod skills;
 
+/// Learned command rules (Phase 2 — « mode fluide ») : motifs de commande
+/// bénis (`allow`) ou flaggés (`deny`) par l'utilisateur, persistés, qui
+/// OVERRIDENT le classifieur statique (`policy::classify_with_rules`). Un
+/// `allow` retire le BADGE de risque (pas un prompt — il n'y en a pas) sur les
+/// commandes de confiance. Calque la persistance de `skills.rs`.
+pub(crate) mod command_rules;
+
 /// S3 — Closed-loop lesson injection. At the start of each run, retrieves the
 /// most relevant validated past reviews via semantic search and injects them
 /// into the agent's context so past mistakes compound into future improvements.
@@ -578,6 +585,20 @@ pub(crate) fn get_conn(app: &tauri::AppHandle) -> Result<&'static Mutex<Connecti
     if purged_shots > 0 {
         eprintln!("[agents] purged {purged_shots} screenshot row(s) older than 7 days");
     }
+
+    // Phase 2 — table des règles de commande apprises. Auto-migrante côté
+    // backend (CREATE TABLE IF NOT EXISTS) : pas de migration TS à ajouter, la
+    // table existe dès le premier accès agent. PK = pattern (INSERT OR REPLACE
+    // raffine une règle existante).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS agent_command_rules (
+            pattern    TEXT PRIMARY KEY,
+            verdict    TEXT NOT NULL,
+            detail     TEXT,
+            created_at INTEGER NOT NULL
+        );",
+    )
+    .map_err(|e| format!("create agent_command_rules: {e}"))?;
 
     let _ = AGENTS_CONN.set(Mutex::new(conn));
     AGENTS_CONN

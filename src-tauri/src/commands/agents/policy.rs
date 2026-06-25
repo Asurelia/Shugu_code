@@ -253,6 +253,12 @@ pub fn command_matches(command: &str, pattern: &str) -> bool {
     }
     let wild = pat.last() == Some(&"*");
     let fixed: &[&str] = if wild { &pat[..pat.len() - 1] } else { &pat[..] };
+    // SÉCURITÉ : un motif sans token fixe (« * » seul) matcherait TOUT — une
+    // règle `allow` ferait alors taire le drapeau de RM -RF & co. On le rend
+    // INERTE (no-match). `command_rule_save` le refuse aussi (défense en profondeur).
+    if fixed.is_empty() {
+        return false;
+    }
     if wild {
         if cmd.len() < fixed.len() {
             return false;
@@ -855,6 +861,10 @@ mod tests {
         // empty pattern / empty command edge cases
         assert!(!command_matches("", "git *"));
         assert!(!command_matches("git push", ""));
+        // SÉCURITÉ : un motif « * » seul (aucun token fixe) ne matche RIEN —
+        // sinon une règle allow ferait taire tous les drapeaux.
+        assert!(!command_matches("rm -rf /", "*"));
+        assert!(!command_matches("anything at all", "*"));
     }
 
     #[test]

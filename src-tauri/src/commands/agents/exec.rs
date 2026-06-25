@@ -38,7 +38,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use super::policy::{classify_command, CommandRisk, ExecutionPolicy};
+use super::policy::{classify_with_rules, CommandRisk, CommandRule, ExecutionPolicy};
 
 /// Hard ceiling on captured output per stream, to protect the LLM context
 /// budget (and the event log) from a runaway test that prints megabytes.
@@ -189,9 +189,13 @@ pub(super) fn run_command_direct(
     command: &str,
     timeout_secs: u64,
     policy: ExecutionPolicy,
+    rules: &[CommandRule],
 ) -> ExecResult {
     let cwd = strip_verbatim(ws);
-    let risk = classify_command(command, policy);
+    // Phase 2 — les règles apprises de l'utilisateur OVERRIDENT le classifieur
+    // statique (allow → Safe, deny → Danger) ; sinon on retombe sur les
+    // détecteurs. `rules` est vide quand aucune règle / DB indisponible.
+    let risk = classify_with_rules(command, policy, rules);
 
     // Real process sandbox (ALWAYS ON — Claude-Code model). The command runs in
     // a write-confined / reads-open low-integrity child: it can read anywhere
@@ -501,6 +505,7 @@ mod tests {
             "echo hello-exec",
             30,
             ExecutionPolicy::WorkspaceWrite,
+            &[],
         );
         assert_eq!(res.exit_code, 0, "stderr: {}", res.stderr);
         assert!(res.stdout.contains("hello-exec"));
@@ -512,7 +517,7 @@ mod tests {
     #[test]
     fn run_nonzero_exit_reported() {
         let tmp = std::env::temp_dir();
-        let res = run_command_direct(&tmp, "exit 3", 30, ExecutionPolicy::WorkspaceWrite);
+        let res = run_command_direct(&tmp, "exit 3", 30, ExecutionPolicy::WorkspaceWrite, &[]);
         assert_eq!(res.exit_code, 3);
         assert!(!res.timed_out);
     }
@@ -527,6 +532,7 @@ mod tests {
             "git push --force",
             30,
             ExecutionPolicy::WorkspaceWrite,
+            &[],
         );
         // (git may or may not be a repo here — we only assert the classifier ran.)
         assert!(res.risk.is_danger());
@@ -544,7 +550,7 @@ mod tests {
         #[cfg(not(windows))]
         let cmd = "sleep 10";
         let start = Instant::now();
-        let res = run_command_direct(&tmp, cmd, 1, ExecutionPolicy::WorkspaceWrite);
+        let res = run_command_direct(&tmp, cmd, 1, ExecutionPolicy::WorkspaceWrite, &[]);
         let elapsed = start.elapsed();
         assert!(res.timed_out, "expected timeout, got exit {}", res.exit_code);
         assert_eq!(res.exit_code, 124);

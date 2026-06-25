@@ -774,6 +774,10 @@ pub fn run() {
             commands::agents::skills::skills_list,
             commands::agents::skills::skills_clear,
             commands::agents::skills::skill_save_advisor,
+            // Phase 2 — règles d'auto-allow apprises (« mode fluide »).
+            commands::agents::command_rules::command_rule_save,
+            commands::agents::command_rules::command_rule_list,
+            commands::agents::command_rules::command_rule_delete,
             // Codex CLI bridge — auth status + real usage tracking (ChatGPT subscription).
             commands::codex::codex_auth_status,
             commands::codex::codex_login,
