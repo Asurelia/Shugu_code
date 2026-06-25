@@ -2151,9 +2151,12 @@ pub async fn fim_complete(
 /// is exempt (same policy as `chat_send` / `fim_complete`).
 ///
 /// Cancellation reuses the existing `ChatAbortRegistry` + `chat_abort` command:
-/// we register an `Arc<AtomicBool>` under `request_id` (prefixed `"fim:"` by the
-/// caller to avoid colliding with chat conversation_ids) and pass it to
-/// `collect_lines`, which exits on the next chunk boundary when it flips.
+/// we register an `Arc<AtomicBool>` under `request_id` and pass it to
+/// `collect_lines`, which exits on the next chunk boundary when it flips. The
+/// command FORCES a `"fim:"` prefix on the incoming `request_id` (it does not
+/// trust the caller) so the FIM key space can never collide with a chat
+/// `conversation_id` in the shared registry. The frontend reads the prefixed id
+/// back from the `fim://delta` events and passes it verbatim to `chat_abort`.
 ///
 /// Lifecycle contract (mirrors `chat_send`): on EVERY exit — success, abort, or
 /// error — we (a) emit a terminal `FimDelta{ chunk:"", done:true }` and (b)
@@ -2174,6 +2177,15 @@ pub async fn fim_complete_stream(
     suffix: Option<String>,
     abort_registry: tauri::State<'_, ChatAbortRegistry>,
 ) -> Result<String, String> {
+    // Namespacing imposé : le request_id FIM partage le ChatAbortRegistry avec
+    // les conversation_id du chat ; le préfixe garantit qu'un chat_abort ne peut
+    // jamais annuler le mauvais flux (et inversement). Imposé ici, pas laissé à
+    // l'appelant. `format!` réassigne la variable, donc TOUS les usages en aval
+    // (clé d'enregistrement/suppression dans le registry ET champ `request_id`
+    // des FimDelta émis) héritent du préfixe ; le frontend lira l'id préfixé
+    // depuis les events `fim://delta` et le repassera tel quel à `chat_abort`.
+    let request_id = format!("fim:{request_id}");
+
     // Protocol acceptance + SSRF guard (openai/custom guarded, ollama exempt).
     // Run BEFORE registering the abort flag so a rejected request leaves the
     // registry untouched.
