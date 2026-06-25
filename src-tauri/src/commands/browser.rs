@@ -165,6 +165,88 @@ function write(obj) { try { writeFileSync(resultPath, JSON.stringify(obj)); } ca
 })();
 "#;
 
+// ────────────────────────────────────────────────────────────────────
+// Windows : Job Object pour réclamer l'arbre de processus du navigateur
+// ────────────────────────────────────────────────────────────────────
+
+/// RAII : place le `node` Playwright (et donc le chromium qu'il lance en
+/// PETIT-ENFANT) dans un Job Object `KILL_ON_JOB_CLOSE`. À la fermeture du
+/// handle — drop normal, timeout, ou agent-kill — Windows tue TOUT l'arbre,
+/// pas seulement `node` (que `kill_on_drop` couvre déjà mais qui laisse fuir
+/// le chromium orphelin). Même mécanisme que `agents/exec.rs::ProcessTree`, en
+/// variante « par PID » adaptée au `Child` tokio (qui n'expose pas `AsRawHandle`).
+#[cfg(windows)]
+struct KillJob(windows_sys::Win32::Foundation::HANDLE);
+
+// SAFETY: un handle de Job Object Windows n'a pas d'affinité de thread — il est
+// valide et fermable depuis n'importe quel thread. Nécessaire car `_kill_job`
+// est tenu à travers un `.await` dans la future de l'agent (qui doit être Send).
+#[cfg(windows)]
+unsafe impl Send for KillJob {}
+
+#[cfg(windows)]
+impl KillJob {
+    fn for_pid(pid: u32) -> Option<Self> {
+        use std::ptr;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+            JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        };
+        // SAFETY: appels FFI Win32 standards ; chaque handle est vérifié non-null
+        // et refermé sur TOUS les chemins ; best-effort (None à la moindre panne,
+        // l'appelant retombe alors sur le seul `kill_on_drop` de node).
+        unsafe {
+            let job = CreateJobObjectW(ptr::null(), ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) == 0
+            {
+                CloseHandle(job);
+                return None;
+            }
+            // Course infime entre spawn et assign : node met des centaines de ms à
+            // démarrer playwright + chromium, donc le chromium hérite quasi toujours
+            // du job. Bien meilleur que la fuite garantie sans job.
+            let proc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            if proc.is_null() {
+                CloseHandle(job);
+                return None;
+            }
+            let assigned = AssignProcessToJobObject(job, proc) != 0;
+            CloseHandle(proc);
+            if !assigned {
+                CloseHandle(job);
+                return None;
+            }
+            Some(KillJob(job))
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for KillJob {
+    fn drop(&mut self) {
+        // SAFETY: handle valide créé dans `for_pid`, fermé une seule fois ;
+        // KILL_ON_JOB_CLOSE réclame les survivants (node + chromium).
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
 struct PlaywrightShellBackend {
     /// `node_modules` du projet (pour `NODE_PATH`) quand un workspace est ouvert.
     project_root: Option<std::path::PathBuf>,
@@ -203,6 +285,12 @@ impl BrowserBackend for PlaywrightShellBackend {
         }
 
         let child = cmd.spawn().map_err(|e| format!("spawn node: {e}"))?;
+        // Windows : `kill_on_drop` ne tue que `node`, PAS le chromium petit-enfant
+        // que Playwright lance → fuite à l'abandon/timeout. Le Job Object
+        // `KILL_ON_JOB_CLOSE` réclame TOUT l'arbre quand `_kill_job` est droppé
+        // (fin normale, timeout, ou agent-kill via drop de la future).
+        #[cfg(windows)]
+        let _kill_job = child.id().and_then(KillJob::for_pid);
         let out = match tokio::time::timeout(
             Duration::from_secs(HARD_KILL_SECS),
             child.wait_with_output(),
@@ -281,9 +369,14 @@ impl BrowserBackend for ChromiumoxideBackend {
         use chromiumoxide::browser::{Browser, BrowserConfig};
         use futures_util::StreamExt;
 
-        // Headless par défaut dans chromiumoxide. `LAUNCH_FAILED` est le sentinel
-        // que `browser_test_run` reconnaît pour basculer sur Playwright en "auto".
+        // Profil dédié par run : le défaut de chromiumoxide est un user-data-dir
+        // FIXE partagé (temp/chromiumoxide-runner) → deux runs concurrents se
+        // verrouillent. UUID unique + cleanup après fermeture.
+        let profile = std::env::temp_dir().join(format!("shugu-cdp-{}", uuid::Uuid::new_v4()));
+        // Headless par défaut. `LAUNCH_FAILED` = sentinel reconnu par
+        // `browser_test_run` pour basculer sur Playwright en "auto".
         let config = BrowserConfig::builder()
+            .user_data_dir(&profile)
             .build()
             .map_err(|e| format!("LAUNCH_FAILED: config navigateur: {e}"))?;
         let (mut browser, mut handler) = Browser::launch(config)
@@ -298,9 +391,23 @@ impl BrowserBackend for ChromiumoxideBackend {
             }
         });
 
-        let outcome = cdp_inner(&browser, spec, png_path).await;
+        // Garde-fou DUR : `page.goto`/`wait_for_navigation` de chromiumoxide n'ont
+        // PAS de timeout interne — un serveur qui ne répond jamais figerait le
+        // tour de l'agent. On borne tout le corps CDP.
+        let outcome = match tokio::time::timeout(
+            Duration::from_secs(HARD_KILL_SECS),
+            cdp_inner(&browser, spec, png_path),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(format!(
+                "browser_test: délai dépassé ({HARD_KILL_SECS}s) — la page n'a pas fini de charger (chromiumoxide)"
+            )),
+        };
         let _ = browser.close().await;
         handler_task.abort();
+        let _ = std::fs::remove_dir_all(&profile);
         outcome
     }
 }
@@ -325,10 +432,14 @@ async fn cdp_inner(
     page.evaluate_on_new_document(CDP_SHIM.to_string())
         .await
         .map_err(|e| format!("inject shim: {e}"))?;
-    page.goto(url).await.map_err(|e| format!("goto {url}: {e}"))?;
-    page.wait_for_navigation()
+    // Bornage par-opération EN PLUS du garde-fou dur du backend (chromiumoxide
+    // ne timeout pas en interne).
+    tokio::time::timeout(Duration::from_millis(timeout_ms), page.goto(url))
         .await
-        .map_err(|e| format!("wait navigation: {e}"))?;
+        .map_err(|_| format!("goto {url}: délai dépassé ({timeout_ms}ms)"))?
+        .map_err(|e| format!("goto {url}: {e}"))?;
+    // `goto` se résout déjà au load ; ce wait est best-effort et JAMAIS bloquant.
+    let _ = tokio::time::timeout(Duration::from_millis(timeout_ms), page.wait_for_navigation()).await;
 
     if let Some(sel) = spec["waitSelector"].as_str() {
         // Tolère un selector jamais présent (timeout) sans tuer le test —
@@ -549,7 +660,10 @@ pub async fn browser_test_run(
         "playwright" => pw().run(&spec, &png_path).await,
         "chromiumoxide" => ChromiumoxideBackend.run(&spec, &png_path).await,
         "auto" => match ChromiumoxideBackend.run(&spec, &png_path).await {
-            Err(e) if e.contains("LAUNCH_FAILED") => pw().run(&spec, &png_path).await,
+            // `starts_with` (pas `contains`) : le sentinel est en TÊTE de nos
+            // messages de lancement ; un autre message embarquant une URL/texte
+            // contenant "LAUNCH_FAILED" ne doit pas déclencher un faux repli.
+            Err(e) if e.starts_with("LAUNCH_FAILED") => pw().run(&spec, &png_path).await,
             other => other,
         },
         other => {
