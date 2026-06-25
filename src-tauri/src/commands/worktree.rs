@@ -650,12 +650,34 @@ pub(crate) async fn merge_back(root: &Path, branch: &str) -> Result<MergeOutcome
     })
 }
 
-/// Human-readable `git diff --stat <base>..<branch>` summary, run in `root`.
-/// Used to show the user what an UNMERGED (conflicting / declined) worktree
-/// contains so they can review it manually. Empty string when there is no diff.
-pub(crate) async fn diff_summary(root: &Path, branch: &str, base: &str) -> Result<String, String> {
-    let range = format!("{base}..{branch}");
+/// Human-readable `git diff --stat` summary of what `branch` adds ON TOP of
+/// `target`, run in `root`. Used to show the user what an UNMERGED (conflicting /
+/// declined) worktree contains so they can review it manually.
+///
+/// Uses the THREE-DOT range `target...branch`, which git resolves to
+/// `merge-base(target, branch)..branch` — i.e. ONLY the branch's own commits,
+/// never the commits the target already has. This matters when the user's
+/// branch advanced AFTER the worktree was forked (concurrent agents, or just
+/// time passing): a two-dot `entry.base..branch` from the STALE fork OID would
+/// bloat the review diff with unrelated work the user already merged. `target`
+/// is typically the root's current branch name or `HEAD`. Empty string when the
+/// branch adds nothing over the target.
+pub(crate) async fn diff_summary(root: &Path, branch: &str, target: &str) -> Result<String, String> {
+    let range = format!("{target}...{branch}");
     run_git(root, &["diff", "--stat", &range]).await
+}
+
+/// The root's current branch name, or `None` when HEAD is detached (e.g. the
+/// user checked out a raw commit / tag). Callers use `None` to (a) surface a
+/// clear "HEAD détachée" reason and (b) fall back to `HEAD` for diffing.
+pub(crate) async fn current_branch(root: &Path) -> Option<String> {
+    let out = run_git(root, &["symbolic-ref", "--short", "HEAD"]).await.ok()?;
+    let name = out.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 /// Look up a tracked worktree entry by id from the persisted model.
@@ -1112,12 +1134,96 @@ mod tests {
         std::fs::write(wt.join("new.txt"), b"a\nb\nc\n").unwrap();
         commit_worktree(&wt, "add new.txt").await.expect("commit");
 
-        let summary = diff_summary(&root, &entry.branch, &entry.base)
+        // Diff against the root's current branch (the target), not the stale base.
+        let target = current_branch(&root).await.expect("current_branch");
+        let summary = diff_summary(&root, &entry.branch, &target)
             .await
             .expect("diff_summary");
         assert!(summary.contains("new.txt"), "got summary: {summary:?}");
 
         let _ = cleanup_inner(&root, Some(&entry.id), true, false).await;
+        cleanup(&root);
+    }
+
+    /// M1 regression — when the user's target branch advances AFTER the worktree
+    /// is forked, the review diff must contain ONLY the agent's own changes, not
+    /// the commits the target gained in the meantime. A two-dot `base..branch`
+    /// from the stale fork OID would wrongly include `target_only.txt`; the
+    /// three-dot merge-base range used by `diff_summary` must not.
+    #[tokio::test]
+    async fn diff_summary_excludes_commits_already_on_advanced_target() {
+        if which_git().is_none() {
+            return;
+        }
+        let root = make_temp_dir("diff_advanced_target");
+        init_repo(&root);
+
+        // Fork the worktree from the CURRENT HEAD.
+        let entry = create_inner(&root, None, Some("coder"))
+            .await
+            .expect("create");
+        let wt = PathBuf::from(&entry.path);
+
+        // The agent adds ITS file in the worktree and commits.
+        std::fs::write(wt.join("agent_change.txt"), b"agent\n").unwrap();
+        commit_worktree(&wt, "agent change")
+            .await
+            .expect("commit branch");
+
+        // Meanwhile the user's branch ADVANCES with an UNRELATED commit (a file
+        // the agent never touched) — simulating concurrent work / time passing.
+        std::fs::write(root.join("target_only.txt"), b"user moved on\n").unwrap();
+        run(&root, &["add", "target_only.txt"]);
+        run(&root, &["commit", "-q", "-m", "user advances target"]);
+
+        let target = current_branch(&root).await.expect("current_branch");
+        let summary = diff_summary(&root, &entry.branch, &target)
+            .await
+            .expect("diff_summary");
+
+        // The review diff shows the agent's file…
+        assert!(
+            summary.contains("agent_change.txt"),
+            "review diff should include the agent's change, got: {summary:?}"
+        );
+        // …and NOT the commit the target already has (the bug M1 fixes).
+        assert!(
+            !summary.contains("target_only.txt"),
+            "review diff must NOT include commits already on the advanced target, got: {summary:?}"
+        );
+
+        let _ = cleanup_inner(&root, Some(&entry.id), true, false).await;
+        cleanup(&root);
+    }
+
+    /// M2 — `current_branch` returns the branch name normally, and `None` when
+    /// the root's HEAD is detached (so the finalize path can surface an explicit
+    /// "HEAD détachée" reason instead of a generic "merge failed").
+    #[tokio::test]
+    async fn current_branch_detects_detached_head() {
+        if which_git().is_none() {
+            return;
+        }
+        let root = make_temp_dir("detached_head");
+        init_repo(&root);
+
+        // On a branch → Some(name).
+        let on_branch = current_branch(&root).await;
+        assert!(on_branch.is_some(), "expected a branch name, got None");
+
+        // Add a second commit so we have a concrete OID to detach onto.
+        std::fs::write(root.join("second.txt"), b"two\n").unwrap();
+        run(&root, &["add", "second.txt"]);
+        run(&root, &["commit", "-q", "-m", "second"]);
+        let head_oid = run_git(&root, &["rev-parse", "HEAD"]).await.unwrap();
+
+        // Detach HEAD onto the raw commit.
+        run(&root, &["checkout", "-q", head_oid.trim()]);
+        assert!(
+            current_branch(&root).await.is_none(),
+            "detached HEAD should yield None"
+        );
+
         cleanup(&root);
     }
 

@@ -1055,14 +1055,21 @@ async fn finalize_isolation(
     kind: IsolationKind,
 ) {
     use crate::commands::worktree::{
-        cleanup_inner, commit_worktree, diff_summary, merge_back, MergeLock, MergeOutcome,
+        cleanup_inner, commit_worktree, current_branch, diff_summary, merge_back, MergeLock,
+        MergeOutcome,
     };
 
     let wt_path = PathBuf::from(&entry.path);
 
     // Helper: emit a "keep for manual review" finalize carrying the branch diff.
-    // Used for every non-merge outcome (conflict, dirty target, errors). The
-    // worktree + branch are intentionally left on disk.
+    // Used for every non-merge outcome (conflict, dirty target, detached HEAD,
+    // errors). The worktree + branch are intentionally left on disk.
+    //
+    // The review diff is computed against the root's CURRENT branch (or `HEAD`
+    // when detached), NOT the stale fork OID `entry.base` (M1): `diff_summary`
+    // uses the three-dot range so only the agent's own commits show, never work
+    // the user's branch already has from advancing after the worktree was
+    // created.
     async fn emit_keep_for_review(
         app: &AppHandle,
         root: &std::path::Path,
@@ -1070,7 +1077,8 @@ async fn finalize_isolation(
         agent_id: &str,
         reason: &str,
     ) {
-        let diff = diff_summary(root, &entry.branch, &entry.base)
+        let target = current_branch(root).await.unwrap_or_else(|| "HEAD".to_string());
+        let diff = diff_summary(root, &entry.branch, &target)
             .await
             .unwrap_or_default();
         let _ = persist_and_emit(
@@ -1123,6 +1131,22 @@ async fn finalize_isolation(
 
         // ── Success with a commit — attempt the merge-back under the lock. ──
         (IsolationKind::Success, Ok(Some(_oid))) => {
+            // M2 — detached HEAD on root: `merge_back` would (correctly) refuse,
+            // but bubble it as a generic "merge failed". Detect it up front and
+            // give the user an EXPLICIT reason so they understand why their
+            // changes weren't auto-merged. The worktree is kept for review.
+            if current_branch(root).await.is_none() {
+                emit_keep_for_review(
+                    app,
+                    root,
+                    entry,
+                    agent_id,
+                    "HEAD détachée sur le dépôt — pas d'auto-merge ; review manually",
+                )
+                .await;
+                return;
+            }
+
             // Serialize merges so up to MAX_CONCURRENT_AGENTS isolated agents
             // never `git merge` into the same root at once.
             let merge_lock = app.state::<MergeLock>();

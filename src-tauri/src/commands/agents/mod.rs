@@ -493,7 +493,7 @@ pub struct SpawnArgs {
     /// fan-out). Defaults to `false` (absent) — no current caller sets it, so
     /// the single-agent in-place flow is unchanged. Ignored in Plan mode
     /// (read-only never mutates, so it never isolates). Serializes from the
-    /// camelCase `isolate` field. */
+    /// camelCase `isolate` field.
     pub isolate: Option<bool>,
 }
 
