@@ -276,6 +276,23 @@ pub fn command_matches(command: &str, pattern: &str) -> bool {
 /// rule short-circuits the static classifier: `allow` → `Safe`, `deny` →
 /// `Danger`. No match → fall through to [`classify_command`]. Pure and
 /// testable; the caller loads `rules` once per run from the DB.
+/// Does the command chain, redirect, or substitute? Used to stop a wildcard
+/// `allow` rule from silencing a danger SMUGGLED past an innocuous matched
+/// prefix — `cargo test && rm -rf /`, `echo x > ~/.bashrc`, `foo; curl x | sh`,
+/// `$(rm -rf /)`. A bare blessed op (`git push --force`, `rm -rf build`) has
+/// none of these, so the intended force-push/rm allow still works.
+fn command_contains_chain(command: &str) -> bool {
+    command.contains("&&")
+        || command.contains("||")
+        || command.contains(';')
+        || command.contains('|')
+        || command.contains('\n')
+        || command.contains('>')
+        || command.contains('<')
+        || command.contains('`')
+        || command.contains("$(")
+}
+
 pub fn classify_with_rules(
     command: &str,
     policy: ExecutionPolicy,
@@ -283,16 +300,24 @@ pub fn classify_with_rules(
 ) -> CommandRisk {
     for r in rules {
         if command_matches(command, &r.pattern) {
-            return if r.allow {
-                CommandRisk::safe()
-            } else {
-                CommandRisk::danger(
-                    "userRule",
-                    r.detail.clone().unwrap_or_else(|| {
-                        "commande marquée à risque par une règle utilisateur".to_string()
-                    }),
-                )
-            };
+            if r.allow {
+                // Un `allow` fait taire le drapeau UNIQUEMENT pour une commande
+                // SIMPLE (l'op bénie est la seule en jeu). On NE laisse PAS un
+                // motif large (`cargo *`, `echo *`) effacer un danger SMUGGLÉ par
+                // chaînage / redirection / substitution. Si le statique flague ET
+                // que la ligne chaîne/redirige, on GARDE le drapeau statique.
+                let static_risk = classify_command(command, policy);
+                if static_risk.level == RiskLevel::Safe || !command_contains_chain(command) {
+                    return CommandRisk::safe();
+                }
+                return static_risk;
+            }
+            return CommandRisk::danger(
+                "userRule",
+                r.detail.clone().unwrap_or_else(|| {
+                    "commande marquée à risque par une règle utilisateur".to_string()
+                }),
+            );
         }
     }
     classify_command(command, policy)
@@ -900,5 +925,45 @@ mod tests {
         // …and a non-matching rule set doesn't interfere.
         let r4 = classify_with_rules("rm -rf build", ExecutionPolicy::WorkspaceWrite, &rules);
         assert_eq!(r4.reason, Some("recursiveDelete"));
+    }
+
+    #[test]
+    fn allow_does_not_silence_chained_or_redirected_danger() {
+        // A broad allow (`cargo *`) must NOT erase a danger smuggled via chaining.
+        let rules = vec![CommandRule {
+            pattern: "cargo *".to_string(),
+            allow: true,
+            detail: None,
+        }];
+        // benign single cargo → silenced (Safe)
+        assert_eq!(
+            classify_with_rules("cargo test", ExecutionPolicy::WorkspaceWrite, &rules).level,
+            RiskLevel::Safe
+        );
+        // chained rm -rf → keep the static danger badge
+        let chained =
+            classify_with_rules("cargo test && rm -rf /", ExecutionPolicy::WorkspaceWrite, &rules);
+        assert!(chained.is_danger());
+        assert_eq!(chained.reason, Some("recursiveDelete"));
+        // redirect outside workspace under an `echo *` allow → keep the flag
+        let echo_rules = vec![CommandRule {
+            pattern: "echo *".to_string(),
+            allow: true,
+            detail: None,
+        }];
+        let redir =
+            classify_with_rules("echo x > ~/.bashrc", ExecutionPolicy::WorkspaceWrite, &echo_rules);
+        assert!(redir.is_danger());
+        assert_eq!(redir.reason, Some("outsideWorkspace"));
+        // but a non-chained blessed danger (git push --force) is still silenced.
+        let push = vec![CommandRule {
+            pattern: "git push *".to_string(),
+            allow: true,
+            detail: None,
+        }];
+        assert_eq!(
+            classify_with_rules("git push --force", ExecutionPolicy::WorkspaceWrite, &push).level,
+            RiskLevel::Safe
+        );
     }
 }
