@@ -71,6 +71,31 @@ describe("chunkSource", () => {
     const rs = ["fn a() {", "  1", "  1", "  1", "  1", "  1", "fn b() {", "  2", "}"].join("\n");
     expect(chunkSource(rs).length).toBe(2);
   });
+
+  it("treats `export default <Identifier>` as a boundary (C1 parity lock)", () => {
+    // The Rust incremental chunker MUST agree with this exact split. DECL_RE
+    // matches `export default OpsView;` because it backtracks on the optional
+    // `default`: abandoning it lets the keyword group match `def` (a prefix of
+    // `default`). A file with ≥6 lines of context then a bare-identifier default
+    // export splits into [1-6],[7-8]. Keep this fixture identical to the Rust
+    // `chunker_parity_export_default_bare_identifier_splits` test — divergence
+    // here produces orphan/duplicate ids on incremental reindex.
+    const src = [
+      "import { x } from './x';", // 1
+      "// context line", //          2
+      "// context line", //          3
+      "// context line", //          4
+      "// context line", //          5
+      "const view = makeView();", // 6
+      "export default OpsView;", //  7 ← boundary (chunk so far = 6 ≥ MIN)
+      "// trailing", //              8
+    ].join("\n");
+    const r = chunkSource(src);
+    expect(r).toHaveLength(2);
+    expect(r[0]).toMatchObject({ startLine: 1, endLine: 6 });
+    expect(r[1]).toMatchObject({ startLine: 7, endLine: 8 });
+    expect(r[1].text).toContain("export default OpsView;");
+  });
 });
 
 describe("chunkId", () => {

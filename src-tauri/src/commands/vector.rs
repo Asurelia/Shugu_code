@@ -389,41 +389,74 @@ fn md_header_re(line: &str) -> bool {
 /// raw prefixes; every keyword alternative is matched as a prefix exactly as the
 /// regex would (the regex has no trailing `\b`, mirroring chunker.ts verbatim).
 fn decl_re(line: &str) -> bool {
-    let mut rest = line;
-
-    // (?:export\s+(?:default\s+)?)?
-    if let Some(after) = strip_kw_ws(rest, "export") {
-        rest = after;
-        if let Some(after2) = strip_kw_ws(rest, "default") {
-            rest = after2;
+    // (?:export\s+(?:default\s+)?)?  — fully OPTIONAL and, crucially, the inner
+    // (?:default\s+)? is independently optional. The JS engine BACKTRACKS on both:
+    // for "export default OpsView" it first consumes `export default `, fails the
+    // keyword group on "OpsView", then ABANDONS the inner `default\s+` and re-tries
+    // the keyword group on "default OpsView" — where `def` (a keyword) matches as a
+    // prefix → MATCH. A no-backtrack port (consume export AND default, then test
+    // only "OpsView") wrongly returns false and diverges from chunker.ts on every
+    // `export default <Identifier>;` line (a real, common file shape). We replicate
+    // the backtracking by trying the rest-of-pattern at EACH abandonment point:
+    //   1. the original line (export group abandoned entirely),
+    //   2. after `export `      (inner default abandoned),
+    //   3. after `export default ` (inner default consumed).
+    if decl_after_export(line) {
+        return true;
+    }
+    if let Some(after_export) = strip_kw_ws(line, "export") {
+        // (3) with `default ` consumed.
+        if let Some(after_default) = strip_kw_ws(after_export, "default") {
+            if decl_after_export(after_default) {
+                return true;
+            }
+        }
+        // (2) `default` abandoned — continue from just after `export `.
+        if decl_after_export(after_export) {
+            return true;
         }
     }
+    false
+}
 
-    // (?:pub(?:\([^)]*\))?\s+)?
-    if let Some(after) = strip_pub(rest) {
-        rest = after;
+/// The pattern tail AFTER the optional `export[ default]` prefix:
+/// `(?:pub(?:\([^)]*\))?\s+)? (?:<modifier>\s+)* <keyword>`.
+fn decl_after_export(line: &str) -> bool {
+    // (?:pub(?:\([^)]*\))?\s+)? — also backtrackable: `pub` could itself begin a
+    // keyword? No keyword starts with `pub` except `public`, which is handled by
+    // the keyword group on the un-stripped string. So we test BOTH with `pub `
+    // stripped and without.
+    if decl_after_pub(line) {
+        return true;
     }
+    if let Some(after_pub) = strip_pub(line) {
+        if decl_after_pub(after_pub) {
+            return true;
+        }
+    }
+    false
+}
 
-    // (?:public\s+|private\s+|...|unsafe\s+)*  — zero or more, each kw + \s+ —
-    // FOLLOWED BY the required keyword group. The JS regex engine BACKTRACKS:
-    // because `public`/`private`/`protected` appear in BOTH the modifier set and
-    // the keyword set, a line like "public static void …" matches by consuming
-    // ZERO modifiers and letting the keyword group match `public` directly. A
-    // greedy no-backtrack scan (consume `public static`, then fail on `void`)
-    // would WRONGLY reject it and diverge from chunker.ts. We therefore try the
-    // keyword group at every modifier-boundary: after zero modifiers, after one,
-    // after two, …  If it matches at ANY split point, the whole regex matches.
+/// `(?:public\s+|private\s+|...|unsafe\s+)* <keyword>` — zero or more modifiers,
+/// each `kw\s+`, FOLLOWED BY the required keyword group.
+///
+/// The JS regex engine BACKTRACKS: because `public`/`private`/`protected` appear
+/// in BOTH the modifier set and the keyword set, a line like "public static void …"
+/// matches by consuming ZERO modifiers and letting the keyword group match
+/// `public` directly. A greedy no-backtrack scan (consume `public static`, then
+/// fail on `void`) would WRONGLY reject it. We therefore try the keyword group at
+/// every modifier-boundary: after zero modifiers, after one, after two, …  If it
+/// matches at ANY split point, the whole tail matches.
+fn decl_after_pub(line: &str) -> bool {
     const MODIFIERS: &[&str] = &[
         "public", "private", "protected", "internal", "static", "async",
         "abstract", "final", "unsafe",
     ];
+    let mut rest = line;
     loop {
-        // Try the required keyword group AT THIS position first (the engine can
-        // stop consuming modifiers here and hand off to the keyword alternative).
         if matches_decl_keyword(rest) {
             return true;
         }
-        // Otherwise consume one more modifier and retry; stop when none match.
         let mut advanced = false;
         for kw in MODIFIERS {
             if let Some(after) = strip_kw_ws(rest, kw) {
@@ -521,6 +554,11 @@ fn chunk_source(text: &str) -> Vec<(String, usize, usize)> {
         *start = end_exclusive;
     };
 
+    // Index loop (not an iterator): the body needs `i` for BOTH the running
+    // chunk size `i - start` AND `flush(.., i)`. A `.enumerate()` form would still
+    // index `lines[i]`, so the range loop is the clearest faithful port of the
+    // 1:1 chunker.ts `for (let i = 0; ...)` — keep it.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..lines.len() {
         let size_so_far = i - start;
         let at_boundary = i > start && is_boundary(lines[i]) && size_so_far >= MIN_CHUNK_LINES;
@@ -571,7 +609,13 @@ const MAX_FILE_BYTES: usize = 200_000;
 /// three workspaceIndexer gates: extension not in EXCLUDE_EXTS, byte size within
 /// MAX_FILE_BYTES, and non-empty (trimmed) content.
 fn is_code_eligible(rel: &str, text: &str) -> bool {
-    if text.len() > MAX_FILE_BYTES {
+    // Size guard parity: workspaceIndexer.ts gates on `content.text.length`, which
+    // in JS is the UTF-16 CODE UNIT count — NOT bytes. A file of multibyte text
+    // (CJK, emoji) has more UTF-8 bytes than UTF-16 units, so `text.len()` (bytes)
+    // would reject a file the TS indexer accepts → the two indexers would disagree
+    // on which files are eligible. Count UTF-16 units to match `.length` exactly.
+    let utf16_len: usize = text.chars().map(char::len_utf16).sum();
+    if utf16_len > MAX_FILE_BYTES {
         return false;
     }
     if text.trim().is_empty() {
@@ -1502,6 +1546,18 @@ mod tests {
         assert!(is_boundary("#[derive(Debug)]"));
         assert!(is_boundary("# Markdown header"));
         assert!(is_boundary("###### h6"));
+        // C1 REGRESSION (CRITICAL) — `export default <bare identifier>` MUST be a
+        // boundary. The JS DECL_RE matches it because it backtracks on the optional
+        // `default`: it abandons `default\s+` and the keyword group then matches
+        // `def` as a prefix of `default`. Verified empirically against the live JS
+        // regex. A no-backtrack port returned false here → 2-vs-1 chunk divergence
+        // → orphan/duplicate ids on incremental reindex. See decl_re().
+        assert!(is_boundary("export default OpsView;"));
+        assert!(is_boundary("export default Foo"));
+        assert!(is_boundary("export default deffo"), "abandon `default`, `def` matches `default`");
+        assert!(is_boundary("export deffo"), "`def` prefix matches on bare ident after export");
+        assert!(is_boundary("export funcky()"), "`func` prefix matches after export");
+        assert!(is_boundary("export const x = 1"));
         // Negative cases.
         assert!(!is_boundary("  function indented() {"), "col-0 required");
         assert!(!is_boundary(""), "empty line is not a boundary");
@@ -1509,6 +1565,35 @@ mod tests {
         assert!(!is_boundary("####### too many hashes"), ">6 hashes is not MD");
         assert!(!is_boundary("#noheaderspace"), "MD header needs a space");
         assert!(!is_boundary("return 1;"), "plain statement");
+        // C1 negatives: `export <bare non-keyword identifier>` is NOT a boundary
+        // (no keyword prefix matches after abandoning the optional groups).
+        assert!(!is_boundary("export Foo"), "bare ident, no keyword prefix");
+        assert!(!is_boundary("export Widget"), "bare ident, no keyword prefix");
+    }
+
+    #[test]
+    fn chunker_parity_export_default_bare_identifier_splits() {
+        // C1 REGRESSION at the CHUNK level: a file with >=6 lines of context then
+        // `export default OpsView;` must split into TWO chunks [1-6],[7-8], exactly
+        // like chunker.test.ts. Before the export-default backtracking fix, the
+        // Rust port produced ONE chunk [1-8] → different ids than TS → corruption.
+        let src = [
+            "import { x } from './x';", // 1
+            "// context line",          // 2
+            "// context line",          // 3
+            "// context line",          // 4
+            "// context line",          // 5
+            "const view = makeView();", // 6
+            "export default OpsView;",   // 7 ← boundary (chunk so far = 6 >= MIN)
+            "// trailing",              // 8
+        ]
+        .join("\n");
+        let r = chunk_source(&src);
+        assert_eq!(r.len(), 2, "export default <Identifier> must start a new chunk");
+        assert_eq!((r[0].1, r[0].2), (1, 6));
+        assert_eq!((r[1].1, r[1].2), (7, 8));
+        assert!(r[1].0.contains("export default OpsView;"));
+        assert_chunk_invariants(&src, &r);
     }
 
     // -----------------------------------------------------------------------
@@ -1537,6 +1622,28 @@ mod tests {
         assert!(is_code_eligible("src/exact.ts", &at_cap));
         // Extension is the LAST dot-segment: foo.min.js → "js" (kept).
         assert!(is_code_eligible("bundle.min.js", "var x=1"));
+
+        // M2 — size guard counts UTF-16 CODE UNITS (matching TS `.length`), NOT
+        // UTF-8 bytes. A BMP char like 'é' (U+00E9) is 1 UTF-16 unit but 2 UTF-8
+        // bytes. A file of MAX_FILE_BYTES such chars is exactly at the JS `.length`
+        // cap (eligible) even though it is ~2x MAX_FILE_BYTES in UTF-8 bytes — a
+        // byte-based guard would WRONGLY reject a file the TS indexer accepts.
+        let multibyte_at_cap = "é".repeat(MAX_FILE_BYTES); // UTF-16 len == MAX, bytes == 2*MAX
+        assert_eq!(
+            multibyte_at_cap.chars().map(char::len_utf16).sum::<usize>(),
+            MAX_FILE_BYTES
+        );
+        assert!(multibyte_at_cap.len() > MAX_FILE_BYTES, "byte len exceeds cap");
+        assert!(
+            is_code_eligible("src/accents.ts", &multibyte_at_cap),
+            "UTF-16-unit count at the cap must be eligible (parity with TS .length)"
+        );
+        // One UTF-16 unit over the cap → rejected.
+        let multibyte_over = "é".repeat(MAX_FILE_BYTES + 1);
+        assert!(!is_code_eligible("src/accents_over.ts", &multibyte_over));
+        // An astral char (e.g. emoji U+1F600) is 2 UTF-16 units; two of them are
+        // 4 units in JS — confirm we count surrogate pairs as 2, not 1.
+        assert_eq!("😀😀".chars().map(char::len_utf16).sum::<usize>(), 4);
     }
 
     // -----------------------------------------------------------------------

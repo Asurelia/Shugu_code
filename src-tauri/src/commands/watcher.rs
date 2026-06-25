@@ -262,18 +262,20 @@ fn debouncer_loop(rx_evt: Receiver<(ChangeKind, Vec<PathBuf>)>, app: tauri::AppH
     }
 }
 
-/// Flush the accumulated reindex buffer: relativize each absolute path to the
-/// workspace root, drop ignored / out-of-root / directory paths, and either
-/// (storm) emit `vec://index-stale`, or feed each surviving file into the
-/// vector index. Always clears `pending`. Never panics; per-file errors are
-/// counted and logged ONCE per window.
+/// Flush the accumulated reindex buffer. Resolves the workspace root, hands the
+/// (kind, abs-path) pairs to the PURE `plan_reindex` (relativize + filter ignored
+/// / out-of-root + dedupe + storm guard — the exact logic the watcher tests
+/// cover), then ACTS on the returned `ReindexPlan`: emit `vec://index-stale` on a
+/// storm, or feed each surviving file into the vector index. Always clears
+/// `pending`. Never panics; per-file errors are counted and logged ONCE per window.
 fn flush_reindex(app: &tauri::AppHandle, pending: &mut HashMap<PathBuf, ChangeKind>) {
     if pending.is_empty() {
         return;
     }
     // Drain the buffer regardless of outcome so a transient error can't pin
     // stale entries into the next window.
-    let drained: Vec<(PathBuf, ChangeKind)> = pending.drain().collect();
+    let drained: Vec<(ChangeKind, PathBuf)> =
+        pending.drain().map(|(p, k)| (k, p)).collect();
 
     // Resolve the workspace root from managed state. If none is open we can't
     // relativize — drop the batch (the next full index/reopen rebuilds it).
@@ -285,75 +287,52 @@ fn flush_reindex(app: &tauri::AppHandle, pending: &mut HashMap<PathBuf, ChangeKi
         Err(_) => return,
     };
 
-    // Relativize + filter to workspace-relative FILE paths. We dedupe by the
-    // relative path (a rename can yield two abs paths mapping to the same rel).
-    let mut rel_changes: HashMap<String, ChangeKind> = HashMap::new();
-    for (abs, kind) in drained {
-        if let Some(rel) = relativize(&root, &abs) {
-            // Skip anything under an ignored directory (mirrors should_forward,
-            // which only checks at the EVENT level — a mixed event can still
-            // carry an ignored path).
-            if rel
-                .split('/')
-                .any(|seg| !seg.is_empty() && is_ignored(seg))
-            {
-                continue;
-            }
-            // Drop obvious directory events: a Removed dir has no index entry,
-            // and an Added/Modified dir isn't a file to embed. We can't stat a
-            // removed path, so we rely on `index_file_internal` no-op'ing a
-            // non-file on the AddedOrModified side; for Removed we just attempt a
-            // delete (a no-op when nothing was indexed under that key).
-            rel_changes.insert(rel, kind);
-        }
-    }
-
-    if rel_changes.is_empty() {
-        return;
-    }
-
-    // STORM GUARD — a checkout / branch switch / mass install touches far more
-    // files than an interactive edit. Above the threshold, skip per-file work
-    // and tell the UI the index is stale (offer a full reindex) instead of
-    // hammering the embedding model thousands of times on the watcher thread.
-    if rel_changes.len() > REINDEX_MAX_FILES {
-        eprintln!(
-            "[watcher] reindex storm: {} files changed (> {}), emitting vec://index-stale",
-            rel_changes.len(),
-            REINDEX_MAX_FILES
-        );
-        if let Err(e) = app.emit("vec://index-stale", ()) {
-            eprintln!("[watcher] emit vec://index-stale failed: {e}");
-        }
-        return;
-    }
-
-    // Per-file reindex. Embeddings run HERE, on the debouncer thread — never on
-    // the renderer. One error counter + a single eprintln per window keeps the
-    // log readable when (e.g.) the embedding model isn't ready yet.
-    let mut errors = 0usize;
-    let mut first_err: Option<String> = None;
-    for (rel, kind) in rel_changes {
-        let result = match kind {
-            ChangeKind::AddedOrModified => {
-                crate::commands::vector::index_file_internal(app, &root, &rel).map(|_| ())
-            }
-            ChangeKind::Removed => {
-                crate::commands::vector::delete_file_index_internal(app, &rel)
-            }
-        };
-        if let Err(e) = result {
-            errors += 1;
-            if first_err.is_none() {
-                first_err = Some(e);
+    // The relativize / filter / dedupe / storm-guard DECISION is the pure
+    // `plan_reindex` — the SAME function the unit tests exercise, so the tests
+    // now cover the real flush path (no duplicated logic to drift out of sync).
+    match plan_reindex(&root, &drained) {
+        ReindexPlan::Storm { unique_files } => {
+            // STORM — a checkout / branch switch / mass install touches far more
+            // files than an interactive edit. Skip per-file work and tell the UI
+            // the index is stale (offer a full reindex) instead of hammering the
+            // embedding model thousands of times on the watcher thread.
+            eprintln!(
+                "[watcher] reindex storm: {unique_files} files changed (> {REINDEX_MAX_FILES}), \
+                 emitting vec://index-stale"
+            );
+            if let Err(e) = app.emit("vec://index-stale", ()) {
+                eprintln!("[watcher] emit vec://index-stale failed: {e}");
             }
         }
-    }
-    if errors > 0 {
-        eprintln!(
-            "[watcher] reindex: {errors} file(s) failed this window (first: {})",
-            first_err.as_deref().unwrap_or("?")
-        );
+        ReindexPlan::Files(files) => {
+            // Per-file reindex. Embeddings run HERE, on the debouncer thread —
+            // never on the renderer. One error counter + a single eprintln per
+            // window keeps the log readable when (e.g.) the model isn't ready yet.
+            let mut errors = 0usize;
+            let mut first_err: Option<String> = None;
+            for (rel, kind) in files {
+                let result = match kind {
+                    ChangeKind::AddedOrModified => {
+                        crate::commands::vector::index_file_internal(app, &root, &rel).map(|_| ())
+                    }
+                    ChangeKind::Removed => {
+                        crate::commands::vector::delete_file_index_internal(app, &rel)
+                    }
+                };
+                if let Err(e) = result {
+                    errors += 1;
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+            if errors > 0 {
+                eprintln!(
+                    "[watcher] reindex: {errors} file(s) failed this window (first: {})",
+                    first_err.as_deref().unwrap_or("?")
+                );
+            }
+        }
     }
 }
 
@@ -409,18 +388,19 @@ fn should_forward(event: &Event) -> bool {
 /// Outcome of planning a reindex window: either a per-file action list, or a
 /// storm signal (too many files → emit `vec://index-stale` instead).
 #[derive(Debug, PartialEq, Eq)]
-pub enum ReindexPlan {
+enum ReindexPlan {
     /// Per-file changes, deduped by workspace-relative path.
     Files(Vec<(String, ChangeKind)>),
     /// The window exceeded `REINDEX_MAX_FILES` unique files — reindex is stale.
     Storm { unique_files: usize },
 }
 
-/// Pure planner mirroring `flush_reindex`'s decision logic, factored out so it
-/// can be unit-tested without an `AppHandle`/managed state: relativize each abs
-/// path against `root`, drop ignored / out-of-root paths, dedupe by rel path,
-/// and apply the storm guard. The returned `Files` vec is sorted for
-/// deterministic assertions.
+/// Pure planner that IS the reindex-window decision logic — `flush_reindex`
+/// calls this directly (so the watcher tests below cover the real path, with no
+/// duplicated logic to drift). Relativizes each abs path against `root`, drops
+/// ignored / out-of-root paths, dedupes by rel path (last writer wins), and
+/// applies the storm guard. The returned `Files` vec is sorted by rel path for
+/// deterministic ordering.
 fn plan_reindex(root: &Path, events: &[(ChangeKind, PathBuf)]) -> ReindexPlan {
     let mut rel_changes: HashMap<String, ChangeKind> = HashMap::new();
     for (kind, abs) in events {
