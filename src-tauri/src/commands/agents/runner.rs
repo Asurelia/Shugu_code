@@ -739,6 +739,15 @@ pub(super) async fn run_agent_task(
     // Modèle conseiller distinct pour l'outil `advisor` (v2). `None` ⇒ le
     // conseiller est le modèle de l'exécuteur (auto-consultation).
     advisor: Option<AdvisorConfig>,
+    // Phase 3 — worktree-per-agent isolation. When `true`, the agent runs inside
+    // a FRESH git worktree on its own branch (off the committed HEAD); all its
+    // tools + the run_command sandbox retarget there automatically (via
+    // `workspace_override`), and after the run its changes are merged back into
+    // the user's tree (or kept for manual review on conflict). DEFAULT `false`
+    // everywhere — no current caller opts in, so the in-place flow is unchanged.
+    // Ignored when `workspace_override` is already Some (Atelier) or `read_only`
+    // (Plan): those never isolate.
+    isolate: bool,
 ) {
     let start = std::time::Instant::now();
     let protocol = protocol.unwrap_or_else(|| "openai".to_string());
@@ -816,15 +825,68 @@ pub(super) async fn run_agent_task(
         content: task,
     });
 
+    // Phase 3 — worktree-per-agent isolation. When the caller opted in
+    // (`isolate=true`) AND we are on the real workspace (no override) AND we are
+    // allowed to mutate (not read_only), spin up a FRESH git worktree on its own
+    // branch off the committed HEAD and retarget the whole run there by setting
+    // `workspace_override`. Every tool + the run_command LOW-integrity sandbox
+    // then resolves against the worktree automatically (no tool-code change), and
+    // the checkpoint block below auto-skips (worktree IS the rollback unit).
+    //
+    // Strictly best-effort and NEVER blocking: a missing workspace, a non-git
+    // dir, or a worktree-creation failure logs and continues IN-PLACE (the exact
+    // pre-Phase-3 behaviour). `iso_root`/`iso_entry` carry the merge-back context
+    // to `finalize_isolation` after the run; they stay `None` when we didn't
+    // isolate, so the finalize step is a no-op on every existing path.
+    let mut workspace_override = workspace_override;
+    let mut iso_root: Option<PathBuf> = None;
+    let mut iso_entry: Option<crate::commands::worktree::WorktreeEntry> = None;
+    if isolate && workspace_override.is_none() && !read_only {
+        if let Some(root) = get_workspace_root(&app) {
+            if root.join(".git").exists() {
+                match crate::commands::worktree::create_inner(&root, None, Some(&role)).await {
+                    Ok(entry) => {
+                        eprintln!(
+                            "[agents] isolation: worktree {} on branch {} (agent={agent_id})",
+                            entry.path, entry.branch
+                        );
+                        let _ = persist_and_emit(
+                            &app,
+                            &AgentEvent::WorktreeStarted {
+                                agent_id: agent_id.clone(),
+                                path: entry.path.clone(),
+                                branch: entry.branch.clone(),
+                            },
+                        );
+                        workspace_override = Some(PathBuf::from(&entry.path));
+                        iso_root = Some(root);
+                        iso_entry = Some(entry);
+                    }
+                    Err(e) => {
+                        eprintln!("[agents] isolation skipped (worktree create failed): {e}");
+                    }
+                }
+            } else {
+                eprintln!(
+                    "[agents] isolation skipped: workspace is not a git repo (agent={agent_id})"
+                );
+            }
+        } else {
+            eprintln!("[agents] isolation skipped: no workspace open (agent={agent_id})");
+        }
+    }
+
     // Lot 0 — auto-checkpoint du working-tree AVANT que l'agent agisse, pour que
     // l'utilisateur puisse annuler tout le run d'un clic (« laisse tourner, annule
     // si moche »). Ref fantôme refs/shugu/turn/<agent_id> — ne touche jamais
     // l'index/HEAD/branches de l'utilisateur (cf. snapshot.rs). Sauté pour le
     // dossier jetable de l'Atelier (workspace_override Some) et les runs Plan
-    // (read_only, aucune mutation). Best-effort : un échec (pas de workspace, pas
-    // un dépôt git) est loggé et le run continue — un checkpoint ne doit JAMAIS
-    // bloquer un agent. Récupérable via `shugu_snapshot_list`, annulable via
-    // `shugu_snapshot_revert` (turn_id = agent_id).
+    // (read_only, aucune mutation). Sauté aussi quand on isole (workspace_override
+    // devient Some ci-dessus → le worktree EST l'unité de rollback). Best-effort :
+    // un échec (pas de workspace, pas un dépôt git) est loggé et le run continue —
+    // un checkpoint ne doit JAMAIS bloquer un agent. Récupérable via
+    // `shugu_snapshot_list`, annulable via `shugu_snapshot_revert` (turn_id =
+    // agent_id).
     if workspace_override.is_none() && !read_only {
         if let Some(root) = get_workspace_root(&app) {
             if root.join(".git").exists() {
@@ -874,6 +936,30 @@ pub(super) async fn run_agent_task(
         ) => r,
         _ = abort.notified() => {
             mark_killed(&app, &agent_id);
+            // Phase 3 — killed mid-flight: DISCARD the isolated worktree (its
+            // edits are abandoned with the run). No-op when not isolating.
+            // Best-effort + non-panicking on the kill path.
+            if let (Some(root), Some(entry)) = (iso_root.as_ref(), iso_entry.as_ref()) {
+                let _ = crate::commands::worktree::cleanup_inner(
+                    root,
+                    Some(&entry.id),
+                    true,
+                    false,
+                )
+                .await;
+                let _ = persist_and_emit(
+                    &app,
+                    &AgentEvent::WorktreeFinalized {
+                        agent_id: agent_id.clone(),
+                        outcome: "discarded".to_string(),
+                        branch: None,
+                        path: None,
+                        commit: None,
+                        diff: None,
+                        reason: None,
+                    },
+                );
+            }
             return;
         }
     };
@@ -918,12 +1004,189 @@ pub(super) async fn run_agent_task(
                     ms,
                 },
             );
+            // Phase 3 — run succeeded: commit the worktree and merge it back into
+            // the user's tree (or keep it for manual review on conflict/dirty).
+            // No-op when not isolating.
+            if let (Some(root), Some(entry)) = (iso_root.as_ref(), iso_entry.as_ref()) {
+                finalize_isolation(&app, root, entry, &agent_id, IsolationKind::Success).await;
+            }
             if let Ok(mut g) = state.lock() {
                 g.remove(&agent_id);
             }
         }
         Err(e) => {
             finish_error(&app, &state, &agent_id, &e);
+            // Phase 3 — run errored: commit whatever the agent produced and KEEP
+            // the worktree + branch for manual review (never auto-merge a failed
+            // run). No-op when not isolating.
+            if let (Some(root), Some(entry)) = (iso_root.as_ref(), iso_entry.as_ref()) {
+                finalize_isolation(&app, root, entry, &agent_id, IsolationKind::Error).await;
+            }
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Phase 3 — worktree isolation finalize
+// ────────────────────────────────────────────────────────────────────
+
+/// How the isolated run ended — decides the merge-back policy.
+enum IsolationKind {
+    /// The tool loop returned `Ok` — we may attempt a merge-back.
+    Success,
+    /// The tool loop returned `Err` — never auto-merge; keep for review.
+    Error,
+}
+
+/// Finalize an isolated agent run: commit its worktree, then either merge the
+/// branch back into the user's tree (on success + a clean merge) or KEEP the
+/// worktree + branch for manual review (on conflict, dirty target, error, or a
+/// commit/merge failure). Emits exactly one `AgentEvent::WorktreeFinalized`
+/// describing the outcome. Entirely best-effort and non-panicking: any git
+/// failure degrades to "keep + review" rather than disturbing the user's tree.
+///
+/// Only ever called when the run actually isolated (`iso_root`/`iso_entry` are
+/// `Some`); on every non-isolated path this code never runs.
+async fn finalize_isolation(
+    app: &AppHandle,
+    root: &std::path::Path,
+    entry: &crate::commands::worktree::WorktreeEntry,
+    agent_id: &str,
+    kind: IsolationKind,
+) {
+    use crate::commands::worktree::{
+        cleanup_inner, commit_worktree, diff_summary, merge_back, MergeLock, MergeOutcome,
+    };
+
+    let wt_path = PathBuf::from(&entry.path);
+
+    // Helper: emit a "keep for manual review" finalize carrying the branch diff.
+    // Used for every non-merge outcome (conflict, dirty target, errors). The
+    // worktree + branch are intentionally left on disk.
+    async fn emit_keep_for_review(
+        app: &AppHandle,
+        root: &std::path::Path,
+        entry: &crate::commands::worktree::WorktreeEntry,
+        agent_id: &str,
+        reason: &str,
+    ) {
+        let diff = diff_summary(root, &entry.branch, &entry.base)
+            .await
+            .unwrap_or_default();
+        let _ = persist_and_emit(
+            app,
+            &AgentEvent::WorktreeFinalized {
+                agent_id: agent_id.to_string(),
+                outcome: "diff".to_string(),
+                branch: Some(entry.branch.clone()),
+                path: Some(entry.path.clone()),
+                commit: None,
+                diff: if diff.trim().is_empty() { None } else { Some(diff) },
+                reason: Some(reason.to_string()),
+            },
+        );
+    }
+
+    // 1. Commit whatever the agent left in the worktree.
+    let committed = commit_worktree(&wt_path, &format!("shugu agent {agent_id}")).await;
+
+    match (kind, committed) {
+        // ── Run errored — never auto-merge. Commit what exists (best-effort),
+        //    keep the worktree, surface the diff so the user can review it. ──
+        (IsolationKind::Error, _) => {
+            emit_keep_for_review(app, root, entry, agent_id, "error — review manually").await;
+        }
+
+        // ── Success, but the commit step itself failed — keep for review. ──
+        (IsolationKind::Success, Err(e)) => {
+            eprintln!("[agents] isolation commit failed (agent={agent_id}): {e}");
+            emit_keep_for_review(app, root, entry, agent_id, "commit failed — review manually")
+                .await;
+        }
+
+        // ── Success with nothing to commit — clean up silently. ──
+        (IsolationKind::Success, Ok(None)) => {
+            let _ = cleanup_inner(root, Some(&entry.id), true, false).await;
+            let _ = persist_and_emit(
+                app,
+                &AgentEvent::WorktreeFinalized {
+                    agent_id: agent_id.to_string(),
+                    outcome: "no-changes".to_string(),
+                    branch: None,
+                    path: None,
+                    commit: None,
+                    diff: None,
+                    reason: None,
+                },
+            );
+        }
+
+        // ── Success with a commit — attempt the merge-back under the lock. ──
+        (IsolationKind::Success, Ok(Some(_oid))) => {
+            // Serialize merges so up to MAX_CONCURRENT_AGENTS isolated agents
+            // never `git merge` into the same root at once.
+            let merge_lock = app.state::<MergeLock>();
+            let _guard = merge_lock.0.lock().await;
+
+            match merge_back(root, &entry.branch).await {
+                Ok(MergeOutcome::Merged { commit }) => {
+                    // Merged cleanly — the changes are in the user's tree; the
+                    // worktree is no longer needed.
+                    let _ = cleanup_inner(root, Some(&entry.id), true, false).await;
+                    let _ = persist_and_emit(
+                        app,
+                        &AgentEvent::WorktreeFinalized {
+                            agent_id: agent_id.to_string(),
+                            outcome: "merged".to_string(),
+                            branch: None,
+                            path: None,
+                            commit: Some(commit),
+                            diff: None,
+                            reason: None,
+                        },
+                    );
+                }
+                Ok(MergeOutcome::NoChanges) => {
+                    // The branch added no commits over the target — nothing to
+                    // land. Clean up.
+                    let _ = cleanup_inner(root, Some(&entry.id), true, false).await;
+                    let _ = persist_and_emit(
+                        app,
+                        &AgentEvent::WorktreeFinalized {
+                            agent_id: agent_id.to_string(),
+                            outcome: "no-changes".to_string(),
+                            branch: None,
+                            path: None,
+                            commit: None,
+                            diff: None,
+                            reason: None,
+                        },
+                    );
+                }
+                Ok(MergeOutcome::Conflict { files }) => {
+                    let reason = if files.is_empty() {
+                        "merge conflict — review manually".to_string()
+                    } else {
+                        format!("merge conflict on {} — review manually", files.join(", "))
+                    };
+                    emit_keep_for_review(app, root, entry, agent_id, &reason).await;
+                }
+                Ok(MergeOutcome::DirtyTarget) => {
+                    emit_keep_for_review(
+                        app,
+                        root,
+                        entry,
+                        agent_id,
+                        "target has uncommitted overlapping edits — review manually",
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    eprintln!("[agents] isolation merge failed (agent={agent_id}): {e}");
+                    emit_keep_for_review(app, root, entry, agent_id, "merge failed — review manually")
+                        .await;
+                }
+            }
         }
     }
 }

@@ -993,6 +993,14 @@ async function handleDelegate(
       advisorProtocol: advisor?.protocol,
       advisorBaseUrl: advisor?.baseUrl,
       advisorApiKey: advisor?.apiKey,
+      // Phase 3 — worktree-per-agent isolation. DELIBERATELY NOT SET here: the
+      // chat delegation runs a SINGLE orchestrator agent IN-PLACE on the real
+      // workspace (the git tab + per-turn checkpoint are the safety net). Leaving
+      // `isolate` undefined keeps the runner's default-OFF in-place behaviour
+      // byte-identical. The mechanism (worktree + merge-back) ships dormant; a
+      // FUTURE chat fan-out that spawns several agents at once should pass
+      // `isolate: true` HERE (gated behind its own fan-out flag, default OFF) so
+      // parallel agents don't clobber each other's edits in the shared tree.
     });
   } catch (err) {
     await appendMessage(convId, {

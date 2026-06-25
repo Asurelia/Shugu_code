@@ -361,6 +361,41 @@ pub enum AgentEvent {
         path: String,
         thumb_data_url: String,
     },
+    /// Phase 3 — an isolated agent run started inside a FRESH git worktree.
+    /// Emitted once, right after the worktree is created and BEFORE the tool
+    /// loop runs. `path` is the worktree's working dir, `branch` its fresh
+    /// branch. Only ever emitted when a caller opted into isolation
+    /// (`isolate=true`); the default in-place path never emits it.
+    WorktreeStarted {
+        agent_id: String,
+        path: String,
+        branch: String,
+    },
+    /// Phase 3 — an isolated agent run finished and its worktree was finalized.
+    /// `outcome` is one of:
+    ///   * `"merged"`     — branch merged cleanly into the user's tree (`commit`
+    ///                      is the merge commit); worktree removed.
+    ///   * `"no-changes"` — the agent produced nothing to land; worktree removed.
+    ///   * `"discarded"`  — the run was killed mid-flight; worktree discarded.
+    ///   * `"diff"`       — the changes were KEPT for manual review (conflict,
+    ///                      dirty target, or error). `branch`/`path` point at the
+    ///                      kept worktree, `diff` is a `git diff --stat` summary,
+    ///                      and `reason` explains why it wasn't auto-merged.
+    /// Only ever emitted when a caller opted into isolation.
+    WorktreeFinalized {
+        agent_id: String,
+        outcome: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        commit: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        diff: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 impl AgentEvent {
@@ -381,6 +416,8 @@ impl AgentEvent {
             AgentEvent::MemoryCompacted { .. } => "memoryCompacted",
             AgentEvent::Write { .. } => "write",
             AgentEvent::Screenshot { .. } => "screenshot",
+            AgentEvent::WorktreeStarted { .. } => "worktreeStarted",
+            AgentEvent::WorktreeFinalized { .. } => "worktreeFinalized",
         }
     }
 
@@ -400,7 +437,9 @@ impl AgentEvent {
             | AgentEvent::MemoryRecalled { agent_id, .. }
             | AgentEvent::MemoryCompacted { agent_id, .. }
             | AgentEvent::Write { agent_id, .. }
-            | AgentEvent::Screenshot { agent_id, .. } => agent_id,
+            | AgentEvent::Screenshot { agent_id, .. }
+            | AgentEvent::WorktreeStarted { agent_id, .. }
+            | AgentEvent::WorktreeFinalized { agent_id, .. } => agent_id,
         }
     }
 }
@@ -448,6 +487,14 @@ pub struct SpawnArgs {
     pub advisor_protocol: Option<String>,
     pub advisor_base_url: Option<String>,
     pub advisor_api_key: Option<String>,
+    /// Phase 3 — worktree-per-agent isolation opt-in. When `Some(true)`, the
+    /// agent runs inside a fresh git worktree and its changes are merged back at
+    /// the end (parity with Cursor's per-agent isolation, for a future chat
+    /// fan-out). Defaults to `false` (absent) — no current caller sets it, so
+    /// the single-agent in-place flow is unchanged. Ignored in Plan mode
+    /// (read-only never mutates, so it never isolates). Serializes from the
+    /// camelCase `isolate` field. */
+    pub isolate: Option<bool>,
 }
 
 /// Arguments for an Atelier run (env-grounded build→test→learn loop). Mirrors the
@@ -854,6 +901,10 @@ pub async fn agent_spawn(
     // Mode Plan → lecture seule. Le sélecteur de chat envoie `mode: "plan"` ;
     // tout le reste (agent / Atelier / Studio) reste en exécution complète.
     let read_only_for_task = args.mode.as_deref() == Some("plan");
+    // Phase 3 — isolation opt-in. Only honoured when the caller explicitly set
+    // `isolate: true` AND the run can mutate (never in Plan/read-only). Defaults
+    // OFF: no current caller passes it, so every existing path stays in-place.
+    let isolate_for_task = args.isolate.unwrap_or(false) && !read_only_for_task;
     // Mémoire de conversation : le chemin chat passe la conv pour recharger les
     // tours précédents dans l'historique de l'agent.
     let conversation_id_for_task = args.conversation_id.clone();
@@ -905,6 +956,7 @@ pub async fn agent_spawn(
             read_only_for_task, // Plan mode ⇒ outils mutants retirés + refusés
             conversation_id_for_task, // recharge les tours précédents de la conv
             advisor_for_task, // modèle conseiller distinct (v2) ou None
+            isolate_for_task, // Phase 3 — worktree-per-agent (default OFF)
         )
         .await;
     });
@@ -1022,6 +1074,7 @@ pub async fn agent_atelier_run(
             false, // read_only — l'Atelier doit écrire/exécuter (build→test→learn)
             None,  // conversation_id — l'Atelier n'est pas lié à une conversation
             None,  // advisor — pas de conseiller distinct pour l'Atelier
+            false, // isolate — l'Atelier a DÉJÀ son dossier jetable (override Some)
         )
         .await;
         // The creation dir is intentionally left on disk so the preview pane can
@@ -1169,6 +1222,7 @@ pub async fn agent_grounded_run(
             false, // read_only — Grounded Run écrit/exécute sur le vrai projet
             None,  // conversation_id — Grounded Run n'est pas lié à une conversation
             None,  // advisor — pas de conseiller distinct pour Grounded Run
+            false, // isolate — Grounded Run travaille DÉLIBÉRÉMENT sur le vrai arbre
         )
         .await;
     });

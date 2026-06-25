@@ -549,6 +549,10 @@ pub fn run() {
         // Lot C — registre des connexions MCP vives (un RunningService par serveur).
         .manage(commands::mcp::McpManager::default())
         .manage(commands::chat::ChatAbortRegistry::default())
+        // Phase 3 — merge-back lock. Isolated agents (worktree-per-agent) acquire
+        // this around `merge_back` so up to MAX_CONCURRENT_AGENTS concurrent runs
+        // serialize their merges into the user's tree (no two `git merge` at once).
+        .manage(commands::worktree::MergeLock(tokio::sync::Mutex::new(())))
         // LOT 3 — LSP server registry (un LspSession par langId).
         .manage(commands::lsp::LspServerRegistry::default())
         .setup(|app| {

@@ -40,7 +40,9 @@ export type AgentEventKind =
   | "skillLearned"
   | "lessonsInjected"
   | "write"
-  | "screenshot";
+  | "screenshot"
+  | "worktreeStarted"
+  | "worktreeFinalized";
 
 // ────────────────────────────────────────────────────────────────────
 // DB row shapes (mirror Rust AgentRow / AgentEventRow)
@@ -167,6 +169,32 @@ export type AgentEvent =
       /** Miniature 512 px en data URL — affichée dans le fil (persistée dans
        *  agent_events, survit au reload). */
       thumbDataUrl: string;
+    }
+  | {
+      kind: "worktreeStarted";
+      agentId: string;
+      /** Working dir of the fresh worktree the isolated agent runs in. */
+      path: string;
+      /** The fresh branch the worktree checked out (off the committed HEAD). */
+      branch: string;
+    }
+  | {
+      kind: "worktreeFinalized";
+      agentId: string;
+      /** "merged" | "no-changes" | "discarded" | "diff" — see the Rust doc on
+       *  `AgentEvent::WorktreeFinalized`. */
+      outcome: "merged" | "no-changes" | "discarded" | "diff" | (string & {});
+      /** Present on "diff": the kept worktree's branch (for manual review). */
+      branch?: string;
+      /** Present on "diff": the kept worktree's working dir. */
+      path?: string;
+      /** Present on "merged": the merge commit OID landed in the user's tree. */
+      commit?: string;
+      /** Present on "diff": a `git diff --stat` summary of the kept changes. */
+      diff?: string;
+      /** Present on "diff": why the changes weren't auto-merged (conflict / dirty
+       *  target / error). */
+      reason?: string;
     };
 
 // ────────────────────────────────────────────────────────────────────
@@ -215,6 +243,15 @@ export interface SpawnArgs {
   advisorProtocol?: string;
   advisorBaseUrl?: string;
   advisorApiKey?: string;
+  /** Phase 3 — worktree-per-agent isolation opt-in. When `true`, the agent runs
+   *  inside a fresh git worktree on its own branch (off the committed HEAD) and
+   *  its changes are merged back at the end (or kept for manual review on
+   *  conflict). For a FUTURE chat fan-out where multiple agents run in parallel
+   *  without clobbering each other. Defaults to `false`/undefined — the
+   *  single-agent in-place flow does NOT set it, so behaviour is unchanged.
+   *  Ignored in Plan mode (read-only never mutates). Serializes to the Rust
+   *  `isolate` field (SpawnArgs). */
+  isolate?: boolean;
 }
 
 /** Spawn an agent. Returns the freshly minted agent id (UUID v4 string).
