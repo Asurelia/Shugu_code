@@ -707,6 +707,7 @@ pub fn run() {
             commands::chat::chat_send,
             commands::chat::chat_abort,
             commands::chat::fim_complete,
+            commands::chat::fim_complete_stream,
             commands::chat_tools::chat_revert_writes,
             commands::credentials::cred_set,
             commands::credentials::cred_get,

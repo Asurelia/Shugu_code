@@ -1927,6 +1927,108 @@ pub fn chat_abort(
     }
 }
 
+// ---------------------------------------------------------------------------
+// FIM (Fill-In-the-Middle) — Phase 4: Tab-autocomplete backend.
+//
+// The Rust port of the frontend's `fimPrompt.ts`. The autocomplete surface
+// builds a FIM prompt from the document + cursor; each model family wraps the
+// prefix/suffix in its own sentinel triplet. We keep ONE source of truth for
+// the prompt shape on the backend so both the non-streaming (`fim_complete`)
+// and streaming (`fim_complete_stream`) commands — and any future
+// ollama/openai branch — agree on byte-identical prompts.
+// ---------------------------------------------------------------------------
+
+/// Model family for FIM sentinel selection — a faithful port of
+/// `FimModelFamily` in `src/features/code/autocomplete/fimPrompt.ts`.
+///
+/// The sentinel triplets differ per family:
+///   * `Qwen` / `Deepseek` → `<|fim_prefix|>P<|fim_suffix|>S<|fim_middle|>`
+///   * `Codellama`         → `<PRE> P <SUF>S <MID>`
+///   * `Starcoder`         → `<fim_prefix>P<fim_suffix>S<fim_middle>`
+///   * `Generic`           → prefix only (suffix lost; last-resort completion)
+///
+/// Currently consumed by `build_fim_prompt` + the FIM tests. The backend
+/// commands take a pre-built `prompt` from the frontend (which owns prompt
+/// construction today); these helpers exist so prompt-building can move into
+/// Rust in the ghost-text UI phase without re-deriving the sentinel rules.
+#[allow(dead_code)] // wired into the FIM commands in the ghost-text UI phase
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FimFamily {
+    Qwen,
+    Deepseek,
+    Codellama,
+    Starcoder,
+    Generic,
+}
+
+/// Guess the FIM family from a model id — a name heuristic mirroring
+/// `detectFimFamily(model)` in `fimPrompt.ts` (same order, same substrings).
+#[allow(dead_code)] // wired into the FIM commands in the ghost-text UI phase
+pub(crate) fn detect_fim_family(model: &str) -> FimFamily {
+    let m = model.to_lowercase();
+    if m.contains("qwen") {
+        FimFamily::Qwen
+    } else if m.contains("deepseek") {
+        FimFamily::Deepseek
+    } else if m.contains("codellama") || m.contains("code-llama") {
+        FimFamily::Codellama
+    } else if m.contains("starcoder") || m.contains("starchat") || m.contains("santacoder") {
+        FimFamily::Starcoder
+    } else {
+        FimFamily::Generic
+    }
+}
+
+/// Build the FIM prompt for `model`, wrapping `prefix`/`suffix` in the
+/// family's sentinels. Faithful port of `buildFimPrompt` in `fimPrompt.ts` —
+/// the spacing in the codellama template (`<PRE> {prefix} <SUF>{suffix} <MID>`)
+/// is intentional and matches the TS source byte-for-byte.
+#[allow(dead_code)] // wired into the FIM commands in the ghost-text UI phase
+pub(crate) fn build_fim_prompt(prefix: &str, suffix: &str, model: &str) -> String {
+    match detect_fim_family(model) {
+        FimFamily::Qwen | FimFamily::Deepseek => {
+            format!("<|fim_prefix|>{prefix}<|fim_suffix|>{suffix}<|fim_middle|>")
+        }
+        FimFamily::Codellama => format!("<PRE> {prefix} <SUF>{suffix} <MID>"),
+        FimFamily::Starcoder => format!("<fim_prefix>{prefix}<fim_suffix>{suffix}<fim_middle>"),
+        FimFamily::Generic => prefix.to_string(),
+    }
+}
+
+/// Pure SSRF + protocol validation for the FIM commands, factored out so it can
+/// be unit-tested without an `AppHandle`/`State` (the commands themselves take
+/// Tauri State and can't be invoked from a plain unit test — same constraint as
+/// `chat_send`, whose guard is covered via the validator + a wiring proof).
+///
+/// Accepts `openai` / `custom` / `ollama`. For openai/custom it runs the shared
+/// `validate_custom_base_url` SSRF guard (honoring `SHUGU_CUSTOM_ALLOW_PRIVATE`);
+/// ollama is exempt (it defaults to `localhost:11434`, which the guard would
+/// otherwise block — same exemption as `chat_send`). Any other protocol is
+/// rejected with an explicit message.
+pub(crate) fn fim_validate(protocol: &str, base_url: &str) -> Result<(), String> {
+    match protocol {
+        "openai" | "custom" => validate_custom_base_url(base_url),
+        "ollama" => Ok(()),
+        other => Err(format!(
+            "FIM completion not supported for protocol '{other}' — use an openai-compatible or ollama FIM endpoint"
+        )),
+    }
+}
+
+/// Streaming delta emitted to the frontend on the `fim://delta` channel — the
+/// FIM sibling of [`ChatDelta`]. `kind` is always `"content"` (FIM has no
+/// reasoning channel); `done:true` marks the terminal event with an empty
+/// `chunk`. `request_id` lets the frontend correlate the stream with the edit
+/// that requested it (and is the key under which the abort flag is registered).
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FimDelta {
+    request_id: Option<String>,
+    chunk: String,
+    kind: &'static str,
+    done: bool,
+}
+
 /// Lot 5 (scaffold) — complétion Fill-In-the-Middle non-streaming.
 ///
 /// Le tab-autocomplete (ghost text) utilise l'endpoint LEGACY `/v1/completions`
@@ -1934,11 +2036,13 @@ pub fn chat_abort(
 /// un prompt brut, pas par un tour de chat. Le frontend construit le prompt FIM
 /// (cf. fimPrompt.ts) ; ici on poste + on retourne `choices[0].text`.
 ///
-/// Seul le path openai-compatible est supporté (llama.cpp, vLLM, LM Studio,
-/// Together…). anthropic/ollama n'exposent pas d'API FIM comparable ici →
-/// erreur explicite. ⚠ QUALITÉ/LATENCE = réglage runtime (modèle FIM, taille de
-/// fenêtre, max_tokens) : ce lot livre le tuyau, pas le réglage fin.
+/// Phase 4: en plus d'openai/custom (`/v1/completions`), on accepte ollama
+/// (`/api/generate`, qui prend `prompt` + `suffix` + `stream`). anthropic
+/// n'expose pas d'API FIM comparable ici → erreur explicite. ⚠ QUALITÉ/LATENCE =
+/// réglage runtime (modèle FIM, taille de fenêtre, max_tokens) : ce lot livre le
+/// tuyau, pas le réglage fin.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn fim_complete(
     prompt: String,
     model: String,
@@ -1947,21 +2051,56 @@ pub async fn fim_complete(
     api_key: Option<String>,
     max_tokens: Option<u32>,
     stop: Option<Vec<String>>,
+    suffix: Option<String>,
 ) -> Result<String, String> {
-    if protocol != "openai" && protocol != "custom" {
-        return Err(format!(
-            "FIM completion not supported for protocol '{protocol}' — use an openai-compatible FIM endpoint"
-        ));
-    }
-    // Same SSRF guard as chat_send. fim_complete only supports openai + custom
-    // (anything else is rejected above), and BOTH funnel a user-supplied
-    // base_url into the backend request — so guard both, not just custom.
-    // Honors SHUGU_CUSTOM_ALLOW_PRIVATE=1.
-    if matches!(protocol.as_str(), "openai" | "custom") {
-        validate_custom_base_url(&base_url)?;
-    }
+    // Protocol acceptance + SSRF guard in one place (openai/custom guarded,
+    // ollama exempt; anything else rejected). Honors SHUGU_CUSTOM_ALLOW_PRIVATE=1.
+    fim_validate(&protocol, &base_url)?;
     let key = resolve_key(&protocol, &api_key)?;
     let base = base_url.trim_end_matches('/');
+
+    // FIM = complétion inline : au-delà de 60 s le ghost text n'a plus de sens.
+    let client = request_client(60)?;
+
+    if protocol == "ollama" {
+        // Ollama FIM via the generate endpoint: it takes `prompt` (the prefix)
+        // and an optional `suffix` natively, applying the model's own FIM
+        // template server-side. `num_predict` is ollama's `max_tokens`.
+        let url = format!("{}/api/generate", base);
+        let mut options = serde_json::json!({
+            "num_predict": max_tokens.unwrap_or(128),
+        });
+        if let Some(s) = stop {
+            options["stop"] = serde_json::json!(s);
+        }
+        let mut body = serde_json::json!({
+            "model": model,
+            "prompt": prompt,
+            "stream": false,
+            "options": options,
+        });
+        if let Some(suf) = suffix {
+            body["suffix"] = serde_json::json!(suf);
+        }
+        let resp = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("FIM API error {}: {}", status, text));
+        }
+        let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        // /api/generate (non-streaming) → the completion is in `response`.
+        let text = v["response"].as_str().unwrap_or("").to_string();
+        return Ok(text);
+    }
+
+    // openai / custom: legacy /v1/completions (prompt, not messages).
     let url = if base.ends_with("/v1") {
         format!("{}/completions", base)
     } else {
@@ -1979,8 +2118,6 @@ pub async fn fim_complete(
         body["stop"] = serde_json::json!(s);
     }
 
-    // FIM = complétion inline : au-delà de 60 s le ghost text n'a plus de sens.
-    let client = request_client(60)?;
     let mut req = client
         .post(&url)
         .header("content-type", "application/json")
@@ -2003,6 +2140,237 @@ pub async fn fim_complete(
         .unwrap_or("")
         .to_string();
     Ok(text)
+}
+
+/// Phase 4 — complétion FIM EN STREAMING (sœur de `fim_complete`).
+///
+/// Streams the completion token-by-token over the `fim://delta` Tauri channel
+/// so the editor can render ghost text as it arrives (and abort it mid-flight).
+/// Supports `openai` / `custom` (SSE on `/v1/completions`) and `ollama`
+/// (NDJSON on `/api/generate`). The SSRF guard runs for openai/custom; ollama
+/// is exempt (same policy as `chat_send` / `fim_complete`).
+///
+/// Cancellation reuses the existing `ChatAbortRegistry` + `chat_abort` command:
+/// we register an `Arc<AtomicBool>` under `request_id` (prefixed `"fim:"` by the
+/// caller to avoid colliding with chat conversation_ids) and pass it to
+/// `collect_lines`, which exits on the next chunk boundary when it flips.
+///
+/// Lifecycle contract (mirrors `chat_send`): on EVERY exit — success, abort, or
+/// error — we (a) emit a terminal `FimDelta{ chunk:"", done:true }` and (b)
+/// remove the abort flag from the registry, so the frontend always sees a clean
+/// end and the registry never leaks. Returns the full accumulated completion.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn fim_complete_stream(
+    app: tauri::AppHandle,
+    request_id: String,
+    prompt: String,
+    model: String,
+    protocol: String,
+    base_url: String,
+    api_key: Option<String>,
+    max_tokens: Option<u32>,
+    stop: Option<Vec<String>>,
+    suffix: Option<String>,
+    abort_registry: tauri::State<'_, ChatAbortRegistry>,
+) -> Result<String, String> {
+    // Protocol acceptance + SSRF guard (openai/custom guarded, ollama exempt).
+    // Run BEFORE registering the abort flag so a rejected request leaves the
+    // registry untouched.
+    fim_validate(&protocol, &base_url)?;
+    let key = resolve_key(&protocol, &api_key)?;
+    let base = base_url.trim_end_matches('/');
+
+    // Register the abort flag under request_id. chat_abort flips it by key;
+    // collect_lines polls it on each chunk boundary.
+    let abort_flag = Arc::new(AtomicBool::new(false));
+    if let Ok(mut reg) = abort_registry.0.lock() {
+        reg.insert(request_id.clone(), Arc::clone(&abort_flag));
+    }
+
+    // Run the stream and ALWAYS finalize (terminal delta + flag removal),
+    // whatever the inner result. We capture the result, clean up, then return.
+    let result = fim_stream_inner(
+        &app,
+        &request_id,
+        &protocol,
+        base,
+        &model,
+        &prompt,
+        suffix.as_deref(),
+        &key,
+        max_tokens,
+        stop,
+        Arc::clone(&abort_flag),
+    )
+    .await;
+
+    // Terminal delta — the frontend stops the ghost-text spinner on `done`.
+    let _ = app.emit(
+        "fim://delta",
+        FimDelta {
+            request_id: Some(request_id.clone()),
+            chunk: String::new(),
+            kind: "content",
+            done: true,
+        },
+    );
+
+    // Remove the abort flag on every exit path so the registry never leaks.
+    if let Ok(mut reg) = abort_registry.0.lock() {
+        reg.remove(&request_id);
+    }
+
+    result
+}
+
+/// Inner body of [`fim_complete_stream`] — does the network I/O and per-token
+/// emission. Split out so the public command can guarantee the terminal delta +
+/// abort-flag cleanup run on EVERY exit (it `?`-frees this fn from cleanup duty).
+#[allow(clippy::too_many_arguments)]
+async fn fim_stream_inner(
+    app: &tauri::AppHandle,
+    request_id: &str,
+    protocol: &str,
+    base: &str,
+    model: &str,
+    prompt: &str,
+    suffix: Option<&str>,
+    key: &str,
+    max_tokens: Option<u32>,
+    stop: Option<Vec<String>>,
+    abort_flag: Arc<AtomicBool>,
+) -> Result<String, String> {
+    let client = request_client(60)?;
+    let mut acc = String::new();
+
+    if protocol == "ollama" {
+        // Ollama FIM streaming: NDJSON on /api/generate. Each line carries a
+        // `response` token; the terminal line has `done:true`.
+        let url = format!("{}/api/generate", base);
+        let mut options = serde_json::json!({
+            "num_predict": max_tokens.unwrap_or(128),
+        });
+        if let Some(s) = stop {
+            options["stop"] = serde_json::json!(s);
+        }
+        let mut body = serde_json::json!({
+            "model": model,
+            "prompt": prompt,
+            "stream": true,
+            "options": options,
+        });
+        if let Some(suf) = suffix {
+            body["suffix"] = serde_json::json!(suf);
+        }
+        let response = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("FIM API error {}: {}", status, text));
+        }
+
+        collect_lines(response, Some(abort_flag), |line| {
+            if line.is_empty() {
+                return;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                return;
+            };
+            if let Some(text) = v["response"].as_str() {
+                if !text.is_empty() {
+                    acc.push_str(text);
+                    let _ = app.emit(
+                        "fim://delta",
+                        FimDelta {
+                            request_id: Some(request_id.to_string()),
+                            chunk: text.to_string(),
+                            kind: "content",
+                            done: false,
+                        },
+                    );
+                }
+            }
+            // `v["done"] == true` marks the end of the NDJSON stream; ollama
+            // closes the connection after it, so collect_lines returns on its
+            // own — no explicit break needed (the closure can't break anyway).
+        })
+        .await?;
+
+        return Ok(acc);
+    }
+
+    // openai / custom: SSE on /v1/completions with `"stream": true`.
+    let url = if base.ends_with("/v1") {
+        format!("{}/completions", base)
+    } else {
+        format!("{}/v1/completions", base)
+    };
+    let mut body = serde_json::json!({
+        "model": model,
+        "prompt": prompt,
+        "max_tokens": max_tokens.unwrap_or(128),
+        "stream": true,
+        "temperature": 0.2,
+    });
+    if let Some(s) = stop {
+        body["stop"] = serde_json::json!(s);
+    }
+
+    let mut req = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .json(&body);
+    if !key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", key));
+    }
+    let response = req.send().await.map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!("FIM API error {}: {}", status, text));
+    }
+
+    collect_lines(response, Some(abort_flag), |line| {
+        let Some(payload) = line.strip_prefix("data: ") else {
+            return;
+        };
+        // Terminal sentinel — not JSON; just stop accumulating.
+        if payload.trim() == "[DONE]" {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
+            return;
+        };
+        // /v1/completions streams the token at choices[0].text (fallback
+        // choices[0].content for servers that mislabel the field).
+        let chunk = v["choices"][0]["text"]
+            .as_str()
+            .or_else(|| v["choices"][0]["content"].as_str());
+        if let Some(text) = chunk {
+            if !text.is_empty() {
+                acc.push_str(text);
+                let _ = app.emit(
+                    "fim://delta",
+                    FimDelta {
+                        request_id: Some(request_id.to_string()),
+                        chunk: text.to_string(),
+                        kind: "content",
+                        done: false,
+                    },
+                );
+            }
+        }
+    })
+    .await?;
+
+    Ok(acc)
 }
 
 #[cfg(test)]
@@ -2215,6 +2583,7 @@ mod ssrf_tests {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await;
                 assert!(res.is_err(), "{proto} fim to {url} must be blocked");
@@ -2227,6 +2596,128 @@ mod ssrf_tests {
                     "{proto} {url}: expected SSRF/validation error, got: {err}"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fim_tests {
+    use super::{build_fim_prompt, detect_fim_family, fim_validate, FimFamily};
+
+    // --- detect_fim_family — mirrors detectFimFamily cases in fimPrompt.test.ts.
+
+    #[test]
+    fn detect_fim_family_matches_ts_cases() {
+        use FimFamily::*;
+        for (model, expected) in [
+            ("qwen2.5-coder-7b", Qwen),
+            ("Qwen2.5-Coder", Qwen),
+            ("deepseek-coder-v2", Deepseek),
+            ("codellama-13b", Codellama),
+            ("code-llama-7b", Codellama),
+            ("starcoder2-15b", Starcoder),
+            ("santacoder", Starcoder),
+            ("starchat-beta", Starcoder),
+            ("gpt-4o", Generic),
+            ("", Generic),
+        ] {
+            assert_eq!(detect_fim_family(model), expected, "model {model:?}");
+        }
+    }
+
+    // --- build_fim_prompt — mirrors buildFimPrompt cases in fimPrompt.test.ts.
+    // The TS fixture uses prefix="const x = ", suffix=";\n".
+
+    const PREFIX: &str = "const x = ";
+    const SUFFIX: &str = ";\n";
+
+    #[test]
+    fn build_fim_prompt_qwen_and_deepseek_share_fim_pipe_sentinels() {
+        let expected = "<|fim_prefix|>const x = <|fim_suffix|>;\n<|fim_middle|>";
+        assert_eq!(build_fim_prompt(PREFIX, SUFFIX, "qwen2.5-coder"), expected);
+        assert_eq!(build_fim_prompt(PREFIX, SUFFIX, "deepseek-coder"), expected);
+    }
+
+    #[test]
+    fn build_fim_prompt_codellama_uses_pre_suf_mid() {
+        assert_eq!(
+            build_fim_prompt(PREFIX, SUFFIX, "codellama-13b"),
+            "<PRE> const x =  <SUF>;\n <MID>"
+        );
+    }
+
+    #[test]
+    fn build_fim_prompt_starcoder_uses_fim_angle_sentinels() {
+        assert_eq!(
+            build_fim_prompt(PREFIX, SUFFIX, "starcoder2-15b"),
+            "<fim_prefix>const x = <fim_suffix>;\n<fim_middle>"
+        );
+    }
+
+    #[test]
+    fn build_fim_prompt_generic_falls_back_to_prefix_only() {
+        assert_eq!(build_fim_prompt(PREFIX, SUFFIX, "gpt-4o"), "const x = ");
+    }
+
+    // --- fim_validate — pure SSRF + protocol guard (the command itself takes
+    // State + AppHandle, so we test the extracted helper, as the codebase
+    // already does for chat_send). Default env (override UNSET); no env mutation.
+
+    #[test]
+    fn fim_validate_blocks_internal_targets_for_openai_and_custom() {
+        for proto in ["openai", "custom"] {
+            for url in [
+                "http://127.0.0.1:8080",
+                "http://169.254.169.254/latest/meta-data",
+                "http://localhost:8090/v1",
+                "http://[::1]:8080/v1",
+            ] {
+                assert!(
+                    fim_validate(proto, url).is_err(),
+                    "{proto} fim to {url} must be blocked"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fim_validate_allows_public_targets_for_openai_and_custom() {
+        for proto in ["openai", "custom"] {
+            for url in ["https://api.openai.com/v1", "https://8.8.8.8/v1"] {
+                assert!(
+                    fim_validate(proto, url).is_ok(),
+                    "{proto} fim to {url} should be allowed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fim_validate_exempts_ollama_from_the_ssrf_guard() {
+        // ollama defaults to localhost:11434 — the guard that blocks loopback for
+        // openai/custom must NOT block it here (same exemption as chat_send).
+        for url in [
+            "http://localhost:11434",
+            "http://127.0.0.1:11434",
+            "http://[::1]:11434",
+            "http://169.254.169.254",
+        ] {
+            assert!(
+                fim_validate("ollama", url).is_ok(),
+                "ollama fim to {url} should be exempt from the SSRF guard"
+            );
+        }
+    }
+
+    #[test]
+    fn fim_validate_rejects_unsupported_protocols() {
+        for proto in ["anthropic", "codex", "bogus"] {
+            let err = fim_validate(proto, "https://api.example.com/v1")
+                .expect_err("unsupported protocol must be rejected");
+            assert!(
+                err.contains("not supported"),
+                "{proto}: expected 'not supported' error, got: {err}"
+            );
         }
     }
 }
