@@ -755,6 +755,10 @@ pub fn run() {
             commands::vector::vec_clear,
             // AM-2 — orchestrated-memory search surface (recall facts + episodes).
             commands::vector::memory_search,
+            // Phase 5 — incremental single-file (re)index + standalone semantic search.
+            commands::vector::vec_index_file,
+            commands::vector::semantic_search,
+            commands::vector::vec_remove_file,
             commands::model_bundle::model_bundle_catalog,
             commands::model_bundle::model_bundle_status,
             commands::model_bundle::model_bundle_download,

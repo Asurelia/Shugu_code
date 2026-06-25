@@ -79,3 +79,43 @@ export async function vecClear(collection: VecCollection): Promise<void> {
 export async function memorySearch(query: string, k = 8): Promise<MemoryHit[]> {
   return invoke<MemoryHit[]>("memory_search", { query, k });
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5 — incremental single-file (re)index + standalone semantic search.
+//
+// These complement the full-walk indexer (workspaceIndexer.ts): the Rust side
+// chunks the file with a chunker that is byte-for-byte parity with chunker.ts,
+// deletes the file's PRIOR chunk ids precisely (via the vec_code_files side
+// table), and inserts the fresh chunks — all atomically. The file watcher calls
+// these on save (debounced, off the renderer); these wrappers expose the same
+// operations to the UI (e.g. an explicit "reindex this file" action).
+// ---------------------------------------------------------------------------
+
+/**
+ * (Re)index a single workspace-relative file into the `code` collection.
+ * Returns the number of chunks indexed (0 for a no-op: missing / binary /
+ * too-large / empty / ineligible file). Throws only on a genuine failure
+ * (embedding model not ready, DB error).
+ */
+export async function vecIndexFile(path: string): Promise<number> {
+  return invoke<number>("vec_index_file", { path });
+}
+
+/**
+ * Remove a single workspace-relative file's chunks from the `code` collection
+ * (and its `vec_code_files` tracking row). A file that was never indexed is a
+ * clean no-op.
+ */
+export async function vecRemoveFile(path: string): Promise<void> {
+  await invoke<void>("vec_remove_file", { path });
+}
+
+/**
+ * Standalone semantic search over the indexed `code` collection (k clamped
+ * 1..=50 on the Rust side, default 8). Returns `[]` when the index is empty or
+ * the embedding model isn't ready — degrades to "no results" rather than
+ * throwing.
+ */
+export async function semanticSearch(query: string, k = 8): Promise<VecHit[]> {
+  return invoke<VecHit[]>("semantic_search", { query, k });
+}
