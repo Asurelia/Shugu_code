@@ -449,6 +449,9 @@ export async function superviseDeliverable(args: {
       apiKey:       rev.apiKey,
       agentDefPath: rev.agentDefPath,
       conversationId: convId,
+      // Phase 7 #4 — le superviseur RELIT (read-mostly) ; pas d'isolation
+      // (sinon un worktree créé+jeté à chaque revue, pour rien). In-place.
+      isolate: false,
     });
 
     // 6. Await completion (90 s — reviews are typically short).

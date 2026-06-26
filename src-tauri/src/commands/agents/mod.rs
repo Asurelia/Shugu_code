@@ -396,6 +396,14 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// Phase 7 #4 — l'isolation a été DEMANDÉE mais n'a pas pu démarrer (pas de
+    /// dépôt git, pas de workspace, ou échec `git worktree add`). Le run continue
+    /// IN-PLACE sur le checkout — l'UI affiche un badge « exec sur checkout » pour
+    /// ne jamais laisser croire à une protection inexistante. `reason` explique.
+    WorktreeSkipped {
+        agent_id: String,
+        reason: String,
+    },
 }
 
 impl AgentEvent {
@@ -418,6 +426,7 @@ impl AgentEvent {
             AgentEvent::Screenshot { .. } => "screenshot",
             AgentEvent::WorktreeStarted { .. } => "worktreeStarted",
             AgentEvent::WorktreeFinalized { .. } => "worktreeFinalized",
+            AgentEvent::WorktreeSkipped { .. } => "worktreeSkipped",
         }
     }
 
@@ -439,7 +448,8 @@ impl AgentEvent {
             | AgentEvent::Write { agent_id, .. }
             | AgentEvent::Screenshot { agent_id, .. }
             | AgentEvent::WorktreeStarted { agent_id, .. }
-            | AgentEvent::WorktreeFinalized { agent_id, .. } => agent_id,
+            | AgentEvent::WorktreeFinalized { agent_id, .. }
+            | AgentEvent::WorktreeSkipped { agent_id, .. } => agent_id,
         }
     }
 }
@@ -901,10 +911,13 @@ pub async fn agent_spawn(
     // Mode Plan → lecture seule. Le sélecteur de chat envoie `mode: "plan"` ;
     // tout le reste (agent / Atelier / Studio) reste en exécution complète.
     let read_only_for_task = args.mode.as_deref() == Some("plan");
-    // Phase 3 — isolation opt-in. Only honoured when the caller explicitly set
-    // `isolate: true` AND the run can mutate (never in Plan/read-only). Defaults
-    // OFF: no current caller passes it, so every existing path stays in-place.
-    let isolate_for_task = args.isolate.unwrap_or(false) && !read_only_for_task;
+    // Phase 7 #4 — isolation par DÉFAUT en mode Agent (chat/cockpit). L'agent
+    // travaille seul dans un worktree, l'utilisateur relit le diff puis merge ou
+    // jette, son checkout reste intact. `unwrap_or(true)` : le frontend peut
+    // explicitement passer `isolate:false` pour rester in-place, mais le défaut
+    // est l'isolation. JAMAIS en Plan/read-only (rien à isoler). Si la création
+    // du worktree échoue, le runner retombe in-place + émet WorktreeSkipped.
+    let isolate_for_task = args.isolate.unwrap_or(true) && !read_only_for_task;
     // Mémoire de conversation : le chemin chat passe la conv pour recharger les
     // tours précédents dans l'historique de l'agent.
     let conversation_id_for_task = args.conversation_id.clone();
@@ -1222,7 +1235,8 @@ pub async fn agent_grounded_run(
             false, // read_only — Grounded Run écrit/exécute sur le vrai projet
             None,  // conversation_id — Grounded Run n'est pas lié à une conversation
             None,  // advisor — pas de conseiller distinct pour Grounded Run
-            false, // isolate — Grounded Run travaille DÉLIBÉRÉMENT sur le vrai arbre
+            true,  // isolate — Phase 7 #4 : Grounded Run isolé par défaut (Option B,
+                   // cohérence « autonomie fiable » ; merge-back opt-in via l'UI)
         )
         .await;
     });

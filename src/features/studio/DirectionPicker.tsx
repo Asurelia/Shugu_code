@@ -61,6 +61,9 @@ export function DirectionPicker({
         apiKey: orch.apiKey,
         conversationId: getActiveConv(),
         // NB: no designContext → no generation mode → text reply, no files.
+        // Phase 7 #4 — flux Studio : pas d'isolation worktree (réponse texte,
+        // et les assets générés doivent atterrir direct dans le projet).
+        isolate: false,
       });
       const [wait] = awaitAgentComplete(agentId, { timeoutMs: 2 * 60 * 1000 });
       const { output } = await wait;

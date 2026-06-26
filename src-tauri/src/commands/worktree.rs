@@ -756,6 +756,82 @@ pub async fn shugu_worktree_size(app: AppHandle, id: String) -> Result<u64, Stri
 }
 
 // ---------------------------------------------------------------------------
+// Phase 7 #4 — merge-back / discard user-initiated (l'isolation devient le
+// défaut ; le merge n'est plus automatique : l'utilisateur relit le diff puis
+// merge ou jette depuis l'UI).
+// ---------------------------------------------------------------------------
+
+/// Rapport d'un merge-back user-initiated, sérialisé camelCase pour l'UI.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeReport {
+    /// "merged" | "no-changes" | "conflict" | "dirty".
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<String>>,
+}
+
+/// Merge la branche d'un run isolé dans l'arbre de l'utilisateur (déclenché par
+/// le bouton « Merger »). Sur `merged`/`no-changes` le worktree est nettoyé ;
+/// sur `conflict`/`dirty` il est GARDÉ (l'utilisateur résout puis réessaie).
+/// `Err` = HEAD détachée sur le dépôt ou panne git.
+#[command(rename_all = "camelCase")]
+pub async fn worktree_merge_back(app: AppHandle, branch: String) -> Result<MergeReport, String> {
+    let root = workspace_root_required(&app)?;
+    let model = load_model(&root)?;
+    let Some(id) = model.entries.iter().find(|e| e.branch == branch).map(|e| e.id.clone())
+    else {
+        // Idempotence (revue H1) : la branche n'est plus dans le modèle = déjà
+        // mergée+nettoyée (ex. double-clic après un reload qui a réinitialisé le
+        // `busy` côté UI). On renvoie un rapport BÉNIN plutôt qu'une erreur.
+        return Ok(MergeReport { outcome: "no-changes".to_string(), commit: None, files: None });
+    };
+
+    // HEAD détachée → pas de merge possible (raison explicite, cohérent avec
+    // l'ancien finalize_isolation).
+    if current_branch(&root).await.is_none() {
+        return Err("HEAD détachée sur le dépôt — checkout une branche avant de merger".to_string());
+    }
+
+    // Sérialise les merges concurrents dans l'arbre de l'utilisateur.
+    let merge_lock = app.state::<MergeLock>();
+    let _guard = merge_lock.0.lock().await;
+
+    match merge_back(&root, &branch).await? {
+        MergeOutcome::Merged { commit } => {
+            let _ = cleanup_inner(&root, Some(&id), true, false).await;
+            Ok(MergeReport { outcome: "merged".to_string(), commit: Some(commit), files: None })
+        }
+        MergeOutcome::NoChanges => {
+            let _ = cleanup_inner(&root, Some(&id), true, false).await;
+            Ok(MergeReport { outcome: "no-changes".to_string(), commit: None, files: None })
+        }
+        MergeOutcome::Conflict { files } => {
+            Ok(MergeReport { outcome: "conflict".to_string(), commit: None, files: Some(files) })
+        }
+        MergeOutcome::DirtyTarget => {
+            Ok(MergeReport { outcome: "dirty".to_string(), commit: None, files: None })
+        }
+    }
+}
+
+/// Rejette un run isolé : supprime le worktree + sa branche SANS merger (le
+/// checkout principal n'a jamais été touché). Idempotent — un worktree déjà
+/// nettoyé renvoie `Ok`.
+#[command(rename_all = "camelCase")]
+pub async fn worktree_discard(app: AppHandle, branch: String) -> Result<(), String> {
+    let root = workspace_root_required(&app)?;
+    let model = load_model(&root)?;
+    let Some(id) = model.entries.iter().find(|e| e.branch == branch).map(|e| e.id.clone()) else {
+        return Ok(()); // déjà nettoyé
+    };
+    // cleanup_inner renvoie les ids supprimés ; le frontend n'en a pas besoin.
+    cleanup_inner(&root, Some(&id), true, false).await.map(|_| ())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

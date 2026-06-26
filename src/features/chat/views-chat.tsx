@@ -26,8 +26,10 @@ import { ChatWritesCard } from "./ChatWritesCard";
 import { db } from "@/lib/db";
 import { ModelPicker } from "@/features/panels/panels";
 import { revealAgent, killAgent, type AgentStatus } from "@/lib/agents";
+import { extractWorktreeStatus, isWorktreeRunActive, type WorktreeStatus } from "@/lib/worktree";
 import { useAgentDefs } from "@/features/agents/agentDefsQueries";
 import { useMessageDisplay, type AgentActivityItem } from "./useMessageDisplay";
+import { useAgentTranscript } from "@/features/agents/queries";
 import { BrowserTestResultViewer } from "./BrowserTestResultViewer";
 import { CommandRiskCard } from "./CommandRiskCard";
 import { AgentPlan } from "./AgentPlan";
@@ -161,6 +163,23 @@ export function ChatView({
     }
     return null;
   })();
+
+  // Phase 7 #4 — badge « 🔒 isolé » près du composer pendant un run isolé EN
+  // COURS. On suit le transcript du DERNIER message agent (celui qui tourne, le
+  // cas échéant) et on n'affiche le badge que tant que l'isolation est active
+  // (worktreeStarted sans finalized). Le transcript est tenu à jour en live par
+  // useAgentEvents ; subscribe avec null = no-op quand il n'y a aucun run agent.
+  const latestAgentRunId = (() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const msg = messages[i];
+      if (msg.viaAgent && typeof msg.agentId === "string") return msg.agentId;
+    }
+    return null;
+  })();
+  const { data: latestAgentTranscript } = useAgentTranscript(latestAgentRunId);
+  const composerIsolated =
+    latestAgentTranscript != null &&
+    isWorktreeRunActive(extractWorktreeStatus(latestAgentTranscript.events));
 
   useEffect(() => {
     if (feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
@@ -563,6 +582,22 @@ export function ChatView({
             <span className="dot" />
             {branch}
           </button>
+        )}
+        {/* Phase 7 #4 — badge « 🔒 isolé » pendant un run isolé en cours : le
+            travail de l'agent vit dans un worktree git séparé, ton checkout
+            principal reste intact jusqu'au merge (manuel) depuis le panneau
+            Agents. Non interactif — pur indicateur d'état. */}
+        {composerIsolated && (
+          <span
+            className="cx-chip"
+            title="Run en cours isolé dans un worktree git — ton checkout principal reste intact jusqu'au merge (depuis le panneau Agents)."
+            style={{
+              color: "var(--primary, #7c3aed)",
+              borderColor: "rgba(124, 58, 237, 0.45)",
+            }}
+          >
+            🔒 isolé
+          </span>
         )}
         <div className="cx-chip-spacer" />
         {/* Trust-UX (Lane 5) — remplace l'ancien chip « 🛡 local » ambigu (local =
@@ -988,6 +1023,142 @@ function AgentActivity({
   );
 }
 
+// ─── Bandeau d'isolation worktree (Phase 7 #4) ──────────────────
+// L'agent en mode Agent travaille par DÉFAUT dans un worktree git isolé ; le
+// merge n'est plus automatique. Ce bandeau COMPACT, rendu dans la bulle du run
+// agent, signale l'état d'isolation et renvoie vers le panneau Agents (via
+// app://reveal-agent) où l'utilisateur relit le diff puis merge ou jette. Il ne
+// duplique PAS les boutons Merger/Jeter (ils vivent dans le panneau Agents, la
+// surface de revue) — il reste un indicateur non bloquant.
+function WorktreeBanner({
+  worktree,
+  agentId,
+}: {
+  worktree: WorktreeStatus;
+  agentId: string;
+}) {
+  const { started, finalized, skipped } = worktree;
+
+  // Aucun signal d'isolation → rien (run in-place classique).
+  if (!started && !finalized && !skipped) return null;
+
+  // Style commun : une fine bande sous la timeline, tokens CSS, non intrusive.
+  const base: React.CSSProperties = {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    marginTop: 6,
+    padding: "5px 9px",
+    borderRadius: 6,
+    fontSize: 11,
+    lineHeight: 1.4,
+  };
+
+  // Isolation impossible → avertissement (exec sur checkout).
+  if (skipped) {
+    return (
+      <div
+        style={{
+          ...base,
+          background: "rgba(245, 158, 11, 0.08)",
+          border: "1px solid rgba(245, 158, 11, 0.28)",
+          color: "var(--warn, #f59e0b)",
+        }}
+      >
+        <span>⚠ Isolation impossible — exécuté sur ton checkout ({skipped.reason})</span>
+      </div>
+    );
+  }
+
+  // Diff prêt à relire → bandeau cliquable qui ouvre le panneau Agents.
+  if (finalized && finalized.outcome === "diff") {
+    return (
+      <button
+        type="button"
+        onClick={() => void revealAgent(agentId)}
+        title="Relire le diff et merger / jeter dans le panneau Agents"
+        style={{
+          ...base,
+          width: "100%",
+          textAlign: "left",
+          cursor: "pointer",
+          fontFamily: "inherit",
+          background: "rgba(124, 58, 237, 0.08)",
+          border: "1px solid rgba(124, 58, 237, 0.30)",
+          color: "var(--on-surface, #ddd)",
+        }}
+      >
+        <span aria-hidden>🔒</span>
+        <span style={{ flex: 1 }}>
+          Run isolé — diff prêt à relire
+          {finalized.branch && (
+            <span
+              style={{
+                marginLeft: 6,
+                fontFamily: "var(--font-mono)",
+                color: "var(--on-surface-variant, #a5a0bf)",
+              }}
+            >
+              {finalized.branch}
+            </span>
+          )}
+        </span>
+        <span style={{ color: "var(--primary, #7c3aed)", fontWeight: 600 }}>
+          Relire ›
+        </span>
+      </button>
+    );
+  }
+
+  // Finalisé sans diff (mergé / no-changes / jeté) → statut texte discret.
+  if (finalized) {
+    const text =
+      finalized.outcome === "merged"
+        ? "✅ Run isolé mergé"
+        : finalized.outcome === "no-changes"
+          ? "Run isolé — rien à merger"
+          : finalized.outcome === "discarded"
+            ? "Run isolé jeté"
+            : `Run isolé — ${finalized.outcome}`;
+    return (
+      <div
+        style={{
+          ...base,
+          background: "rgba(124, 58, 237, 0.05)",
+          border: "1px solid rgba(124, 58, 237, 0.18)",
+          color: "var(--on-surface-variant, #a5a0bf)",
+        }}
+      >
+        <span>{text}</span>
+      </div>
+    );
+  }
+
+  // Démarré, pas encore finalisé → run isolé EN COURS.
+  if (isWorktreeRunActive(worktree)) {
+    return (
+      <div
+        style={{
+          ...base,
+          background: "rgba(124, 58, 237, 0.06)",
+          border: "1px solid rgba(124, 58, 237, 0.22)",
+          color: "var(--on-surface, #ddd)",
+        }}
+      >
+        <span aria-hidden>🔒</span>
+        <span>
+          Run isolé dans{" "}
+          <span style={{ fontFamily: "var(--font-mono)", color: "var(--primary, #7c3aed)" }}>
+            {started?.branch}
+          </span>
+        </span>
+      </div>
+    );
+  }
+
+  return null;
+}
+
 // ─── Per-message renderer ───────────────────────────────────
 function CxMessage({
   m,
@@ -1021,6 +1192,7 @@ function CxMessage({
     writeRecords,
     startedAt,
     finishedAt,
+    worktree,
   } = useMessageDisplay(m);
 
   // Le journal d'activité ne s'affiche que pour le travail de l'ORCHESTRATEUR,
@@ -1101,6 +1273,13 @@ function CxMessage({
           finishedAt={finishedAt}
           agentId={m.agentId}
         />
+      )}
+
+      {/* Phase 7 #4 — bandeau d'isolation worktree. Non bloquant : il signale
+          juste qu'un run a tourné isolé et pointe vers le panneau Agents où on
+          relit le diff et on merge/jette. */}
+      {isAgentRun && m.agentId && (
+        <WorktreeBanner worktree={worktree} agentId={m.agentId} />
       )}
 
       <div className="cx-body">

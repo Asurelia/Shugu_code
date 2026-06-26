@@ -39,6 +39,12 @@ import {
   ConfirmDialog,
   InlineNotice,
 } from "@/components/trust";
+import { pushToast } from "@/components/toast";
+import {
+  worktreeMergeBack,
+  worktreeDiscard,
+  extractWorktreeStatus,
+} from "@/lib/worktree";
 
 // Resolve the active model → provider routing (protocol / baseUrl / key), exactly
 // like the chat delegate flow: the key stays in the keychain, never cleartext.
@@ -612,6 +618,15 @@ export function TranscriptDrawer({
         </div>
       )}
 
+      {/* Phase 7 #4 — Isolation worktree : statut du run isolé + actions
+          Merger / Jeter. C'est LÀ que l'utilisateur relit le diff d'un run
+          terminé et décide de merger ou de jeter (le merge n'est plus auto). */}
+      <WorktreeIsolationSection
+        events={events}
+        sectionStyle={sectionStyle}
+        labelStyle={labelStyle}
+      />
+
       {/* Atelier — live preview of the built app (served by the preview:// handler) */}
       {isAtelierRun && (
         <div style={sectionStyle}>
@@ -661,6 +676,280 @@ export function TranscriptDrawer({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Isolation worktree (Phase 7 #4) — statut du run isolé + actions.
+//
+// L'isolation devient le défaut en mode Agent : le run tourne dans un worktree
+// git sur sa propre branche, et le merge n'est PLUS automatique. Cette section
+// est l'endroit où l'utilisateur RELIT le diff puis décide :
+//   • « Merger » → worktree_merge_back(branch) ;
+//   • « Jeter »  → worktree_discard(branch) (derrière une confirmation, c'est
+//                  destructif des changements de l'agent).
+// On dérive le statut du transcript via extractWorktreeStatus (dernier event de
+// chaque type gagne). useState local pour le busy des boutons + masquage d'une
+// carte résolue (rien à persister : le backend nettoie le worktree, et un
+// reload relira un transcript qui pointe sur la finalisation).
+// ────────────────────────────────────────────────────────────────────
+
+function WorktreeIsolationSection({
+  events,
+  sectionStyle,
+  labelStyle,
+}: {
+  events: AgentEvent[];
+  sectionStyle: React.CSSProperties;
+  labelStyle: React.CSSProperties;
+}) {
+  const { started, finalized, skipped } = extractWorktreeStatus(events);
+
+  // Busy d'action (merge/discard en vol) + masquage local d'une carte résolue
+  // (l'utilisateur a mergé ou jeté → on retire la carte sans attendre un refetch).
+  const [busy, setBusy] = useState(false);
+  const [resolved, setResolved] = useState(false);
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
+
+  // Rien d'isolé pour ce run (cas in-place classique) → on ne rend rien.
+  if (!started && !finalized && !skipped) return null;
+
+  // L'isolation a échoué → badge d'avertissement honnête (exec sur checkout).
+  if (skipped) {
+    return (
+      <div
+        style={{
+          ...sectionStyle,
+          background: "rgba(245, 158, 11, 0.06)",
+          border: "1px solid rgba(245, 158, 11, 0.25)",
+        }}
+      >
+        <span style={{ ...labelStyle, color: "var(--warn, #f59e0b)" }}>Isolation</span>
+        <div
+          style={{
+            fontSize: 11,
+            lineHeight: 1.5,
+            color: "var(--warn, #f59e0b)",
+          }}
+        >
+          ⚠ Isolation impossible — exécuté sur le checkout ({skipped.reason})
+        </div>
+      </div>
+    );
+  }
+
+  const branch = finalized?.branch ?? started?.branch;
+
+  const onMerge = async () => {
+    if (!branch || busy) return;
+    setBusy(true);
+    try {
+      const report = await worktreeMergeBack(branch);
+      if (report.outcome === "merged") {
+        pushToast(
+          `✅ Mergé dans ton arbre${report.commit ? ` (${report.commit.slice(0, 8)})` : ""}`,
+          "success",
+        );
+        setResolved(true);
+      } else if (report.outcome === "no-changes") {
+        pushToast("Rien à merger — le worktree ne contenait aucun changement.", "info");
+        setResolved(true);
+      } else if (report.outcome === "conflict") {
+        const n = report.files?.length ?? 0;
+        pushToast(
+          `⚠ Conflit de merge${n ? ` sur ${n} fichier${n > 1 ? "s" : ""}` : ""} — le worktree est gardé, résous puis réessaie.`,
+          "error",
+          8000,
+        );
+        // On GARDE la carte : le worktree existe toujours côté backend.
+      } else if (report.outcome === "dirty") {
+        pushToast(
+          "⚠ Ton arbre a des changements non commités — commit-les puis réessaie. Le worktree est gardé.",
+          "error",
+          8000,
+        );
+      } else {
+        pushToast(`Merge : ${report.outcome}`, "info");
+      }
+    } catch (err) {
+      pushToast(
+        `Échec du merge : ${err instanceof Error ? err.message : String(err)}`,
+        "error",
+        8000,
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onDiscard = async () => {
+    if (!branch || busy) return;
+    setConfirmDiscard(false);
+    setBusy(true);
+    try {
+      await worktreeDiscard(branch);
+      pushToast("Run isolé jeté — ton checkout principal est resté intact.", "info");
+      setResolved(true);
+    } catch (err) {
+      pushToast(
+        `Échec du rejet : ${err instanceof Error ? err.message : String(err)}`,
+        "error",
+        8000,
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Carte résolue localement (mergée / jetée / no-changes) → on l'efface.
+  if (resolved) return null;
+
+  // Statut texte court pour les finalisations déjà décidées côté backend.
+  if (finalized && finalized.outcome !== "diff") {
+    const label =
+      finalized.outcome === "merged"
+        ? { text: "✅ Mergé", color: "var(--success, #4ade80)" }
+        : finalized.outcome === "no-changes"
+          ? { text: "rien à merger", color: "var(--on-surface-variant, #a5a0bf)" }
+          : finalized.outcome === "discarded"
+            ? { text: "jeté", color: "var(--on-surface-variant, #a5a0bf)" }
+            : { text: finalized.outcome, color: "var(--on-surface-variant, #a5a0bf)" };
+    return (
+      <div style={sectionStyle}>
+        <span style={labelStyle}>Isolation</span>
+        <div style={{ fontSize: 11, color: label.color }}>
+          {label.text}
+          {branch && (
+            <span
+              style={{
+                marginLeft: 6,
+                fontFamily: "var(--font-mono)",
+                color: "var(--on-surface-variant, #a5a0bf)",
+              }}
+            >
+              {branch}
+            </span>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // Finalisé en "diff" → l'utilisateur relit + décide (Merger / Jeter).
+  if (finalized && finalized.outcome === "diff") {
+    return (
+      <div style={sectionStyle}>
+        <span style={labelStyle}>Isolation — diff prêt à relire</span>
+        {branch && (
+          <div
+            style={{
+              fontSize: 11,
+              marginBottom: 6,
+              fontFamily: "var(--font-mono)",
+              color: "var(--on-surface-variant, #a5a0bf)",
+            }}
+          >
+            🔒 {branch}
+            {finalized.reason && (
+              <span style={{ marginLeft: 6, fontStyle: "italic" }}>
+                — pas mergé auto : {finalized.reason}
+              </span>
+            )}
+          </div>
+        )}
+        {finalized.diff && (
+          <pre
+            style={{
+              margin: "0 0 8px",
+              padding: 6,
+              fontSize: 10,
+              lineHeight: 1.4,
+              maxHeight: 200,
+              overflow: "auto",
+              whiteSpace: "pre-wrap",
+              borderRadius: 6,
+              background: "rgba(0,0,0,0.18)",
+              color: "var(--on-surface, #ddd)",
+            }}
+          >
+            {finalized.diff}
+          </pre>
+        )}
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button
+            type="button"
+            onClick={() => void onMerge()}
+            disabled={busy || !branch}
+            style={{
+              fontSize: 11,
+              fontWeight: 700,
+              padding: "5px 14px",
+              borderRadius: 6,
+              background: "rgba(74, 222, 128, 0.16)",
+              color: "var(--success, #4ade80)",
+              border: "1px solid rgba(74, 222, 128, 0.45)",
+              cursor: busy || !branch ? "default" : "pointer",
+              opacity: busy || !branch ? 0.5 : 1,
+              fontFamily: "inherit",
+            }}
+          >
+            {busy ? "…" : "Merger"}
+          </button>
+          <button
+            type="button"
+            onClick={() => setConfirmDiscard(true)}
+            disabled={busy || !branch}
+            style={{
+              fontSize: 11,
+              fontWeight: 700,
+              padding: "5px 14px",
+              borderRadius: 6,
+              background: "rgba(255, 106, 138, 0.16)",
+              color: "var(--danger, #ff6a8a)",
+              border: "1px solid rgba(255, 106, 138, 0.45)",
+              cursor: busy || !branch ? "default" : "pointer",
+              opacity: busy || !branch ? 0.5 : 1,
+              fontFamily: "inherit",
+            }}
+          >
+            Jeter
+          </button>
+        </div>
+        <ConfirmDialog
+          open={confirmDiscard}
+          tone="danger"
+          title="Jeter ce run isolé ?"
+          body={
+            <>
+              <p style={{ margin: "0 0 8px" }}>
+                Les changements de l'agent sur la branche <code>{branch}</code> seront{" "}
+                <b>supprimés définitivement</b> (worktree + branche).
+              </p>
+              <p style={{ margin: 0 }}>
+                Ton checkout principal n'a jamais été touché — il reste intact.
+              </p>
+            </>
+          }
+          confirmLabel="Jeter quand même"
+          cancelLabel="Annuler"
+          onConfirm={() => void onDiscard()}
+          onCancel={() => setConfirmDiscard(false)}
+        />
+      </div>
+    );
+  }
+
+  // Démarré mais pas encore finalisé → run isolé en cours.
+  return (
+    <div style={sectionStyle}>
+      <span style={labelStyle}>Isolation</span>
+      <div style={{ fontSize: 11, color: "var(--on-surface, #ddd)" }}>
+        🔒 Isolé dans{" "}
+        <span style={{ fontFamily: "var(--font-mono)", color: "var(--primary, #7c3aed)" }}>
+          {started?.branch}
+        </span>
+      </div>
     </div>
   );
 }

@@ -28,6 +28,7 @@ import type { AgentEvent, AgentStatus } from "@/lib/agents";
 import type { ChatWriteRecord } from "./chatWritesStore";
 import type { Message } from "@/lib/types";
 import { parseRiskFlag, type RiskFlag } from "@/lib/commandRules";
+import { extractWorktreeStatus, type WorktreeStatus } from "@/lib/worktree";
 
 /** Une ligne du journal d'activité de l'agent — un appel d'outil + son issue. */
 export interface AgentActivityItem {
@@ -95,6 +96,11 @@ export interface MessageDisplay {
    *  body starts with "data:"). Renderers should show an <img> tag instead of
    *  interpreting displayBody as text. */
   imageDataUrl?: string;
+  /** Phase 7 #4 — statut d'isolation worktree du run (dernier event de chaque
+   *  type gagne). Vide quand le run n'a pas été isolé. La timeline de chat s'en
+   *  sert pour un bandeau compact « run isolé — diff prêt à relire » qui pointe
+   *  vers le panneau Agents. */
+  worktree: WorktreeStatus;
 }
 
 // ── Mappage outil → libellé humain ────────────────────────────────────────
@@ -221,6 +227,9 @@ export function useMessageDisplay(m: Message): MessageDisplay {
   let plan: AgentPlanStep[] | undefined;
   const writeRecords: ChatWriteRecord[] = [];
   const seenWritePaths = new Set<string>();
+  // Phase 7 #4 — statut d'isolation worktree, dérivé des events du transcript.
+  const worktree: WorktreeStatus =
+    isAgentRun && transcript ? extractWorktreeStatus(transcript.events) : {};
 
   if (isAgentRun && transcript) {
     // 1er passage : indexer issue (ok/error) + sortie texte de chaque appel,
@@ -313,6 +322,7 @@ export function useMessageDisplay(m: Message): MessageDisplay {
     plan,
     writeRecords,
     imageDataUrl,
+    worktree,
   };
 }
 

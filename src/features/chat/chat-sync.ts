@@ -993,14 +993,14 @@ async function handleDelegate(
       advisorProtocol: advisor?.protocol,
       advisorBaseUrl: advisor?.baseUrl,
       advisorApiKey: advisor?.apiKey,
-      // Phase 3 — worktree-per-agent isolation. DELIBERATELY NOT SET here: the
-      // chat delegation runs a SINGLE orchestrator agent IN-PLACE on the real
-      // workspace (the git tab + per-turn checkpoint are the safety net). Leaving
-      // `isolate` undefined keeps the runner's default-OFF in-place behaviour
-      // byte-identical. The mechanism (worktree + merge-back) ships dormant; a
-      // FUTURE chat fan-out that spawns several agents at once should pass
-      // `isolate: true` HERE (gated behind its own fan-out flag, default OFF) so
-      // parallel agents don't clobber each other's edits in the shared tree.
+      // Phase 7 #4 — worktree-per-agent isolation est le DÉFAUT en mode Agent.
+      // On NE passe PAS `isolate` ici → le backend applique `unwrap_or(true)` :
+      // l'orchestrateur chat/cockpit travaille seul dans un worktree, l'utilisateur
+      // relit le diff puis merge ou jette (UI panneau Agents + bandeau timeline),
+      // son checkout reste intact. Si l'isolation échoue (pas de dépôt git), le
+      // runner retombe in-place et émet `worktreeSkipped` (toast). Pour FORCER
+      // l'in-place sur un flux précis, passer `isolate: false` explicitement (cf.
+      // Studio / superviseurs qui le font).
     });
   } catch (err) {
     await appendMessage(convId, {

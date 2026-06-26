@@ -850,6 +850,9 @@ pub fn run() {
             commands::worktree::shugu_worktree_list,
             commands::worktree::shugu_worktree_cleanup,
             commands::worktree::shugu_worktree_size,
+            // Phase 7 #4 — merge-back / discard user-initiated (isolation par défaut).
+            commands::worktree::worktree_merge_back,
+            commands::worktree::worktree_discard,
             // Lane rattrapage — snapshots de tour (refs/shugu/turn/<id>).
             commands::snapshot::shugu_snapshot_checkpoint,
             commands::snapshot::shugu_snapshot_revert,

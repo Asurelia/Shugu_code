@@ -42,7 +42,8 @@ export type AgentEventKind =
   | "write"
   | "screenshot"
   | "worktreeStarted"
-  | "worktreeFinalized";
+  | "worktreeFinalized"
+  | "worktreeSkipped";
 
 // ────────────────────────────────────────────────────────────────────
 // DB row shapes (mirror Rust AgentRow / AgentEventRow)
@@ -195,6 +196,16 @@ export type AgentEvent =
       /** Present on "diff": why the changes weren't auto-merged (conflict / dirty
        *  target / error). */
       reason?: string;
+    }
+  | {
+      // Phase 7 #4 — l'isolation a été DEMANDÉE mais n'a pas pu démarrer (pas de
+      // dépôt git, pas de workspace, ou échec `git worktree add`). Le run continue
+      // IN-PLACE sur le checkout — l'UI affiche un badge « exec sur checkout » pour
+      // ne jamais laisser croire à une protection inexistante. `reason` explique.
+      kind: "worktreeSkipped";
+      agentId: string;
+      /** Pourquoi l'isolation n'a pas pu démarrer (affiché tel quel à l'user). */
+      reason: string;
     };
 
 // ────────────────────────────────────────────────────────────────────

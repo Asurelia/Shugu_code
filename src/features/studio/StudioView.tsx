@@ -186,6 +186,10 @@ export function StudioView() {
         apiKey: orch.apiKey,
         conversationId: convId,
         designContext: designContext || undefined,
+        // Phase 7 #4 — Studio (génération) : pas d'isolation worktree — les
+        // assets générés doivent atterrir direct dans le projet, pas derrière
+        // une revue de diff.
+        isolate: false,
       });
       appendStudioTurn({ id: crypto.randomUUID(), userText, agentId, context });
       setGateError(null);

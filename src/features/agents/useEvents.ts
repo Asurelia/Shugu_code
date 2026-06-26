@@ -26,6 +26,7 @@ import type { ParsedAgentTranscript } from "./queries";
 import { agentKeys } from "./keys";
 import { fireMoodReaction } from "@/features/mascot/moodReactionStore";
 import { sayMascot, truncateSpeech } from "@/features/mascot/speechStore";
+import { pushToast } from "@/components/toast";
 
 export function useAgentEvents(): void {
   const qc = useQueryClient();
@@ -188,6 +189,22 @@ export function useAgentEvents(): void {
             sayMascot(
               `📚 J'applique ${event.count} leçon${event.count > 1 ? "s" : ""} déjà apprise${event.count > 1 ? "s" : ""}.`,
               { tone: "proud", ttlMs: 4000, agentId: event.agentId },
+            );
+          } else if (event.kind === "worktreeSkipped") {
+            // Phase 7 #4 — l'isolation worktree a été DEMANDÉE mais n'a pas pu
+            // démarrer (pas de dépôt git / échec `git worktree add`). Le run
+            // continue IN-PLACE sur le checkout. On le signale fort (toast +
+            // mascotte inquiète) car la promesse d'isolation n'est PAS tenue :
+            // ne jamais laisser croire à une protection inexistante.
+            pushToast(
+              `⚠ Isolation impossible : ${event.reason} — l'agent a tourné sur ton checkout`,
+              "error",
+              8000,
+            );
+            fireMoodReaction("agent-error");
+            sayMascot(
+              `⚠ Pas pu m'isoler (${truncateSpeech(event.reason, 50)}) — je tourne sur ton checkout.`,
+              { tone: "error", ttlMs: 7000, agentId: event.agentId },
             );
           }
         });
