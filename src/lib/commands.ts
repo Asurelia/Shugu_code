@@ -116,6 +116,12 @@ export interface CommandContext {
   regenerateLast?: () => Promise<boolean>;
   /** Ouvre/ferme le picker « projets récents » — câblé par RootLayout. */
   setRecentOpen?: (open: boolean) => void;
+
+  // ─── Phase 7 #2 : Recherche sémantique (code) ────────────────────────
+  /** Ouvre/ferme la palette de recherche sémantique — câblé par RootLayout.
+   *  La commande `semantic-search` ne fait QUE basculer ce flag ; la palette
+   *  (SemanticSearchPalette) appelle le backend et rend ses résultats. */
+  setSemanticSearchOpen?: (open: boolean) => void;
 }
 
 // ─── Command interface ─────────────────────────────────────────
@@ -804,6 +810,23 @@ export const COMMANDS: Command[] = [
       if (ctx.currentView !== "code") ctx.navigateTo("code");
       ctx.setFindPanelOpen?.(true);
     },
+  },
+  {
+    // Phase 7 #2 — palette de recherche SÉMANTIQUE (RAG) sur l'index `code`.
+    // Distincte de `search-in-files` (grep textuel) : ici la requête est une
+    // intention en langage naturel, le backend semantic_search renvoie les
+    // chunks les plus proches. `run` reste un pur toggle de ctx — la palette
+    // (SemanticSearchPalette) appelle le backend et ouvre le fichier à la ligne.
+    // Pas de keybinding par défaut (évite une collision ; découvrable via la
+    // command palette). `when` la masque tant que RootLayout n'a pas câblé le
+    // setter (ex. fenêtre mascotte sans éditeur).
+    id: "semantic-search",
+    title: "Recherche sémantique (code)",
+    category: "Go",
+    icon: "search",
+    description: "RAG — retrouve du code par intention (langage naturel)",
+    when: (ctx) => !!ctx.setSemanticSearchOpen,
+    run: (ctx) => ctx.setSemanticSearchOpen?.(true),
   },
 
   // ── §3b : commandes LSP (palette) ─────────────────────────────────────────

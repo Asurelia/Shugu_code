@@ -58,6 +58,7 @@ import { useGitEvents } from "@/features/git/useEvents";
 import { useRefreshOpenFiles } from "@/features/fs/useRefreshOpenFiles";
 import { indexWorkspace } from "@/features/fs/workspaceIndexer";
 import { QuickOpenPalette } from "@/features/code/QuickOpenPalette";
+import { SemanticSearchPalette } from "@/features/code/SemanticSearchPalette";
 import { useRegenerateLast } from "@/features/chat/mutations";
 import { AgentsPanel } from "@/features/agents/AgentsPanel";
 import { useAgentEvents } from "@/features/agents/useEvents";
@@ -347,6 +348,8 @@ export function RootLayout() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   // Lot stubs-palette (2026-06-10) — Quick Open (Cmd+P) + Regenerate (Cmd+R).
   const [quickOpenOpen, setQuickOpenOpen] = useState(false);
+  // Phase 7 #2 — palette de recherche sémantique (code / RAG).
+  const [semanticSearchOpen, setSemanticSearchOpen] = useState(false);
   const regenerateLast = useRegenerateLast();
   // Lot projets-récents — picker « Open Recent Folder… » (palette).
   const [recentOpen, setRecentOpen] = useState(false);
@@ -1035,6 +1038,8 @@ export function RootLayout() {
     regenerateLast,
     // Lot projets-récents
     setRecentOpen,
+    // Phase 7 #2 — recherche sémantique (code)
+    setSemanticSearchOpen,
   }), [
     navigateTo, view, setPaletteOpen,
     sideCollapsed, setSideCollapsed,
@@ -1059,6 +1064,9 @@ export function RootLayout() {
     compareFile, setCompareFile,
     // Lot stubs-palette
     regenerateLast,
+    // Phase 7 #2 — recherche sémantique (code) ; setter useState stable,
+    // inclusion explicite pour que cmdCtx ne capture pas une closure périmée.
+    setSemanticSearchOpen,
   ]);
 
   // Global keybinding dispatcher — replaces the hardcoded Cmd+K useEffect.
@@ -1346,6 +1354,15 @@ export function RootLayout() {
             void openFile(path);
             navigate({ to: "/code" });
           }}
+        />
+
+        {/* Phase 7 #2 — Recherche sémantique (code / RAG). Auto-suffisante :
+            consomme useShell() (openFile + editorViewRef) pour ouvrir le
+            fichier à la ligne du hit. Déclenchée par commands.ts::semantic-search
+            via le setter threadé dans cmdCtx. */}
+        <SemanticSearchPalette
+          open={semanticSearchOpen}
+          onClose={() => setSemanticSearchOpen(false)}
         />
 
         {/* Lot projets-récents — picker « Open Recent Folder… » (palette). */}

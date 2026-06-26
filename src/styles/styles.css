@@ -1501,6 +1501,22 @@ body {
 }
 .palette-foot .spacer { flex: 1; }
 
+/* Phase 7 #2 — SemanticSearchPalette loading pulse. Décoratif : il est TOUJOURS
+   accompagné du label texte « Recherche sémantique en cours… » (la couleur /
+   l'animation n'est jamais le seul signal). Le guard global
+   prefers-reduced-motion (plus bas) neutralise déjà l'animation pour les
+   utilisateurs concernés — le point reste alors visible mais figé. */
+.sem-pulse {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--primary);
+  box-shadow: 0 0 8px var(--primary);
+  animation: sem-pulse 1s ease-in-out infinite;
+}
+@keyframes sem-pulse {
+  0%, 100% { opacity: 0.35; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1.1); }
+}
+
 /* ── MenuBar (Pass 2) ─────────────────────────────────────────
    The menu bar lives inside .titlebar, after .brand, before the first
    .tb-spacer. The outer wrapper and all interactive children carry
