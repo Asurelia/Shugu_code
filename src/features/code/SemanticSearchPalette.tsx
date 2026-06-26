@@ -71,6 +71,12 @@ export function SemanticSearchPalette({
   // qui pilote l'empty-state pédagogique (index froid) vs l'invite initiale.
   const [searched, setSearched] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  // Ref sur le bouton-résultat actif : sert à le faire défiler dans la vue
+  // quand on flèche sous la ligne de pli (k=20 → la sélection peut sortir de
+  // la zone visible de .palette-list). Le focus DOM reste sur l'input (pattern
+  // combobox éditable), donc le scroll natif du focus ne s'applique pas — on
+  // scrolle manuellement la ligne active.
+  const activeRowRef = useRef<HTMLButtonElement | null>(null);
 
   // Reset complet à chaque (ré)ouverture + focus immédiat de l'input.
   useEffect(() => {
@@ -127,6 +133,12 @@ export function SemanticSearchPalette({
   useEffect(() => {
     setIdx(0);
   }, [q]);
+
+  // M1 — garde la ligne active visible quand on navigue au clavier. `nearest`
+  // ne scrolle que si la ligne est hors champ (pas de saut inutile).
+  useEffect(() => {
+    activeRowRef.current?.scrollIntoView({ block: "nearest" });
+  }, [idx]);
 
   // Ouvre le hit sélectionné : openFile (read+tab+setActive) puis attend le
   // view du BON fichier avant de positionner le curseur sur la ligne de départ.
@@ -201,11 +213,32 @@ export function SemanticSearchPalette({
             onKeyDown={onKey}
             placeholder="Recherche sémantique : décris ce que tu cherches…"
             aria-label="Requête de recherche sémantique"
+            // M2 — pattern combobox éditable : lie l'input à la listbox et
+            // annonce l'option active (le focus DOM reste sur l'input, donc
+            // sans aria-activedescendant un SR ignore le highlight visuel).
+            role="combobox"
+            // Les attributs ARIA doivent refléter le DOM RENDU, pas l'état
+            // logique : pendant une 2e recherche `loading=true` mais `hits`
+            // garde l'ancien jeu (pour éviter un flash vide) ALORS QUE les
+            // <button role=option> sont masqués par `!loading` plus bas. On
+            // gate donc expanded/activedescendant sur `!loading` — sinon
+            // aria-activedescendant pointe un id absent (contrat ARIA violé).
+            aria-expanded={!loading && hits.length > 0}
+            aria-controls="sem-listbox"
+            aria-autocomplete="list"
+            aria-activedescendant={
+              !loading && hits.length ? `sem-opt-${idx}` : undefined
+            }
           />
           <span className="kbd">esc</span>
         </div>
 
-        <div className="palette-list scroll" role="listbox" aria-label="Résultats">
+        <div
+          id="sem-listbox"
+          className="palette-list scroll"
+          role="listbox"
+          aria-label="Résultats"
+        >
           {/* Indicateur de chargement — texte + pulse ; le pulse respecte
               prefers-reduced-motion (cf. .sem-pulse dans styles.css) et le
               texte reste TOUJOURS présent (la couleur/animation n'est jamais
@@ -234,6 +267,10 @@ export function SemanticSearchPalette({
             rows.map((row, me) => (
               <button
                 key={row.hit.id}
+                // M1/M2 — ref sur la ligne active (scrollIntoView) + id stable
+                // ciblé par aria-activedescendant de l'input.
+                ref={me === idx ? activeRowRef : undefined}
+                id={`sem-opt-${me}`}
                 type="button"
                 role="option"
                 aria-selected={me === idx}
