@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { detectFimFamily, buildFimPrompt, fimWindow } from "./fimPrompt";
+import { detectFimFamily, buildFimPrompt, fimWindow, buildFimRequest } from "./fimPrompt";
 
 describe("detectFimFamily", () => {
   it.each([
@@ -53,5 +53,28 @@ describe("fimWindow", () => {
   it("clamps an out-of-range cursor", () => {
     expect(fimWindow(doc, 999)).toEqual({ prefix: doc, suffix: "" });
     expect(fimWindow(doc, -5)).toEqual({ prefix: "", suffix: doc });
+  });
+});
+
+describe("buildFimRequest", () => {
+  // « const x = |42; » (curseur après « = »).
+  const doc = "const x = 42;";
+  const cursor = 10; // juste après "const x = "
+
+  it("ollama : prefix + suffix BRUTS (ollama template côté serveur)", () => {
+    const r = buildFimRequest(doc, cursor, "ollama", "qwen2.5-coder");
+    expect(r).toEqual({ prompt: "const x = ", suffix: "42;" });
+  });
+
+  it("openai : prompt sentinel-encodé, suffix OMIS (ignoré côté serveur)", () => {
+    const r = buildFimRequest(doc, cursor, "openai", "qwen2.5-coder");
+    expect(r.prompt).toBe("<|fim_prefix|>const x = <|fim_suffix|>42;<|fim_middle|>");
+    expect(r.suffix).toBeUndefined();
+  });
+
+  it("custom : même encodage que openai (selon la famille du modèle)", () => {
+    const r = buildFimRequest(doc, cursor, "custom", "codellama-13b");
+    expect(r.prompt).toBe("<PRE> const x =  <SUF>42; <MID>");
+    expect(r.suffix).toBeUndefined();
   });
 });

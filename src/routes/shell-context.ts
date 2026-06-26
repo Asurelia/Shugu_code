@@ -32,8 +32,11 @@ export interface EditorPrefs {
   formatOnSave: boolean;
   gitDecorations: boolean;
   gitBlame: boolean;
-  /** Lot 5 — FIM tab-autocomplete (ghost text). Default OFF : nécessite un
-   *  modèle FIM openai-compatible configuré, qualité/latence à régler. */
+  /** Lot 5 / Phase 7 #1 — FIM tab-autocomplete (ghost text STREAMING). Default
+   *  OFF (opt-in) : contrairement à Cursor (modèle inclus dans l'abo), Shugu
+   *  route vers le provider — potentiellement PAYANT — de l'utilisateur, donc
+   *  on n'envoie pas de requête FIM par frappe sans opt-in explicite. Activable
+   *  dans Settings → Editor ; le streaming est prêt dès l'activation. */
   tabAutocomplete: boolean;
 }
 

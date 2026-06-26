@@ -67,3 +67,25 @@ export function fimWindow(
     suffix: doc.slice(c, c + maxSuffix),
   };
 }
+
+/**
+ * Construit la paire (prompt, suffix) à envoyer au backend FIM SELON LE
+ * PROTOCOLE (le backend ne re-template pas) :
+ *   - ollama (`/api/generate`) : prefix BRUT + `suffix` BRUT — ollama applique
+ *     le template FIM du modèle côté serveur (l'encoder ici = double-template).
+ *   - openai/custom (`/v1/completions`) : prompt sentinel-encodé (le champ
+ *     `suffix` est ignoré côté serveur, d'où `suffix` omis).
+ * Pur + testé. Consommé par `runFimCompletion` + `startFimCompletionStream`.
+ */
+export function buildFimRequest(
+  doc: string,
+  cursor: number,
+  protocol: string,
+  model: string,
+): { prompt: string; suffix?: string } {
+  const parts = fimWindow(doc, cursor);
+  if (protocol === "ollama") {
+    return { prompt: parts.prefix, suffix: parts.suffix };
+  }
+  return { prompt: buildFimPrompt(parts, detectFimFamily(model)) };
+}
