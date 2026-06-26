@@ -27,6 +27,7 @@ import { useAgentTranscript } from "@/features/agents/queries";
 import type { AgentEvent, AgentStatus } from "@/lib/agents";
 import type { ChatWriteRecord } from "./chatWritesStore";
 import type { Message } from "@/lib/types";
+import { parseRiskFlag, type RiskFlag } from "@/lib/commandRules";
 
 /** Une ligne du journal d'activité de l'agent — un appel d'outil + son issue. */
 export interface AgentActivityItem {
@@ -49,6 +50,12 @@ export interface AgentActivityItem {
   /** Nom d'outil brut (ev.tool) — permet à la timeline de rendre un viewer
    *  dédié (ex. `browser_test`) plutôt que la sortie générique. */
   tool?: string;
+  /** Flag de risque parsé du préfixe « [RISK: …] » d'une commande (sinon
+   *  undefined). Pilote la carte de risque + le bouton « Toujours autoriser ». */
+  risk?: RiskFlag;
+  /** Commande brute (arg `command`) d'un appel exec — sert à dériver le motif
+   *  de règle proposé. Présent seulement pour les outils d'exécution. */
+  command?: string;
 }
 
 /** Une étape du plan de l'orchestrateur (tool `todo_write`). */
@@ -242,15 +249,30 @@ export function useMessageDisplay(m: Message): MessageDisplay {
         }
         const d = describeToolCall(ev.tool, ev.args);
         const seen = errorByCall.has(ev.toolCallId);
+        // Risque + commande brute uniquement pour les outils d'exécution (seul
+        // run_command préfixe sa sortie par « [RISK: …] » et porte un `command`).
+        const isExec = /run|command|exec|shell|bash/.test(ev.tool.toLowerCase());
+        // resultByCall = sortie déjà tronquée à RESULT_CAP. Sûr ici : le préfixe
+        // « [RISK: …] » est TOUJOURS la 1re ligne, très en-deçà du cap, donc la
+        // troncature ne l'altère jamais (≠ resultIsError qui lit ev.result brut).
+        const resultStr = resultByCall.get(ev.toolCallId);
+        const risk = isExec ? parseRiskFlag(resultStr) : undefined;
+        const command = isExec
+          ? firstString(asRecord(ev.args), ["command", "cmd", "script"])
+          : undefined;
         activity.push({
           key: ev.toolCallId,
           icon: d.icon,
           label: d.label,
           detail: d.detail,
           status: !seen ? "running" : errorByCall.get(ev.toolCallId) ? "error" : "ok",
-          result: resultByCall.get(ev.toolCallId),
+          // Quand le risque est extrait, on retire la ligne « [RISK: …] » de la
+          // sortie affichée (elle est rendue par la carte de risque).
+          result: risk && resultStr ? resultStr.replace(/^\[RISK:[^\n]*\n?/, "") : resultStr,
           imageUrl: imageByCall.get(ev.toolCallId),
           tool: ev.tool,
+          risk,
+          command,
         });
       } else if (ev.kind === "write") {
         // 1er write d'un path gagne : son `before` = état d'avant le run, donc

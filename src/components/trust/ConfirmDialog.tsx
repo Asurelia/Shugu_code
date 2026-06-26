@@ -25,6 +25,7 @@ export function ConfirmDialog({
   tone = "default",
   onConfirm,
   onCancel,
+  initialFocusRef,
 }: {
   open: boolean;
   title: string;
@@ -35,6 +36,10 @@ export function ConfirmDialog({
   tone?: "default" | "danger";
   onConfirm: () => void;
   onCancel: () => void;
+  /** Élément à focus à l'ouverture À LA PLACE du bouton Confirmer. À utiliser
+   *  quand le `body` contient un champ éditable (ex. un motif à corriger) — sans
+   *  ça, focus sur Confirmer = un Entrée immédiat valide la valeur non éditée. */
+  initialFocusRef?: React.RefObject<HTMLElement | null>;
 }) {
   const confirmRef = useRef<HTMLButtonElement | null>(null);
   const titleId = useId();
@@ -49,14 +54,17 @@ export function ConfirmDialog({
       }
     };
     document.addEventListener("keydown", onKey);
-    // Focus the confirm button so Enter confirms and focus is trapped at the
-    // start of the dialog (keyboard users land inside, not behind, the modal).
-    const t = window.setTimeout(() => confirmRef.current?.focus(), 0);
+    // Focus le champ éditable fourni (initialFocusRef) sinon le bouton Confirmer.
+    // Focus trappé au début du modal (l'utilisateur atterrit DANS, pas derrière).
+    const t = window.setTimeout(
+      () => (initialFocusRef?.current ?? confirmRef.current)?.focus(),
+      0,
+    );
     return () => {
       document.removeEventListener("keydown", onKey);
       window.clearTimeout(t);
     };
-  }, [open, onCancel]);
+  }, [open, onCancel, initialFocusRef]);
 
   if (!open) return null;
 

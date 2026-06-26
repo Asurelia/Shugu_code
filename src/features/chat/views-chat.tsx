@@ -29,6 +29,7 @@ import { revealAgent, killAgent, type AgentStatus } from "@/lib/agents";
 import { useAgentDefs } from "@/features/agents/agentDefsQueries";
 import { useMessageDisplay, type AgentActivityItem } from "./useMessageDisplay";
 import { BrowserTestResultViewer } from "./BrowserTestResultViewer";
+import { CommandRiskCard } from "./CommandRiskCard";
 import { AgentPlan } from "./AgentPlan";
 import { Markdown } from "./markdownView";
 import { useShell } from "@/routes/shell-context";
@@ -864,8 +865,20 @@ function ActivityRow({ it }: { it: AgentActivityItem }) {
       </span>
     </>
   );
+  // La carte de risque (chip danger + « toujours autoriser/refuser ») est
+  // TOUJOURS visible quand la commande est flaggée — hors du <details> pour ne
+  // pas la cacher quand la sortie est repliée.
+  const riskCard = it.risk ? (
+    <CommandRiskCard risk={it.risk} command={it.command} />
+  ) : null;
+
   if (!it.result && !it.imageUrl) {
-    return <li className={"act " + it.status}>{head}</li>;
+    return (
+      <li className={"act " + it.status}>
+        {head}
+        {riskCard}
+      </li>
+    );
   }
   return (
     <li className={"act has-out " + it.status}>
@@ -888,6 +901,7 @@ function ActivityRow({ it }: { it: AgentActivityItem }) {
           </>
         )}
       </details>
+      {riskCard}
     </li>
   );
 }

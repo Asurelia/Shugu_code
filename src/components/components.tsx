@@ -827,6 +827,7 @@ export function SideSettings({ section, setSection }: any) {
     { id: 'mascot', label: 'Mascot' },
     { id: 'shortcuts', label: 'Keyboard shortcuts' },
     { id: 'privacy', label: 'Privacy' },
+    { id: 'command-rules', label: 'Command Rules' },
     { id: 'ops', label: 'Storage & Backup' },
     { id: 'about', label: 'About' },
   ];
