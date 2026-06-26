@@ -39,6 +39,8 @@ export type AgentEventKind =
   | "error"
   | "skillLearned"
   | "lessonsInjected"
+  | "memoryRecalled"
+  | "memoryCompacted"
   | "write"
   | "screenshot"
   | "worktreeStarted"
@@ -149,6 +151,30 @@ export type AgentEvent =
        * context at start (S3 closed loop). The Agents panel shows a
        * "📚 N leçons réinjectées" badge. */
       count: number;
+    }
+  | {
+      // AM-2 — orchestrated-memory RECALL. The `recall()` hook injected past
+      // facts/episodes (from the `memory` vector collection) relevant to this
+      // task into the agent's context. Distinct from `lessonsInjected`
+      // (validated reviews) — these are the agent's own remembered facts +
+      // compaction summaries.
+      kind: "memoryRecalled";
+      agentId: string;
+      role: string;
+      /** How many memories were surfaced — the UI shows a
+       * "🧠 N souvenir(s) rappelé(s)" badge. */
+      count: number;
+    }
+  | {
+      // AM-2 — history COMPACTION. The loop summarised its oldest turns into one
+      // episodic memory (written to the `memory` collection) and replaced them
+      // with a single recap, to stay within context.
+      kind: "memoryCompacted";
+      agentId: string;
+      role: string;
+      /** How many turns were collapsed into the summary — the UI shows a
+       * "🗜 N tours compactés" note instead of a silent message drop. */
+      folded: number;
     }
   | {
       kind: "write";
