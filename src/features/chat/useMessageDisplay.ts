@@ -46,6 +46,9 @@ export interface AgentActivityItem {
   /** Miniature (data URL) d'un screenshot pris par l'outil capture_screen —
    *  la preuve visuelle s'affiche dépliable dans la timeline. */
   imageUrl?: string;
+  /** Nom d'outil brut (ev.tool) — permet à la timeline de rendre un viewer
+   *  dédié (ex. `browser_test`) plutôt que la sortie générique. */
+  tool?: string;
 }
 
 /** Une étape du plan de l'orchestrateur (tool `todo_write`). */
@@ -114,6 +117,12 @@ function describeToolCall(tool: string, args: unknown): { icon: string; label: s
   const a = asRecord(args);
   const t = tool.toLowerCase();
 
+  // En tête : `browser_test` est spécifique (lance un navigateur headless et
+  // VÉRIFIE l'app web). Match EXACT — un `includes("browser")` avalerait
+  // silencieusement de futurs outils (open_browser, browser_cookies…).
+  if (t === "browser_test") {
+    return { icon: "🌐", label: "teste", detail: clip(firstString(a, ["url", "query"]) || "le navigateur") };
+  }
   if (t.includes("read") || t === "cat") {
     return { icon: "📖", label: "lit", detail: clip(firstString(a, ["path", "file_path", "filename", "file"])) };
   }
@@ -162,6 +171,10 @@ function resultIsError(ev: Extract<AgentEvent, { kind: "toolResult" }>): boolean
   // succès un résultat d'erreur encodé dans un objet.
   const resStr = typeof ev.result === "string" ? ev.result : JSON.stringify(ev.result ?? "");
   if (resStr.includes("[TIMED OUT")) return true;
+  // `browser_test` signale un échec d'assertion en DONNÉES (is_error est réservé
+  // aux pannes d'INFRA côté backend), donc sans ce test la timeline afficherait
+  // un faux ✓ sur un test FAILED. On lit le verdict du summary.
+  if (/^browser_test:\s*FAILED/m.test(resStr)) return true;
   const m = resStr.match(/\[exit\s+(-?\d+)\]/);
   return m ? m[1] !== "0" : false;
 }
@@ -237,6 +250,7 @@ export function useMessageDisplay(m: Message): MessageDisplay {
           status: !seen ? "running" : errorByCall.get(ev.toolCallId) ? "error" : "ok",
           result: resultByCall.get(ev.toolCallId),
           imageUrl: imageByCall.get(ev.toolCallId),
+          tool: ev.tool,
         });
       } else if (ev.kind === "write") {
         // 1er write d'un path gagne : son `before` = état d'avant le run, donc

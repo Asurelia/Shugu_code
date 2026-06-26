@@ -28,6 +28,7 @@ import { ModelPicker } from "@/features/panels/panels";
 import { revealAgent, killAgent, type AgentStatus } from "@/lib/agents";
 import { useAgentDefs } from "@/features/agents/agentDefsQueries";
 import { useMessageDisplay, type AgentActivityItem } from "./useMessageDisplay";
+import { BrowserTestResultViewer } from "./BrowserTestResultViewer";
 import { AgentPlan } from "./AgentPlan";
 import { Markdown } from "./markdownView";
 import { useShell } from "@/routes/shell-context";
@@ -870,15 +871,22 @@ function ActivityRow({ it }: { it: AgentActivityItem }) {
     <li className={"act has-out " + it.status}>
       <details>
         <summary>{head}</summary>
-        {/* Preuve visuelle d'un capture_screen — miniature dépliable. */}
-        {it.imageUrl && (
-          <img
-            src={it.imageUrl}
-            alt="Capture d'écran prise par l'agent"
-            style={{ maxWidth: "100%", borderRadius: 6, marginTop: 6, display: "block" }}
-          />
+        {it.tool === "browser_test" ? (
+          // Viewer dédié : verdict réussite/échec + capture + assertions.
+          <BrowserTestResultViewer summary={it.result} imageUrl={it.imageUrl} />
+        ) : (
+          <>
+            {/* Preuve visuelle d'un capture_screen — miniature dépliable. */}
+            {it.imageUrl && (
+              <img
+                src={it.imageUrl}
+                alt="Capture d'écran prise par l'agent"
+                style={{ maxWidth: "100%", borderRadius: 6, marginTop: 6, display: "block" }}
+              />
+            )}
+            {it.result && <pre className="out">{it.result}</pre>}
+          </>
         )}
-        {it.result && <pre className="out">{it.result}</pre>}
       </details>
     </li>
   );
