@@ -817,6 +817,12 @@ export function RootLayout() {
   // jamais via fermeture. openFile devient un callback stable (deps vides).
   const fileContentsRef = useRef(fileContents);
   fileContentsRef.current = fileContents;
+  // NOTE: `openFile` PEUT throw (fsReadFile échoue : absent / accès refusé /
+  // binaire). C'est VOULU — `applyCodeToFile` s'appuie sur ce throw pour
+  // détecter un fichier neuf à créer. Les appelants fire-and-forget (`void
+  // openFile(p)` du file tree / RightPanel / nav LSP / palette) DOIVENT donc
+  // catcher pour ne pas produire d'unhandledrejection : ils passent par
+  // `openFileSafe` ci-dessous.
   const openFile = useCallback(async (path: string) => {
     if (!(path in fileContentsRef.current)) {
       const content = await fsReadFile(path);
@@ -827,19 +833,39 @@ export function RootLayout() {
     setFilesPanelActive(path);
   }, []);
 
+  // Variante fire-and-forget : ouvre le fichier et, en cas d'échec de lecture
+  // (accès refusé, verrou, fichier disparu), signale via un toast au lieu de
+  // laisser la promesse rejeter (qui devenait une unhandledrejection
+  // « read error: … » sur les appels `void openFile(p)`). À utiliser partout où
+  // l'ouverture est déclenchée par un clic UI sans `await` qui catche.
+  const openFileSafe = useCallback(
+    async (path: string): Promise<void> => {
+      try {
+        await openFile(path);
+      } catch (err) {
+        pushToast(
+          `Impossible d'ouvrir ${path.replace(/\\/g, "/").split("/").pop()} : ${String(err)}`,
+          "error",
+          6000,
+        );
+      }
+    },
+    [openFile],
+  );
+
   // Lot B §2 — publie openFile + l'accès à l'EditorView actif au pont LSP, pour
   // que ShuguWorkspace.displayFile puisse naviguer cross-fichier (F12, Ctrl+Clic
   // vers une définition dans un autre fichier, panneau de références).
   useEffect(() => {
     setLspBridge({
-      openFile,
+      openFile: openFileSafe,
       getViewForPath: (path) => {
         const v = editorViewRef.current;
         if (!v) return null;
         return v.getPath() === path ? (v.getView() ?? null) : null;
       },
     });
-  }, [openFile]);
+  }, [openFileSafe]);
 
   const saveFile = useCallback(async (path: string) => {
     const content = fileContents[path];
@@ -980,7 +1006,7 @@ export function RootLayout() {
           if (cancelled) return;
           const path = e.payload?.path;
           if (!path) return;
-          void openFile(path);
+          void openFileSafe(path);
           navigate({ to: "/code" });
         });
       } catch (err) {
@@ -988,7 +1014,7 @@ export function RootLayout() {
       }
     })();
     return () => { cancelled = true; unlisten?.(); };
-  }, [openFile, navigate]);
+  }, [openFileSafe, navigate]);
 
   // newChat creates a fresh conversation row in SQLite and switches the
   // active conv to it. The empty-messages render falls out naturally:
@@ -1121,7 +1147,7 @@ export function RootLayout() {
       return (
         <SideFiles
           active={filesPanelActive}
-          onPick={openFile}
+          onPick={openFileSafe}
         />
       );
     }
@@ -1192,7 +1218,11 @@ export function RootLayout() {
     findPanelOpen, setFindPanelOpen,
     // LOT 2 — openFile (read+open+focus) lifted so FindPanel can open a
     // file from a grep result even if it isn't already in openFiles.
-    openFile,
+    // Variante SAFE exposée au contexte : un échec de lecture (accès refusé…)
+    // toaste au lieu de rejeter — les consumers (FindPanel/RightPanel/palette/
+    // file tree) appellent souvent en fire-and-forget. applyCodeToFile garde la
+    // locale throwing (détection fichier neuf).
+    openFile: openFileSafe,
     // LOT 1 — editor prefs
     editorPrefs,
     setEditorPref,
@@ -1208,7 +1238,7 @@ export function RootLayout() {
     editorViewRef,
     // LOT 2
     findPanelOpen, setFindPanelOpen,
-    openFile,
+    openFileSafe,
     // LOT 1 — editor prefs
     editorPrefs,
     setEditorPref,
