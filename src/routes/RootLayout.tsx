@@ -53,6 +53,9 @@ import {
 } from "@/features/fs/recentWorkspaces";
 import { pushToast } from "@/components/toast";
 import { invalidateFileTree } from "@/features/fs/queries";
+import { queryClient } from "@/lib/queryClient";
+import { fsKeys } from "@/features/fs/keys";
+import { gitKeys } from "@/features/git/keys";
 import { useFsEvents } from "@/features/fs/useEvents";
 import { useGitEvents } from "@/features/git/useEvents";
 import { useRefreshOpenFiles } from "@/features/fs/useRefreshOpenFiles";
@@ -624,6 +627,19 @@ export function RootLayout() {
       try {
         const { listen } = await import("@tauri-apps/api/event");
         unlisten = await listen("workspace://changed", () => {
+          // Le workspace a changé → tout cache SCOPÉ au workspace est périmé.
+          // Sans cette invalidation : le git status reste figé (badges « 76 »
+          // collés à l'ancien dossier), `isRepo` périmé cache la carte git-init,
+          // et le root affiché (chip composer) reste sur l'ancien nom. `gitKeys.all`
+          // couvre status/branches/log/isRepo ; `fsKeys.workspaceRoot()` rafraîchit
+          // le chip (staleTime Infinity → invalidate force le refetch).
+          void queryClient.invalidateQueries({ queryKey: gitKeys.all });
+          void queryClient.invalidateQueries({ queryKey: fsKeys.workspaceRoot() });
+          // Self-contained (revue MEDIUM) : invalide AUSSI l'arbre de fichiers ici
+          // pour que ce listener soit l'unique point canonique de nettoyage au
+          // changement de workspace (les appelants actuels le faisaient déjà ;
+          // un futur 3e appelant n'aura rien à dupliquer).
+          invalidateFileTree();
           setTimeout(() => { void indexWorkspace(); }, 3000);
         });
       } catch (err) {

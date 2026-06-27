@@ -54,7 +54,13 @@ export function ContextTiles({
   const cols = chunk2(tiles);
 
   return (
-    <PanelGroup direction="horizontal" className="ctx-tiles">
+    // `key` dérivée de l'ENSEMBLE des tuiles : react-resizable-panels ne gère
+    // pas proprement l'ajout/retrait de Panel sur un même PanelGroup (son
+    // registre interne reste sur l'ancienne structure → la tuile fermée
+    // restait affichée, « croix morte »). Re-monter le groupe quand l'ensemble
+    // change règle ça ; le drag de redimensionnement (qui ne change pas
+    // l'ensemble) est préservé.
+    <PanelGroup key={"tiles-" + tiles.join("|")} direction="horizontal" className="ctx-tiles">
       {cols.map((col, ci) => (
         <Fragment key={"col-" + col.join("-")}>
           {ci > 0 && <PanelResizeHandle className="dock-rrp-handle v" />}
