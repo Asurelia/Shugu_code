@@ -55,7 +55,13 @@ const MAX_ITERATIONS: u32 = 24;
 fn is_write_tool(name: &str) -> bool {
     matches!(
         name,
-        "fs_write_file" | "fs_edit" | "fs_delete" | "fs_move" | "run_command" | "skill_save"
+        "fs_write_file"
+            | "fs_edit"
+            | "fs_delete"
+            | "fs_move"
+            | "run_command"
+            | "skill_save"
+            | "delegate"
     )
 }
 
@@ -109,12 +115,12 @@ const RECALL_MAX_DISTANCE: f32 = 1.15;
 /// text is multi-byte). Keeps the injected block bounded.
 const RECALL_SNIPPET_CHARS: usize = 600;
 
-/// COMPACTION threshold is now MODEL-DERIVED (was a fixed 28). The live loop
-/// computes it from the model's context window via
-/// `model_capabilities::compaction_trigger` and passes it to `maybe_compact` as
-/// `trigger_turns`. Small-context models compact earlier (≤14 turns); strong
-/// models keep the historical 28. Folding the oldest turns still happens BEFORE
-/// bloat, not after a hard drop.
+// COMPACTION threshold is now MODEL-DERIVED (was a fixed 28). The live loop
+// computes it from the model's context window via
+// `model_capabilities::compaction_trigger` and passes it to `maybe_compact` as
+// `trigger_turns`. Small-context models compact earlier (≤14 turns); strong
+// models keep the historical 28. Folding the oldest turns still happens BEFORE
+// bloat, not after a hard drop.
 
 /// How many of the OLDEST turns to fold into one episodic summary when
 /// compaction fires. Leaves the recent tail verbatim (the model needs fresh
@@ -954,6 +960,7 @@ pub(super) async fn run_agent_task(
             read_only,
             advisor.as_ref(),
             conversation_id.as_deref(),
+            0, // depth racine — un run top-level n'est jamais lui-même un sous-agent
         ) => r,
         _ = abort.notified() => {
             mark_killed(&app, &agent_id);
@@ -1171,6 +1178,311 @@ async fn finalize_isolation(
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Délégation : sous-agent à contexte isolé (Phase B)
+// ────────────────────────────────────────────────────────────────────
+
+/// Profondeur de délégation max (0 = run racine). À 2 : racine → enfant →
+/// petit-enfant (qui ne voit plus `delegate`). Borne mécaniquement l'explosion.
+const MAX_DELEGATION_DEPTH: u32 = 2;
+
+/// Timeout d'un sous-run délégué (s). Un sous-agent qui patine ne pend pas le
+/// parent indéfiniment (le parent occupe un slot pendant qu'il attend).
+const DELEGATE_TIMEOUT_SECS: u64 = 600;
+
+/// System prompt du sous-agent délégué : contexte isolé + contrat de handoff.
+const DELEGATE_CHILD_PROMPT: &str = "Tu es un SOUS-AGENT à contexte ISOLÉ, lancé par un agent parent pour une sous-tâche précise et auto-suffisante. Tu n'as AUCUN accès à la conversation du parent — tout ce dont tu as besoin est dans la tâche ci-dessous. Exécute-la, VÉRIFIE ton travail avec run_command (build/tests) quand c'est pertinent, puis termine par un bloc :\n\n## RÉSULTAT\n<2-4 phrases : ce que tu as fait + le verdict de ta vérification>\n\n## FAITS\n- fichiers : <file:line des points clés à inspecter>\n- vérif : <commande lancée → résultat observé>\n\nLes FAITS seront RE-VÉRIFIÉS par l'environnement (diff git réel) — ne prétends pas un succès que tu n'as pas obtenu.";
+
+/// Compose le handoff renvoyé au PARENT : prose compressée (étiquetée NON
+/// vérifiée) + bloc FAITS capté de l'environnement (le diff git réel est la
+/// vérité-terrain que la prose de l'enfant ne peut pas falsifier).
+fn format_delegate_handoff(
+    output: &str,
+    diff_stat: Option<&str>,
+    child_branch: Option<&str>,
+    iterations: u32,
+    tool_errors: u32,
+    error: Option<&str>,
+) -> String {
+    let prose: String = output.chars().take(800).collect();
+    let mut s = String::from("## RÉSULTAT (sous-agent — prose, NON vérifiée)\n");
+    s.push_str(prose.trim());
+    s.push_str("\n\n## FAITS (capturés de l'environnement — vérifiables)\n");
+    match diff_stat {
+        Some(d) if !d.trim().is_empty() => {
+            s.push_str("- diff (git --stat) :\n");
+            for line in d.lines() {
+                s.push_str("    ");
+                s.push_str(line);
+                s.push('\n');
+            }
+        }
+        _ => s.push_str("- diff : AUCUN fichier modifié\n"),
+    }
+    s.push_str(&format!(
+        "- itérations : {iterations}   tool errors : {tool_errors}\n"
+    ));
+    if let Some(b) = child_branch {
+        s.push_str(&format!(
+            "- branche worktree : {b}  (relis/merge via la tuile Git)\n"
+        ));
+    }
+    if let Some(e) = error {
+        s.push_str(&format!(
+            "\n⚠ Le sous-agent n'a PAS terminé normalement : {e}\n"
+        ));
+    }
+    s
+}
+
+/// Insère un handle agent dans le registre global. Forme `match`+`return` (et
+/// non `if let` traînant) pour un drop order propre du `MutexGuard` (évite E0597).
+fn registry_insert(app: &AppHandle, id: &str, handle: super::AgentHandle) {
+    let registry = app.state::<super::AgentManagerState>().0.clone();
+    let mut g = match registry.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    g.insert(id.to_string(), handle);
+}
+
+/// Retire un handle agent du registre global (best-effort).
+fn registry_remove(app: &AppHandle, id: &str) {
+    let registry = app.state::<super::AgentManagerState>().0.clone();
+    let mut g = match registry.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    g.remove(id);
+}
+
+/// Lance un SOUS-AGENT délégué à contexte ISOLÉ, l'attend (timeout + abort en
+/// cascade), et renvoie un HANDOFF machine-vérifiable. Réutilise `tool_use_loop`
+/// (le cœur awaitable) — ne touche PAS `run_agent_task` (zéro régression du
+/// chemin agent principal). L'enfant : conversation_id=None (contexte vierge),
+/// worktree frais (jamais auto-mergé → keep-for-review), provider/modèle hérités.
+/// Hors du cap `MAX_CONCURRENT_AGENTS` (continuation du parent, bornée par depth).
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_delegated_child(
+    app: &AppHandle,
+    client: &reqwest::Client,
+    protocol: &str,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+    chat_template_kwargs: &Option<serde_json::Value>,
+    parent_id: &str,
+    depth: u32,
+    task: String,
+) -> Result<String, String> {
+    let start = std::time::Instant::now();
+    let child_id = uuid::Uuid::new_v4().to_string();
+    let child_abort = std::sync::Arc::new(tokio::sync::Notify::new());
+
+    // Registre : insérer le handle enfant SANS le check de capacité
+    // (MAX_CONCURRENT_AGENTS). L'enfant est une CONTINUATION du parent (qui
+    // occupe déjà un slot et attend) — la profondeur le borne. Permet aussi au
+    // cascade kill (agent_kill) de le retrouver et l'abort.
+    registry_insert(
+        app,
+        &child_id,
+        super::AgentHandle {
+            role: "delegate".to_string(),
+            abort: child_abort.clone(),
+        },
+    );
+
+    // INSERT de la row enfant (parent_id → arbre UI ; conversation_id NULL →
+    // contexte vierge). Parité avec agent_spawn : un échec d'INSERT rollback le
+    // handle ET fait échouer la délégation proprement (pas d'orphelin registre).
+    let insert_res: Result<(), String> = (|| {
+        let conn_mutex = get_conn(app)?;
+        let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO agents
+                (id, role, status, parent_id, model, task, conversation_id, created_at)
+             VALUES (?1, 'delegate', 'running', ?2, ?3, ?4, NULL, ?5)",
+            params![child_id, parent_id, model, task, now_ms()],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    if let Err(e) = insert_res {
+        registry_remove(app, &child_id);
+        return Err(format!("insert sous-agent : {e}"));
+    }
+    let _ = persist_and_emit(
+        app,
+        &AgentEvent::Spawn {
+            agent_id: child_id.clone(),
+            parent_id: Some(parent_id.to_string()),
+            role: "delegate".to_string(),
+            task: task.clone(),
+            model: model.to_string(),
+            conversation_id: None,
+        },
+    );
+
+    // Worktree isolé best-effort. `iso` porte (root, entry) pour le diff + finalize.
+    let mut workspace_override: Option<PathBuf> = None;
+    let mut iso: Option<(PathBuf, crate::commands::worktree::WorktreeEntry)> = None;
+    if let Some(root) = get_workspace_root(app) {
+        if root.join(".git").exists() {
+            if let Ok(entry) =
+                crate::commands::worktree::create_inner(&root, None, Some("delegate")).await
+            {
+                let _ = persist_and_emit(
+                    app,
+                    &AgentEvent::WorktreeStarted {
+                        agent_id: child_id.clone(),
+                        path: entry.path.clone(),
+                        branch: entry.branch.clone(),
+                    },
+                );
+                workspace_override = Some(PathBuf::from(&entry.path));
+                iso = Some((root, entry));
+            }
+        }
+    }
+
+    // Historique enfant : prompt de délégation + tâche (contexte vierge).
+    let mut history: Vec<AgentMessage> = vec![
+        AgentMessage::Text {
+            role: "system".to_string(),
+            content: DELEGATE_CHILD_PROMPT.to_string(),
+        },
+        AgentMessage::Text {
+            role: "user".to_string(),
+            content: task,
+        },
+    ];
+    let mut metrics = LoopMetrics::default();
+
+    // Boucle enfant en course contre le timeout ET l'abort en cascade. Le bloc
+    // borne l'emprunt mutable de `history`/`metrics` par le future ; après, on
+    // lit `metrics` librement.
+    let outcome: Result<(String, String), String> = {
+        let loop_fut = tool_use_loop(
+            app,
+            client,
+            protocol,
+            base_url,
+            model,
+            api_key,
+            chat_template_kwargs,
+            &child_id,
+            "delegate",
+            &mut history,
+            &mut metrics,
+            workspace_override.clone(),
+            false, // read_only : un sous-agent peut muter (déjà gardé par is_write_tool en mode Plan côté parent)
+            None,  // advisor : pas de conseiller imbriqué en v1
+            None,  // conversation_id : contexte vierge
+            depth,
+        );
+        tokio::select! {
+            r = tokio::time::timeout(
+                std::time::Duration::from_secs(DELEGATE_TIMEOUT_SECS),
+                loop_fut,
+            ) => match r {
+                Ok(inner) => inner,
+                Err(_) => Err(format!("timeout après {DELEGATE_TIMEOUT_SECS}s")),
+            },
+            _ = child_abort.notified() => Err("annulé (kill en cascade)".to_string()),
+        }
+    };
+
+    // L'enfant a fini sa boucle (succès / timeout / abort) — retirer son handle
+    // du registre AVANT le nettoyage async (diff/finalize), pour ne pas laisser
+    // un handle « zombie » qu'un second agent_kill retrouverait.
+    registry_remove(app, &child_id);
+
+    // Faits objectifs : diff git RÉEL du worktree enfant (vérité-terrain non
+    // falsifiable par la prose). 3-points → seuls les commits de l'enfant.
+    let mut diff_stat: Option<String> = None;
+    let mut child_branch: Option<String> = None;
+    if let Some((root, entry)) = iso.as_ref() {
+        child_branch = Some(entry.branch.clone());
+        let target = crate::commands::worktree::current_branch(root)
+            .await
+            .unwrap_or_else(|| "HEAD".to_string());
+        diff_stat = crate::commands::worktree::diff_summary(root, &entry.branch, &target)
+            .await
+            .ok();
+    }
+
+    // Finalize : commit + keep-for-review (JAMAIS auto-merge — le parent/user
+    // merge via la tuile Git).
+    if let Some((root, entry)) = iso.as_ref() {
+        let kind = if outcome.is_ok() {
+            IsolationKind::Success
+        } else {
+            IsolationKind::Error
+        };
+        finalize_isolation(app, root, entry, &child_id, kind).await;
+    }
+
+    // MAJ DB + event terminal + handoff.
+    let ms = start.elapsed().as_millis() as u64;
+    let handoff = match &outcome {
+        Ok((output, _reasoning)) => {
+            if let Ok(conn_mutex) = get_conn(app) {
+                if let Ok(conn) = conn_mutex.lock() {
+                    let _ = conn.execute(
+                        "UPDATE agents SET status='complete', finished_at=?1, output=?2 WHERE id=?3",
+                        params![now_ms(), output, child_id],
+                    );
+                }
+            }
+            let _ = persist_and_emit(
+                app,
+                &AgentEvent::Complete {
+                    agent_id: child_id.clone(),
+                    output: output.clone(),
+                    tokens_used: None,
+                    reasoning: None,
+                    ms,
+                },
+            );
+            format_delegate_handoff(
+                output,
+                diff_stat.as_deref(),
+                child_branch.as_deref(),
+                metrics.iterations,
+                metrics.tool_errors,
+                None,
+            )
+        }
+        Err(e) => {
+            if let Ok(conn_mutex) = get_conn(app) {
+                if let Ok(conn) = conn_mutex.lock() {
+                    let _ = conn.execute(
+                        "UPDATE agents SET status='error', finished_at=?1, error=?2 WHERE id=?3",
+                        params![now_ms(), e, child_id],
+                    );
+                }
+            }
+            let _ = persist_and_emit(
+                app,
+                &AgentEvent::Error {
+                    agent_id: child_id.clone(),
+                    error: e.clone(),
+                },
+            );
+            format_delegate_handoff(
+                "(le sous-agent n'a pas produit de résultat)",
+                diff_stat.as_deref(),
+                child_branch.as_deref(),
+                metrics.iterations,
+                metrics.tool_errors,
+                Some(e),
+            )
+        }
+    };
+
+    Ok(handoff)
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Tool-use loop (the heart of Phase 2)
 // ────────────────────────────────────────────────────────────────────
 
@@ -1215,6 +1527,9 @@ pub(super) async fn tool_use_loop(
     // / Grounded leave it None). Scopes the memories written by remember/compaction
     // so a future run in the SAME chat can recall them with conversation context.
     conversation_id: Option<&str>,
+    // Profondeur de délégation (0 = run racine). Borne la récursion de l'outil
+    // `delegate` (cf. MAX_DELEGATION_DEPTH) et conditionne sa présence au manifest.
+    depth: u32,
 ) -> Result<(String, String), String> {
     // Stall-detection state: repeated identical tool-call signatures and
     // consecutive tool-error rounds are the two cheap "stuck" signals, recorded
@@ -1406,6 +1721,19 @@ pub(super) async fn tool_use_loop(
                 });
             }
         }
+        // Outil `delegate` : visible UNIQUEMENT si le modèle supporte la délégation
+        // ET qu'on n'est pas déjà à la profondeur max (évite la récursion sans fin
+        // + ne donne l'orchestration qu'aux modèles capables). Retiré sinon.
+        let allow_delegate = depth < MAX_DELEGATION_DEPTH
+            && crate::commands::model_capabilities::model_supports_delegation(protocol, model);
+        if !allow_delegate {
+            if let Some(a) = arr.as_array_mut() {
+                a.retain(|t| {
+                    let name = t["name"].as_str().or_else(|| t["function"]["name"].as_str());
+                    name != Some("delegate")
+                });
+            }
+        }
         Some(arr)
     };
 
@@ -1538,6 +1866,7 @@ pub(super) async fn tool_use_loop(
                     || tc.name == "web_fetch"
                     || tc.name == "advisor"
                     || tc.name == "browser_test"
+                    || tc.name == "delegate"
             });
 
         let results: Vec<ToolResult> = if any_async {
@@ -1661,6 +1990,61 @@ pub(super) async fn tool_use_loop(
                         id: tc.id.clone(),
                         name: tc.name.clone(),
                         is_error: outcome.is_error,
+                        content,
+                    });
+                } else if tc.name == "delegate" {
+                    // Offload vers un SOUS-AGENT à contexte isolé. Le parent attend
+                    // (await) et reçoit un handoff machine-vérifiable (diff réel +
+                    // itérations), pas une simple prose. Box::pin casse la récursion
+                    // async tool_use_loop → enfant → tool_use_loop.
+                    let args: serde_json::Value =
+                        serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
+                    let task = args["task"].as_str().unwrap_or("").trim().to_string();
+                    let focus = args["focus_hint"].as_str().unwrap_or("").trim();
+                    let expected = args["expected_artifacts"].as_str().unwrap_or("").trim();
+                    let (content, is_error) = if read_only {
+                        // Defense-in-depth : Plan mode interdit un sous-agent mutant
+                        // (delegate ∈ is_write_tool → déjà hors manifest, mais M3 peut
+                        // l'émettre en texte XML).
+                        (PLAN_BLOCK_MSG.to_string(), true)
+                    } else if task.is_empty() {
+                        ("delegate: missing required field: task".to_string(), true)
+                    } else if depth >= MAX_DELEGATION_DEPTH {
+                        // Garde profondeur (ceinture + bretelles avec le filtre manifest).
+                        (
+                            format!("delegate: profondeur max ({MAX_DELEGATION_DEPTH}) atteinte — fais la sous-tâche toi-même"),
+                            true,
+                        )
+                    } else {
+                        let mut child_task = task.clone();
+                        if !focus.is_empty() {
+                            child_task.push_str(&format!("\n\nPoint de départ : {focus}"));
+                        }
+                        if !expected.is_empty() {
+                            child_task.push_str(&format!("\n\nLivrable attendu : {expected}"));
+                        }
+                        match Box::pin(run_delegated_child(
+                            app,
+                            client,
+                            protocol,
+                            base_url,
+                            model,
+                            api_key,
+                            chat_template_kwargs,
+                            agent_id,
+                            depth + 1,
+                            child_task,
+                        ))
+                        .await
+                        {
+                            Ok(handoff) => (handoff, false),
+                            Err(e) => (format!("delegate: {e}"), true),
+                        }
+                    };
+                    acc.push(ToolResult {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        is_error,
                         content,
                     });
                 } else if tc.name.starts_with("mcp__") {

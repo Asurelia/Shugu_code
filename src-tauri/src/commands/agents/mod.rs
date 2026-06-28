@@ -1250,19 +1250,53 @@ pub async fn agent_grounded_run(
 /// 10–50 ms latency — acceptable for v1; true mid-chunk abort would
 /// require aborting the reqwest connection, a Phase 2 improvement).
 ///
-/// Non-cascading: only the targeted agent is killed. Phase 2+ orchestrator
-/// spawning sub-agents must add child-cascade here.
+/// CASCADE (Phase B) : tue la cible ET tous ses sous-agents délégués encore
+/// vivants (descendants via `parent_id`, index `idx_agents_parent`), pour qu'un
+/// kill du parent n'orpheline pas un enfant en cours.
 #[tauri::command]
 pub async fn agent_kill(
     app: tauri::AppHandle,
     state: State<'_, AgentManagerState>,
     agent_id: String,
 ) -> Result<(), String> {
-    // Take the handle out of the registry AND grab its abort token in
-    // one critical section so a concurrent spawn can't see the slot as
-    // freed while the task is still in tokio::select.
+    // Cascade : rassembler tous les descendants vivants (BFS via parent_id)
+    // AVANT de toucher au registre.
+    let mut descendants: Vec<String> = Vec::new();
+    {
+        let conn_mutex = get_conn(&app)?;
+        let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
+        let mut frontier = vec![agent_id.clone()];
+        while let Some(pid) = frontier.pop() {
+            let kids: Vec<String> = {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT id FROM agents
+                          WHERE parent_id = ?1 AND status IN ('running', 'pending')",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(params![pid], |r| r.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?;
+                rows.flatten().collect()
+            };
+            for k in kids {
+                if k != agent_id && !descendants.contains(&k) {
+                    descendants.push(k.clone());
+                    frontier.push(k);
+                }
+            }
+        }
+    }
+
+    // Abort + retrait des handles : descendants (best-effort) PUIS la cible —
+    // une seule section critique par lock. La cible DOIT exister (préservé).
     let abort_token = {
         let mut guard = state.0.lock().map_err(|e| e.to_string())?;
+        for d in &descendants {
+            if let Some(h) = guard.remove(d) {
+                h.abort.notify_one();
+            }
+        }
         match guard.remove(&agent_id) {
             Some(handle) => handle.abort,
             None => return Err(format!("agent not found: {agent_id}")),
@@ -1272,27 +1306,34 @@ pub async fn agent_kill(
     // are a no-op once the task has consumed the first one.
     abort_token.notify_one();
 
+    // UPDATE status='killed' pour la cible + tous les descendants.
     let finished_at = now_ms();
     {
         let conn_mutex = get_conn(&app)?;
         let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
-        conn.execute(
-            "UPDATE agents
-                SET status = 'killed',
-                    finished_at = ?1,
-                    error = COALESCE(error, 'killed by user')
-              WHERE id = ?2",
-            params![finished_at, agent_id],
-        )
-        .map_err(|e| format!("update agents kill: {e}"))?;
+        for id in std::iter::once(&agent_id).chain(descendants.iter()) {
+            conn.execute(
+                "UPDATE agents
+                    SET status = 'killed',
+                        finished_at = ?1,
+                        error = COALESCE(error, 'killed by user')
+                  WHERE id = ?2 AND status IN ('running', 'pending')",
+                params![finished_at, id],
+            )
+            .map_err(|e| format!("update agents kill: {e}"))?;
+        }
     }
-    persist_and_emit(
-        &app,
-        &AgentEvent::Error {
-            agent_id,
-            error: "killed by user".into(),
-        },
-    )?;
+
+    // Emit Error pour la cible + descendants (l'UI les marque arrêtés).
+    for id in std::iter::once(&agent_id).chain(descendants.iter()) {
+        persist_and_emit(
+            &app,
+            &AgentEvent::Error {
+                agent_id: id.clone(),
+                error: "killed by user".into(),
+            },
+        )?;
+    }
     Ok(())
 }
 

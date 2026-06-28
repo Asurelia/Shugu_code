@@ -210,6 +210,35 @@ pub fn compaction_trigger(context_window: u32) -> usize {
     }
 }
 
+/// Un modèle peut-il piloter une DÉLÉGATION (orchestration multi-agent fiable :
+/// l'outil `delegate` qui spawn un sous-agent à contexte isolé) ? Conservateur
+/// comme `search::model_supports_native_search` : seuls les modèles à tool-use
+/// robuste + raisonnement long le voient. Volontairement restrictif (un modèle
+/// faible qui fumble une délégation gâche un sous-run entier). Élargissable.
+pub fn model_supports_delegation(protocol: &str, model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    match protocol {
+        "anthropic" => {
+            m.contains("opus-4")
+                || m.contains("sonnet-4")
+                || m.contains("claude-4")
+                || m.contains("fable")
+        }
+        // GPT-5 / o-series / GPT-4.1 + MiniMax M2/M3 (provider built-in, capable),
+        // SAUF les variantes « -mini ». NB : on exclut « -mini » (et non « mini »)
+        // pour ne PAS écarter « minimax » qui contient « mini ».
+        "openai" | "custom" => {
+            let capable = m.contains("gpt-5")
+                || m.contains("o3")
+                || m.contains("o4")
+                || m.contains("gpt-4.1")
+                || m.contains("minimax");
+            capable && !m.contains("-mini")
+        }
+        _ => false,
+    }
+}
+
 /// Outils « core » conservés pour les petits modèles (toolset réduit). Exclut
 /// web_*, code_search, advisor, skill_save, todo_write, capture_screen et les
 /// outils MCP namespacés (`mcp__…`) — un petit modèle se noie dans un gros set.
@@ -309,6 +338,20 @@ mod tests {
         assert_eq!(c.recommended_toolset, Toolset::Full);
         assert!(c.supports_tools);
         assert!(c.context_window > 65_536, "unknown strong keeps 28-turn compaction");
+    }
+
+    #[test]
+    fn delegation_gate_is_conservative() {
+        assert!(model_supports_delegation("anthropic", "claude-opus-4-8"));
+        assert!(model_supports_delegation("anthropic", "claude-sonnet-4-6"));
+        assert!(model_supports_delegation("openai", "gpt-5"));
+        assert!(model_supports_delegation("openai", "MiniMax-M2"));
+        // Refusés : petits / anciens / mini.
+        assert!(!model_supports_delegation("openai", "gpt-4o-mini"));
+        assert!(!model_supports_delegation("openai", "gpt-5-mini"));
+        assert!(!model_supports_delegation("anthropic", "claude-3-5-sonnet"));
+        assert!(!model_supports_delegation("ollama", "qwen2.5:7b"));
+        assert!(!model_supports_delegation("ollama", "qwen2.5:72b"));
     }
 
     #[test]
