@@ -116,6 +116,13 @@ pub(crate) mod command_rules;
 /// into the agent's context so past mistakes compound into future improvements.
 mod lessons;
 
+/// LOT 1 — Task-graph d'orchestration. Logique PURE (aucune I/O) qui transforme
+/// les args de `todo_write` en graphe de tâches dependency-aware : validation
+/// (ids/deps/cycles), prochaine tâche actionnable, accusé utile pour le modèle
+/// et bloc d'ancrage ré-injecté dans la boucle (`runner.rs`). Le graphe n'a pas
+/// de table dédiée : il vit dans les args du toolCall, déjà persistés.
+mod plan;
+
 // Re-export the crate-visible items from `tools` so `chat.rs` can reach
 // them via `crate::commands::agents::*` without poking into the private
 // submodule path. The streaming helpers in `chat.rs` consume:

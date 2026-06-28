@@ -1968,8 +1968,31 @@ pub(super) async fn tool_use_loop(
     // CETTE fenêtre, plus sur un compteur de tours fixe.
     let context_window = resolve_context_window(client, protocol, base_url, model).await;
 
+    // LOT 1 — plan vivant : le dernier `todo_write` parsé en task-graph. Quand il
+    // change, on le ré-injecte au tour suivant (step 0a) pour ANCRER la boucle sur
+    // le graphe — c'est ce qui rend le plan « exécutable » plutôt qu'advisory : le
+    // modèle revoit son plan + la prochaine action même après compaction.
+    let mut current_plan: Option<super::plan::TaskGraph> = None;
+    let mut plan_dirty = false;
+
     while iteration < budget {
         metrics.iterations = iteration + 1;
+
+        // ── 0a. Ancrage du plan — après une mise à jour `todo_write`, on ré-énonce
+        //        le graphe (compact : checklist + tâches bloquées + prochaine
+        //        action). UNE injection par mise à jour (bornée), façon deep-agents.
+        if plan_dirty {
+            if let Some(p) = &current_plan {
+                history.push(AgentMessage::Text {
+                    role: "user".to_string(),
+                    content: format!(
+                        "[Shugu system] Plan en cours — garde les statuts à jour via todo_write au fil de l'avancée :\n{}",
+                        p.reminder_block()
+                    ),
+                });
+            }
+            plan_dirty = false;
+        }
         // ── 0. Inject "approaching budget" nudge messages — aide les
         //       modèles moins capables (DeepSeek V4 Flash, Mistral 7B…)
         //       à converger vers une réponse au lieu de tool-call à
@@ -2458,6 +2481,21 @@ pub(super) async fn tool_use_loop(
                         source: "agent".to_string(),
                     },
                 );
+            }
+        }
+
+        // LOT 1 — capture du plan : le dernier `todo_write` de ce tour devient le
+        // graphe vivant, ré-injecté au tour suivant (step 0a). Parsé ICI tant que
+        // `turn.tool_calls` est encore empruntable (il est MOVÉ dans l'historique
+        // juste en dessous). Best-effort : un graphe invalide laisse le plan tel quel.
+        for tc in &turn.tool_calls {
+            if tc.name == "todo_write" {
+                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                    if let Some(graph) = super::plan::TaskGraph::parse(&args) {
+                        current_plan = Some(graph);
+                        plan_dirty = true;
+                    }
+                }
             }
         }
 

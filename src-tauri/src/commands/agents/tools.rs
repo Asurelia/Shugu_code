@@ -270,10 +270,13 @@ fn agent_tools() -> &'static [ToolDef] {
             },
             ToolDef {
                 name: "todo_write",
-                description: "Record or update your short plan for this task as a checklist. Call this \
+                description: "Record or update your task-graph for this work as a checklist. Call this \
                               FIRST to lay out the steps, then again to update statuses as you progress. \
                               Pass the FULL current list each time — the latest call replaces the previous. \
-                              Purely advisory: it surfaces your plan to the user and never touches files.",
+                              Use `id` + `depends_on` to express ordering: a task is only actionable once all \
+                              its dependencies are completed. The tool replies with progress, the NEXT \
+                              actionable task, and any warnings (unknown deps, cycles), and your live plan is \
+                              re-stated to you as you go — so keep statuses accurate. It never touches files.",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -283,6 +286,10 @@ fn agent_tools() -> &'static [ToolDef] {
                             "items": {
                                 "type": "object",
                                 "properties": {
+                                    "id": {
+                                        "type": "string",
+                                        "description": "Stable short id, e.g. \"T1\". Optional — auto-assigned (T1, T2…) if omitted. Required if other tasks depend on this one."
+                                    },
                                     "text": {
                                         "type": "string",
                                         "description": "Short imperative step, e.g. \"Write index.html\"."
@@ -290,7 +297,16 @@ fn agent_tools() -> &'static [ToolDef] {
                                     "status": {
                                         "type": "string",
                                         "enum": ["pending", "in_progress", "completed"],
-                                        "description": "Step state."
+                                        "description": "Step state. Keep at most ONE task in_progress at a time."
+                                    },
+                                    "depends_on": {
+                                        "type": "array",
+                                        "items": { "type": "string" },
+                                        "description": "Ids of tasks that must be completed before this one (e.g. [\"T1\"]). Omit if none."
+                                    },
+                                    "done_when": {
+                                        "type": "string",
+                                        "description": "Optional acceptance criterion — how you'll know this step is truly done (e.g. \"build passes\")."
                                     }
                                 },
                                 "required": ["text", "status"]
@@ -865,11 +881,17 @@ fn dispatch_inner(
             crate::commands::fs::list_dir_inner(root, path)
         }
         "todo_write" => {
-            // No-op: the plan lives in the persisted toolCall args; the UI reads
-            // the latest call. We just acknowledge with a count so the model
-            // continues its loop.
-            let n = args["todos"].as_array().map(|a| a.len()).unwrap_or(0);
-            Ok(format!("recorded {n} todo(s)"))
+            // LOT 1 — plus un no-op : on parse le graphe de tâches, on le valide
+            // (ids/deps/cycles) et on renvoie un accusé ACTIONNABLE (progrès +
+            // prochaine tâche + avertissements). Le graphe lui-même est aussi
+            // capté par la boucle (runner.rs) pour le ré-injecter ; les args
+            // persistés du toolCall restent la source de vérité de l'UI.
+            match super::plan::TaskGraph::parse(&args) {
+                Some(graph) => Ok(graph.ack()),
+                None => Ok("todo_write : aucune tâche valide — passe une liste `todos` \
+                            d'objets { id?, text, status, depends_on?, done_when? }."
+                    .to_string()),
+            }
         }
         "code_search" => {
             let query = args["query"]

@@ -59,10 +59,18 @@ export interface AgentActivityItem {
   command?: string;
 }
 
-/** Une étape du plan de l'orchestrateur (tool `todo_write`). */
+/** Une étape du plan de l'orchestrateur (tool `todo_write`). LOT 1 : le plan est
+ *  un task-graph dependency-aware — `dependsOn` exprime l'ordre (une tâche n'est
+ *  actionnable que si toutes ses dépendances sont terminées). */
 export interface AgentPlanStep {
+  /** Id stable (fourni par le modèle, ou auto-assigné T1.. à défaut). */
+  id: string;
   text: string;
   status: "pending" | "in_progress" | "completed";
+  /** Ids des tâches qui doivent être terminées avant celle-ci. */
+  dependsOn?: string[];
+  /** Critère d'acceptation optionnel (« fini quand… »). */
+  doneWhen?: string;
 }
 
 export interface MessageDisplay {
@@ -192,17 +200,34 @@ function resultIsError(ev: Extract<AgentEvent, { kind: "toolResult" }>): boolean
   return m ? m[1] !== "0" : false;
 }
 
-/** Parse les `todos` d'un appel `todo_write` en étapes de plan typées. */
+/** Parse les `todos` d'un appel `todo_write` en étapes de plan typées. Lit aussi
+ *  `id` / `depends_on` / `done_when` (LOT 1) ; auto-assigne `T1..` sur l'index
+ *  d'origine si l'id manque — strictement aligné sur le parseur Rust (plan.rs). */
 export function parsePlan(args: unknown): AgentPlanStep[] | undefined {
   const todos = asRecord(args)["todos"];
   if (!Array.isArray(todos)) return undefined;
   const steps: AgentPlanStep[] = [];
-  for (const t of todos) {
-    const r = asRecord(t);
+  for (let i = 0; i < todos.length; i++) {
+    const r = asRecord(todos[i]);
     const text = typeof r["text"] === "string" ? r["text"].trim() : "";
+    if (!text) continue;
     const raw = typeof r["status"] === "string" ? r["status"] : "pending";
     const status = raw === "in_progress" || raw === "completed" ? raw : "pending";
-    if (text) steps.push({ text, status });
+    const idRaw = typeof r["id"] === "string" ? r["id"].trim() : "";
+    const id = idRaw || `T${i + 1}`;
+    const dependsOn = Array.isArray(r["depends_on"])
+      ? r["depends_on"]
+          .filter((d): d is string => typeof d === "string" && d.trim() !== "")
+          .map((d) => d.trim())
+      : undefined;
+    const dwRaw = typeof r["done_when"] === "string" ? r["done_when"].trim() : "";
+    steps.push({
+      id,
+      text,
+      status,
+      dependsOn: dependsOn && dependsOn.length ? dependsOn : undefined,
+      doneWhen: dwRaw || undefined,
+    });
   }
   return steps.length ? steps : undefined;
 }
