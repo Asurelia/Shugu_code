@@ -32,7 +32,7 @@ export function AgentPlan({ steps }: { steps: AgentPlanStep[] }) {
         <span className="ct">{done}/{steps.length}</span>
       </summary>
       <ul>
-        {steps.map((s) => {
+        {steps.map((s, i) => {
           const blocked =
             s.status !== "completed" && (s.dependsOn?.some((d) => !completed.has(d)) ?? false);
           const label = blocked ? "bloqué" : STATUS_LABEL[s.status];
@@ -46,7 +46,9 @@ export function AgentPlan({ steps }: { steps: AgentPlanStep[] }) {
                   : "☐";
           return (
             <li
-              key={s.id}
+              // `s.id#i` : l'index désambiguïse une éventuelle collision d'id
+              // (auto-assigné T1 qui percute un T1 explicite) — clé toujours unique.
+              key={`${s.id}#${i}`}
               className={"pstep " + s.status + (blocked ? " blocked" : "")}
               // L'état est porté par le glyphe + le texte/style (pas la couleur
               // seule) ; aria-label le rend explicite aux lecteurs d'écran.

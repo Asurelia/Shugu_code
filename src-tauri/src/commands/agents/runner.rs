@@ -1981,7 +1981,9 @@ pub(super) async fn tool_use_loop(
         // ── 0a. Ancrage du plan — après une mise à jour `todo_write`, on ré-énonce
         //        le graphe (compact : checklist + tâches bloquées + prochaine
         //        action). UNE injection par mise à jour (bornée), façon deep-agents.
-        if plan_dirty {
+        //        Sauté sur la DERNIÈRE itération (le nudge final dit « n'appelle plus
+        //        d'outils » — inutile de réclamer une mise à jour du plan).
+        if plan_dirty && iteration + 1 < budget {
             if let Some(p) = &current_plan {
                 history.push(AgentMessage::Text {
                     role: "user".to_string(),
