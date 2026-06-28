@@ -122,13 +122,27 @@ fn name_has_vision(m: &str) -> bool {
 }
 
 /// Fenêtre de contexte (tokens). Défaut côté FORT = large (pas de régression de
-/// compaction sur cloud/custom) ; seuls les petits modèles obtiennent une
-/// petite fenêtre → compaction plus précoce. Indices explicites (`128k`/`32k`)
-/// honorés.
+/// compaction sur cloud/custom) ; seuls les petits modèles obtiennent une petite
+/// fenêtre → compaction plus précoce. Indices explicites (`128k`/`32k`) honorés.
+/// Valeurs des familles cloud VÉRIFIÉES vs sources officielles (docs Anthropic /
+/// OpenAI, model cards MiniMax) — sous-estimer ne provoque jamais d'overflow, mais
+/// gaspille la fenêtre, d'où les corrections nommées ci-dessous.
 fn context_window_for(protocol: &str, m: &str, tier: Tier) -> u32 {
     if protocol == "anthropic" {
-        return 200_000; // familles Claude 4.x
+        // Opus 4.6/4.7/4.8 et Sonnet 4.6 embarquent une fenêtre 1M ; les familles
+        // Claude antérieures (Opus 4/4.1, Sonnet 4, Haiku 3.5/4.5) restent à 200k.
+        // Le défaut du repo `claude-opus-4-8` EST 1M — ne pas le brider à 200k
+        // (sinon compaction ~5× trop tôt).
+        if m.contains("opus-4-6")
+            || m.contains("opus-4-7")
+            || m.contains("opus-4-8")
+            || m.contains("sonnet-4-6")
+        {
+            return 1_000_000;
+        }
+        return 200_000;
     }
+    // Marqueurs de taille explicites dans le nom (honorés en premier).
     if m.contains("1m") || m.contains("1000k") {
         return 1_000_000;
     }
@@ -144,12 +158,17 @@ fn context_window_for(protocol: &str, m: &str, tier: Tier) -> u32 {
     if m.contains("32k") {
         return 32_768;
     }
+    // Familles cloud à grande fenêtre dont le nom ne porte pas de marqueur de
+    // taille (vérifié vs officiel) : MiniMax (Text-01 / M1 = 1M) et GPT-4.1
+    // (+ mini/nano = 1M, contrairement à GPT-4o qui reste à 128k).
+    if m.contains("minimax") || m.contains("gpt-4.1") {
+        return 1_000_000;
+    }
     match tier {
-        // cloud/custom fort, fenêtre inconnue → on suppose large → 28 tours
-        // (comportement actuel inchangé, zéro régression).
+        // cloud/custom fort, fenêtre inconnue → on suppose large (128k).
         Tier::Strong => 128_000,
-        // petit (local ou cloud faible), fenêtre inconnue → prudent → 14 tours
-        // (protège de l'overflow).
+        // petit (local ou cloud faible), fenêtre inconnue → prudent (8k, protège
+        // de l'overflow).
         Tier::Small => 8_192,
     }
 }
@@ -345,6 +364,27 @@ mod tests {
         assert!(!model_supports_delegation("anthropic", "claude-3-5-sonnet"));
         assert!(!model_supports_delegation("ollama", "qwen2.5:7b"));
         assert!(!model_supports_delegation("ollama", "qwen2.5:72b"));
+    }
+
+    #[test]
+    fn context_window_values_match_official_sizes() {
+        let w = |p: &str, m: &str| capabilities(p, m).context_window;
+        // Claude : Opus 4.6/4.7/4.8 + Sonnet 4.6 = 1M (dont le défaut repo
+        // claude-opus-4-8) ; familles antérieures = 200k (discrimination de version).
+        assert_eq!(w("anthropic", "claude-opus-4-8"), 1_000_000);
+        assert_eq!(w("anthropic", "claude-sonnet-4-6"), 1_000_000);
+        assert_eq!(w("anthropic", "claude-opus-4-1"), 200_000);
+        assert_eq!(w("anthropic", "claude-sonnet-4"), 200_000);
+        assert_eq!(w("anthropic", "claude-haiku-4-5"), 200_000);
+        // MiniMax (Text-01 / M1) = 1M malgré l'absence de marqueur de taille.
+        assert_eq!(w("openai", "MiniMax-M1"), 1_000_000);
+        assert_eq!(w("openai", "MiniMax-Text-01"), 1_000_000);
+        // GPT-4.1 (+ mini) = 1M ; GPT-4o reste à 128k.
+        assert_eq!(w("openai", "gpt-4.1"), 1_000_000);
+        assert_eq!(w("openai", "gpt-4.1-mini"), 1_000_000);
+        assert_eq!(w("openai", "gpt-4o"), 128_000);
+        // Marqueur explicite dans le nom honoré.
+        assert_eq!(w("openai", "some-model-32k"), 32_768);
     }
 
     #[test]
