@@ -18,7 +18,7 @@ use base64::{engine::general_purpose, Engine as _};
 /// ~400 caractères) : la bulle de la mascotte parle court, pas un audiobook.
 const MAX_TTS_CHARS: usize = 600;
 
-fn decode_hex_or_b64(s: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn decode_hex_or_b64(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();
     // Hex (défaut t2a_v2). Décodage manuel — pas la peine d'une crate `hex`
     // pour 16 symboles. AMBIGUÏTÉ assumée : une chaîne base64 composée
@@ -72,7 +72,10 @@ pub async fn voice_tts(
     };
 
     let body = serde_json::json!({
-        "model": model.as_deref().filter(|m| !m.trim().is_empty()).unwrap_or("speech-02-turbo"),
+        // Défaut bumpé speech-02-turbo → speech-2.6-turbo (génération récente,
+        // bon compromis latence/qualité pour la voix interactive de la mascotte ;
+        // dispo dès le tier Plus). Surchargeable via l'argument `model`.
+        "model": model.as_deref().filter(|m| !m.trim().is_empty()).unwrap_or("speech-2.6-turbo"),
         "text": text,
         "stream": false,
         "output_format": "hex",

@@ -748,6 +748,8 @@ pub fn run() {
             commands::terminal::term_kill,
             commands::terminal::term_snapshot,
             commands::image::image_generate,
+            commands::video::video_generate,
+            commands::music::music_generate,
             commands::capture::capture_screen,
             commands::capture::capture_list_monitors,
             commands::voice::voice_tts,

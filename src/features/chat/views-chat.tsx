@@ -48,6 +48,13 @@ import { CommentTray } from "@/features/cockpit/CommentTray";
 import { getComments, clearComments } from "@/features/cockpit/commentStore";
 import type { Message, MessageAction } from "@/lib/types";
 import { IMAGE_MODEL_PRESETS, resolveImageProvider } from "@/lib/imageProviders";
+import {
+  VIDEO_MODEL_PRESETS,
+  MUSIC_MODEL_PRESETS,
+  VIDEO_RESOLUTIONS,
+  VIDEO_DURATIONS,
+  MINIMAX_DEFAULT_BASE_URL,
+} from "@/lib/mediaGenProviders";
 import { fallbackGradient, formatGenerationTime, imageDisplaySrc, ratioToCss, copyText as copyImageText } from "@/features/image/imageAssets";
 import { pushToast } from "@/components/toast";
 import { togglePinnedAsset, useStudioBrandBoard } from "@/features/studio/brandBoard";
@@ -1525,8 +1532,8 @@ export function CodeBlock({
   );
 }
 
-// ─── Image view (dedicated) — unchanged data wiring ─────────
-export function ImageView({ generations, setGenerations }: any) {
+// ─── Image panel — onglet « Image » du Studio média (logique inchangée) ─────
+function ImagePanel({ generations, setGenerations }: any) {
   const [prompt, setPrompt] = useState("interface companion mascot in a quiet desktop IDE, luminous glass, precise product illustration");
   const [negative, setNegative] = useState("");
   const [ratio, setRatio] = useState("1:1");
@@ -1768,6 +1775,320 @@ export function ImageView({ generations, setGenerations }: any) {
             </div>
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ─── MiniMax auth resolver — partagé par les onglets Vidéo & Musique ────────
+// Vidéo/musique réutilisent la MÊME clé/host que l'image (provider "minimax").
+async function resolveMinimaxAuth(): Promise<{ baseUrl: string; apiKey: string }> {
+  const config = await loadProviderConfig("minimax").catch(() => null);
+  const baseUrl =
+    config?.baseUrl?.trim() || config?.endpoint?.trim() || MINIMAX_DEFAULT_BASE_URL;
+  const apiKey = config?.apiKey?.trim() || "";
+  return { baseUrl, apiKey };
+}
+
+// ─── Vidéo (Hailuo) — onglet « Vidéo » du Studio média ──────────────────────
+function VideoPanel() {
+  const [prompt, setPrompt] = useState(
+    "a cozy desktop mascot waving hello, soft volumetric light, smooth camera [Push in]",
+  );
+  const [model, setModel] = useState(VIDEO_MODEL_PRESETS[0]?.id ?? "MiniMax-Hailuo-02");
+  const [resolution, setResolution] = useState<string>("1080P");
+  const [duration, setDuration] = useState<number>(6);
+  const [firstFrame, setFirstFrame] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [current, setCurrent] = useState<{ id: string; resultUrl: string | null } | null>(null);
+
+  const currentSrc = imageDisplaySrc(current?.resultUrl);
+
+  const generate = async () => {
+    setBusy(true);
+    setError(null);
+    setCurrent(null);
+    try {
+      const { baseUrl, apiKey } = await resolveMinimaxAuth();
+      if (!apiKey) {
+        throw new Error(
+          "Clé API MiniMax absente — Réglages → Connexions → MiniMax (colle ta Subscription Key).",
+        );
+      }
+      const raw = await invoke<any>("video_generate", {
+        args: {
+          prompt,
+          model,
+          firstFrameImage: firstFrame.trim() || undefined,
+          duration,
+          resolution,
+          baseUrl,
+          apiKey,
+        },
+      });
+      setCurrent({ id: String(raw?.id ?? Date.now()), resultUrl: raw?.resultUrl ?? null });
+      if (!raw?.resultUrl) pushToast("Vidéo : aucun fichier reçu", "info", 4500);
+      else pushToast("Vidéo générée", "success", 3000);
+    } catch (err) {
+      setError(String(err));
+      pushToast("Génération vidéo échouée", "error", 6000);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="image-shell">
+      <div className="image-canvas">
+        <div className="image-stage">
+          {busy && (
+            <div className="loading">
+              <div className="ring"></div>
+              <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--on-surface-variant)" }}>
+                Génération vidéo… <span style={{ color: "var(--primary)" }}>{resolution}</span> · {duration}s
+                <div style={{ marginTop: 6, color: "var(--on-surface-muted)" }}>
+                  ça peut prendre 1 à 5 minutes
+                </div>
+              </div>
+            </div>
+          )}
+          {!busy && current && (
+            <div className="preview" style={{ aspectRatio: "16 / 9" }}>
+              {currentSrc ? (
+                <video className="img-real" src={currentSrc} controls autoPlay loop muted style={{ width: "100%", height: "100%", objectFit: "contain", background: "#000" }} />
+              ) : (
+                <div className="img-fallback-note">Aucun fichier vidéo reçu</div>
+              )}
+              <div style={{ position: "absolute", left: 14, bottom: 14, right: 14, display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <button
+                  className="lgb lgb-sm"
+                  disabled={!current.resultUrl}
+                  onClick={() => {
+                    copyImageText(current.resultUrl ?? "");
+                    pushToast(current.resultUrl ? "Chemin vidéo copié" : "Aucun fichier", current.resultUrl ? "success" : "info", 2400);
+                  }}
+                ><Icon name="download" size={12} /> Path</button>
+                <button className="lgb lgb-sm" onClick={() => { copyImageText(prompt); pushToast("Prompt copié", "success", 2000); }}><Icon name="copy" size={12} /> Copy prompt</button>
+              </div>
+            </div>
+          )}
+          {!busy && !current && (
+            <div className="empty">
+              <Icon name="sparkle" size={28} />
+              <div style={{ marginTop: 10 }}>VIDÉO — DÉCRIS TA SCÈNE</div>
+              <div style={{ marginTop: 6, fontSize: 11, color: "var(--on-surface-muted)" }}>3 clips/jour inclus dans ton plan Max</div>
+            </div>
+          )}
+        </div>
+        <div style={{ marginTop: 14, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <span className="chip">{model}</span>
+          <span className="chip tertiary">{resolution}</span>
+          <span className="chip">{duration}s</span>
+          {firstFrame.trim() && <span className="chip" style={{ textTransform: "none" }}>image→vidéo</span>}
+        </div>
+      </div>
+
+      <div className="image-controls scroll" style={{ paddingLeft: 0 }}>
+        <div className="panel">
+          <div className="panel-title">Prompt</div>
+          <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="Décris la scène… ajoute [Pan left] / [Zoom in] pour la caméra" />
+          {error && <div className="image-error">{error}</div>}
+          <button className="lgb lgb-primary lgb-lg" style={{ width: "100%", marginTop: 14 }} onClick={() => void generate()} disabled={busy || !prompt.trim()}>
+            <Icon name="sparkle" size={14} /> {busy ? "Génération…" : "Générer la vidéo"}
+          </button>
+        </div>
+
+        <div className="panel">
+          <div className="panel-title">Format</div>
+          <div className="label-row"><span className="l">Résolution</span><span className="v">{resolution}</span></div>
+          <div className="ratio-row">
+            {VIDEO_RESOLUTIONS.map((r) => (
+              <button key={r} className={"ratio-btn" + (r === resolution ? " on" : "")} onClick={() => setResolution(r)}>{r}</button>
+            ))}
+          </div>
+          <div className="label-row"><span className="l">Durée</span><span className="v">{duration}s</span></div>
+          <div className="ratio-row">
+            {VIDEO_DURATIONS.map((d) => (
+              <button key={d} className={"ratio-btn" + (d === duration ? " on" : "")} onClick={() => setDuration(d)}>{d}s</button>
+            ))}
+          </div>
+          <div className="label-row"><span className="l">Image de départ (image→vidéo)</span></div>
+          <input className="image-model-custom" value={firstFrame} onChange={(e) => setFirstFrame(e.target.value)} placeholder="URL https://… ou data:image/… (optionnel)" />
+        </div>
+
+        <div className="panel">
+          <div className="panel-title">Modèle</div>
+          <div className="label-row"><span className="l">Modèle</span><span className="v">{model}</span></div>
+          <div className="image-model-list">
+            {VIDEO_MODEL_PRESETS.map((m) => (
+              <button key={m.id} className={"image-model-btn" + (m.id === model ? " on" : "")} onClick={() => setModel(m.id)}>
+                <span>{m.label}</span>
+                <small>MiniMax · {m.meta}</small>
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Musique — onglet « Musique » du Studio média ───────────────────────────
+function MusicPanel() {
+  const [prompt, setPrompt] = useState("upbeat lo-fi hip-hop, warm vinyl, mellow piano, relaxed tempo");
+  const [lyrics, setLyrics] = useState("");
+  const [instrumental, setInstrumental] = useState(true);
+  const [model, setModel] = useState(MUSIC_MODEL_PRESETS[0]?.id ?? "music-2.6");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [current, setCurrent] = useState<{ id: string; resultUrl: string | null } | null>(null);
+
+  const currentSrc = imageDisplaySrc(current?.resultUrl);
+
+  const generate = async () => {
+    setBusy(true);
+    setError(null);
+    setCurrent(null);
+    try {
+      const { baseUrl, apiKey } = await resolveMinimaxAuth();
+      if (!apiKey) {
+        throw new Error(
+          "Clé API MiniMax absente — Réglages → Connexions → MiniMax (colle ta Subscription Key).",
+        );
+      }
+      const raw = await invoke<any>("music_generate", {
+        args: {
+          prompt,
+          lyrics: instrumental ? undefined : lyrics,
+          instrumental,
+          model,
+          baseUrl,
+          apiKey,
+        },
+      });
+      setCurrent({ id: String(raw?.id ?? Date.now()), resultUrl: raw?.resultUrl ?? null });
+      if (!raw?.resultUrl) pushToast("Musique : aucun fichier reçu", "info", 4500);
+      else pushToast("Morceau généré", "success", 3000);
+    } catch (err) {
+      setError(String(err));
+      pushToast("Génération musique échouée", "error", 6000);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="image-shell">
+      <div className="image-canvas">
+        <div className="image-stage">
+          {busy && (
+            <div className="loading">
+              <div className="ring"></div>
+              <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--on-surface-variant)" }}>
+                Composition en cours… <span style={{ color: "var(--primary)" }}>{model}</span>
+                <div style={{ marginTop: 6, color: "var(--on-surface-muted)" }}>~30–60 s</div>
+              </div>
+            </div>
+          )}
+          {!busy && current && (
+            <div className="preview" style={{ aspectRatio: "16 / 9", display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 16, padding: 24 }}>
+              <Icon name="sparkle" size={36} />
+              {currentSrc ? (
+                <audio src={currentSrc} controls autoPlay style={{ width: "100%" }} />
+              ) : (
+                <div className="img-fallback-note">Aucun fichier audio reçu</div>
+              )}
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "center" }}>
+                <button
+                  className="lgb lgb-sm"
+                  disabled={!current.resultUrl}
+                  onClick={() => {
+                    copyImageText(current.resultUrl ?? "");
+                    pushToast(current.resultUrl ? "Chemin audio copié" : "Aucun fichier", current.resultUrl ? "success" : "info", 2400);
+                  }}
+                ><Icon name="download" size={12} /> Path</button>
+              </div>
+            </div>
+          )}
+          {!busy && !current && (
+            <div className="empty">
+              <Icon name="sparkle" size={28} />
+              <div style={{ marginTop: 10 }}>MUSIQUE — DÉCRIS LE STYLE</div>
+              <div style={{ marginTop: 6, fontSize: 11, color: "var(--on-surface-muted)" }}>inclus dans le quota partagé de ton plan</div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="image-controls scroll" style={{ paddingLeft: 0 }}>
+        <div className="panel">
+          <div className="panel-title">Style / ambiance</div>
+          <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="ex. epic orchestral, cinematic, rising tension…" />
+          {error && <div className="image-error">{error}</div>}
+          <button className="lgb lgb-primary lgb-lg" style={{ width: "100%", marginTop: 14 }} onClick={() => void generate()} disabled={busy || !prompt.trim() || (!instrumental && !lyrics.trim())}>
+            <Icon name="sparkle" size={14} /> {busy ? "Composition…" : "Générer le morceau"}
+          </button>
+        </div>
+
+        <div className="panel">
+          <div className="panel-title">Paroles</div>
+          <div className="style-chips">
+            <button className={"style-chip" + (instrumental ? " on" : "")} onClick={() => setInstrumental(true)}>Instrumental</button>
+            <button className={"style-chip" + (!instrumental ? " on" : "")} onClick={() => setInstrumental(false)}>Chanté</button>
+          </div>
+          {!instrumental && (
+            <>
+              <div className="label-row"><span className="l">Paroles (requis pour le chant)</span></div>
+              <textarea value={lyrics} onChange={(e) => setLyrics(e.target.value)} placeholder="Écris les paroles…" style={{ minHeight: 90 }} />
+            </>
+          )}
+        </div>
+
+        <div className="panel">
+          <div className="panel-title">Modèle</div>
+          <div className="label-row"><span className="l">Modèle</span><span className="v">{model}</span></div>
+          <div className="image-model-list">
+            {MUSIC_MODEL_PRESETS.map((m) => (
+              <button key={m.id} className={"image-model-btn" + (m.id === model ? " on" : "")} onClick={() => setModel(m.id)}>
+                <span>{m.label}</span>
+                <small>MiniMax · {m.meta}</small>
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Studio média — onglets Image / Vidéo / Musique sur la route /image ─────
+// Conserve la signature publique d'ImageView (props image) attendue par
+// routes/image.tsx : seul l'onglet « Image » consomme generations/setGenerations.
+export function ImageView({ generations, setGenerations }: any) {
+  const [tab, setTab] = useState<"image" | "video" | "music">("image");
+  const tabs: { id: "image" | "video" | "music"; label: string; icon: string }[] = [
+    { id: "image", label: "Image", icon: "image" },
+    { id: "video", label: "Vidéo", icon: "sparkle" },
+    { id: "music", label: "Musique", icon: "sparkle" },
+  ];
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
+      <div style={{ display: "flex", gap: 6, padding: "10px 0 12px", flex: "none" }}>
+        {tabs.map((t) => (
+          <button
+            key={t.id}
+            className={"lgb lgb-sm" + (t.id === tab ? " lgb-primary" : "")}
+            onClick={() => setTab(t.id)}
+          >
+            <Icon name={t.icon} size={12} /> {t.label}
+          </button>
+        ))}
+      </div>
+      <div style={{ flex: 1, minHeight: 0 }}>
+        {tab === "image" && <ImagePanel generations={generations} setGenerations={setGenerations} />}
+        {tab === "video" && <VideoPanel />}
+        {tab === "music" && <MusicPanel />}
       </div>
     </div>
   );
