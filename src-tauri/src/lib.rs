@@ -753,6 +753,7 @@ pub fn run() {
             commands::voice::voice_tts,
             commands::models::models_list,
             commands::models::models_discover_external,
+            commands::model_capabilities::model_capabilities,
             commands::vector::vec_index,
             commands::vector::vec_search,
             commands::vector::vec_delete,

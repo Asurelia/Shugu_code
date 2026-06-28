@@ -109,13 +109,12 @@ const RECALL_MAX_DISTANCE: f32 = 1.15;
 /// text is multi-byte). Keeps the injected block bounded.
 const RECALL_SNIPPET_CHARS: usize = 600;
 
-/// COMPACTION threshold: once the live history (excluding the leading system
-/// blocks) holds at least this many turns, the oldest are summarised into an
-/// episodic memory and replaced by that single summary. Sits a few turns under
-/// the model's practical comfort zone so we compact BEFORE bloat, not after a
-/// hard drop. Mirrors `MAX_HISTORY_MESSAGES` (the reload cap) but applies to the
-/// LIVE loop, which grows unbounded as tools fire.
-const COMPACTION_TRIGGER_TURNS: usize = 28;
+/// COMPACTION threshold is now MODEL-DERIVED (was a fixed 28). The live loop
+/// computes it from the model's context window via
+/// `model_capabilities::compaction_trigger` and passes it to `maybe_compact` as
+/// `trigger_turns`. Small-context models compact earlier (≤14 turns); strong
+/// models keep the historical 28. Folding the oldest turns still happens BEFORE
+/// bloat, not after a hard drop.
 
 /// How many of the OLDEST turns to fold into one episodic summary when
 /// compaction fires. Leaves the recent tail verbatim (the model needs fresh
@@ -343,8 +342,8 @@ fn transcript_excerpt(turns: &[AgentMessage]) -> String {
     s
 }
 
-/// COMPACTION — when the live history outgrows `COMPACTION_TRIGGER_TURNS`, fold
-/// the oldest `COMPACTION_FOLD_TURNS` (after the leading system blocks) into ONE
+/// COMPACTION — when the live history outgrows `trigger_turns` (model-derived),
+/// fold the oldest `COMPACTION_FOLD_TURNS` (after the leading system blocks) into ONE
 /// episodic summary, write that summary to memory, and REPLACE the folded turns
 /// with a single recap message kept in context. This is the key AM-2 fix: old
 /// turns are RESUMED, not dropped at a hard limit.
@@ -361,6 +360,7 @@ async fn maybe_compact<F, Fut>(
     agent_id: &str,
     role: &str,
     conversation_id: Option<&str>,
+    trigger_turns: usize,
     summarise: F,
 ) -> bool
 where
@@ -375,7 +375,7 @@ where
         .take_while(|m| matches!(m, AgentMessage::Text { role, .. } if role == "system"))
         .count();
     let dialogue_len = history.len().saturating_sub(head);
-    if dialogue_len < COMPACTION_TRIGGER_TURNS {
+    if dialogue_len < trigger_turns {
         return false;
     }
     // Fold a bounded slab of the OLDEST dialogue turns; keep the recent tail.
@@ -1322,6 +1322,14 @@ pub(super) async fn tool_use_loop(
     // THIS protocol. With no enabled server, `enabled_tools_json` returns `[]` and
     // the array is byte-identical to the native default — the no-MCP path is
     // unchanged. `None` is threaded for the `ollama` branch (which ignores tools).
+    // Capacité du modèle (source unique : model_capabilities) — calculée UNE
+    // fois par run. Pilote la réduction de toolset (petits modèles) ET le seuil
+    // de compaction token-aware (cf. maybe_compact plus bas). Additif : un
+    // modèle fort n'est jamais affecté.
+    let caps = crate::commands::model_capabilities::capabilities(protocol, model);
+    let compaction_trigger =
+        crate::commands::model_capabilities::compaction_trigger(caps.context_window);
+
     let agent_tools: Option<serde_json::Value> = if protocol == "ollama" {
         None
     } else {
@@ -1381,6 +1389,21 @@ pub(super) async fn tool_use_loop(
             if let Some(a) = arr.as_array_mut() {
                 a.retain(|t| t["name"].as_str() != Some("web_search"));
                 a.extend(search::anthropic_server_web_tools());
+            }
+        }
+        // Réduction de toolset pour les PETITS modèles (recommended_toolset =
+        // Reduced) : ne garder que les outils core — un petit modèle se noie dans
+        // un gros set et hallucine les arguments d'outils. Miroir des gates
+        // read_only / capture ci-dessus. Additif : un modèle fort (Full) n'est
+        // jamais affecté.
+        if caps.recommended_toolset
+            == crate::commands::model_capabilities::Toolset::Reduced
+        {
+            if let Some(a) = arr.as_array_mut() {
+                a.retain(|t| {
+                    let name = t["name"].as_str().or_else(|| t["function"]["name"].as_str());
+                    name.is_some_and(crate::commands::model_capabilities::is_core_small_tool)
+                });
             }
         }
         Some(arr)
@@ -1875,9 +1898,19 @@ pub(super) async fn tool_use_loop(
         // errors → maybe_compact no-ops). Awaited inline — the loop is already
         // inside the abort `tokio::select!`, so a kill still wins at the next
         // turn boundary.
-        let _ = maybe_compact(app, history, agent_id, role, conversation_id, |excerpt| {
-            summarise_turns(client, protocol, base_url, model, api_key, chat_template_kwargs, excerpt)
-        })
+        let _ = maybe_compact(
+            app,
+            history,
+            agent_id,
+            role,
+            conversation_id,
+            compaction_trigger,
+            |excerpt| {
+                summarise_turns(
+                    client, protocol, base_url, model, api_key, chat_template_kwargs, excerpt,
+                )
+            },
+        )
         .await;
 
         iteration += 1;

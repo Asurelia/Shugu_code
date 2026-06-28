@@ -21,6 +21,7 @@ pub mod lsp;
 pub mod mcp;
 pub mod mcp_sources;
 pub mod model_bundle;
+pub mod model_capabilities;
 pub mod preview;
 pub mod search;
 pub mod snapshot;

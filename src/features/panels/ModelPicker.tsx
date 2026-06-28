@@ -11,6 +11,7 @@ import { Icon } from "@/components/components";
 import { useDiscoveredModels } from "@/lib/modelDiscovery";
 import { useActiveCodexEffort } from "@/features/chat/chat-sync";
 import { codexModels, type CodexModel } from "@/lib/codex";
+import { useModelCapabilities } from "@/lib/modelCapabilities";
 
 // Mirrors the labels used in ConnectionsView's card catalog. Local copy here
 // so ModelPicker can label provider groups even when discovery reports only
@@ -29,6 +30,24 @@ export interface ModelPickerProps {
   model: string;
   onChange: (m: string) => void;
   className?: string;
+}
+
+// Petit badge de capacité affiché sur les modèles « Small » (toolset réduit /
+// sans outils). Source de vérité = commande Rust `model_capabilities` (via le
+// hook). Silencieux pour les modèles forts et hors-Tauri (mock web/dev).
+function CapBadge({ modelId }: { modelId: string }) {
+  const caps = useModelCapabilities(modelId);
+  if (!caps || caps.tier !== "small") return null;
+  const ctxK = Math.max(1, Math.round(caps.contextWindow / 1000));
+  return (
+    <span
+      className="meta"
+      title={`Petit modèle — ${caps.supportsTools ? "toolset réduit" : "outils désactivés"}, contexte ~${ctxK}k`}
+      style={{ color: "var(--tertiary, #b48ead)", fontSize: 9 }}
+    >
+      {caps.supportsTools ? "petit · outils réduits" : "petit · sans outils"}
+    </span>
+  );
 }
 
 export function ModelPicker({ model, onChange, className = "float-foot-model" }: ModelPickerProps) {
@@ -118,6 +137,7 @@ export function ModelPicker({ model, onChange, className = "float-foot-model" }:
                 <button key={m.id} className={"model-pop-item" + (m.id === model ? " on" : "")} onClick={() => { onChange(m.id); setOpen(false); }}>
                   <span className="name">{m.label}</span>
                   <span className="meta">{m.providerId}</span>
+                  <CapBadge modelId={m.id} />
                   {m.id === model && <span className="check">✓</span>}
                 </button>
               ))}

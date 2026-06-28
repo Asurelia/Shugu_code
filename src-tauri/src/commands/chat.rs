@@ -1207,6 +1207,13 @@ async fn run_chat_tool_loop(
     // boundaries. See `ChatDeltaCoalescer` for the why.
     let mut coalescer = ChatDeltaCoalescer::new(app.clone(), conversation_id.clone());
 
+    // Capacité du modèle (source unique : model_capabilities) — réduit le toolset
+    // pour les petits modèles (recommended_toolset = Reduced). Calculée une fois
+    // par run de boucle. RECALCULÉE ici à dessein (et non héritée de chat_send) :
+    // en cas de FAILOVER, `protocol`/`model` peuvent différer du primaire, et le
+    // toolset doit refléter le modèle RÉELLEMENT utilisé, pas le primaire.
+    let chat_caps = crate::commands::model_capabilities::capabilities(protocol, model);
+
     for iter in 0..CHAT_TOOL_MAX_ITERS {
         // The last allowed iteration forces a final text answer (no tools), the
         // same termination guarantee as `runner::tool_use_loop`'s last round.
@@ -1243,6 +1250,18 @@ async fn run_chat_tool_loop(
                 if let Some(a) = arr.as_array_mut() {
                     a.retain(|t| t["name"].as_str() != Some("web_search"));
                     a.extend(crate::commands::search::anthropic_server_web_tools());
+                }
+            }
+            // Réduction toolset petits modèles (miroir du runner agent) : ne
+            // garder que les outils core quand recommended_toolset = Reduced.
+            if chat_caps.recommended_toolset
+                == crate::commands::model_capabilities::Toolset::Reduced
+            {
+                if let Some(a) = arr.as_array_mut() {
+                    a.retain(|t| {
+                        let name = t["name"].as_str().or_else(|| t["function"]["name"].as_str());
+                        name.is_some_and(crate::commands::model_capabilities::is_core_small_tool)
+                    });
                 }
             }
             Some(arr)
@@ -1743,7 +1762,11 @@ pub async fn chat_send(
     //   * NO attached image — the structured helpers + AgentMessage builders
     //     don't carry multimodal content, so a vision turn falls back to the
     //     single-call path (vision + tools together is out of scope here).
-    let protocol_supports_tools = matches!(protocol_str, "anthropic" | "openai" | "custom");
+    // Gate par CAPACITÉ modèle (en plus du gate par protocole) : un modèle
+    // vraiment minuscule (supports_tools=false) retombe sur le single-call legacy.
+    let chat_caps = crate::commands::model_capabilities::capabilities(protocol_str, &model);
+    let protocol_supports_tools =
+        matches!(protocol_str, "anthropic" | "openai" | "custom") && chat_caps.supports_tools;
     let use_tool_loop =
         read_tools == Some(true) && protocol_supports_tools && attached_image.is_none();
 
