@@ -611,6 +611,13 @@ pub async fn enabled_tools_json(
         if !is_enabled(app, server) {
             continue;
         }
+        // Défensif (un `.mcp.json` édité à la main pourrait contourner la validation
+        // de `mcp_add_server`) : un nom contenant `__` casserait le reparse des noms
+        // d'outils → on n'expose pas ses outils (ils échoueraient tous).
+        if server.contains("__") {
+            eprintln!("[mcp] serveur « {server} » ignoré : nom contenant « __ »");
+            continue;
+        }
         let conn = match connect(app, mgr, server).await {
             Ok(c) => c,
             Err(_) => {
@@ -864,6 +871,16 @@ pub async fn mcp_add_server(
     config: McpServerConfig,
     global: bool,
 ) -> Result<(), String> {
+    // Les noms d'outils MCP sont `mcp__<server>__<tool>`, reparsés en splittant au
+    // PREMIER `__` après le préfixe (`split_namespaced`). Un nom de serveur contenant
+    // `__` casse ce round-trip (l'outil serait routé vers un mauvais serveur, tout
+    // appel échouerait comme « serveur inconnu »). On refuse à l'ajout.
+    if name.contains("__") {
+        return Err(format!(
+            "Nom de serveur invalide « {name} » : il ne doit pas contenir « __ » \
+             (réservé au délimiteur des noms d'outils MCP)."
+        ));
+    }
     write_server(&app, &name, &config, global)
 }
 
