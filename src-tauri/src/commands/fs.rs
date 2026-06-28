@@ -58,6 +58,57 @@ const IGNORED_NAMES: &[&str] = &[
 /// another trace write → ... a tight loop that saturates IPC.
 const IGNORED_SUFFIXES: &[&str] = &[".log"];
 
+// Phase 7 #10 (option A) — priorité d'indexation sémantique. Sur un gros repo
+// (ML : 30k+ fichiers réels), le budget `max_files` est rempli AVEC LE CODE
+// d'abord, puis la config/markup, puis le reste (dumps de données .txt/.csv/…).
+// Tri stable AVANT le cap → ce sont les données qui sautent, jamais le code.
+// Une mémoire sémantique de CODE doit indexer du code, pas des dumps.
+const CODE_EXTS: &[&str] = &[
+    // ipynb : notebooks Jupyter = code principal des repos ML (revue [2]).
+    "py", "pyi", "ipynb", "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "java", "kt",
+    "kts", "c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "cs", "rb", "php",
+    "swift", "scala", "sh", "bash", "zsh", "fish", "ps1", "lua", "r", "jl", "dart",
+    "ex", "exs", "erl", "hrl", "hs", "ml", "mli", "clj", "cljs", "cljc", "vue",
+    "svelte", "astro", "sql", "graphql", "gql", "proto", "md", "mdx", "rst", "adoc",
+];
+const CONFIG_EXTS: &[&str] = &[
+    "json", "jsonc", "yaml", "yml", "toml", "ini", "cfg", "conf", "xml", "html",
+    "htm", "css", "scss", "sass", "less", "gradle", "cmake", "tf", "env",
+];
+
+/// Fichiers SANS extension qui sont du code/build (revue [1]) : sinon ils
+/// tombent en tier 2 (données) et sautent avant un vulgaire .csv.
+const EXTENSIONLESS_CODE_NAMES: &[&str] = &[
+    "makefile", "dockerfile", "gemfile", "rakefile", "procfile", "jenkinsfile",
+    "vagrantfile", "brewfile", "containerfile", "justfile",
+];
+
+/// Tier de priorité d'indexation : 0 = code/docs, 1 = config/markup, 2 = autre
+/// (données / texte divers). `ext` est déjà en minuscules.
+fn index_tier(ext: &str) -> u8 {
+    if CODE_EXTS.contains(&ext) {
+        0
+    } else if CONFIG_EXTS.contains(&ext) {
+        1
+    } else {
+        2
+    }
+}
+
+/// Tier d'un fichier d'après son NOM + extension. Gère le cas sans extension
+/// (Makefile, Dockerfile…) qui serait sinon classé en données. `name` est le
+/// nom de fichier (pas le chemin) ; `ext` sa dernière extension en minuscules.
+fn index_tier_for_file(name: &str, ext: &str) -> u8 {
+    if !ext.is_empty() {
+        return index_tier(ext);
+    }
+    if EXTENSIONLESS_CODE_NAMES.contains(&name.to_lowercase().as_str()) {
+        0
+    } else {
+        2
+    }
+}
+
 pub(crate) fn is_ignored(name: &str) -> bool {
     // Case-insensitive on Windows, case-sensitive on macOS/Linux.
     #[cfg(target_os = "windows")]
@@ -674,9 +725,11 @@ pub fn fs_list_files(
     let excluded: std::collections::HashSet<String> =
         exclude_exts.iter().map(|e| e.to_lowercase()).collect();
 
-    let mut paths: Vec<String> = Vec::new();
+    // (rel, tier) — on collecte AU-DELÀ de `max_files` (borné par HARD_LIST_CAP)
+    // puis on TRIE par priorité (code d'abord) avant de tronquer au budget.
+    const HARD_LIST_CAP: usize = 200_000; // garde-fou mémoire (repos pathologiques)
+    let mut scored: Vec<(String, u8)> = Vec::new();
     let mut total_seen = 0usize;
-    let mut truncated = false;
 
     let walker = WalkDir::new(&root)
         .follow_links(false)
@@ -706,18 +759,26 @@ pub fn fs_list_files(
             continue;
         }
         total_seen += 1;
-        if paths.len() >= max_files {
-            truncated = true;
-            continue; // keep counting total_seen so the caller can report it
+        // Collecte au-delà de max_files (jusqu'au garde-fou) pour pouvoir
+        // prioriser le code AVANT de tronquer. total_seen compte TOUT.
+        if scored.len() < HARD_LIST_CAP {
+            let abs = entry.path();
+            let rel = abs
+                .strip_prefix(&root)
+                .unwrap_or(abs)
+                .to_string_lossy()
+                .replace('\\', "/");
+            scored.push((rel, index_tier_for_file(&name, &ext)));
         }
-        let abs = entry.path();
-        let rel = abs
-            .strip_prefix(&root)
-            .unwrap_or(abs)
-            .to_string_lossy()
-            .replace('\\', "/");
-        paths.push(rel);
     }
+
+    // Priorise code (0) > config (1) > autre/données (2). `sort_by_key` est STABLE
+    // → l'ordre de walk est préservé dans chaque tier. La troncature au budget
+    // fait donc sauter les fichiers de données en premier, jamais le code.
+    scored.sort_by_key(|(_, tier)| *tier);
+    let truncated = total_seen > max_files;
+    scored.truncate(max_files);
+    let paths: Vec<String> = scored.into_iter().map(|(rel, _)| rel).collect();
 
     Ok(FileListResult {
         paths,
@@ -1216,6 +1277,43 @@ mod tests {
 
     fn cleanup(dir: &Path) {
         let _ = fs::remove_dir_all(dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // index_tier (priorité d'indexation — Phase 7 #10 option A)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn index_tier_prioritises_code_then_config_then_data() {
+        // Code / docs = tier 0 (indexé en premier). ipynb inclus (repos ML).
+        for ext in ["rs", "ts", "tsx", "py", "ipynb", "go", "md", "sql"] {
+            assert_eq!(index_tier(ext), 0, "{ext} devrait être code (tier 0)");
+        }
+        // Config / markup = tier 1.
+        for ext in ["json", "yaml", "toml", "css", "html"] {
+            assert_eq!(index_tier(ext), 1, "{ext} devrait être config (tier 1)");
+        }
+        // Données / divers = tier 2 (sautent EN PREMIER quand le budget déborde).
+        for ext in ["csv", "txt", "dat", "tsv", ""] {
+            assert_eq!(index_tier(ext), 2, "{ext} devrait être autre (tier 2)");
+        }
+        // L'ordre du tri (croissant) garantit code < config < données.
+        assert!(index_tier("rs") < index_tier("json"));
+        assert!(index_tier("json") < index_tier("csv"));
+    }
+
+    #[test]
+    fn index_tier_for_file_handles_extensionless_code() {
+        // Sans extension mais code/build connu → tier 0 (pas largué en données).
+        for name in ["Makefile", "Dockerfile", "Gemfile", "Jenkinsfile", "justfile"] {
+            assert_eq!(index_tier_for_file(name, ""), 0, "{name} devrait être code");
+        }
+        // Sans extension et inconnu → tier 2 (données/divers).
+        assert_eq!(index_tier_for_file("LICENSE", ""), 2);
+        assert_eq!(index_tier_for_file("data", ""), 2);
+        // Avec extension → délègue à index_tier (le nom n'override pas).
+        assert_eq!(index_tier_for_file("main.rs", "rs"), 0);
+        assert_eq!(index_tier_for_file("dataset.csv", "csv"), 2);
     }
 
     // -----------------------------------------------------------------------

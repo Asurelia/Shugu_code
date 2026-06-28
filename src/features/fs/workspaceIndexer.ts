@@ -27,11 +27,13 @@ import { pushToast } from "@/components/toast";
 const MAX_FILE_BYTES = 200_000;
 const INDEX_TTL_MS   = 24 * 60 * 60 * 1000; // 24 h
 
-// Generous budget for the number of code files to index in one pass. Big ML
-// repos (Comfyui ≈ 98k entries) blow past the file-tree's 5000 cap, but the
-// indexer walks WITHOUT that cap (it's background work) — this budget instead
-// bounds the embedding cost. When exceeded, the user is told (toast) rather
-// than the index silently truncating or, as before, failing entirely (0 files).
+// Generous budget for the number of files to index in one pass. Big ML repos
+// (Comfyui ≈ 98k entries) blow past the file-tree's 5000 cap, but the indexer
+// walks WITHOUT that cap (it's background work) — this budget instead bounds the
+// LOCAL embedding cost (fastembed = CPU-bound). Phase 7 #10 (option A): the Rust
+// side (fs_list_files) now PRIORITISES code/docs > config > data BEFORE applying
+// this cap, so when a repo exceeds the budget it's the DATA dumps that drop, not
+// the code. When truncated, the user is told (toast) — never a silent cap.
 const MAX_INDEX_FILES = 20_000;
 
 // Extensions excluded from indexing — binaries, media, models/datasets, and
@@ -168,7 +170,8 @@ async function runIndex(force = false): Promise<number> {
     //    always announce; the gated boot path only announces on big projects.
     if (truncated) {
       pushToast(
-        `Indexation du code : ${paths.length} fichiers (sur ${totalSeen} — au-delà de la limite de ${MAX_INDEX_FILES}, le reste est ignoré).`,
+        `Indexation : ${paths.length} fichiers (code prioritaire) sur ${totalSeen}. ` +
+          `Au-delà de ${MAX_INDEX_FILES}, le reste (données / fichiers divers) est ignoré.`,
         "info",
         7000,
       );
