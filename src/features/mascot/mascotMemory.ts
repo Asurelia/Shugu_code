@@ -2,7 +2,8 @@
 //
 // Le CRUD vit dans db.ts (pattern de l'app) ; ce module isole la logique PURE
 // (testable sans Tauri) et le canal de diffusion cross-fenêtre (event Tauri,
-// même patron que calibration.ts — le bus Tauri franchit les WebviewWindow).
+// même patron que calibration.ts — le bus Tauri franchit les WebviewWindow,
+// contrairement au `storage` event qui n'est pas fiable entre webviews).
 
 export const MASCOT_CATEGORIES = ["tech", "relation", "habits", "shared", "general"] as const;
 export type MascotCategory = (typeof MASCOT_CATEGORIES)[number];
@@ -27,26 +28,41 @@ export interface MascotFact {
   updatedAt: number;
 }
 
+/** Rabat toute valeur inconnue/absente sur "general" (catégorie contrôlée côté TS). */
 export function normalizeCategory(c: string | undefined | null): MascotCategory {
   return (MASCOT_CATEGORIES as readonly string[]).includes(c ?? "")
     ? (c as MascotCategory)
     : "general";
 }
 
-export type CoerceResult =
-  | { ok: true; value: { category: MascotCategory; key: string; value: string } }
-  | { ok: false; error: string };
+export interface NormalizedFact {
+  category: MascotCategory;
+  key: string;
+  value: string;
+}
 
-export function coerceFactInput(input: {
-  category?: string; key?: string; value?: string;
-}): CoerceResult {
+/** Message d'erreur de validation, ou null si l'entrée est valide. */
+export function validateFactInput(input: { key?: string; value?: string }): string | null {
   const key = (input.key ?? "").trim();
   const value = (input.value ?? "").trim();
-  if (!key) return { ok: false, error: "La clé est obligatoire." };
-  if (!value) return { ok: false, error: "La valeur est obligatoire." };
-  if (key.length > 80) return { ok: false, error: "La clé est trop longue (80 max)." };
-  if (value.length > 2000) return { ok: false, error: "La valeur est trop longue (2000 max)." };
-  return { ok: true, value: { category: normalizeCategory(input.category), key, value } };
+  if (!key) return "La clé est obligatoire.";
+  if (!value) return "La valeur est obligatoire.";
+  if (key.length > 80) return "La clé est trop longue (80 max).";
+  if (value.length > 2000) return "La valeur est trop longue (2000 max).";
+  return null;
+}
+
+/** Normalise une saisie (catégorie rabattue, trim). À appeler APRÈS validation. */
+export function normalizeFactInput(input: {
+  category?: string;
+  key?: string;
+  value?: string;
+}): NormalizedFact {
+  return {
+    category: normalizeCategory(input.category),
+    key: (input.key ?? "").trim(),
+    value: (input.value ?? "").trim(),
+  };
 }
 
 const MEMORY_EVENT = "mascot://memory-changed";
@@ -63,7 +79,7 @@ export function emitMemoryChanged(): void {
   })();
 }
 
-/** S'abonne aux changements cross-fenêtre. Retourne un désabonnement. */
+/** S'abonne aux changements cross-fenêtre. Retourne une fonction de désabonnement. */
 export function subscribeMemoryChanged(callback: () => void): () => void {
   let unlisten: (() => void) | null = null;
   void (async () => {

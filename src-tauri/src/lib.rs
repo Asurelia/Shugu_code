@@ -412,11 +412,11 @@ const MIGRATION_V16: &str = "
 CREATE TABLE IF NOT EXISTS mascot_memory (
   id         TEXT    PRIMARY KEY,
   category   TEXT    NOT NULL DEFAULT 'general',
-  key        TEXT    NOT NULL,
-  value      TEXT    NOT NULL,
-  source     TEXT    NOT NULL DEFAULT 'user',
-  confidence REAL    NOT NULL DEFAULT 1.0,
-  validated  INTEGER NOT NULL DEFAULT 1,
+  key        TEXT    NOT NULL CHECK (length(key) BETWEEN 1 AND 80),
+  value      TEXT    NOT NULL CHECK (length(value) BETWEEN 1 AND 2000),
+  source     TEXT    NOT NULL DEFAULT 'user' CHECK (source IN ('user', 'extracted')),
+  confidence REAL    NOT NULL DEFAULT 1.0  CHECK (confidence >= 0.0 AND confidence <= 1.0),
+  validated  INTEGER NOT NULL DEFAULT 1    CHECK (validated IN (0, 1)),
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );

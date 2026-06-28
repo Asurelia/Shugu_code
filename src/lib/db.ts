@@ -762,12 +762,24 @@ const mascotMemory = {
     ) as Promise<MascotMemoryRow[]>;
   },
 
+  /**
+   * Insère un fait, ou met à jour celui de même `id` SANS toucher `created_at`
+   * (préservé par le SQL via ON CONFLICT — pas de read-modify-write en JS).
+   */
   async upsert(row: MascotMemoryRow): Promise<void> {
     const dbh = await getDb();
     await dbh.execute(
-      `INSERT OR REPLACE INTO mascot_memory
+      `INSERT INTO mascot_memory
          (id, category, key, value, source, confidence, validated, created_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       ON CONFLICT(id) DO UPDATE SET
+         category   = excluded.category,
+         key        = excluded.key,
+         value      = excluded.value,
+         source     = excluded.source,
+         confidence = excluded.confidence,
+         validated  = excluded.validated,
+         updated_at = excluded.updated_at`,
       [row.id, row.category, row.key, row.value, row.source,
        row.confidence, row.validated, row.created_at, row.updated_at]
     );
@@ -778,10 +790,12 @@ const mascotMemory = {
     await dbh.execute("DELETE FROM mascot_memory WHERE id = $1", [id]);
   },
 
+  /** Promeut un fait à « validé ». Préserve la `confidence` enregistrée
+   *  (la validation utilisateur est déjà portée par `validated = 1`). */
   async setValidated(id: string, updatedAt: number): Promise<void> {
     const dbh = await getDb();
     await dbh.execute(
-      "UPDATE mascot_memory SET validated = 1, confidence = 1.0, updated_at = $1 WHERE id = $2",
+      "UPDATE mascot_memory SET validated = 1, updated_at = $1 WHERE id = $2",
       [updatedAt, id]
     );
   },
@@ -806,7 +820,10 @@ export const db = {
   /**
    * Wipe all user-generated data from the local SQLite database.
    * Clears: messages, conversations, projects, generations, jobs, logs,
-   *         agents, agent_events.
+   *         agents, agent_events, message_sources, mascot_memory.
+   * `mascot_memory` (ce que la mascotte a appris sur l'utilisateur) est inclus :
+   * c'est la donnée la plus personnelle de la feature, « effacer mes données »
+   * doit l'effacer aussi.
    * Settings are intentionally preserved (provider keys, preferences, etc.)
    * so the user's configuration survives a data reset.
    *
@@ -825,6 +842,7 @@ export const db = {
     await database.execute("DELETE FROM generations");
     await database.execute("DELETE FROM jobs");
     await database.execute("DELETE FROM logs");
+    await database.execute("DELETE FROM mascot_memory");
   },
 };
 
