@@ -375,10 +375,19 @@ async fn call_comfyui(
 
 fn comfy_image_from_history(v: &Value, prompt_id: &str) -> Option<(String, String, String)> {
     let outputs = v.get(prompt_id)?.get("outputs")?.as_object()?;
+    // Cherche le PREMIER nœud de sortie portant une image valide. Un nœud sans
+    // champ `images` (autre type de sortie ComfyUI) ou une image sans `filename`
+    // est SAUTÉ — PAS abandonné. (Avant : des `?` faisaient échouer TOUTE la
+    // fonction au premier nœud/image incomplet, perdant silencieusement une image
+    // produite par un nœud SaveImage situé plus loin.)
     for node in outputs.values() {
-        let images = node.get("images")?.as_array()?;
+        let Some(images) = node.get("images").and_then(|x| x.as_array()) else {
+            continue;
+        };
         for img in images {
-            let filename = img.get("filename")?.as_str()?.to_string();
+            let Some(filename) = img.get("filename").and_then(|x| x.as_str()) else {
+                continue;
+            };
             let subfolder = img
                 .get("subfolder")
                 .and_then(|x| x.as_str())
@@ -389,7 +398,7 @@ fn comfy_image_from_history(v: &Value, prompt_id: &str) -> Option<(String, Strin
                 .and_then(|x| x.as_str())
                 .unwrap_or("output")
                 .to_string();
-            return Some((filename, subfolder, kind));
+            return Some((filename.to_string(), subfolder, kind));
         }
     }
     None
@@ -907,5 +916,59 @@ pub async fn image_generate(app: AppHandle, args: ImageGenerateArgs) -> Result<I
             call_stability(&client, &app, &args.base_url, &args, &api_key, &fid).await
         }
         other => Err(format!("image: unsupported protocol '{other}'")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skips_nodes_without_images_and_returns_first_valid() {
+        // Un nœud SANS "images" (autre type de sortie) ET une image incomplète
+        // AVANT l'image valide. Avant le fix, les `?` abandonnaient toute la
+        // fonction au premier incomplet → image silencieusement perdue.
+        let v = serde_json::json!({
+            "pid": {
+                "outputs": {
+                    "10": { "text": ["nothing"] },
+                    "9": { "images": [
+                        { "no_filename": true },
+                        { "filename": "shugu_0001.png", "subfolder": "sub", "type": "output" }
+                    ] }
+                }
+            }
+        });
+        assert_eq!(
+            comfy_image_from_history(&v, "pid"),
+            Some((
+                "shugu_0001.png".to_string(),
+                "sub".to_string(),
+                "output".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn defaults_subfolder_and_type_when_absent() {
+        let v = serde_json::json!({
+            "pid": { "outputs": { "9": { "images": [ { "filename": "a.png" } ] } } }
+        });
+        assert_eq!(
+            comfy_image_from_history(&v, "pid"),
+            Some(("a.png".to_string(), String::new(), "output".to_string()))
+        );
+    }
+
+    #[test]
+    fn none_when_no_image_anywhere() {
+        let v = serde_json::json!({ "pid": { "outputs": { "10": { "text": ["x"] } } } });
+        assert!(comfy_image_from_history(&v, "pid").is_none());
+    }
+
+    #[test]
+    fn none_when_prompt_id_absent() {
+        let v = serde_json::json!({ "other": { "outputs": {} } });
+        assert!(comfy_image_from_history(&v, "pid").is_none());
     }
 }
