@@ -197,18 +197,11 @@ pub fn capabilities(protocol: &str, model: &str) -> ModelCapabilities {
     }
 }
 
-/// Seuil de compaction (en tours de dialogue) dérivé de la fenêtre de contexte.
-/// ≤16k → 14 ; ≤64k → 22 ; sinon 28 (le défaut historique, inchangé pour les
-/// modèles forts).
-pub fn compaction_trigger(context_window: u32) -> usize {
-    if context_window <= 16_384 {
-        14
-    } else if context_window <= 65_536 {
-        22
-    } else {
-        28
-    }
-}
+// `context_window` (ci-dessus) est désormais la fenêtre consommée DIRECTEMENT par
+// la compaction token-aware du runner (budget de tokens, cf.
+// `agents::runner::resolve_context_window`) — l'ancien helper `compaction_trigger`
+// (seuil EN TOURS dérivé de la fenêtre) a été retiré : le déclencheur n'est plus
+// un compteur de tours.
 
 /// Un modèle peut-il piloter une DÉLÉGATION (orchestration multi-agent fiable :
 /// l'outil `delegate` qui spawn un sous-agent à contexte isolé) ? Conservateur
@@ -337,7 +330,7 @@ mod tests {
         assert_eq!(c.tier, Tier::Strong, "unknown → safe default Strong");
         assert_eq!(c.recommended_toolset, Toolset::Full);
         assert!(c.supports_tools);
-        assert!(c.context_window > 65_536, "unknown strong keeps 28-turn compaction");
+        assert!(c.context_window > 65_536, "unknown strong keeps a large context window");
     }
 
     #[test]
@@ -352,13 +345,6 @@ mod tests {
         assert!(!model_supports_delegation("anthropic", "claude-3-5-sonnet"));
         assert!(!model_supports_delegation("ollama", "qwen2.5:7b"));
         assert!(!model_supports_delegation("ollama", "qwen2.5:72b"));
-    }
-
-    #[test]
-    fn compaction_trigger_tiers() {
-        assert_eq!(compaction_trigger(8_192), 14);
-        assert_eq!(compaction_trigger(32_768), 22);
-        assert_eq!(compaction_trigger(200_000), 28);
     }
 
     #[test]

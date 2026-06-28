@@ -115,17 +115,57 @@ const RECALL_MAX_DISTANCE: f32 = 1.15;
 /// text is multi-byte). Keeps the injected block bounded.
 const RECALL_SNIPPET_CHARS: usize = 600;
 
-// COMPACTION threshold is now MODEL-DERIVED (was a fixed 28). The live loop
-// computes it from the model's context window via
-// `model_capabilities::compaction_trigger` and passes it to `maybe_compact` as
-// `trigger_turns`. Small-context models compact earlier (≤14 turns); strong
-// models keep the historical 28. Folding the oldest turns still happens BEFORE
-// bloat, not after a hard drop.
+// ────────────────────────────────────────────────────────────────────
+// COMPACTION — token-aware trigger gated on the model's context window.
+//
+// The trigger is NO LONGER a fixed turn count: an 8k-context local model blows
+// past its window long before any turn count, while a 1M model would compact
+// far too early and waste capacity. Instead we estimate the live history's token
+// footprint and compact once it crosses a budget derived from the REAL window
+// (probed for local servers, table for cloud). 100% token-driven — no magic turn
+// number gates the decision. Robustness comes from an exact/conservative window,
+// a pessimistic char→token estimate, and an absolute response margin.
+// ────────────────────────────────────────────────────────────────────
 
-/// How many of the OLDEST turns to fold into one episodic summary when
-/// compaction fires. Leaves the recent tail verbatim (the model needs fresh
-/// detail) while the old head becomes a durable, recallable episode.
-const COMPACTION_FOLD_TURNS: usize = 16;
+/// chars→tokens divisor. Deliberately pessimistic: JSON / code / paths (the bulk
+/// of tool results) tokenise at ~2–3 chars/token, not 4. Over-estimating compacts
+/// a little early — the safe side of the error (a provider 400 "context exceeded"
+/// kills the run; one extra compaction only costs a summary).
+const CHARS_PER_TOKEN: usize = 3;
+
+/// Token cost of an image (screenshot) still carried as a `data_url`. We NEVER
+/// count the base64 length (over-counts 10–50×). Flat estimate ≈ real visual cost
+/// (Anthropic ≈ (w·h)/750 ; OpenAI high-detail ≈ 1–2k). `prune_user_images` caps
+/// the history at 2 live images → worst case ≈ 4000 tokens.
+const IMAGE_TOKENS: usize = 2000;
+
+/// Fraction of the window past which we compact.
+const COMPACTION_BUDGET_FRACTION: f64 = 0.75;
+
+/// Absolute token margin always reserved under the window, for the current turn's
+/// response + estimation error. Dominates on a small window (8k → budget 5192,
+/// margin 3000); irrelevant on a large one (1M → the fraction dominates).
+const COMPACTION_BUDGET_MARGIN_TOKENS: usize = 3000;
+
+/// After compacting, aim for this ratio of the budget (anti-churn hysteresis: we
+/// trigger AT the budget but relax well below it, so the next turn doesn't
+/// immediately re-trigger).
+const COMPACTION_RELAX_FRACTION: f64 = 0.70;
+
+/// Most recent dialogue turns kept VERBATIM (the model needs fresh detail).
+const COMPACTION_KEEP_TAIL_TURNS: usize = 4;
+
+/// Minimum size of one fold: a useful compaction, not a micro-summary of 1–2 turns.
+const COMPACTION_FOLD_MIN_TURNS: usize = 6;
+
+/// Estimated weight of the recap message that replaces the folded slab (used when
+/// computing the cut point). Bounded by what the summariser returns.
+const RECAP_EST_TOKENS: usize = 400;
+
+/// Conservative fallback when the window is unknown (local server not probable /
+/// unknown model) — the cited "8k local" case. A genuinely smaller local model is
+/// still protected by the absolute margin + the pessimistic ÷3 estimate.
+const LOCAL_WINDOW_FALLBACK: usize = 8192;
 
 /// Recharge les `limit` derniers messages NON supprimés de la conversation et
 /// les mappe en `AgentMessage::Text`, en ordre chronologique (ancien→récent).
@@ -348,11 +388,225 @@ fn transcript_excerpt(turns: &[AgentMessage]) -> String {
     s
 }
 
-/// COMPACTION — when the live history outgrows `trigger_turns` (model-derived),
-/// fold the oldest `COMPACTION_FOLD_TURNS` (after the leading system blocks) into ONE
-/// episodic summary, write that summary to memory, and REPLACE the folded turns
-/// with a single recap message kept in context. This is the key AM-2 fix: old
-/// turns are RESUMED, not dropped at a hard limit.
+/// Estimation pessimiste du coût en tokens d'UN message (cf. `CHARS_PER_TOKEN`).
+/// `chars().count()` = scalaires Unicode (pas bytes) : le français accentué ne
+/// sur-compte pas (cohérent avec `RECALL_SNIPPET_CHARS`).
+fn estimate_msg_tokens(m: &AgentMessage) -> usize {
+    match m {
+        AgentMessage::Text { role, content } => {
+            (role.chars().count() + content.chars().count()) / CHARS_PER_TOKEN
+        }
+        AgentMessage::AssistantWithTools { content, tool_calls } => {
+            let chars = content.chars().count()
+                + tool_calls
+                    .iter()
+                    .map(|tc| tc.name.chars().count() + tc.arguments.chars().count())
+                    .sum::<usize>();
+            chars / CHARS_PER_TOKEN
+        }
+        AgentMessage::ToolResults(results) => results
+            .iter()
+            .map(|r| (r.name.chars().count() + r.content.chars().count()) / CHARS_PER_TOKEN)
+            .sum(),
+        AgentMessage::UserImage { text, data_url } => {
+            text.chars().count() / CHARS_PER_TOKEN
+                + if data_url.is_empty() { 0 } else { IMAGE_TOKENS }
+        }
+    }
+}
+
+/// Estimation du coût total d'un historique — tête système INCLUSE (elle consomme
+/// la fenêtre même si elle n'est jamais repliée).
+fn estimate_tokens(history: &[AgentMessage]) -> usize {
+    history.iter().map(estimate_msg_tokens).sum()
+}
+
+/// Budget de déclenchement : `fraction × fenêtre`, plafonné par `fenêtre − marge`.
+/// La marge absolue domine sur petite fenêtre (réserve pour la réponse + l'erreur
+/// d'estimation : 8k → 5192) ; la fraction domine sur grande fenêtre (1M → 750k).
+fn compaction_budget(window: usize) -> usize {
+    let frac = (window as f64 * COMPACTION_BUDGET_FRACTION) as usize;
+    frac.min(window.saturating_sub(COMPACTION_BUDGET_MARGIN_TOKENS))
+}
+
+/// Décide PUREMENT (sans I/O ni LLM) si/où compacter. Renvoie `Some(cut)` —
+/// l'indice de fin (exclusif) du slab des plus vieux tours à replier en un seul
+/// résumé — ou `None` si rien à faire. Pur ⇒ testable en isolation.
+fn plan_compaction_cut(history: &[AgentMessage], window: usize) -> Option<usize> {
+    // La tête système (seed + skills + lessons + recall) n'est JAMAIS repliée :
+    // c'est le contexte permanent de l'agent. Tout ce qui suit est un vrai tour
+    // de dialogue éligible à la compaction.
+    let head = history
+        .iter()
+        .take_while(|m| matches!(m, AgentMessage::Text { role, .. } if role == "system"))
+        .count();
+    let dialogue_len = history.len().saturating_sub(head);
+    if dialogue_len <= COMPACTION_KEEP_TAIL_TURNS {
+        return None; // pas assez de dialogue pour replier quoi que ce soit
+    }
+
+    let budget = compaction_budget(window);
+    let total = estimate_tokens(history);
+    if total < budget {
+        return None; // sous le budget → no-op
+    }
+
+    // Fold ADAPTATIF : replier les plus vieux tours jusqu'à repasser sous la cible
+    // d'hystérésis, en gardant les `KEEP_TAIL` derniers verbatim et en repliant au
+    // moins `FOLD_MIN` tours. Trigger ET fold en tokens (même unité) ⇒ une passe
+    // ramène le cas courant nettement sous le budget. Cas limites (slab très lourd
+    // borné par `max_cut`, ou walk-back orphan qui recule la coupe) : on peut
+    // re-déclencher au tour suivant, mais chaque passe remplace le slab par un
+    // recap plus court → `total` décroît, ça converge (pas de churn non borné).
+    let target = (budget as f64 * COMPACTION_RELAX_FRACTION) as usize;
+    let max_cut = history.len() - COMPACTION_KEEP_TAIL_TURNS;
+    let mut folded_tokens = 0usize;
+    let mut cut = head;
+    while cut < max_cut {
+        folded_tokens += estimate_msg_tokens(&history[cut]);
+        cut += 1;
+        let kept = total.saturating_sub(folded_tokens) + RECAP_EST_TOKENS;
+        if kept <= target && (cut - head) >= COMPACTION_FOLD_MIN_TURNS {
+            break;
+        }
+    }
+
+    // A compacted slab MUST NOT end on an assistant turn that opened tool_calls
+    // without its matching tool results in the SAME slab — otherwise the kept
+    // tail would start with orphan ToolResults (no preceding tool_use → provider
+    // 400). Walk the cut point back until it lands AFTER a complete pair.
+    while cut > head + 1 {
+        let dangling_call = matches!(history[cut - 1], AgentMessage::AssistantWithTools { .. });
+        let orphan_result = matches!(history.get(cut), Some(AgentMessage::ToolResults(_)));
+        if dangling_call || orphan_result {
+            cut -= 1;
+        } else {
+            break;
+        }
+    }
+    if cut <= head + 1 {
+        return None; // couldn't find a clean cut — skip this round
+    }
+    Some(cut)
+}
+
+/// Un endpoint local (sondable) : Ollama, ou une base_url qui pointe sur la
+/// machine (llama.cpp openai-compat tourne sur 127.0.0.1:8090 par défaut).
+fn is_local_endpoint(protocol: &str, base_url: &str) -> bool {
+    protocol == "ollama"
+        || ["localhost", "127.0.0.1", "0.0.0.0", "[::1]"]
+            .iter()
+            .any(|h| base_url.contains(h))
+}
+
+/// Sonde best-effort le vrai n_ctx d'un serveur local. `None` sur toute erreur
+/// (serveur éteint, format inattendu, timeout) ⇒ l'appelant retombe sur le repli.
+/// - Ollama (`/api/show`)  : `parameters` « num_ctx N » (runtime, préféré car
+///   Ollama peut charger un n_ctx inférieur au max de l'archi), sinon
+///   `model_info["<arch>.context_length"]`.
+/// - llama.cpp (`/props`)  : `n_ctx` (top-level ou `default_generation_settings`)
+///   = le n_ctx RÉELLEMENT chargé pour ce GGUF.
+/// URL racine = `base_url` sans suffixe `/v1`. Timeout court (3 s).
+async fn probe_local_context_window(
+    client: &reqwest::Client,
+    protocol: &str,
+    base_url: &str,
+    model: &str,
+) -> Option<usize> {
+    let trimmed = base_url.trim_end_matches('/');
+    let root = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+    let timeout = std::time::Duration::from_secs(3);
+
+    if protocol == "ollama" {
+        let resp = client
+            .post(format!("{root}/api/show"))
+            .json(&serde_json::json!({ "model": model, "name": model }))
+            .timeout(timeout)
+            .send()
+            .await
+            .ok()?;
+        let v: serde_json::Value = resp.json().await.ok()?;
+        // 1) parameters : blob texte multi-lignes « clé valeur ».
+        if let Some(params) = v.get("parameters").and_then(|p| p.as_str()) {
+            for line in params.lines() {
+                let mut it = line.split_whitespace();
+                if it.next() == Some("num_ctx") {
+                    if let Some(n) = it.next().and_then(|s| s.parse::<usize>().ok()) {
+                        return Some(n);
+                    }
+                }
+            }
+        }
+        // 2) model_info : clé se terminant par « .context_length ».
+        if let Some(info) = v.get("model_info").and_then(|m| m.as_object()) {
+            for (k, val) in info {
+                if k.ends_with(".context_length") {
+                    if let Some(n) = val.as_u64() {
+                        return Some(n as usize);
+                    }
+                }
+            }
+        }
+        return None;
+    }
+
+    // llama.cpp (openai-compat) : GET /props.
+    let resp = client
+        .get(format!("{root}/props"))
+        .timeout(timeout)
+        .send()
+        .await
+        .ok()?;
+    let v: serde_json::Value = resp.json().await.ok()?;
+    if let Some(n) = v.get("n_ctx").and_then(|x| x.as_u64()) {
+        return Some(n as usize);
+    }
+    if let Some(n) = v
+        .get("default_generation_settings")
+        .and_then(|g| g.get("n_ctx"))
+        .and_then(|x| x.as_u64())
+    {
+        return Some(n as usize);
+    }
+    None
+}
+
+/// Résout la fenêtre de contexte du modèle actif, UNE fois par run : sonde locale
+/// → source de vérité `model_capabilities` pour le distant. Best-effort : ne
+/// bloque jamais le run.
+async fn resolve_context_window(
+    client: &reqwest::Client,
+    protocol: &str,
+    base_url: &str,
+    model: &str,
+) -> usize {
+    // Endpoints LOCAUX d'abord : on sonde le VRAI n_ctx. Un GGUF servi en local
+    // peut porter un nom « claude-… » / « gpt-… » / « …-gemini » (distill, merge,
+    // alias) ; le matcher par nom renverrait une grande fenêtre cloud et on ne
+    // compacterait jamais une fenêtre réelle de 8k → précisément le 400 « context
+    // exceeded » que cette feature existe pour empêcher. Si la sonde échoue, repli
+    // conservateur (et NON la valeur model_capabilities, qui suppose « fort » pour
+    // un nom inconnu en openai-compat → trop grande pour un local).
+    if is_local_endpoint(protocol, base_url) {
+        if let Some(w) = probe_local_context_window(client, protocol, base_url, model).await {
+            // Garde-fou contre une valeur aberrante (0, ou un chiffre délirant).
+            return w.clamp(2048, 2_000_000);
+        }
+        return LOCAL_WINDOW_FALLBACK;
+    }
+    // Cloud / distant : la fenêtre vient de la SOURCE DE VÉRITÉ unique
+    // (`model_capabilities`, calquée sur le nom de modèle) — pas de table dupliquée
+    // ici (cf. la lane « capacité par modèle »).
+    crate::commands::model_capabilities::capabilities(protocol, model).context_window as usize
+}
+
+/// COMPACTION — once the live history's estimated token footprint crosses the
+/// budget derived from the model's context `window`, fold the oldest dialogue
+/// turns (after the leading system blocks) into ONE episodic summary, write that
+/// summary to memory, and REPLACE the folded turns with a single recap message
+/// kept in context. Token-driven trigger AND fold (adaptive size via
+/// `plan_compaction_cut`) — no fixed turn count. Old turns are RESUMED, not
+/// dropped at a hard limit.
 ///
 /// `summarise` is the async closure that turns the transcript excerpt into a
 /// summary (an LLM sub-call). It is invoked at most once per compaction. On any
@@ -366,53 +620,25 @@ async fn maybe_compact<F, Fut>(
     agent_id: &str,
     role: &str,
     conversation_id: Option<&str>,
-    trigger_turns: usize,
+    window: usize,
     summarise: F,
 ) -> bool
 where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = Result<String, String>>,
 {
-    // Count the leading system blocks (seed + skills + lessons + recall): they
-    // are NEVER folded — they're the agent's standing context. Everything after
-    // is a real dialogue turn eligible for compaction.
-    let head = history
+    // Pure decision (trigger + adaptive fold cut). `None` ⇒ nothing to do.
+    let cut = match plan_compaction_cut(history, window) {
+        Some(c) => c,
+        None => return false,
+    };
+    // `fold_start` = leading system blocks (seed + skills + lessons + recall):
+    // NEVER folded. Recomputed here — identical to the `head` `plan_compaction_cut`
+    // used (history is unchanged between the two).
+    let fold_start = history
         .iter()
         .take_while(|m| matches!(m, AgentMessage::Text { role, .. } if role == "system"))
         .count();
-    let dialogue_len = history.len().saturating_sub(head);
-    if dialogue_len < trigger_turns {
-        return false;
-    }
-    // Fold a bounded slab of the OLDEST dialogue turns; keep the recent tail.
-    let fold = COMPACTION_FOLD_TURNS.min(dialogue_len.saturating_sub(4));
-    if fold == 0 {
-        return false;
-    }
-    let fold_start = head;
-    let fold_end = head + fold;
-
-    // A compacted slab MUST NOT end on an assistant turn that opened tool_calls
-    // without its matching tool results in the SAME slab — otherwise the kept
-    // tail would start with orphan ToolResults (no preceding tool_use → provider
-    // 400). Walk the cut point back until it lands AFTER a complete pair (i.e.
-    // the next kept message is not a ToolResults, and the last folded one is not
-    // an AssistantWithTools).
-    let mut cut = fold_end;
-    while cut > fold_start + 1 {
-        let last_folded = &history[cut - 1];
-        let next_kept = history.get(cut);
-        let dangling_call = matches!(last_folded, AgentMessage::AssistantWithTools { .. });
-        let orphan_result = matches!(next_kept, Some(AgentMessage::ToolResults(_)));
-        if dangling_call || orphan_result {
-            cut -= 1;
-        } else {
-            break;
-        }
-    }
-    if cut <= fold_start + 1 {
-        return false; // couldn't find a clean cut — skip this round
-    }
 
     let excerpt = transcript_excerpt(&history[fold_start..cut]);
     if excerpt.trim().is_empty() {
@@ -1638,12 +1864,11 @@ pub(super) async fn tool_use_loop(
     // the array is byte-identical to the native default — the no-MCP path is
     // unchanged. `None` is threaded for the `ollama` branch (which ignores tools).
     // Capacité du modèle (source unique : model_capabilities) — calculée UNE
-    // fois par run. Pilote la réduction de toolset (petits modèles) ET le seuil
-    // de compaction token-aware (cf. maybe_compact plus bas). Additif : un
-    // modèle fort n'est jamais affecté.
+    // fois par run. Pilote la réduction de toolset pour les petits modèles. La
+    // fenêtre de contexte de la compaction token-aware est résolue séparément par
+    // `resolve_context_window` (qui sonde EN PLUS le n_ctx réel des serveurs
+    // locaux). Additif : un modèle fort n'est jamais affecté.
     let caps = crate::commands::model_capabilities::capabilities(protocol, model);
-    let compaction_trigger =
-        crate::commands::model_capabilities::compaction_trigger(caps.context_window);
 
     let agent_tools: Option<serde_json::Value> = if protocol == "ollama" {
         None
@@ -1736,6 +1961,12 @@ pub(super) async fn tool_use_loop(
         }
         Some(arr)
     };
+
+    // Résout la fenêtre de contexte du modèle UNE fois par run (sonde réseau
+    // best-effort pour les serveurs locaux ; table pour le cloud ; repli 8k). Le
+    // déclencheur de compaction plus bas est gaté sur le budget token dérivé de
+    // CETTE fenêtre, plus sur un compteur de tours fixe.
+    let context_window = resolve_context_window(client, protocol, base_url, model).await;
 
     while iteration < budget {
         metrics.iterations = iteration + 1;
@@ -2282,19 +2513,9 @@ pub(super) async fn tool_use_loop(
         // errors → maybe_compact no-ops). Awaited inline — the loop is already
         // inside the abort `tokio::select!`, so a kill still wins at the next
         // turn boundary.
-        let _ = maybe_compact(
-            app,
-            history,
-            agent_id,
-            role,
-            conversation_id,
-            compaction_trigger,
-            |excerpt| {
-                summarise_turns(
-                    client, protocol, base_url, model, api_key, chat_template_kwargs, excerpt,
-                )
-            },
-        )
+        let _ = maybe_compact(app, history, agent_id, role, conversation_id, context_window, |excerpt| {
+            summarise_turns(client, protocol, base_url, model, api_key, chat_template_kwargs, excerpt)
+        })
         .await;
 
         iteration += 1;
@@ -3121,5 +3342,114 @@ mod tests {
         let ex = transcript_excerpt(&h);
         // "user: " prefix + at most 800 chars for a Text turn + newline.
         assert!(ex.len() < 900, "excerpt should be bounded, got {}", ex.len());
+    }
+
+    // ── AM-2 : token-aware compaction trigger (pure, no I/O) ──────────
+    fn txt(role: &str, content: &str) -> AgentMessage {
+        AgentMessage::Text { role: role.into(), content: content.into() }
+    }
+
+    #[test]
+    fn estimate_tokens_divides_chars_by_three() {
+        // role "system" (6) + content "abcdef" (6) = 12 chars / 3 = 4 tokens.
+        assert_eq!(estimate_tokens(&[txt("system", "abcdef")]), 4);
+    }
+
+    #[test]
+    fn estimate_tokens_image_is_flat_not_base64_length() {
+        // A LIVE image adds IMAGE_TOKENS, never the (huge) base64 length.
+        let huge_b64 = "A".repeat(100_000);
+        let h = vec![AgentMessage::UserImage {
+            text: "look".into(),
+            data_url: format!("data:image/jpeg;base64,{huge_b64}"),
+        }];
+        assert_eq!(estimate_tokens(&h), "look".len() / CHARS_PER_TOKEN + IMAGE_TOKENS);
+        // A pruned image (empty data_url) carries no flat visual cost.
+        let pruned = vec![AgentMessage::UserImage { text: "look".into(), data_url: "".into() }];
+        assert_eq!(estimate_tokens(&pruned), "look".len() / CHARS_PER_TOKEN);
+    }
+
+    #[test]
+    fn compaction_budget_margin_dominates_small_window() {
+        assert_eq!(compaction_budget(8_192), 5_192); // min(6144, 8192-3000)
+        assert_eq!(compaction_budget(200_000), 150_000); // fraction dominates
+        assert_eq!(compaction_budget(1_000_000), 750_000);
+    }
+
+    #[test]
+    fn is_local_endpoint_detects_local_servers() {
+        assert!(is_local_endpoint("ollama", "http://localhost:11434"));
+        assert!(is_local_endpoint("openai", "http://127.0.0.1:8090"));
+        assert!(!is_local_endpoint("openai", "https://api.minimax.io"));
+        assert!(!is_local_endpoint("anthropic", "https://api.anthropic.com"));
+    }
+
+    #[test]
+    fn plan_cut_none_under_budget() {
+        // Small history, huge window → nothing to compact.
+        let h = vec![txt("system", "seed"), txt("user", "hi"), txt("assistant", "hello"),
+            txt("user", "more"), txt("assistant", "ok"), txt("user", "again")];
+        assert_eq!(plan_compaction_cut(&h, 1_000_000), None);
+    }
+
+    #[test]
+    fn plan_cut_none_when_dialogue_at_or_below_keep_tail() {
+        // dialogue_len <= KEEP_TAIL → None even with a tiny window ("over budget").
+        let h = vec![txt("system", "seed"), txt("user", "a"), txt("assistant", "b"),
+            txt("user", "c"), txt("assistant", "d")]; // 4 dialogue turns
+        assert_eq!(plan_compaction_cut(&h, 2_048), None);
+    }
+
+    #[test]
+    fn plan_cut_folds_oldest_keeps_tail_and_drops_under_budget() {
+        // 20 fat user turns (~300 tokens each) cross an 8k budget (5192).
+        let fat = "x".repeat(896); // role "user" (4) + 896 = 900 chars / 3 = 300 tok
+        let mut h = vec![txt("system", "seed")];
+        for _ in 0..20 {
+            h.push(txt("user", &fat));
+        }
+        let window = 8_192;
+        let cut = plan_compaction_cut(&h, window).expect("should compact when over budget");
+        // head == 1 (single leading system block).
+        assert!(cut - 1 >= COMPACTION_FOLD_MIN_TURNS, "must fold at least FOLD_MIN turns");
+        // Keep the last KEEP_TAIL dialogue turns verbatim.
+        assert!(cut <= h.len() - COMPACTION_KEEP_TAIL_TURNS, "must keep the recent tail");
+        // After folding [1..cut] into one recap, the estimate drops under budget.
+        let kept_after = estimate_tokens(&h[..1]) + RECAP_EST_TOKENS + estimate_tokens(&h[cut..]);
+        assert!(
+            kept_after < compaction_budget(window),
+            "kept {} should be < budget {}",
+            kept_after,
+            compaction_budget(window)
+        );
+    }
+
+    #[test]
+    fn plan_cut_never_leaves_orphan_tool_results() {
+        // A tool pair sits exactly where the token-driven cut would land; the
+        // orphan walk-back must move the cut so the kept tail does NOT start on
+        // ToolResults and the folded slab does NOT end on a dangling tool_call.
+        let fat = "z".repeat(1_492); // ~500 tokens per turn
+        let mut h = vec![txt("system", "seed")];
+        for _ in 0..5 {
+            h.push(txt("user", &fat)); // idx 1..5
+        }
+        h.push(AgentMessage::AssistantWithTools {
+            content: fat.clone(),
+            tool_calls: vec![tc("c", "fs_read_file", "{}")],
+        }); // idx 6
+        h.push(AgentMessage::ToolResults(vec![tr("c", "fs_read_file", false, &fat)])); // idx 7
+        for _ in 0..5 {
+            h.push(txt("user", &fat)); // tail
+        }
+        let cut = plan_compaction_cut(&h, 8_192).expect("should compact");
+        assert!(
+            !matches!(h.get(cut), Some(AgentMessage::ToolResults(_))),
+            "kept tail must not start on orphan ToolResults"
+        );
+        assert!(
+            !matches!(h[cut - 1], AgentMessage::AssistantWithTools { .. }),
+            "folded slab must not end on a dangling tool_call"
+        );
     }
 }
