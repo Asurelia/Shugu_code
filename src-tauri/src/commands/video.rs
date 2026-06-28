@@ -9,6 +9,7 @@
 // de clé en clair côté Rust. MiniMax signale les erreurs logiques en HTTP 200 +
 // base_resp.status_code != 0. Réf : platform.minimax.io/docs/guides/video-generation.
 
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
@@ -116,10 +117,16 @@ pub async fn video_generate(app: AppHandle, args: VideoGenerateArgs) -> Result<V
         .to_string();
 
     // 2. Polling du statut jusqu'à Success/Fail.
-    let query_url = format!("{base}/v1/query/video_generation?task_id={task_id}");
+    // task_id vient de l'API : on l'encode malgré tout (défense en profondeur,
+    // même discipline qu'image.rs pour toute valeur injectée dans une URL).
+    let task_id_enc = utf8_percent_encode(&task_id, NON_ALPHANUMERIC).to_string();
+    let query_url = format!("{base}/v1/query/video_generation?task_id={task_id_enc}");
     let mut file_id = String::new();
-    for _ in 0..POLL_ATTEMPTS {
-        tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+    for attempt in 0..POLL_ATTEMPTS {
+        // Poll immédiat au 1er tour (la tâche peut déjà être prête), sleep ensuite.
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+        }
         let resp = match client
             .get(&query_url)
             .header("Authorization", format!("Bearer {}", args.api_key))
@@ -133,12 +140,20 @@ pub async fn video_generate(app: AppHandle, args: VideoGenerateArgs) -> Result<V
             Ok(v) => v,
             Err(_) => continue,
         };
+        // Erreur logique MiniMax pendant le polling (quota, auth, task invalide)
+        // = HTTP 200 + base_resp.status_code != 0 → fail-fast au lieu de boucler 10 min.
+        media::check_base_resp(&v, "video polling")?;
         match v.get("status").and_then(|s| s.as_str()).unwrap_or("") {
             "Success" => {
+                // Success SANS file_id = drift de contrat : on échoue explicitement
+                // plutôt que de retomber sur le message de timeout (trompeur).
                 file_id = v
                     .get("file_id")
                     .and_then(|f| f.as_str())
-                    .unwrap_or("")
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| {
+                        format!("minimax video: tâche {task_id} terminée (Success) mais sans file_id")
+                    })?
                     .to_string();
                 break;
             }
@@ -160,7 +175,8 @@ pub async fn video_generate(app: AppHandle, args: VideoGenerateArgs) -> Result<V
     }
 
     // 3. Récupération du lien de téléchargement (valable ~9 h) puis download local.
-    let retrieve_url = format!("{base}/v1/files/retrieve?file_id={file_id}");
+    let file_id_enc = utf8_percent_encode(&file_id, NON_ALPHANUMERIC).to_string();
+    let retrieve_url = format!("{base}/v1/files/retrieve?file_id={file_id_enc}");
     let resp = client
         .get(&retrieve_url)
         .header("Authorization", format!("Bearer {}", args.api_key))

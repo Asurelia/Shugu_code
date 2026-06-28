@@ -104,15 +104,27 @@ pub async fn music_generate(app: AppHandle, args: MusicGenerateArgs) -> Result<M
         .map_err(|e| format!("minimax music: réponse JSON invalide: {e}"))?;
     media::check_base_resp(&v, "music")?;
 
-    let audio = v
+    // Robuste aux deux schémas de réponse : output_format "hex" → data.audio
+    // (encodé HEX, comme le TTS), "url" (ou repli serveur) → data.audio_url (24 h).
+    let id = media::fallback_id("music");
+    let result_url = if let Some(audio) = v
         .pointer("/data/audio")
         .and_then(|a| a.as_str())
         .filter(|a| !a.trim().is_empty())
-        .ok_or_else(|| "minimax music: la réponse ne contient pas data.audio".to_string())?;
-
-    let bytes = crate::commands::voice::decode_hex_or_b64(audio)?;
-    let id = media::fallback_id("music");
-    let result_url = media::save_bytes(&app, "music-assets", &id, "mp3", &bytes)?;
+    {
+        let bytes = crate::commands::voice::decode_hex_or_b64(audio)?;
+        media::save_bytes(&app, "music-assets", &id, "mp3", &bytes)?
+    } else if let Some(url) = v
+        .pointer("/data/audio_url")
+        .and_then(|a| a.as_str())
+        .filter(|a| !a.trim().is_empty())
+    {
+        media::download_to_asset(&client, &app, "music-assets", &id, "mp3", url).await?
+    } else {
+        return Err(
+            "minimax music: la réponse ne contient ni data.audio ni data.audio_url".to_string(),
+        );
+    };
 
     Ok(MusicJob {
         id,
