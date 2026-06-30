@@ -261,6 +261,41 @@ pub fn is_core_small_tool(name: &str) -> bool {
     )
 }
 
+/// Fragment de prompt système ajouté SELON le palier du modèle. Pendant logique
+/// de `is_core_small_tool` : on conçoit pour le modèle FORT (prompt de base
+/// inchangé → `None`) et on DÉGRADE pour le PETIT en lui ajoutant des consignes
+/// directives, cohérentes avec le toolset déjà réduit. `has_tools` distingue une
+/// boucle outillée (agent / chat-tool-loop) d'un appel chat sans outils — un
+/// petit modèle sans outils (ollama agent, tiny, single-call) reçoit la variante
+/// « plain » qui ne mentionne aucun outil. Le fragment est inséré comme message
+/// `role:"system"` séparé (donc PAS de `\n\n` en tête) ; il est hoisté/joint avec
+/// les autres blocs système en aval.
+pub fn tier_prompt(tier: Tier, has_tools: bool) -> Option<&'static str> {
+    match (tier, has_tools) {
+        (Tier::Strong, _) => None,
+        (Tier::Small, true) => Some(SMALL_TIER_PROMPT_TOOLS),
+        (Tier::Small, false) => Some(SMALL_TIER_PROMPT_PLAIN),
+    }
+}
+
+/// Consignes pour un petit modèle DANS une boucle outillée. Les outils nommés
+/// reflètent exactement la whitelist `is_core_small_tool`.
+const SMALL_TIER_PROMPT_TOOLS: &str = "You are running as a smaller model. Work in small, verifiable steps:\n\
+- Call ONE tool at a time, then read its result before deciding the next step.\n\
+- Only the core tools exist (fs_read_file, fs_list_dir, fs_search, fs_write_file, fs_edit, run_command). Do not assume others.\n\
+- Keep each action tightly scoped; prefer the smallest change that makes progress.\n\
+- After each tool result, restate in one line what you learned and what you'll do next.\n\
+- If the task is too large to do reliably in one pass, ask for a smaller, more specific instruction instead of guessing.\n\
+- Do not fabricate file contents or command output; rely only on what tools return.";
+
+/// Consignes pour un petit modèle SANS outils (chat single-call). Ne mentionne
+/// aucun outil.
+const SMALL_TIER_PROMPT_PLAIN: &str = "You are running as a smaller model. Keep your answer focused and concrete:\n\
+- Address only what was asked; do not pad with unrelated detail.\n\
+- Prefer short, direct steps over long reasoning chains.\n\
+- If the request is ambiguous or too broad, ask one clarifying question instead of guessing.\n\
+- State only what you are confident about; do not invent facts.";
+
 /// Commande Tauri d'exposition à l'UI (badges du sélecteur de modèle).
 /// L'enforcement (gating outils/contexte) reste côté Rust ; le TS n'appelle
 /// ceci que pour AFFICHER.
@@ -395,5 +430,33 @@ mod tests {
         assert!(!is_core_small_tool("advisor"));
         assert!(!is_core_small_tool("web_search"));
         assert!(!is_core_small_tool("mcp__fs__read_file"));
+    }
+
+    #[test]
+    fn strong_tier_gets_no_prompt_fragment() {
+        // Doctrine : le prompt de base EST taillé pour le fort → aucun ajout,
+        // quel que soit l'état des outils. Additif, jamais de régression.
+        assert_eq!(tier_prompt(Tier::Strong, true), None);
+        assert_eq!(tier_prompt(Tier::Strong, false), None);
+    }
+
+    #[test]
+    fn small_tier_with_tools_names_the_core_tools() {
+        let frag = tier_prompt(Tier::Small, true).expect("small+tools → fragment");
+        // Mentionne au moins un outil core et cadre l'usage outil à la fois.
+        assert!(frag.contains("fs_read_file"), "tools fragment should name core tools");
+        assert!(frag.contains("ONE tool at a time"));
+    }
+
+    #[test]
+    fn small_tier_without_tools_mentions_no_tool() {
+        let frag = tier_prompt(Tier::Small, false).expect("small+no-tools → fragment");
+        // La variante « plain » ne doit nommer AUCUN outil (chat sans outils).
+        for tool in ["fs_read_file", "fs_edit", "run_command", "tool"] {
+            assert!(
+                !frag.contains(tool),
+                "plain fragment must not mention `{tool}` (no tools available)"
+            );
+        }
     }
 }

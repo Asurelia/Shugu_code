@@ -1214,6 +1214,25 @@ async fn run_chat_tool_loop(
     // toolset doit refléter le modèle RÉELLEMENT utilisé, pas le primaire.
     let chat_caps = crate::commands::model_capabilities::capabilities(protocol, model);
 
+    // Prompt par PALIER (miroir du runner agent) : un PETIT modèle reçoit en plus
+    // un fragment de consignes directives, cohérent avec le toolset réduit. Basé
+    // sur le `chat_caps` RECALCULÉ ci-dessus → correct même après failover. Variante
+    // « outils » (la boucle est outillée). Inséré à la suite de la tête système
+    // (persona / design-system venus du TS), donc hoisté/joint en aval. FORT → rien.
+    if let Some(frag) = crate::commands::model_capabilities::tier_prompt(chat_caps.tier, true) {
+        let head = history
+            .iter()
+            .take_while(|m| matches!(m, AgentMessage::Text { role, .. } if role == "system"))
+            .count();
+        history.insert(
+            head,
+            AgentMessage::Text {
+                role: "system".to_string(),
+                content: frag.to_string(),
+            },
+        );
+    }
+
     for iter in 0..CHAT_TOOL_MAX_ITERS {
         // The last allowed iteration forces a final text answer (no tools), the
         // same termination guarantee as `runner::tool_use_loop`'s last round.
@@ -1795,6 +1814,26 @@ pub async fn chat_send(
         .await
     } else {
         // ── Legacy single-call path (+ opt-in failover) ───────────────────
+        //
+        // Prompt par PALIER (chemin single-call : modèles tiny `supports_tools=
+        // false`, ollama/codex, vision, ou outils désactivés — ceux qui en ont le
+        // plus besoin). Variante « plain » (sans outils) préfixée aux messages
+        // pour CE chemin uniquement — la boucle outillée a sa propre injection.
+        // FORT → messages inchangés (pas de clone, on déplace le Vec). codex
+        // DROPpe le system, ollama le projette en texte : inoffensif.
+        let messages: Vec<ChatMessage> = if let Some(frag) =
+            crate::commands::model_capabilities::tier_prompt(chat_caps.tier, false)
+        {
+            let mut m = Vec::with_capacity(messages.len() + 1);
+            m.push(ChatMessage {
+                role: "system".to_string(),
+                content: frag.to_string(),
+            });
+            m.extend(messages);
+            m
+        } else {
+            messages
+        };
         //
         // Primary attempt. The `on_chunk` closure lives in this inner scope so
         // it drops at the end of the block, releasing the `&mut coalescer`

@@ -1962,6 +1962,32 @@ pub(super) async fn tool_use_loop(
         Some(arr)
     };
 
+    // Prompt par PALIER (source unique : model_capabilities) : un PETIT modèle
+    // reçoit en plus un fragment de consignes directives, cohérent avec le
+    // toolset déjà réduit ci-dessus ; un modèle FORT n'est jamais affecté
+    // (`tier_prompt` → None). `has_tools = agent_tools.is_some()` : sur ollama
+    // l'agent n'a PAS d'outils (`agent_tools == None`) → variante « plain ».
+    // Inséré comme message system À LA SUITE de la tête (seed + skills + lessons
+    // + recall), donc compté par le `take_while role=="system"` de la compaction
+    // (jamais replié) et hoisté avec les autres blocs système en aval. Couvre
+    // orchestrateur + atelier + grounded + sous-agents délégués (qui réutilisent
+    // tous tool_use_loop).
+    if let Some(frag) =
+        crate::commands::model_capabilities::tier_prompt(caps.tier, agent_tools.is_some())
+    {
+        let head = history
+            .iter()
+            .take_while(|m| matches!(m, AgentMessage::Text { role, .. } if role == "system"))
+            .count();
+        history.insert(
+            head,
+            AgentMessage::Text {
+                role: "system".to_string(),
+                content: frag.to_string(),
+            },
+        );
+    }
+
     // Résout la fenêtre de contexte du modèle UNE fois par run (sonde réseau
     // best-effort pour les serveurs locaux ; table pour le cloud ; repli 8k). Le
     // déclencheur de compaction plus bas est gaté sur le budget token dérivé de
