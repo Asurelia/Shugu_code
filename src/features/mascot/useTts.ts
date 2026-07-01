@@ -19,6 +19,7 @@ import { db } from "@/lib/db";
 const TTS_SETTING_KEY = "voice.tts";
 const TTS_VOICE_KEY = "voice.ttsVoice";
 const TTS_QUERY_KEY = ["settings", TTS_SETTING_KEY] as const;
+const TTS_VOICE_QUERY_KEY = ["settings", TTS_VOICE_KEY] as const;
 
 /** Audio en cours — coupé par le toggle OFF. */
 let currentAudio: HTMLAudioElement | null = null;
@@ -106,4 +107,25 @@ export function useTtsEnabled() {
     },
   });
   return { enabled, toggle: () => toggle.mutate() };
+}
+
+/**
+ * Hook réactif pour la voix choisie (clé `voice.ttsVoice`, déjà relue par
+ * speakNow). Calqué sur useTtsEnabled : lecture + mutation d'écriture. La voix
+ * vide signifie « défaut Rust » — on ne force pas d'id pour rester rétro-compat.
+ */
+export function useTtsVoice() {
+  const { data: voiceId = "" } = useQuery({
+    queryKey: TTS_VOICE_QUERY_KEY,
+    queryFn: async () => (await db.settings.get(TTS_VOICE_KEY).catch(() => "")) || "",
+    staleTime: 30_000,
+  });
+  const set = useMutation({
+    mutationFn: async (id: string) => {
+      await db.settings.set(TTS_VOICE_KEY, id);
+      return id;
+    },
+    onSuccess: (id) => queryClient.setQueryData(TTS_VOICE_QUERY_KEY, id),
+  });
+  return { voiceId, setVoice: (id: string) => set.mutate(id) };
 }

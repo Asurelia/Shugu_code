@@ -8,7 +8,7 @@ import { Breadcrumbs } from "./Breadcrumbs";
 import { OutlinePanel } from "./OutlinePanel";
 import { LspStatusIndicator } from "./LspStatusIndicator";
 import { ShortcutsSettings, InterfaceSettings } from "@/features/settings/settings-extras";
-import { MascotCalibration } from "@/features/settings/MascotCalibration";
+import { ShuguProfileView } from "@/features/settings/ShuguProfileView";
 import { CommandRulesSection } from "@/features/settings/CommandRulesSection";
 import { ConnectionsView, ProfileView } from "@/features/panels/panels";
 // Lane OPÉRABILITÉ — Storage / Backup / Diagnostics centers (section « ops »).
@@ -412,7 +412,7 @@ export function SettingsView({ section }: { section: string }) {
   if (section === 'editor') return <SettingsEditor/>;
   if (section === 'shortcuts') return <ShortcutsSettings/>;
   if (section === 'interface') return <InterfaceSettings/>;
-  if (section === 'mascot') return <MascotCalibration/>;
+  if (section === 'mascot') return <ShuguProfileView/>;
   if (section === 'privacy') return <SettingsPrivacy/>;
   if (section === 'command-rules') return <CommandRulesSection/>;
   if (section === 'ops') return <OpsView/>;

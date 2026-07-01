@@ -29,6 +29,7 @@ import {
   type BundleProgress,
 } from "@/lib/modelBundle";
 import { db } from "@/lib/db";
+import { useGreetingDone } from "./greetingFlag";
 
 const DISMISS_KEY = "onboarding.dismissed.v1";
 
@@ -47,6 +48,9 @@ export function Onboarding() {
   const { data: installedIds = [] } = useInstalledBundles();
   const { data: dismissedData, isLoading: dismissedLoading } = useOnboardingDismissed();
   const dismissed: boolean | null = dismissedLoading ? null : (dismissedData ?? false);
+  // S3 : la rencontre avec Shugu passe d'abord. Tant qu'elle n'est pas terminée,
+  // l'overlay modèle reste en retrait (évite deux overlays empilés au 1er lancement).
+  const greetingDone = useGreetingDone();
   const [downloading, setDownloading] = useState(false);
   const [progress, setProgress] = useState<BundleProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -92,6 +96,7 @@ export function Onboarding() {
   // Wait until we know the dismissed flag before deciding to render. This
   // prevents a brief flash of the overlay on launch.
   if (dismissed === null) return null;
+  if (greetingDone !== true) return null;
 
   const defaultEntry = catalog[0];
   const installed = defaultEntry ? installedIds.includes(defaultEntry.id) : false;

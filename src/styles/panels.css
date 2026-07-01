@@ -878,6 +878,130 @@
 }
 .float-shell.edge-hidden .float-avatar-glow { opacity: 0; }
 
+/* ══ Mascotte centrale (S1–S3) ══════════════════════════════════════════════ */
+
+/* S1b — Écho de Shugu dans l'IDE : mini-bulle chibi ancrée près du Rail.
+   Partage la donnée speechStore avec la fenêtre mascotte (pas de duplication). */
+.mascot-echo {
+  position: fixed;
+  left: 64px;            /* juste à droite du Rail (~56px) */
+  bottom: 18px;
+  z-index: 1200;
+  max-width: 340px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px 10px 10px;
+  border-radius: 14px;
+  background: rgba(18, 16, 32, 0.92);
+  border: 1px solid rgba(224, 142, 254, 0.28);
+  border-left: 3px solid var(--primary);
+  box-shadow: 0 12px 40px -12px rgba(0,0,0,0.6), 0 0 22px -8px rgba(224,142,254,0.4);
+  backdrop-filter: blur(12px) saturate(150%);
+  color: var(--on-surface);
+  cursor: pointer;
+  animation: mascot-echo-in 200ms ease-out;
+}
+.mascot-echo:hover { border-color: rgba(224, 142, 254, 0.5); }
+.mascot-echo-avatar {
+  flex-shrink: 0;
+  display: flex; align-items: flex-end; justify-content: center;
+  width: 30px; height: 34px; overflow: hidden;
+}
+.mascot-echo-text { font-size: 13px; line-height: 1.4; }
+/* Liseré gauche par ton — le SENS reste porté par le texte (pas la couleur seule). */
+.mascot-echo--info    { border-left-color: var(--primary); }
+.mascot-echo--success { border-left-color: var(--success); }
+.mascot-echo--error   { border-left-color: var(--danger); }
+.mascot-echo--proud   { border-left-color: var(--warn); }
+@keyframes mascot-echo-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* S2 — Profil de Shugu : hero + onglets internes. */
+.shugu-profile-hero { display: flex; gap: 14px; align-items: center; margin-bottom: 12px; }
+.shugu-profile-hero h3 { margin: 0 0 2px; }
+.profile-tabs {
+  display: flex; gap: 4px;
+  margin-top: 8px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+.profile-tab {
+  appearance: none; background: transparent; border: 0;
+  color: var(--on-surface-variant);
+  padding: 8px 12px; font-size: 13px; cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: color 160ms ease, border-color 160ms ease;
+}
+.profile-tab:hover { color: var(--on-surface); }
+.profile-tab.active { color: var(--on-surface); border-bottom-color: var(--primary); }
+.profile-tab:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+/* Sélecteur de voix partagé (Profil + onboarding). */
+.voice-picker { display: flex; flex-direction: column; gap: 10px; }
+.voice-picker-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.voice-picker-row select {
+  padding: 5px 8px; min-width: 220px;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 6px; color: inherit;
+}
+.voice-picker-row input[type="checkbox"] { width: 15px; height: 15px; }
+
+/* S3 — Overlay « rencontre avec Shugu » (au-dessus de l'overlay modèle, z 6000). */
+.shugu-greeting-overlay {
+  position: fixed; inset: 0; z-index: 6000;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(8, 6, 18, 0.82);
+  backdrop-filter: blur(10px);
+  padding: 24px;
+  animation: mascot-echo-in 220ms ease-out;
+}
+.shugu-greeting-card {
+  position: relative;
+  width: 100%; max-width: 460px;
+  background: var(--surface, #16121f);
+  border: 1px solid rgba(224, 142, 254, 0.3);
+  border-radius: 18px;
+  padding: 26px 24px 22px;
+  box-shadow: 0 24px 90px rgba(124, 58, 237, 0.28);
+  color: var(--on-surface);
+  text-align: center;
+}
+.shugu-greeting-card h2 { margin: 6px 0 8px; font-size: 22px; }
+.shugu-greeting-hero { position: relative; display: flex; justify-content: center; margin-bottom: 6px; }
+.shugu-greeting-glow {
+  position: absolute; bottom: -6px; left: 50%; transform: translateX(-50%);
+  width: 120px; height: 40px;
+  background: radial-gradient(ellipse, rgba(224,142,254,0.5), transparent 70%);
+  filter: blur(6px); pointer-events: none;
+}
+.shugu-greeting-bubble {
+  background: rgba(224, 142, 254, 0.08);
+  border: 1px solid rgba(224, 142, 254, 0.18);
+  border-radius: 12px; padding: 12px 14px;
+  font-size: 14px; line-height: 1.55; text-align: left;
+}
+.shugu-greeting-actions { display: flex; justify-content: center; gap: 10px; margin-top: 16px; }
+.shugu-greeting-input {
+  width: 100%; box-sizing: border-box;
+  padding: 9px 12px; margin-top: 6px;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 8px; color: inherit; font-size: 14px;
+}
+.shugu-greeting-skip {
+  position: absolute; top: 12px; right: 14px;
+  background: transparent; border: 0; cursor: pointer;
+  color: var(--on-surface-muted); font-size: 12px;
+}
+.shugu-greeting-skip:hover { color: var(--on-surface); }
+
+@media (prefers-reduced-motion: reduce) {
+  .mascot-echo, .shugu-greeting-overlay { animation: none; }
+}
+
 /* Tooltip while edge-hidden */
 .float-edge-tip {
   position: absolute;

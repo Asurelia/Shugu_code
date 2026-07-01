@@ -24,6 +24,8 @@ import {
 import { MenuBar } from "@/components/MenuBar";
 import { ChatSidebar } from "@/features/chat/chat-sidebar";
 import { Onboarding } from "@/features/onboarding/Onboarding";
+import { ShuguGreeting } from "@/features/onboarding/ShuguGreeting";
+import { MascotEcho } from "@/features/mascot/MascotEcho";
 import {
   DockWorkspace,
   ContextMenu,
@@ -1283,7 +1285,7 @@ export function RootLayout() {
             menu={view === "code" ? <MenuBar ctx={cmdCtx}/> : null}
           />
           <div className="main">
-            <Rail view={view} setView={navigateTo} onAvatar={() => setAccountOpen(o => !o)}/>
+            <Rail view={view} setView={navigateTo} onProfile={() => navigate({ to: "/settings/mascot" as any })}/>
             <SidePanel width={sideWidth} setWidth={setSideWidth} collapsed={sideCollapsed}>
               {sidePanel}
             </SidePanel>
@@ -1462,7 +1464,15 @@ export function RootLayout() {
             or if the user clicked "Plus tard" in a previous session. The
             overlay sits at z-index 5000 (above TweaksPanel) so it pre-empts
             the rest of the chrome while it's visible. */}
+        {/* Rencontre « première fois » avec Shugu (S3) — la relation avant la
+            config technique ; précède l'overlay de téléchargement de modèle. */}
+        <ShuguGreeting/>
+
         <Onboarding/>
+
+        {/* Écho de Shugu dans l'IDE (S1b) — mini-bulle chibi près du Rail,
+            branchée sur speechStore (partagé avec la fenêtre mascotte). */}
+        <MascotEcho/>
 
         {/* Toasts globaux (échecs silencieux FIM, feedback réindexation…). */}
         <ToastHost/>

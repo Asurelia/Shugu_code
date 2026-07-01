@@ -436,6 +436,58 @@ body {
 .rail-avatar:hover { opacity: 0.85; box-shadow: 0 6px 22px -6px rgba(224,142,254,0.75); }
 .rail-avatar:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 
+/* Mini-chibi vivante dans le Rail (S1a) — remplace le gradient « SH ». La chibi
+   a un fond transparent : on retire le gradient et on pose un halo mauve au survol. */
+.rail-avatar.rail-chibi {
+  background: transparent;
+  box-shadow: none;
+  overflow: visible;
+  position: relative;
+  padding: 0;
+}
+.rail-avatar.rail-chibi:hover { opacity: 1; box-shadow: none; }
+.rail-avatar.rail-chibi::before {
+  content: "";
+  position: absolute; inset: -3px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(224,142,254,0.35), transparent 70%);
+  opacity: 0;
+  transition: opacity 200ms ease;
+  pointer-events: none;
+}
+.rail-avatar.rail-chibi:hover::before { opacity: 1; }
+.rail-avatar.rail-chibi .chibi-mascot { display: block; }
+.rail-chibi-badge {
+  position: absolute;
+  top: -1px; right: -1px;
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  background: var(--secondary);
+  box-shadow: 0 0 6px var(--secondary);
+  animation: rail-chibi-pulse 1.6s ease-in-out infinite;
+}
+@keyframes rail-chibi-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50%      { transform: scale(1.25); opacity: 0.7; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rail-chibi-badge { animation: none; }
+}
+
+/* Avatar « compte » de la titlebar (déclencheur de .account-pop, top-right). */
+.tb-avatar {
+  width: 24px; height: 24px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--primary), var(--secondary));
+  color: #1a0a24;
+  font-family: var(--font-display); font-weight: 700; font-size: 10px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 0; cursor: pointer;
+  transition: opacity 160ms ease, box-shadow 160ms ease;
+}
+.tb-avatar:hover { opacity: 0.85; box-shadow: 0 4px 14px -6px rgba(224,142,254,0.7); }
+.tb-avatar:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
 /* Side panel (context: file tree, history, etc) — width is controlled by .side-wrap */
 .side {
   flex-shrink: 0;

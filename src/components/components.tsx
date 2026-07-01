@@ -11,6 +11,8 @@ import { useGitStatusMap, type GitStatusChar } from "@/features/git/useGitStatus
 import { useDirChildren } from "@/features/fs/queries";
 // Colored file-type icons (Shugu's hand-made VS Code-style set).
 import { FileTypeIcon } from "@/components/fileIcons";
+// Mini-chibi mood-sync dans le Rail (S1a) — remplace l'avatar générique « SH ».
+import { RailChibi } from "@/features/mascot/RailChibi";
 
 // ── Icons (24x24 stroke) ────────────────────────────────────
 export function Icon({ name, size = 18, className = "" }: { name: string; size?: number; className?: string }) {
@@ -169,12 +171,16 @@ export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettin
       <button className="tb-action" title="History"><Icon name="history" size={15}/></button>
       {/* TODO(Pass 2): wire to command */}
       <button className="tb-action" title="Notifications"><Icon name="bell" size={15}/></button>
+      {/* Compte — le popover .account-pop s'ancre en haut-droite (top:48px right:12px),
+          sous la titlebar : son déclencheur vit donc ICI. L'avatar « SH » du Rail est
+          devenu la mini-chibi (→ Profil de Shugu), on ne perd donc aucun accès. */}
+      <button className="tb-avatar" title="Compte" aria-label="Compte" onClick={onAvatar}>VU</button>
     </div>
   );
 }
 
 // ── Activity Rail ───────────────────────────────────────────
-export function Rail({ view, setView, onAvatar }: any) {
+export function Rail({ view, setView, onProfile }: any) {
   const items = [
     { id: "chat",    icon: "chat",    label: "Chat" },
     { id: "code",    icon: "code",    label: "Editor" },
@@ -208,7 +214,7 @@ export function Rail({ view, setView, onAvatar }: any) {
           <Icon name="gear" size={18}/>
           <span className="rail-tip">Settings</span>
         </button>
-        <button className="rail-avatar" aria-label="Account" title="Account" onClick={onAvatar}>SH</button>
+        <RailChibi onClick={onProfile} />
       </div>
     </nav>
   );
@@ -824,7 +830,7 @@ export function SideSettings({ section, setSection }: any) {
     { id: 'models', label: 'Models & Keys' },
     { id: 'image', label: 'Image Generation' },
     { id: 'editor', label: 'Editor' },
-    { id: 'mascot', label: 'Mascot' },
+    { id: 'mascot', label: 'Profil de Shugu' },
     { id: 'shortcuts', label: 'Keyboard shortcuts' },
     { id: 'privacy', label: 'Privacy' },
     { id: 'command-rules', label: 'Command Rules' },
