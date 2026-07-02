@@ -4,7 +4,9 @@
 //   /design-systems/index.json   — manifest (id, name, has{Tokens,Components,Spec})
 //   /design-systems/<id>/{DESIGN.md,tokens.css,components.html}
 //   /design-skills/index.json    — manifest (id, name, description, category)
-//   /design-skills/<id>/SKILL.md
+// NB: seuls les manifests sont vendorés. Les corps SKILL.md (jamais fetchés —
+// « Phase K » du plan) ont été retirés de public/ ; scripts/vendor-open-design.mjs
+// les re-vendorera depuis l'upstream si la Phase K se concrétise.
 //
 // In dev Vite serves public/ at the web root; in a packaged Tauri build the
 // same files are bundled into dist and served from the app origin. Either way
@@ -89,12 +91,5 @@ export function useDesignSystemFiles(id: string | null) {
   });
 }
 
-/** Lazily fetch one skill's SKILL.md (empty string if absent). */
-export function useDesignSkillDoc(id: string | null) {
-  return useQuery<string>({
-    queryKey: ["design", "skill-doc", id],
-    enabled: !!id,
-    staleTime: Infinity,
-    queryFn: () => fetchText(`/design-skills/${id}/SKILL.md`).catch(() => ""),
-  });
-}
+// (useDesignSkillDoc supprimé — hook jamais consommé ; les SKILL.md ne sont
+//  plus vendorés dans public/. À réintroduire avec la Phase K si besoin.)

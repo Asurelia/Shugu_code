@@ -284,42 +284,8 @@ export function Rail({ view, setView, onProfile, runningAgents = 0 }: any) {
 }
 
 // ── Side panel (varies by view) ─────────────────────────────
-export function SideHistory({ items, active, onPick, onNew }: any) {
-  return (
-    <aside className="side">
-      <div className="side-head">
-        <div className="side-title">Conversations</div>
-        <button className="side-new" onClick={onNew}><Icon name="plus" size={11}/> New</button>
-      </div>
-      <div className="side-list scroll">
-        <div className="side-section-label">Today</div>
-        {items.slice(0, 3).map((c: any) => (
-          <button type="button" key={c.id} className={"side-item" + (c.id === active ? " active" : "")} onClick={() => onPick(c.id)} aria-current={c.id === active ? "true" : undefined} aria-label={c.title}>
-            <Icon name="chat" size={13} className="ico"/>
-            <span className="label">{c.title}</span>
-            <span className="meta">{c.time}</span>
-          </button>
-        ))}
-        <div className="side-section-label">Yesterday</div>
-        {items.slice(3, 6).map((c: any) => (
-          <button type="button" key={c.id} className={"side-item" + (c.id === active ? " active" : "")} onClick={() => onPick(c.id)} aria-current={c.id === active ? "true" : undefined} aria-label={c.title}>
-            <Icon name="chat" size={13} className="ico"/>
-            <span className="label">{c.title}</span>
-            <span className="meta">{c.time}</span>
-          </button>
-        ))}
-        <div className="side-section-label">Older</div>
-        {items.slice(6).map((c: any) => (
-          <button type="button" key={c.id} className={"side-item" + (c.id === active ? " active" : "")} onClick={() => onPick(c.id)} aria-current={c.id === active ? "true" : undefined} aria-label={c.title}>
-            <Icon name="chat" size={13} className="ico"/>
-            <span className="label">{c.title}</span>
-            <span className="meta">{c.time}</span>
-          </button>
-        ))}
-      </div>
-    </aside>
-  );
-}
+// (SideHistory — maquette de sidebar chat à faux groupes temporels — supprimé :
+//  jamais importé ; la vraie sidebar est features/chat/chat-sidebar.tsx.)
 
 // ── File tree (controlled expansion + CRUD UX) ─────────────
 //
