@@ -512,6 +512,10 @@ export function ChatView({
           rows={1}
         />
         <div className="cx-composer-bar">
+          {/* Le mode (Chat / Plan / Agent) est LE contrat du message qu'on
+              s'apprête à envoyer : il vit DANS le composer (pattern Cursor /
+              Codex), pas dans la rangée de contexte flottante en dessous. */}
+          <ModeSelector />
           <button className="cx-tool" title="Joindre une image" onClick={() => fileInputRef.current?.click()}>
             <Icon name="attach" size={15} />
           </button>
@@ -524,7 +528,8 @@ export function ChatView({
           >
             <Icon name="image" size={15} />
           </button>
-          <button className="cx-tool" title="Voix"><Icon name="mic" size={15} /></button>
+          {/* Le bouton micro « Voix » (inerte, aucun flux derrière) est retiré —
+              un contrôle mort abîme la confiance plus qu'un contrôle absent. */}
           <div className="cx-spacer" />
           <ModelPicker model={model} onChange={setModel} className="composer-model" />
           {typing ? (
@@ -576,10 +581,9 @@ export function ChatView({
             </button>
           </span>
         )}
-        {/* Vrai sélecteur de mode (Chat / Plan / Agent) — remplace l'ancienne
-            pastille décorative « Accès complet ». Le mode pilote le routage
-            (chat-sync) + l'enforcement read-only en mode Plan (runner Rust). */}
-        <ModeSelector />
+        {/* Le ModeSelector a migré DANS la barre du composer (ci-dessus) — cette
+            rangée ne porte plus que du CONTEXTE (fichier joint, workspace,
+            branche, isolation, permission), pas de contrôle d'envoi. */}
         <button className="cx-chip" title="Espace de travail">
           <Icon name="folder" size={11} />
           {cwd}

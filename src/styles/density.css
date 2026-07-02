@@ -1,0 +1,93 @@
+/* Shugu Forge — passe densité & hiérarchie (2026-07-02).
+
+   Suite du retour utilisateur « tout fait générique, placé au pif » :
+   ces surcharges (chargées en dernier, styles.css intact) resserrent la
+   hiérarchie visuelle sur les patterns des références (Cursor / Codex /
+   Claude Desktop) — action primaire évidente, en-têtes discrets, états
+   vides propres, éléments secondaires apaisés. */
+
+/* ── En-tête de vue : bandeau discret, pas un titre de page ─────────────── */
+/* Le gros titre (« Editor », « Settings ») redisait ce que le rail montre
+   déjà ; les références n'ont pas de bandeau-titre qui mange une rangée. */
+.content-head {
+  padding: 9px 22px 8px;
+}
+.content-title {
+  font-size: 13px;
+}
+
+/* ── Titres de sidebar : une ligne, jamais de retour à la ligne ─────────── */
+.side-title {
+  letter-spacing: 0.1em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1;
+}
+
+/* ── Sidebar chat : action primaire pleine largeur (pattern « New chat ») ─ */
+.chat-new-cta {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  margin: 8px 10px 4px;
+  padding: 8px 12px;
+  border-radius: 9px;
+  background: linear-gradient(135deg, rgba(224, 142, 254, 0.16), rgba(253, 108, 156, 0.10));
+  border: 1px solid rgba(224, 142, 254, 0.35);
+  color: var(--on-surface);
+  font-family: var(--font-display);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 140ms ease, border-color 140ms ease, transform 140ms ease;
+}
+.chat-new-cta:hover {
+  background: linear-gradient(135deg, rgba(224, 142, 254, 0.24), rgba(253, 108, 156, 0.16));
+  border-color: rgba(224, 142, 254, 0.55);
+}
+.chat-new-cta:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
+}
+
+/* « New group » : action rare → rangée texte discrète, plus de cadre
+   pointillé qui rivalisait visuellement avec les conversations. */
+.chat-new-group {
+  border: 0;
+  background: transparent;
+  color: var(--on-surface-muted);
+  font-size: 11px;
+  padding: 6px 12px;
+  margin: 2px 6px 6px;
+}
+.chat-new-group:hover {
+  color: var(--primary);
+  background: rgba(224, 142, 254, 0.05);
+  border: 0;
+}
+
+/* ── État vide générique des sidebars (Workers, …) ──────────────────────── */
+.side-empty {
+  padding: 18px 14px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--on-surface-variant);
+}
+.side-empty p { margin: 0 0 8px; }
+.side-empty .muted {
+  color: var(--on-surface-muted);
+  font-size: 11.5px;
+}
+
+/* ── Composer : le ModeSelector vit dans la barre d'outils ──────────────── */
+/* Un poil plus présent que les chips de contexte (c'est un CONTRÔLE). */
+.cx-composer-bar .cx-chip.mode {
+  font-weight: 600;
+}
+/* La rangée sous le composer ne porte plus que du contexte : plus discrète. */
+.cx-ctx-row {
+  margin-top: 8px;
+}

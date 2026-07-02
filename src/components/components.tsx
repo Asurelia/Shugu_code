@@ -837,7 +837,7 @@ export function SideGallery({ folders, active, onPick }: any) {
     <aside className="side">
       <div className="side-head">
         <div className="side-title">Collections</div>
-        <button className="side-new"><Icon name="plus" size={11}/></button>
+        {/* Le « + » inerte (aucun flux de création de collection) est retiré. */}
       </div>
       <div className="side-list scroll">
         {folders.map((f: any) => (
@@ -853,23 +853,37 @@ export function SideGallery({ folders, active, onPick }: any) {
 }
 
 export function SideAgents({ agents, active, onPick }: any) {
+  const running = agents.filter((a: any) => a.status === "running");
+  const idle = agents.filter((a: any) => a.status !== "running");
   return (
     <aside className="side">
       <div className="side-head">
         <div className="side-title">Workers</div>
-        <button className="side-new"><Icon name="plus" size={11}/> New</button>
+        {/* L'ancien « + New » était inerte — la création d'agent vit dans la
+            page (« + Nouvel agent » d'AgentDefsManager). */}
       </div>
       <div className="side-list scroll">
-        <div className="side-section-label">Running</div>
-        {agents.filter((a: any) => a.status === 'running').map((a: any) => (
+        {/* Sections affichées seulement si peuplées ; à vide, un état
+            pédagogique remplace deux labels RUNNING/IDLE orphelins. */}
+        {agents.length === 0 && (
+          <div className="side-empty">
+            <p>Aucun agent en cours.</p>
+            <p className="muted">
+              Lance une tâche en mode <b>Agent</b> depuis le Chat — les runs
+              et leurs transcripts apparaîtront ici.
+            </p>
+          </div>
+        )}
+        {running.length > 0 && <div className="side-section-label">Running</div>}
+        {running.map((a: any) => (
           <button type="button" key={a.id} className={"side-item" + (a.id === active ? " active" : "")} onClick={() => onPick(a.id)} aria-current={a.id === active ? "true" : undefined} aria-label={a.name}>
             <span className="ico" style={{display:'inline-flex',alignItems:'center',justifyContent:'center',width:14,height:14,fontSize:11}} aria-hidden="true">{a.icon}</span>
             <span className="label">{a.name}</span>
             <span className="meta" style={{color:'var(--tertiary)'}} aria-hidden="true">●</span>
           </button>
         ))}
-        <div className="side-section-label">Idle</div>
-        {agents.filter((a: any) => a.status !== 'running').map((a: any) => (
+        {idle.length > 0 && <div className="side-section-label">Idle</div>}
+        {idle.map((a: any) => (
           <button type="button" key={a.id} className={"side-item" + (a.id === active ? " active" : "")} onClick={() => onPick(a.id)} aria-current={a.id === active ? "true" : undefined} aria-label={a.name}>
             <span className="ico" style={{display:'inline-flex',alignItems:'center',justifyContent:'center',width:14,height:14,fontSize:11}} aria-hidden="true">{a.icon}</span>
             <span className="label">{a.name}</span>
