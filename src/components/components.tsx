@@ -13,6 +13,10 @@ import { useDirChildren } from "@/features/fs/queries";
 import { FileTypeIcon } from "@/components/fileIcons";
 // Mini-chibi mood-sync dans le Rail (S1a) — remplace l'avatar générique « SH ».
 import { RailChibi } from "@/features/mascot/RailChibi";
+// Clic droit « Ajouter au chat (@source) » — file d'attente consommée par le
+// composer du ChatView (insertion d'une @-mention).
+import { requestChatMention } from "@/features/chat/chatMentionStore";
+import { pushToast } from "@/components/toast";
 
 // ── Icons (24x24 stroke) ────────────────────────────────────
 export function Icon({ name, size = 18, className = "" }: { name: string; size?: number; className?: string }) {
@@ -326,7 +330,7 @@ export function SideHistory({ items, active, onPick, onNew }: any) {
 // from the parent. We track *collapsed* paths (default = open) so newly
 // arrived folders from a tree refresh feel "open by default" as before.
 
-type FileCtxAction = "newFile" | "newFolder" | "rename" | "delete";
+type FileCtxAction = "newFile" | "newFolder" | "rename" | "delete" | "addToChat";
 
 export function SideFiles({ active, onPick }: any) {
   // LOT 3 git-ui — per-path git status char (no-op outside a git repo).
@@ -372,6 +376,12 @@ export function SideFiles({ active, onPick }: any) {
       setRenaming(node.path);
     } else if (action === "delete") {
       setConfirmDelete(node);
+    } else if (action === "addToChat") {
+      // Insère une @-mention dans le composer chat (flux mentions.ts : le
+      // contenu du fichier est joint au modèle à l'envoi). Si le chat n'est
+      // pas monté, la demande attend la prochaine ouverture du composer.
+      requestChatMention(node.path);
+      pushToast(`@${node.path.split("/").pop()} ajouté comme source du prochain message`, "success", 3500);
     } else if (action === "newFile" || action === "newFolder") {
       const isDir = node.isDir ?? Array.isArray(node.children);
       // New file in a folder = child; new file on a file = sibling.
@@ -796,6 +806,10 @@ function FileCtxMenu({ node, x, y, onClose, onAction }: { node: any; x: number; 
       <button onClick={() => onAction("newFile")}>New File…</button>
       <button onClick={() => onAction("newFolder")}>New Folder…</button>
       <div className="file-ctx-sep" />
+      {/* Fichiers seulement — une @-mention de dossier ne se résout pas. */}
+      {!isDir && (
+        <button onClick={() => onAction("addToChat")}>Ajouter au chat (@source)</button>
+      )}
       <button onClick={() => onAction("rename")}>Rename…</button>
       <button onClick={() => onAction("delete")} className="danger">Delete</button>
       {/* Hint at the bottom so the user knows what they're targeting. */}

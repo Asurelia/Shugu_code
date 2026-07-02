@@ -87,9 +87,25 @@
 .cx-composer-bar .cx-chip.mode {
   font-weight: 600;
 }
-/* La rangée sous le composer ne porte plus que du contexte : plus discrète. */
-.cx-ctx-row {
-  margin-top: 8px;
+/* La rangée de contexte est INTÉGRÉE à la bulle (pied de carte) : un fin
+   trait la sépare de la barre d'outils, plus de chips flottants dehors. */
+.cx-composer .cx-ctx-row {
+  margin: 2px 6px 6px;
+  padding: 7px 6px 2px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  max-width: none;
+}
+
+/* Chip fichier (@-mention / contexte éditeur) : même gabarit compact que les
+   autres chips — icône, nom (ellipsis), × inline. Fini la « grosse bulle ». */
+.cx-ctx-row .cx-chip.ctx-editor {
+  max-width: 260px;
+}
+.cx-ctx-row .cx-chip.ctx-editor .name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 /* Auto-grow (JS règle la hauteur = scrollHeight) : au-delà du cap CSS, le

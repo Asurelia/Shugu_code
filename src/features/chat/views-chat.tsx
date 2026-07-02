@@ -33,6 +33,8 @@ import { useAgentTranscript } from "@/features/agents/queries";
 import { BrowserTestResultViewer } from "./BrowserTestResultViewer";
 import { CommandRiskCard } from "./CommandRiskCard";
 import { AgentPlan } from "./AgentPlan";
+import { QuickOpenPalette } from "@/features/code/QuickOpenPalette";
+import { useChatMentionRequests, clearChatMentionRequests } from "./chatMentionStore";
 import { Markdown } from "./markdownView";
 import { useShell } from "@/routes/shell-context";
 import { detectBlockPath } from "@/lib/markdown";
@@ -205,6 +207,22 @@ export function ChatView({
     el.style.height = "auto";
     el.style.height = `${el.scrollHeight}px`;
   }, [input]);
+
+  // Ajout de sources — le « + » du composer ouvre un picker de fichiers du
+  // workspace et insère une @-mention `@"chemin"` (résolue à l'envoi par le
+  // flux mentions.ts existant : contenu joint au modèle, texte UI propre).
+  const [mentionPickerOpen, setMentionPickerOpen] = useState(false);
+  const insertMention = useCallback((path: string) => {
+    setInput((i) => (i && !/\s$/.test(i) ? i + " " : i) + `@"${path}" `);
+    inputRef.current?.focus();
+  }, []);
+  // Demandes venues d'ailleurs (clic droit explorateur → « Ajouter au chat »).
+  const mentionRequests = useChatMentionRequests();
+  useEffect(() => {
+    if (mentionRequests.length === 0) return;
+    mentionRequests.forEach(insertMention);
+    clearChatMentionRequests();
+  }, [mentionRequests, insertMention]);
 
   // Agents disponibles via slash commands (`/code-reviewer ...`). Source =
   // `.md` sur disque (`~/.claude/agents/*.md` + workspace), refetch on focus.
@@ -522,6 +540,16 @@ export function ChatView({
           rows={1}
         />
         <div className="cx-composer-bar">
+          {/* « + » = ajouter des sources (pattern Cursor/Claude Desktop) :
+              ouvre un picker de fichiers du workspace, insère une @-mention. */}
+          <button
+            className="cx-tool"
+            title="Ajouter un fichier comme source (@fichier) — son contenu sera joint au message"
+            aria-label="Ajouter un fichier comme source"
+            onClick={() => setMentionPickerOpen(true)}
+          >
+            <Icon name="plus" size={15} />
+          </button>
           {/* Le mode (Chat / Plan / Agent) est LE contrat du message qu'on
               s'apprête à envoyer : il vit DANS le composer (pattern Cursor /
               Codex), pas dans la rangée de contexte flottante en dessous. */}
@@ -556,8 +584,10 @@ export function ChatView({
             </button>
           )}
         </div>
-      </div>
-      <div className="cx-ctx-row">
+        {/* Rangée de contexte INTÉGRÉE à la bulle (retour utilisateur : des
+            chips flottants sous le composer « font étranges ») — un pied de
+            carte discret, séparé par un fin trait, comme Cursor/Claude. */}
+        <div className="cx-ctx-row">
         {/* Lot A — chip contexte éditeur retirable. Montre le fichier actif (+
             sélection) qui sera joint au prochain message. Le × le retire pour
             ce tour (réactivé après envoi). Réutilise .cx-chip (charte glass). */}
@@ -651,6 +681,7 @@ export function ChatView({
             title="Mode lecture seule — l'inférence et tes données restent locales ; aucun fichier n'est modifié ni aucune commande exécutée ce tour-ci."
           />
         )}
+        </div>
       </div>
     </>
   );
@@ -748,6 +779,13 @@ export function ChatView({
           the whole chat view incl. the empty state; chatMain isn't rendered
           during the handoff split, so that case is already excluded. */}
       <ContextBubble convId={activeConv} />
+      {/* Picker « + » du composer — réutilise QuickOpen (fuzzy sur le
+          workspace) mais insère une @-mention au lieu d'ouvrir l'éditeur. */}
+      <QuickOpenPalette
+        open={mentionPickerOpen}
+        onClose={() => setMentionPickerOpen(false)}
+        onOpen={insertMention}
+      />
     </div>
   );
 
