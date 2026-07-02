@@ -15,6 +15,8 @@ import "./styles/forge-integrations.css";
 import "./styles/design.css";
 import "./styles/studio.css";
 import "./styles/shell-extras.css";
+// EN DERNIER — surcharge typographique (chrome en sans, code en mono).
+import "./styles/typography.css";
 
 import { RouterProvider } from "@tanstack/react-router";
 import { ThemeBootstrap } from "./lib/ThemeBootstrap";

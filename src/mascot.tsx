@@ -25,6 +25,9 @@ import "./styles/settings-extras.css";
 // Phase 4 — contextual cards rendered inside the mascot panel reuse the
 // shared card styles (Plan / Env / Sources / Prévisu + float ctx strip).
 import "./styles/forge-integrations.css";
+// EN DERNIER — même surcharge typographique que la fenêtre principale
+// (chrome en sans, code en mono), pour un rendu cohérent entre fenêtres.
+import "./styles/typography.css";
 
 // Debug instrumentation — mirror of main.tsx. See the comment there.
 // Both windows wire this so we can tell from which window an error
