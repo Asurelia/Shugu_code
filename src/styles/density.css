@@ -87,52 +87,104 @@
 .cx-composer-bar .cx-chip.mode {
   font-weight: 600;
 }
-/* La rangée de contexte est INTÉGRÉE à la bulle (pied de carte) : un fin
-   trait la sépare de la barre d'outils, plus de chips flottants dehors. */
-.cx-composer .cx-ctx-row {
-  margin: 2px 6px 6px;
-  padding: 7px 6px 2px;
-  border-top: 1px solid rgba(255, 255, 255, 0.05);
-  max-width: none;
-}
-
-/* Chip fichier (@-mention / contexte éditeur) : même gabarit compact que les
-   autres chips — icône, nom (ellipsis), × inline. Fini la « grosse bulle ». */
-.cx-ctx-row .cx-chip.ctx-editor {
-  max-width: 260px;
-}
-.cx-ctx-row .cx-chip.ctx-editor .name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
-}
-
 /* Auto-grow (JS règle la hauteur = scrollHeight) : au-delà du cap CSS, le
    scroll interne reprend — la bulle grandit avec le texte, comme partout. */
 .cx-composer-input {
   overflow-y: auto;
+  /* La bulle ne contient plus que le texte : padding symétrique. */
+  padding: 13px 16px;
+  min-height: 48px;
 }
 
-/* Chips de contexte : plus petits, fond quasi transparent — de l'INFO, pas
-   des boutons massifs. L'affordance de clic n'apparaît qu'au survol des
-   chips réellement interactifs (vrais <button> avec onClick). */
-.cx-ctx-row .cx-chip {
+/* ── Rangée de contrôles SOUS la bulle (référence : Claude Code) ─────────
+   Mini-contrôles sans cadre, presque fondus dans le fond ; l'affordance
+   apparaît au survol. La bulle au-dessus reste pur champ de texte. */
+.cx-under-row {
+  width: 100%;
+  max-width: 760px;
+  margin-top: 7px;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  min-height: 28px;
+  font-size: 11px;
+  color: var(--on-surface-variant);
+}
+.cx-under-row .cx-spacer { flex: 1; }
+.cx-under-row .cx-tool {
+  width: 26px;
+  height: 26px;
+}
+/* Le chip de mode garde sa pilule (c'est LE contrat du message) mais en
+   plus compact ; tout le reste est nu. */
+.cx-under-row .cx-chip.mode {
   padding: 3px 9px;
   font-size: 10.5px;
+  margin-right: 3px;
+}
+.cx-under-row .composer-model {
+  margin: 0 2px 0 4px;
+}
+.cx-under-row .cx-send {
+  width: 27px;
+  height: 27px;
+}
+
+/* Texte discret cliquable (projet, branche) — pas de boîte, juste du texte
+   muted qui s'allume au survol. */
+.cx-quiet {
   background: transparent;
-  border-color: rgba(255, 255, 255, 0.05);
-}
-.cx-ctx-row button.cx-chip {
+  border: 0;
+  padding: 3px 5px;
+  border-radius: 6px;
+  font: inherit;
+  color: var(--on-surface-muted);
   cursor: pointer;
-  transition: color 140ms ease, border-color 140ms ease, background-color 140ms ease;
+  white-space: nowrap;
+  transition: color 140ms ease, background-color 140ms ease;
 }
-.cx-ctx-row button.cx-chip:hover {
+.cx-quiet:hover {
   color: var(--on-surface);
-  border-color: rgba(224, 142, 254, 0.35);
-  background: rgba(224, 142, 254, 0.06);
+  background: rgba(255, 255, 255, 0.05);
 }
-.cx-ctx-row button.cx-chip:focus-visible {
+.cx-quiet:focus-visible {
   outline: 2px solid var(--primary);
   outline-offset: 1px;
 }
+.cx-quiet-sep {
+  color: var(--on-surface-muted);
+  opacity: 0.6;
+}
+
+/* Mini-pilule « fichier joint » (contexte éditeur auto) — retirable. */
+.cx-chip-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 210px;
+  margin-left: 4px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--on-surface-variant);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.cx-chip-file .name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.cx-chip-file .x {
+  background: none;
+  border: 0;
+  padding: 0 1px;
+  margin-left: 1px;
+  color: inherit;
+  opacity: 0.55;
+  cursor: pointer;
+  font: inherit;
+  line-height: 1;
+}
+.cx-chip-file .x:hover { opacity: 1; }

@@ -528,134 +528,77 @@ export function ChatView({
           onPaste={handlePaste}
           rows={1}
         />
-        <div className="cx-composer-bar">
-          {/* « + » = ajouter des sources (pattern Cursor/Claude Desktop) :
-              ouvre un picker de fichiers du workspace, insère une @-mention. */}
-          <button
-            className="cx-tool"
-            title="Ajouter un fichier comme source (@fichier) — son contenu sera joint au message"
-            aria-label="Ajouter un fichier comme source"
-            onClick={() => setMentionPickerOpen(true)}
-          >
-            <Icon name="plus" size={15} />
-          </button>
-          {/* Le mode (Chat / Plan / Agent) est LE contrat du message qu'on
-              s'apprête à envoyer : il vit DANS le composer (pattern Cursor /
-              Codex), pas dans la rangée de contexte flottante en dessous. */}
-          <ModeSelector />
-          <button className="cx-tool" title="Joindre une image" onClick={() => fileInputRef.current?.click()}>
-            <Icon name="attach" size={15} />
-          </button>
-          {/* 📷 capture d'écran → même flux pendingImage que le paste/attach. */}
-          <CaptureButton className="cx-tool" iconSize={15} onCaptured={setPendingImage} />
-          <button
-            className={"cx-tool" + (mode === "image" ? " on" : "")}
-            onClick={() => setMode((m) => (m === "image" ? "chat" : "image"))}
-            title="Mode image"
-          >
-            <Icon name="image" size={15} />
-          </button>
-          {/* Le bouton micro « Voix » (inerte, aucun flux derrière) est retiré —
-              un contrôle mort abîme la confiance plus qu'un contrôle absent. */}
-          <div className="cx-spacer" />
-          <ModelPicker model={model} onChange={setModel} className="composer-model" />
-          {typing ? (
-            <button
-              className="cx-send stop"
-              title="Arrêter la génération"
-              onClick={() => { chatStream.abort(); setTyping(false); }}
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2" /></svg>
-            </button>
-          ) : (
-            <button className="cx-send" onClick={() => void send()} disabled={!input.trim() && !pendingImage} title="Envoyer (↵)">
-              <Icon name="send" size={14} />
-            </button>
-          )}
-        </div>
-        {/* Rangée de contexte INTÉGRÉE à la bulle (retour utilisateur : des
-            chips flottants sous le composer « font étranges ») — un pied de
-            carte discret, séparé par un fin trait, comme Cursor/Claude. */}
-        <div className="cx-ctx-row">
-        {/* Lot A — chip contexte éditeur retirable. Montre le fichier actif (+
-            sélection) qui sera joint au prochain message. Le × le retire pour
-            ce tour (réactivé après envoi). Réutilise .cx-chip (charte glass). */}
+      </div>
+      {/* ── Rangée de contrôles SOUS la bulle (référence : Claude Code) ──
+          La bulle ne contient QUE le texte. Tout le reste vit ici, en
+          mini-contrôles discrets sans cadre : mode, ajout de sources,
+          pièces jointes | contexte (fichier, projet·branche, permission),
+          modèle, envoi. */}
+      <div className="cx-under-row">
+        <ModeSelector />
+        <button
+          className="cx-tool"
+          title="Ajouter un fichier comme source (@fichier) — son contenu sera joint au message"
+          aria-label="Ajouter un fichier comme source"
+          onClick={() => setMentionPickerOpen(true)}
+        >
+          <Icon name="plus" size={14} />
+        </button>
+        <button className="cx-tool" title="Joindre une image" onClick={() => fileInputRef.current?.click()}>
+          <Icon name="attach" size={14} />
+        </button>
+        {/* 📷 capture d'écran → même flux pendingImage que le paste/attach. */}
+        <CaptureButton className="cx-tool" iconSize={14} onCaptured={setPendingImage} />
+        <button
+          className={"cx-tool" + (mode === "image" ? " on" : "")}
+          onClick={() => setMode((m) => (m === "image" ? "chat" : "image"))}
+          title="Mode image"
+        >
+          <Icon name="image" size={14} />
+        </button>
+        {/* Chip fichier joint (contexte éditeur auto) — mini-pilule retirable.
+            NB : classe cx-chip-file (PAS « ctx-editor », qui collisionne avec
+            la carte Éditeur de la mascotte dans forge-integrations.css —
+            c'était la cause du chip géant vertical). */}
         {autoCtxOn && !ctxDropped && activeFile && (
-          <span className="cx-chip ctx-editor" title="Contexte envoyé au modèle — cliquez × pour ne pas l'envoyer">
-            <span aria-hidden>📄</span>
+          <span className="cx-chip-file" title={`Contexte joint au prochain message : ${activeFile}${selection?.path === activeFile && selection.text.trim() ? ` (+ sélection de ${selection.endLine - selection.startLine + 1} l.)` : ""} — × pour ne pas l'envoyer`}>
+            <Icon name="file" size={11} />
             <span className="name">{basename(activeFile)}</span>
-            {selection?.path === activeFile && selection.text.trim() && (
-              <span className="sel" title="Sélection courante incluse">
-                ⊿ sélection ({selection.endLine - selection.startLine + 1} l.)
-              </span>
-            )}
-            <button
-              type="button"
-              className="ctx-x"
-              title="Ne pas envoyer ce contexte"
-              onClick={() => setCtxDropped(true)}
-              style={{
-                background: "none",
-                border: "none",
-                cursor: "pointer",
-                color: "inherit",
-                opacity: 0.6,
-                padding: 0,
-                marginLeft: 2,
-                lineHeight: 1,
-                font: "inherit",
-              }}
-            >
-              ×
-            </button>
+            <button type="button" className="x" aria-label="Ne pas envoyer ce contexte" onClick={() => setCtxDropped(true)}>×</button>
           </span>
         )}
-        {/* Le ModeSelector a migré DANS la barre du composer (ci-dessus) — cette
-            rangée ne porte plus que du CONTEXTE (fichier joint, workspace,
-            branche, isolation, permission). Chaque chip cliquable mène à la
-            surface qui le gère (fini les pseudo-boutons inertes). */}
+        <div className="cx-spacer" />
+        {/* Contexte d'exécution en texte discret : projet · branche. */}
         <button
-          className="cx-chip"
+          className="cx-quiet"
           title={`Projet ouvert : ${cwd ?? "aucun"} — cliquer pour changer de projet (récents)`}
           onClick={openRecentPicker}
         >
-          <Icon name="folder" size={11} />
           {cwd}
         </button>
         {branch && (
-          <button
-            className="cx-chip branch"
-            title={`Branche git : ${branch} — cliquer pour ouvrir Source Control (diff, commit, historique)`}
-            onClick={() => navigate({ to: "/git" })}
-          >
-            <span className="dot" />
-            {branch}
-          </button>
+          <>
+            <span className="cx-quiet-sep" aria-hidden="true">·</span>
+            <button
+              className="cx-quiet"
+              title={`Branche git : ${branch} — cliquer pour ouvrir Source Control (diff, commit, historique)`}
+              onClick={() => navigate({ to: "/git" })}
+            >
+              {branch}
+            </button>
+          </>
         )}
-        {/* Phase 7 #4 — badge « 🔒 isolé » pendant un run isolé en cours : le
-            travail de l'agent vit dans un worktree git séparé, ton checkout
-            principal reste intact jusqu'au merge (manuel) depuis le panneau
-            Agents. Non interactif — pur indicateur d'état. */}
+        {/* 🔒 pendant un run isolé (worktree) — pur indicateur d'état. */}
         {composerIsolated && (
           <span
-            className="cx-chip"
+            className="cx-quiet"
+            style={{ color: "var(--primary)", cursor: "default" }}
             title="Run en cours isolé dans un worktree git — ton checkout principal reste intact jusqu'au merge (depuis le panneau Agents)."
-            style={{
-              color: "var(--primary, #7c3aed)",
-              borderColor: "rgba(124, 58, 237, 0.45)",
-            }}
           >
             🔒 isolé
           </span>
         )}
-        <div className="cx-chip-spacer" />
-        {/* Trust-UX (Lane 5) — remplace l'ancien chip « 🛡 local » ambigu (local =
-            privé ? sandboxé ? peut-toucher-mes-fichiers ?) par un fait de
-            permission PRÉCIS, dépendant du mode :
-              • Chat / Plan (lecture seule) → « Privé · sur ta machine » (rien
-                n'est écrit ni exécuté) ;
-              • Agent (exec directe)        → « Filet git » (les actions sont
-                réversibles dans l'onglet Git). */}
+        {/* Trust-UX — fait de permission précis, dépendant du mode. */}
         {chatMode === "agent" ? (
           <PermissionBadge
             kind="guarded"
@@ -666,11 +609,24 @@ export function ChatView({
         ) : (
           <PermissionBadge
             kind="private"
-            label="Privé · sur ta machine"
+            label="Privé"
             title="Mode lecture seule — l'inférence et tes données restent locales ; aucun fichier n'est modifié ni aucune commande exécutée ce tour-ci."
           />
         )}
-        </div>
+        <ModelPicker model={model} onChange={setModel} className="composer-model" />
+        {typing ? (
+          <button
+            className="cx-send stop"
+            title="Arrêter la génération"
+            onClick={() => { chatStream.abort(); setTyping(false); }}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2" /></svg>
+          </button>
+        ) : (
+          <button className="cx-send" onClick={() => void send()} disabled={!input.trim() && !pendingImage} title="Envoyer (↵)">
+            <Icon name="send" size={14} />
+          </button>
+        )}
       </div>
     </>
   );
