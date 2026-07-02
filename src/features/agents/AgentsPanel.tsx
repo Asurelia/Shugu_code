@@ -715,25 +715,26 @@ function WorktreeIsolationSection({
   // Rien d'isolé pour ce run (cas in-place classique) → on ne rend rien.
   if (!started && !finalized && !skipped) return null;
 
-  // L'isolation a échoué → badge d'avertissement honnête (exec sur checkout).
+  // Pas d'espace isolé pour ce run → info d'état honnête (l'agent travaille
+  // quand même, directement sur les fichiers) : habillage neutre, pas une alerte.
   if (skipped) {
     return (
       <div
         style={{
           ...sectionStyle,
-          background: "rgba(245, 158, 11, 0.06)",
-          border: "1px solid rgba(245, 158, 11, 0.25)",
+          background: "rgba(96, 165, 250, 0.06)",
+          border: "1px solid rgba(96, 165, 250, 0.25)",
         }}
       >
-        <span style={{ ...labelStyle, color: "var(--warn, #f59e0b)" }}>Isolation</span>
+        <span style={{ ...labelStyle, color: "var(--info, #60a5fa)" }}>Isolation</span>
         <div
           style={{
             fontSize: 11,
             lineHeight: 1.5,
-            color: "var(--warn, #f59e0b)",
+            color: "var(--info, #60a5fa)",
           }}
         >
-          ⚠ Isolation impossible — exécuté sur le checkout ({skipped.reason})
+          ℹ L'agent travaille directement dans tes fichiers — pas de copie isolée pour ce run ({skipped.reason})
         </div>
       </div>
     );

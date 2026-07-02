@@ -193,18 +193,17 @@ export function useAgentEvents(): void {
           } else if (event.kind === "worktreeSkipped") {
             // Phase 7 #4 — l'isolation worktree a été DEMANDÉE mais n'a pas pu
             // démarrer (pas de dépôt git / échec `git worktree add`). Le run
-            // continue IN-PLACE sur le checkout. On le signale fort (toast +
-            // mascotte inquiète) car la promesse d'isolation n'est PAS tenue :
-            // ne jamais laisser croire à une protection inexistante.
+            // continue IN-PLACE sur le checkout. On le signale honnêtement mais
+            // SANS alarmer : l'agent travaille quand même, c'est une info d'état
+            // (pas une erreur), et la mascotte ne panique pas pour ça.
             pushToast(
-              `⚠ Isolation impossible : ${event.reason} — l'agent a tourné sur ton checkout`,
-              "error",
-              8000,
+              `L'agent travaille directement dans tes fichiers (pas d'espace isolé : ${event.reason}).`,
+              "info",
+              6000,
             );
-            fireMoodReaction("agent-error");
             sayMascot(
-              `⚠ Pas pu m'isoler (${truncateSpeech(event.reason, 50)}) — je tourne sur ton checkout.`,
-              { tone: "error", ttlMs: 7000, agentId: event.agentId },
+              `Je travaille directement dans tes fichiers (${truncateSpeech(event.reason, 50)}).`,
+              { tone: "info", ttlMs: 6000, agentId: event.agentId },
             );
           }
         });

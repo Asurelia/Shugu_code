@@ -76,24 +76,9 @@ fn workspace_root_required(app: &AppHandle) -> Result<PathBuf, String> {
     guard.clone().ok_or_else(|| "no workspace open".to_string())
 }
 
-/// Strip Windows extended-length prefix (`\\?\`) from a path. On non-Windows
-/// targets the input is returned unchanged. The frontend never sees the
-/// prefix — paths cross the IPC boundary as plain absolute paths.
-fn strip_extended_prefix(p: PathBuf) -> PathBuf {
-    if cfg!(windows) {
-        let s = p.to_string_lossy();
-        let stripped = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-            format!(r"\\{rest}")
-        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-            rest.to_string()
-        } else {
-            return p;
-        };
-        PathBuf::from(stripped)
-    } else {
-        p
-    }
-}
+// Strip du préfixe Windows extended-length (`\\?\`) : helper CENTRAL — le
+// frontend ne voit jamais le préfixe via l'IPC (ex-copie locale migrée).
+use super::pathutil::strip_extended_prefix;
 
 fn open_repo_at(root: &Path) -> Result<Repository, String> {
     Repository::discover(root).map_err(|_| "not a git repository".to_string())
@@ -777,14 +762,92 @@ pub async fn git_remote_remove(app: AppHandle, name: String) -> Result<(), Strin
 // git_init (git2) + worktrees (CLI) — Contexte panel "Git" tab
 // ---------------------------------------------------------------------------
 
-/// Initialize a fresh git repository at the open workspace root. No-op-safe:
-/// `Repository::init` on an existing repo just re-opens it. Refreshes the
+/// Lignes semées dans `.gitignore` au moment du commit initial d'un dossier
+/// jamais versionné. `.shugu/` = état interne de Shugu (worktrees d'isolation,
+/// modèle JSON) ; le reste = artefacts lourds classiques qui rendraient le
+/// commit initial — et chaque worktree d'isolation, qui re-matérialise le
+/// tree au checkout — inutilisablement gros (ex. `node_modules/` en Go).
+/// Appliqué UNIQUEMENT sur HEAD unborn : un repo déjà né n'est jamais touché.
+const INIT_GITIGNORE_SEED: &[&str] = &[
+    ".shugu/",
+    "node_modules/",
+    "target/",
+    "dist/",
+    "build/",
+    ".venv/",
+    "__pycache__/",
+];
+
+/// Cœur testable de `git_init`. No-op STRICT sur un repo dont HEAD est déjà
+/// né (`Repository::init` re-ouvre sans rien toucher). Sur un dossier vierge
+/// (ou un repo « unborn ») : sème `INIT_GITIGNORE_SEED` dans `.gitignore`
+/// puis crée un commit initial pour que HEAD résolve — sans lui, `git
+/// rev-parse HEAD` échoue et l'isolation worktree de CHAQUE run agent est
+/// sautée (`worktree::create_inner`, événement `WorktreeSkipped`).
+///
+/// BLOQUANT (hash de tout le dossier par libgit2 si gros projet) — appeler
+/// sous `spawn_blocking`, jamais sur le main thread.
+fn git_init_inner(root: &Path) -> Result<(), String> {
+    let repo = Repository::init(root).map_err(libgit2_err)?;
+    if repo.head().is_ok() {
+        return Ok(()); // repo déjà né — no-op strict (ni commit, ni .gitignore)
+    }
+
+    // 1. Seed du .gitignore AVANT le commit initial : créer ou compléter les
+    //    lignes manquantes, jamais écraser ni dupliquer l'existant.
+    let gitignore = root.join(".gitignore");
+    let existing = match std::fs::read_to_string(&gitignore) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!(".gitignore read: {e}")),
+    };
+    let missing: Vec<&str> = INIT_GITIGNORE_SEED
+        .iter()
+        .copied()
+        .filter(|seed| !existing.lines().any(|l| l.trim() == *seed))
+        .collect();
+    if !missing.is_empty() {
+        let mut content = existing;
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        for seed in missing {
+            content.push_str(seed);
+            content.push('\n');
+        }
+        std::fs::write(&gitignore, content).map_err(|e| format!(".gitignore write: {e}"))?;
+    }
+
+    // 2. Stage tout (`add_all` respecte .gitignore) puis commit initial avec la
+    //    même identité neutre que `commit_worktree` (worktree.rs) — indépendant
+    //    d'une config user.name/email absente ; libgit2 ne signe jamais (gpg).
+    let mut index = repo.index().map_err(libgit2_err)?;
+    index
+        .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+        .map_err(libgit2_err)?;
+    index.write().map_err(libgit2_err)?;
+    let tree_id = index.write_tree().map_err(libgit2_err)?;
+    let tree = repo.find_tree(tree_id).map_err(libgit2_err)?;
+    let sig = git2::Signature::now("shugu", "shugu@localhost").map_err(libgit2_err)?;
+    repo.commit(Some("HEAD"), &sig, &sig, "Commit initial (Shugu)", &tree, &[])
+        .map_err(libgit2_err)?;
+    Ok(())
+}
+
+/// Initialize a fresh git repository at the open workspace root, seeded with
+/// an initial commit so HEAD resolves (cf. `git_init_inner`). Refreshes the
 /// repo-presence cache so `git_is_repo` / status / diff queries pick it up
 /// immediately (otherwise the cached `false` would linger).
+///
+/// ASYNC + `spawn_blocking` : le seed du commit initial peut hasher un gros
+/// dossier (libgit2) — ne JAMAIS geler le main thread / l'UI (revue M1).
 #[command]
-pub fn git_init(app: AppHandle) -> Result<String, String> {
+pub async fn git_init(app: AppHandle) -> Result<String, String> {
     let root = workspace_root_required(&app)?;
-    Repository::init(&root).map_err(libgit2_err)?;
+    let init_root = root.clone();
+    tauri::async_runtime::spawn_blocking(move || git_init_inner(&init_root))
+        .await
+        .map_err(|e| format!("git_init join: {e}"))??;
     {
         let mut cache = repo_cache()
             .write()
@@ -1305,6 +1368,20 @@ mod tests {
         canonical
     }
 
+    /// Dossier temporaire canonicalisé mais SANS `git init` — pour tester
+    /// `git_init_inner` sur un dossier vierge (make_temp_repo initialise déjà).
+    fn make_temp_dir_plain(suffix: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "shugu_git_test_{suffix}_{}",
+            std::process::id()
+        ));
+        if base.exists() {
+            let _ = fs::remove_dir_all(&base);
+        }
+        fs::create_dir_all(&base).expect("create temp dir");
+        fs::canonicalize(&base).expect("canonicalize")
+    }
+
     fn commit_file(root: &Path, rel: &str, contents: &str) {
         let target = root.join(rel);
         if let Some(p) = target.parent() {
@@ -1319,27 +1396,111 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    // NB : les tests de strip_extended_prefix vivent désormais dans
+    // `pathutil.rs` (helper centralisé).
+
+    // ── git_init_inner : commit initial pour que HEAD résolve ─────────────
+
     #[test]
-    fn strip_prefix_noop_on_non_extended() {
-        let p = PathBuf::from(if cfg!(windows) { r"C:\foo\bar" } else { "/foo/bar" });
-        let stripped = strip_extended_prefix(p.clone());
-        assert_eq!(stripped, p);
+    fn git_init_inner_seeds_initial_commit() {
+        let root = make_temp_dir_plain("init_seed");
+        fs::write(root.join("hello.txt"), "bonjour\n").unwrap();
+        // Artefact lourd typique : NE DOIT PAS entrer dans le commit initial
+        // (revue M1 — bloat de .git + re-matérialisation dans chaque worktree).
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::write(root.join("node_modules/pkg/index.js"), "x\n").unwrap();
+
+        git_init_inner(&root).expect("git_init_inner");
+
+        let repo = Repository::open(&root).expect("open repo");
+        assert!(repo.head().is_ok(), "HEAD doit résoudre après git_init");
+        let gitignore =
+            fs::read_to_string(root.join(".gitignore")).expect(".gitignore doit exister");
+        for seed in [".shugu/", "node_modules/"] {
+            assert!(
+                gitignore.lines().any(|l| l.trim() == seed),
+                ".gitignore doit contenir {seed}, got: {gitignore}"
+            );
+        }
+        let head_tree = repo.head().unwrap().peel_to_tree().unwrap();
+        assert!(
+            head_tree.get_name("hello.txt").is_some(),
+            "hello.txt doit être dans le commit initial"
+        );
+        assert!(
+            head_tree.get_name("node_modules").is_none(),
+            "node_modules ne doit PAS être dans le commit initial"
+        );
+        cleanup(&root);
     }
 
-    #[cfg(windows)]
     #[test]
-    fn strip_prefix_handles_drive() {
-        let p = PathBuf::from(r"\\?\C:\foo\bar");
-        let stripped = strip_extended_prefix(p);
-        assert_eq!(stripped, PathBuf::from(r"C:\foo\bar"));
+    fn git_init_inner_noop_on_existing_repo() {
+        let root = make_temp_repo("init_noop");
+        commit_file(&root, "a.txt", "alpha\n");
+        let before = Repository::open(&root)
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap();
+
+        git_init_inner(&root).expect("git_init_inner");
+
+        let repo = Repository::open(&root).unwrap();
+        assert_eq!(
+            repo.head().unwrap().target().unwrap(),
+            before,
+            "HEAD ne doit PAS bouger sur un repo déjà né"
+        );
+        assert!(
+            !root.join(".gitignore").exists(),
+            ".gitignore ne doit PAS être créé sur un repo déjà né"
+        );
+        cleanup(&root);
     }
 
-    #[cfg(windows)]
     #[test]
-    fn strip_prefix_handles_unc() {
-        let p = PathBuf::from(r"\\?\UNC\server\share\foo");
-        let stripped = strip_extended_prefix(p);
-        assert_eq!(stripped, PathBuf::from(r"\\server\share\foo"));
+    fn git_init_inner_appends_shugu_to_existing_gitignore() {
+        let root = make_temp_dir_plain("init_gitignore");
+        fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+
+        git_init_inner(&root).expect("git_init_inner");
+
+        let content = fs::read_to_string(root.join(".gitignore")).unwrap();
+        assert!(
+            content.lines().any(|l| l.trim() == "node_modules/"),
+            "l'existant doit être conservé, got: {content}"
+        );
+        assert_eq!(
+            content.lines().filter(|l| l.trim() == "node_modules/").count(),
+            1,
+            "node_modules/ ne doit PAS être dupliqué, got: {content}"
+        );
+        assert!(
+            content.lines().any(|l| l.trim() == ".shugu/"),
+            ".shugu/ doit être ajouté, got: {content}"
+        );
+        cleanup(&root);
+    }
+
+    /// Bout-en-bout du bug « unborn HEAD » : un dossier initialisé par la
+    /// tuile Git doit permettre l'isolation worktree d'un run agent.
+    #[tokio::test]
+    async fn git_init_then_create_inner_works() {
+        let root = make_temp_dir_plain("init_worktree");
+        fs::write(root.join("app.txt"), "x\n").unwrap();
+
+        git_init_inner(&root).expect("git_init_inner");
+
+        let entry = crate::commands::worktree::create_inner(&root, None, Some("smoke"))
+            .await
+            .expect("create_inner doit réussir après git_init (HEAD né)");
+        assert!(Path::new(&entry.path).is_dir(), "worktree dir exists");
+        crate::commands::worktree::cleanup_inner(&root, Some(&entry.id), true, false)
+            .await
+            .expect("cleanup");
+        cleanup(&root);
     }
 
     #[test]

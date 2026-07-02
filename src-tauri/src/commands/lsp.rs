@@ -146,8 +146,8 @@ pub struct LspInitResult {
 ///   - typescript-language-server décode → path `?/F:/Dev/shugu_code`
 ///   - Node tente `stat` → reconstruit en `F:\?\F:\Dev\shugu_code`
 ///     → ENOENT, l'initialize LSP échoue avec -32603.
-/// Même normalisation que `normalize_cwd_for_shell` dans terminal.rs ;
-/// pourrait être centralisé dans une util/path.rs si on en ajoute d'autres.
+/// Même normalisation que `normalize_cwd_for_shell` (terminal.rs) — toutes
+/// deux délèguent désormais au helper CENTRAL `pathutil::strip_extended_prefix`.
 ///
 /// On utilise PATH_SEGMENT (RFC 3986) qui encode tout sauf les unreserved
 /// + `/` (qu'on veut garder comme séparateur). Le `:` du drive Windows
@@ -163,16 +163,8 @@ fn path_to_file_uri(path: &std::path::Path) -> String {
     // Strip Windows extended-length prefix BEFORE encoding ; sinon le `?`
     // serait percent-encodé en `%3F` et le LSP server reconstruirait un
     // path corrompu type `F:\?\F:\Dev\...` (vérifié au smoke test).
-    let s_raw = path.to_string_lossy();
-    let s_no_prefix: &str = if let Some(rest) = s_raw.strip_prefix(r"\\?\") {
-        rest
-    } else if let Some(rest) = s_raw.strip_prefix("//?/") {
-        rest
-    } else {
-        &s_raw
-    };
-
-    let s = s_no_prefix.replace('\\', "/");
+    let cleaned = strip_extended_prefix(path.to_path_buf());
+    let s = cleaned.to_string_lossy().replace('\\', "/");
     let stripped = s.trim_start_matches('/');
     let encoded: String = utf8_percent_encode(stripped, PATH_SET).collect();
     format!("file:///{encoded}")
@@ -231,31 +223,15 @@ fn resolve_lsp_binary(
     Some((path, args))
 }
 
-/// STRIP le préfixe Windows extended-length `\\?\` d'un chemin.
-///
-/// **Pourquoi c'est critique ici (cause racine du LSP TS muet)** :
-/// `workspace_root` provient de `fs::canonicalize()`, qui sur Windows préfixe
-/// les chemins avec `\\?\` (extended-length). Le `.cmd` résolu hérite donc de
-/// ce préfixe : `\\?\F:\…\typescript-language-server.cmd`. Or **`cmd.exe`
-/// REFUSE les chemins `\\?\`** (il ne supporte pas l'extended-length syntax) →
-/// « Le chemin d'accès spécifié est introuvable. » → le child meurt au spawn
-/// (reader EOF avant l'`initialize`, broken pipe os error 232) → l'init LSP
-/// timeout. rust-analyzer échappe au bug car il est lancé DIRECTEMENT
-/// (CreateProcess accepte `\\?\`), pas via cmd.exe.
-///
-/// Vérifié au repro : `cmd /d /c "\\?\…\…​.cmd" --version` → exit 1 ; le même
-/// sans préfixe → `5.2.0`. Même normalisation que `path_to_file_uri` et que
-/// `normalize_cwd_for_shell` (terminal.rs).
-fn strip_extended_prefix(path: PathBuf) -> PathBuf {
-    let s = path.to_string_lossy();
-    if let Some(rest) = s.strip_prefix(r"\\?\") {
-        return PathBuf::from(rest);
-    }
-    if let Some(rest) = s.strip_prefix("//?/") {
-        return PathBuf::from(rest);
-    }
-    path
-}
+// STRIP du préfixe Windows extended-length `\\?\` : helper CENTRAL pathutil.
+// **Pourquoi c'est critique ici (cause racine du LSP TS muet)** :
+// `workspace_root` provient de `fs::canonicalize()` (donc verbatim), le `.cmd`
+// résolu hérite du préfixe, et **cmd.exe REFUSE les chemins `\\?\`** →
+// « Le chemin d'accès spécifié est introuvable. » → le child meurt au spawn →
+// l'init LSP timeout. rust-analyzer échappe au bug (lancé DIRECTEMENT,
+// CreateProcess accepte `\\?\`). Vérifié au repro : `cmd /d /c "\\?\….cmd"
+// --version` → exit 1 ; le même sans préfixe → `5.2.0`.
+use super::pathutil::strip_extended_prefix;
 
 /// Construit la Command à spawn, avec wrapping cmd.exe sur Windows pour
 /// les .cmd/.bat (e.g. typescript-language-server installé via npm crée un
@@ -619,29 +595,6 @@ mod tests {
         assert!(resolve_lsp_binary("cobol", &tmp).is_none());
     }
 
-    /// Cause racine du LSP TS muet : un chemin canonicalisé Windows porte le
-    /// préfixe `\\?\` que cmd.exe rejette. strip_extended_prefix doit le retirer.
-    #[test]
-    fn strips_windows_extended_prefix() {
-        // Forme Windows `\\?\`.
-        let prefixed = PathBuf::from(r"\\?\F:\Dev\shugu_code\node_modules\.bin\tsls.cmd");
-        let cleaned = strip_extended_prefix(prefixed);
-        assert_eq!(
-            cleaned,
-            PathBuf::from(r"F:\Dev\shugu_code\node_modules\.bin\tsls.cmd"),
-        );
-    }
-
-    #[test]
-    fn strips_forward_slash_extended_prefix() {
-        // Forme normalisée `//?/` (peut apparaître après un replace).
-        let prefixed = PathBuf::from("//?/F:/Dev/x.cmd");
-        assert_eq!(strip_extended_prefix(prefixed), PathBuf::from("F:/Dev/x.cmd"));
-    }
-
-    #[test]
-    fn leaves_plain_path_untouched() {
-        let plain = PathBuf::from(r"F:\Dev\shugu_code\node_modules\.bin\tsls.cmd");
-        assert_eq!(strip_extended_prefix(plain.clone()), plain);
-    }
+    // NB : les tests de strip_extended_prefix (formes `\\?\` et `//?/`) vivent
+    // désormais dans `pathutil.rs` (helper centralisé).
 }

@@ -84,20 +84,9 @@ fn resolve_cwd(
 /// Couvre `C:`, `D:`, `F:`, chemins avec espaces / accents / parenthèses —
 /// rien n'est hardcodé : on strip uniquement le préfixe `\\?\`.
 fn normalize_cwd_for_shell(path: PathBuf) -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        let s = path.to_string_lossy();
-        // strip_prefix conserve le reste tel quel (drive letter + path).
-        if let Some(rest) = s.strip_prefix(r"\\?\") {
-            return PathBuf::from(rest);
-        }
-        // Sécurité défensive — au cas où Tauri normalise déjà les
-        // backslashes en forward slashes lors de la sérialisation IPC.
-        if let Some(rest) = s.strip_prefix("//?/") {
-            return PathBuf::from(rest);
-        }
-    }
-    path
+    // Délègue au helper CENTRAL (pathutil) — formes `\\?\`, `\\?\UNC\` et
+    // `//?/` couvertes, no-op sur un chemin déjà propre.
+    super::pathutil::strip_extended_prefix(path)
 }
 
 fn is_cmd_basename(shell: &str) -> bool {

@@ -146,23 +146,9 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// Strip Windows extended-length prefix (`\\?\`) pour que les chemins passent
-/// l'IPC proprement (même règle que `worktree.rs`).
-fn strip_extended_prefix(p: PathBuf) -> PathBuf {
-    if cfg!(windows) {
-        let s = p.to_string_lossy();
-        let stripped = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-            format!(r"\\{rest}")
-        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-            rest.to_string()
-        } else {
-            return p;
-        };
-        PathBuf::from(stripped)
-    } else {
-        p
-    }
-}
+// Strip du préfixe Windows extended-length (`\\?\`) : helper CENTRAL
+// (ex-copie locale migrée) — les chemins passent l'IPC proprement.
+use super::pathutil::strip_extended_prefix;
 
 fn norm(p: &Path) -> String {
     strip_extended_prefix(p.to_path_buf())

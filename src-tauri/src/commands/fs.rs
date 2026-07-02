@@ -432,7 +432,13 @@ fn apply_workspace_root(
         .map_err(|e| format!("canonicalize workspace: {e}"))?;
 
     // Store in managed state.
-    let display = canonical.to_string_lossy().to_string();
+    // Forme IPC/affichage : préfixe verbatim `\\?\` retiré. Le STATE garde le
+    // chemin canonicalisé COMPLET (contrat safe_resolve/watchers/terminal/lsp),
+    // mais le frontend ne doit JAMAIS voir le préfixe — il compare/relativise
+    // contre des chemins de dialog/git qui n'en ont pas.
+    let display = super::pathutil::strip_extended_prefix(canonical.clone())
+        .to_string_lossy()
+        .to_string();
     {
         let mut guard = root_state
             .lock()
@@ -1020,9 +1026,11 @@ pub fn fs_get_workspace_root(
     root_state: tauri::State<'_, Mutex<Option<PathBuf>>>,
 ) -> Option<String> {
     let guard = root_state.lock().ok()?;
-    guard.as_ref().map(|p| {
-        p.to_string_lossy().replace('\\', "/")
-    })
+    // Le state garde le root canonicalisé AVEC le préfixe `\\?\` (contrat
+    // interne) ; la sortie IPC doit être propre, sinon le frontend reçoit
+    // `//?/F:/…` et ses strip_prefix/relativisations ratent (compare-files,
+    // WorktreesSection).
+    guard.as_ref().map(|p| super::pathutil::norm_display(p))
 }
 
 // ---------------------------------------------------------------------------
@@ -1638,7 +1646,10 @@ mod tests {
 
     #[test]
     fn rename_impl_success() {
-        let root = make_temp_dir("rename_ok");
+        // Suffixe distinct de rename_inner_moves_file_and_removes_source : les
+        // dossiers de make_temp_dir sont à nom FIXE, deux tests parallèles sur
+        // le même suffixe se suppriment mutuellement le dossier via cleanup().
+        let root = make_temp_dir("rename_impl_ok");
         let from = root.join("original.txt");
         fs::write(&from, b"content").unwrap();
         let from_canon = std::fs::canonicalize(&from).unwrap();

@@ -1100,7 +1100,7 @@ pub(super) async fn run_agent_task(
                             &app,
                             &AgentEvent::WorktreeSkipped {
                                 agent_id: agent_id.clone(),
-                                reason: format!("création du worktree impossible : {e}"),
+                                reason: format!("espace isolé indisponible ({e})"),
                             },
                         );
                     }
@@ -1113,7 +1113,7 @@ pub(super) async fn run_agent_task(
                     &app,
                     &AgentEvent::WorktreeSkipped {
                         agent_id: agent_id.clone(),
-                        reason: "le workspace n'est pas un dépôt git".to_string(),
+                        reason: "ce dossier n'est pas encore suivi par git".to_string(),
                     },
                 );
             }

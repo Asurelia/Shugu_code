@@ -156,16 +156,10 @@ impl Drop for ProcessTree {
     }
 }
 
-/// Strip the `\\?\` verbatim prefix `canonicalize` adds on Windows — cmd.exe
-/// and many node tools mis-handle it when it leaks into `cwd`/argv (recurring
-/// Windows bug, cf. terminal.rs `normalize_cwd_for_shell`).
-fn strip_verbatim(p: &Path) -> std::path::PathBuf {
-    let s = p.to_string_lossy();
-    match s.strip_prefix(r"\\?\") {
-        Some(stripped) => std::path::PathBuf::from(stripped),
-        None => p.to_path_buf(),
-    }
-}
+// Strip du préfixe verbatim `\\?\` (helper CENTRAL pathutil) — cmd.exe et
+// nombre d'outils node le refusent quand il fuit dans `cwd`/argv (bug Windows
+// récurrent, cf. terminal.rs `normalize_cwd_for_shell`).
+use crate::commands::pathutil::strip_extended_prefix;
 
 /// Run `command` through the platform shell, cwd = the agent's workspace,
 /// under execution `policy`. BLOCKS (call under `spawn_blocking`). Never
@@ -191,7 +185,7 @@ pub(super) fn run_command_direct(
     policy: ExecutionPolicy,
     rules: &[CommandRule],
 ) -> ExecResult {
-    let cwd = strip_verbatim(ws);
+    let cwd = strip_extended_prefix(ws.to_path_buf());
     // Phase 2 — les règles apprises de l'utilisateur OVERRIDENT le classifieur
     // statique (allow → Safe, deny → Danger) ; sinon on retombe sur les
     // détecteurs. `rules` est vide quand aucune règle / DB indisponible.
@@ -484,17 +478,6 @@ mod tests {
     #[test]
     fn truncate_short_passthrough() {
         assert_eq!(truncate("ok"), "ok");
-    }
-
-    #[test]
-    fn strip_verbatim_removes_prefix() {
-        #[cfg(windows)]
-        {
-            let p = Path::new(r"\\?\C:\Users\test");
-            assert_eq!(strip_verbatim(p), std::path::PathBuf::from(r"C:\Users\test"));
-        }
-        let plain = Path::new("relative/path");
-        assert_eq!(strip_verbatim(plain), std::path::PathBuf::from("relative/path"));
     }
 
     #[test]

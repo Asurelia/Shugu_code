@@ -99,22 +99,9 @@ fn workspace_root_required(app: &AppHandle) -> Result<PathBuf, String> {
     guard.clone().ok_or_else(|| "no workspace open".to_string())
 }
 
-/// Strip Windows extended-length prefix (`\\?\`) so paths cross IPC clean.
-fn strip_extended_prefix(p: PathBuf) -> PathBuf {
-    if cfg!(windows) {
-        let s = p.to_string_lossy();
-        let stripped = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-            format!(r"\\{rest}")
-        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-            rest.to_string()
-        } else {
-            return p;
-        };
-        PathBuf::from(stripped)
-    } else {
-        p
-    }
-}
+// Strip du préfixe Windows extended-length (`\\?\`) : helper CENTRAL
+// (ex-copie locale migrée) — cf. le fix `create_inner` qui en dépend.
+use super::pathutil::strip_extended_prefix;
 
 fn normalize_path_str(s: &str) -> String {
     s.replace('\\', "/")
@@ -277,6 +264,17 @@ pub(crate) async fn create_inner(
     base: Option<&str>,
     label: Option<&str>,
 ) -> Result<WorktreeEntry, String> {
+    // Le root du STATE workspace garde le préfixe verbatim `\\?\` par contrat
+    // (`apply_workspace_root`, fs.rs — les comparaisons `starts_with` de
+    // safe_resolve/watchers/terminal/lsp en dépendent). git tolère ce préfixe
+    // comme CWD mais REFUSE un chemin qui le porte passé en ARGUMENT
+    // (`worktree add <path>` → « could not create leading directories of
+    // '//?/…': Invalid argument »). On strip donc ICI, au point d'usage git —
+    // l'unique point de vérité pour les trois appelants (run agent, delegate,
+    // commande manuelle). Idempotent sur un chemin déjà propre.
+    let root_buf = strip_extended_prefix(root.to_path_buf());
+    let root: &Path = &root_buf;
+
     // Resolve the base ref to a concrete OID so the branch is reproducible even
     // if HEAD moves later.
     let base_ref = base.unwrap_or("HEAD");
@@ -848,8 +846,11 @@ mod tests {
         std::fs::create_dir_all(&base).expect("create temp dir");
         // Canonicalize for stable comparisons, then strip the Windows
         // extended-length prefix (`\\?\`) — `git worktree add` refuses to
-        // create a worktree `.git` under such a path. Production never sees the
-        // prefix because `workspace_root` is already stripped.
+        // create a worktree `.git` under such a path. En PROD le root du state
+        // workspace porte TOUJOURS ce préfixe (apply_workspace_root ne strip
+        // pas) : c'est `create_inner` qui strip lui-même à l'entrée (cf. test
+        // `create_inner_accepts_extended_length_root`). On strip aussi ici pour
+        // des comparaisons de chemins stables dans les asserts.
         let canon = std::fs::canonicalize(&base).expect("canonicalize temp dir");
         strip_extended_prefix(canon)
     }
@@ -965,6 +966,41 @@ mod tests {
         assert!(list_inner(&root).await.unwrap().is_empty());
 
         cleanup(&root);
+    }
+
+    /// Régression : la prod passe à `create_inner` le root du STATE workspace,
+    /// qui sur Windows porte TOUJOURS le préfixe verbatim `\\?\`
+    /// (`apply_workspace_root` canonicalise sans stripper — contrat voulu par
+    /// `safe_resolve`/watchers). `git worktree add` tolère ce préfixe comme CWD
+    /// mais REFUSE le chemin du worktree passé en ARGUMENT → l'isolation
+    /// échouait à CHAQUE run agent (`WorktreeSkipped`). `create_inner` doit
+    /// stripper lui-même son root.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn create_inner_accepts_extended_length_root() {
+        if which_git().is_none() {
+            eprintln!("git not on PATH — skipping extended-prefix test");
+            return;
+        }
+        let root_clean = make_temp_dir("extprefix");
+        init_repo(&root_clean);
+
+        // Reconstruit la forme prod : `\\?\C:\…` (make_temp_dir strippe, on re-préfixe).
+        let prefixed = PathBuf::from(format!(r"\\?\{}", root_clean.display()));
+        let entry = create_inner(&prefixed, None, Some("prefix"))
+            .await
+            .expect("create_inner doit réussir sur un root \\\\?\\ (forme prod)");
+        assert!(
+            !entry.path.contains("//?/") && !entry.path.contains(r"\\?\"),
+            "entry.path doit être un chemin propre, got {}",
+            entry.path
+        );
+        assert!(Path::new(&entry.path).is_dir(), "worktree dir exists");
+
+        cleanup_inner(&root_clean, Some(&entry.id), true, false)
+            .await
+            .expect("cleanup");
+        cleanup(&root_clean);
     }
 
     #[tokio::test]

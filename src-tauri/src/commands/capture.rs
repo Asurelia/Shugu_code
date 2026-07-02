@@ -161,11 +161,9 @@ pub async fn capture_screen(
 const THUMB_EDGE: u32 = 512;
 const THUMB_QUALITY: u8 = 70;
 
-/// Windows : `canonicalize()` préfixe `\\?\` — on le retire systématiquement
-/// avant de stocker/afficher un chemin (bug récurrent, cf. mémoire projet).
-fn strip_extended_prefix(p: &str) -> String {
-    p.strip_prefix(r"\\?\").unwrap_or(p).to_string()
-}
+// Windows : `canonicalize()` préfixe `\\?\` — retiré systématiquement avant
+// stockage/affichage (helper CENTRAL pathutil, variante &str).
+use super::pathutil::strip_extended_prefix_str as strip_extended_prefix;
 
 fn captures_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     let dir = app

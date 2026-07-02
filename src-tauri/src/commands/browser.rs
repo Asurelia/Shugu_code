@@ -552,10 +552,9 @@ fn browser_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     Ok(dir)
 }
 
-/// Windows : retire le préfixe `\\?\` de `canonicalize` avant stockage/affichage.
-fn strip_extended_prefix(p: &str) -> String {
-    p.strip_prefix(r"\\?\").unwrap_or(p).to_string()
-}
+// Windows : retire le préfixe `\\?\` de `canonicalize` avant stockage/affichage
+// (helper CENTRAL pathutil, variante &str).
+use super::pathutil::strip_extended_prefix_str as strip_extended_prefix;
 
 /// Construit une miniature JPEG (data URL) depuis le PNG de capture, pour
 /// l'event `Screenshot` de la timeline (même pipeline que capture.rs).

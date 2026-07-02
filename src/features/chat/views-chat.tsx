@@ -1061,18 +1061,19 @@ function WorktreeBanner({
     lineHeight: 1.4,
   };
 
-  // Isolation impossible → avertissement (exec sur checkout).
+  // Pas d'espace isolé pour ce run → info d'état (l'agent travaille quand
+  // même, directement sur les fichiers) : habillage neutre, pas une alerte.
   if (skipped) {
     return (
       <div
         style={{
           ...base,
-          background: "rgba(245, 158, 11, 0.08)",
-          border: "1px solid rgba(245, 158, 11, 0.28)",
-          color: "var(--warn, #f59e0b)",
+          background: "rgba(96, 165, 250, 0.08)",
+          border: "1px solid rgba(96, 165, 250, 0.28)",
+          color: "var(--info, #60a5fa)",
         }}
       >
-        <span>⚠ Isolation impossible — exécuté sur ton checkout ({skipped.reason})</span>
+        <span>ℹ L'agent travaille directement dans tes fichiers — pas de copie isolée pour ce run ({skipped.reason})</span>
       </div>
     );
   }

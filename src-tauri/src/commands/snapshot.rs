@@ -436,22 +436,9 @@ mod tests {
         strip_extended_prefix(canon)
     }
 
-    /// Strip Windows extended-length prefix so git CLI accepts the test paths.
-    fn strip_extended_prefix(p: PathBuf) -> PathBuf {
-        if cfg!(windows) {
-            let s = p.to_string_lossy();
-            let stripped = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-                format!(r"\\{rest}")
-            } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-                rest.to_string()
-            } else {
-                return p;
-            };
-            PathBuf::from(stripped)
-        } else {
-            p
-        }
-    }
+    // Strip du préfixe extended-length (helper CENTRAL pathutil) — git CLI
+    // refuse les chemins verbatim passés en argument.
+    use crate::commands::pathutil::strip_extended_prefix;
 
     fn cleanup(dir: &Path) {
         let _ = std::fs::remove_dir_all(dir);
