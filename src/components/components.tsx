@@ -65,6 +65,7 @@ export function Icon({ name, size = 18, className = "" }: { name: string; size?:
     case "chevron-left":  return p(<><path d="m15 18-6-6 6-6"/></>);
     case "chevron-right": return p(<><path d="m9 18 6-6-6-6"/></>);
     case "list":   return p(<><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></>);
+    case "plug":   return p(<><path d="M12 22v-4"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M6 8h12v4a6 6 0 0 1-12 0V8Z"/></>);
     default: return p(<circle cx="12" cy="12" r="6"/>);
   }
 }
@@ -188,38 +189,79 @@ export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettin
 }
 
 // ── Activity Rail ───────────────────────────────────────────
-export function Rail({ view, setView, onProfile }: any) {
-  // `kbd` = raccourci par défaut de la commande view-* correspondante dans
-  // src/lib/commands.ts (⌘ = Ctrl sous Windows/Linux, cf. keybindings.ts).
-  // Affiché dans le tooltip pour rendre la navigation clavier découvrable.
-  const items = [
-    { id: "chat",    icon: "chat",    label: "Chat",           kbd: "⌘⇧C" },
-    { id: "code",    icon: "code",    label: "Editor",         kbd: "⌘⇧E" },
-    { id: "git",     icon: "git",     label: "Source Control" },
-    { id: "image",   icon: "image",   label: "Image",          kbd: "⌘⇧I" },
-    { id: "studio",  icon: "palette", label: "Studio" },
-    { id: "agents",  icon: "agent",   label: "Agents",         kbd: "⌘⇧A" },
-    { id: "gallery", icon: "gallery", label: "Gallery",        kbd: "⌘⇧G" },
-  ] as { id: string; icon: string; label: string; kbd?: string }[];
+type RailItem = { id: string; icon: string; label: string; kbd?: string; badge?: number };
+
+// Audit UI/UX 2026-06-21 (phase Navigation) : le rail plat à 8 entrées ne
+// hiérarchisait rien — l'utilisateur ne savait pas quelle surface est
+// principale. Regroupé en Work (le cœur agent-IDE) / Agents (les runs) /
+// Create (périphérie créative), micro-labels affichés dans le rail.
+// `kbd` = raccourci par défaut de la commande view-* correspondante dans
+// src/lib/commands.ts (⌘ = Ctrl sous Windows/Linux, cf. keybindings.ts).
+export function Rail({ view, setView, onProfile, runningAgents = 0 }: any) {
+  const groups: { label: string; items: RailItem[] }[] = [
+    {
+      label: "Work",
+      items: [
+        { id: "chat", icon: "chat", label: "Chat", kbd: "⌘⇧C" },
+        { id: "code", icon: "code", label: "Editor", kbd: "⌘⇧E" },
+        { id: "git",  icon: "git",  label: "Source Control" },
+      ],
+    },
+    {
+      label: "Agents",
+      items: [
+        // Badge = nombre d'agents en cours d'exécution : l'activité de fond
+        // reste visible même depuis une autre vue (pattern Cursor).
+        { id: "agents", icon: "agent", label: "Agents", kbd: "⌘⇧A", badge: runningAgents },
+      ],
+    },
+    {
+      label: "Create",
+      items: [
+        { id: "image",   icon: "image",   label: "Image",   kbd: "⌘⇧I" },
+        { id: "studio",  icon: "palette", label: "Studio" },
+        { id: "gallery", icon: "gallery", label: "Gallery", kbd: "⌘⇧G" },
+      ],
+    },
+  ];
+
+  const renderBtn = (it: RailItem) => (
+    <button
+      key={it.id}
+      className={"rail-btn" + (view === it.id ? " active" : "")}
+      onClick={() => setView(it.id)}
+      aria-label={it.badge ? `${it.label} — ${it.badge} en cours` : it.label}
+    >
+      <Icon name={it.icon} size={18}/>
+      {!!it.badge && <span className="rail-badge">{it.badge > 9 ? "9+" : it.badge}</span>}
+      <span className="rail-tip">
+        {it.label}
+        {it.kbd && <span className="rail-tip-kbd">{it.kbd}</span>}
+      </span>
+    </button>
+  );
+
   return (
     <nav className="rail">
-      {items.map((it, i) => (
-        <React.Fragment key={it.id}>
-          {i === 3 && <div className="rail-divider"/>}
-          <button
-            className={"rail-btn" + (view === it.id ? " active" : "")}
-            onClick={() => setView(it.id)}
-            aria-label={it.label}
-          >
-            <Icon name={it.icon} size={18}/>
-            <span className="rail-tip">
-              {it.label}
-              {it.kbd && <span className="rail-tip-kbd">{it.kbd}</span>}
-            </span>
-          </button>
+      {groups.map((g, gi) => (
+        <React.Fragment key={g.label}>
+          {gi > 0 && <div className="rail-divider"/>}
+          <div className="rail-group-label" aria-hidden="true">{g.label}</div>
+          {g.items.map(renderBtn)}
         </React.Fragment>
       ))}
       <div className="rail-bottom">
+        {/* Groupe Configure — accès direct aux Connections (clés API, MCP,
+            providers) : surface de setup centrale pour un IDE agentique,
+            auparavant enfouie dans Settings. */}
+        <button
+          className={"rail-btn" + (view === "connections" ? " active" : "")}
+          onClick={() => setView("connections")}
+          aria-label="Connections"
+        >
+          <Icon name="plug" size={18}/>
+          <span className="rail-tip">Connections</span>
+        </button>
         <button
           className={"rail-btn" + (view === "settings" ? " active" : "")}
           onClick={() => setView("settings")}

@@ -1294,7 +1294,12 @@ export function RootLayout() {
             bellCount={unreadNotifications}
           />
           <div className="main">
-            <Rail view={view} setView={navigateTo} onProfile={() => navigate({ to: "/settings/mascot" as any })}/>
+            <Rail
+              view={view}
+              setView={navigateTo}
+              onProfile={() => navigate({ to: "/settings/mascot" as any })}
+              runningAgents={agents.filter((a: any) => a.status === "running").length}
+            />
             <SidePanel width={sideWidth} setWidth={setSideWidth} collapsed={sideCollapsed}>
               {sidePanel}
             </SidePanel>

@@ -201,6 +201,41 @@ button.sb-btn:focus-visible {
   color: var(--on-surface-muted);
 }
 
+/* ── Rail regroupé (Work / Agents / Create) ─────────────────────────────── */
+.rail-group-label {
+  width: 100%;
+  padding: 4px 0 2px;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 7.5px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--on-surface-muted);
+  user-select: none;
+  pointer-events: none;
+}
+
+/* Badge d'agents actifs sur le bouton Agents du rail. */
+.rail-badge {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 3px;
+  border-radius: 8px;
+  background: var(--success);
+  color: rgba(0, 0, 0, 0.75);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 15px;
+  text-align: center;
+  box-shadow: 0 0 8px rgba(138, 239, 199, 0.5);
+  pointer-events: none;
+}
+
 /* ── Raccourci clavier dans les tooltips du rail ────────────────────────── */
 .rail-tip-kbd {
   margin-left: 8px;
