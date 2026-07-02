@@ -124,7 +124,7 @@ export function ChatView({
   const toolActivity = useChatToolActivity(activeConv);
 
   const navigate = useNavigate();
-  const { activeFile, openFiles, openFile, fileContents, setFileContents, editorPrefs, compareFile, setCompareFile, applyCodeToFile } = useShell();
+  const { activeFile, openFiles, openFile, fileContents, setFileContents, editorPrefs, compareFile, setCompareFile, applyCodeToFile, openRecentPicker } = useShell();
 
   // Phase 2 — Chat→Editor handoff. When a file is opened from an action card,
   // we reveal an in-chat split (chat left, CodeMirror right) instead of
@@ -195,6 +195,16 @@ export function ChatView({
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
+
+  // Auto-grow du composer : la hauteur suit le contenu (borne CSS max-height,
+  // scroll interne au-delà) — comme dans tous les harness de référence. Sans
+  // ça, un prompt multi-lignes scrollait dans une bulle figée à 56px.
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [input]);
 
   // Agents disponibles via slash commands (`/code-reviewer ...`). Source =
   // `.md` sur disque (`~/.claude/agents/*.md` + workspace), refetch on focus.
@@ -583,13 +593,22 @@ export function ChatView({
         )}
         {/* Le ModeSelector a migré DANS la barre du composer (ci-dessus) — cette
             rangée ne porte plus que du CONTEXTE (fichier joint, workspace,
-            branche, isolation, permission), pas de contrôle d'envoi. */}
-        <button className="cx-chip" title="Espace de travail">
+            branche, isolation, permission). Chaque chip cliquable mène à la
+            surface qui le gère (fini les pseudo-boutons inertes). */}
+        <button
+          className="cx-chip"
+          title={`Projet ouvert : ${cwd ?? "aucun"} — cliquer pour changer de projet (récents)`}
+          onClick={openRecentPicker}
+        >
           <Icon name="folder" size={11} />
           {cwd}
         </button>
         {branch && (
-          <button className="cx-chip branch" title="Branche git courante">
+          <button
+            className="cx-chip branch"
+            title={`Branche git : ${branch} — cliquer pour ouvrir Source Control (diff, commit, historique)`}
+            onClick={() => navigate({ to: "/git" })}
+          >
             <span className="dot" />
             {branch}
           </button>
@@ -622,7 +641,8 @@ export function ChatView({
           <PermissionBadge
             kind="guarded"
             label="Filet git"
-            title="Mode Agent — l'agent peut écrire et exécuter sur ton projet. Chaque modification reste réversible dans l'onglet Git (le filet de sécurité)."
+            title="Mode Agent — l'agent peut écrire et exécuter sur ton projet. Chaque modification reste réversible dans Source Control (le filet de sécurité). Cliquer pour voir le diff."
+            onClick={() => navigate({ to: "/git" })}
           />
         ) : (
           <PermissionBadge

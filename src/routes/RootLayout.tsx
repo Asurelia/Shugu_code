@@ -1237,6 +1237,8 @@ export function RootLayout() {
     // LOT 3 — compare mode
     compareFile,
     setCompareFile,
+    // Lot ergonomie composer — le chip workspace ouvre le picker récents.
+    openRecentPicker: () => setRecentOpen(true),
   }), [
     openFiles, activeFile, fileContents, generations, agents,
     setOpenFiles, setActiveFile, setFileContents, setGenerationsPersisted,

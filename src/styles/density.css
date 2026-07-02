@@ -91,3 +91,32 @@
 .cx-ctx-row {
   margin-top: 8px;
 }
+
+/* Auto-grow (JS règle la hauteur = scrollHeight) : au-delà du cap CSS, le
+   scroll interne reprend — la bulle grandit avec le texte, comme partout. */
+.cx-composer-input {
+  overflow-y: auto;
+}
+
+/* Chips de contexte : plus petits, fond quasi transparent — de l'INFO, pas
+   des boutons massifs. L'affordance de clic n'apparaît qu'au survol des
+   chips réellement interactifs (vrais <button> avec onClick). */
+.cx-ctx-row .cx-chip {
+  padding: 3px 9px;
+  font-size: 10.5px;
+  background: transparent;
+  border-color: rgba(255, 255, 255, 0.05);
+}
+.cx-ctx-row button.cx-chip {
+  cursor: pointer;
+  transition: color 140ms ease, border-color 140ms ease, background-color 140ms ease;
+}
+.cx-ctx-row button.cx-chip:hover {
+  color: var(--on-surface);
+  border-color: rgba(224, 142, 254, 0.35);
+  background: rgba(224, 142, 254, 0.06);
+}
+.cx-ctx-row button.cx-chip:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
+}

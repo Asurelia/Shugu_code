@@ -112,6 +112,19 @@ await page.screenshot({ path: `${OUT}/02-notification-center.png` });
 await page.keyboard.press("Escape");
 await page.waitForTimeout(200);
 
+// ── Composer : auto-grow multi-lignes (régression fréquente) ─────────────
+const ta = page.locator(".cx-composer-input");
+if (await ta.count()) {
+  const h1 = (await ta.boundingBox())?.height ?? 0;
+  await ta.click().catch(() => {});
+  await ta.fill("ligne 1\nligne 2\nligne 3\nligne 4\nligne 5\nligne 6").catch(() => {});
+  await page.waitForTimeout(300);
+  const h2 = (await ta.boundingBox())?.height ?? 0;
+  if (h2 <= h1 + 30) missing.push(`auto-grow composer (h ${h1}→${h2})`);
+  await page.screenshot({ path: `${OUT}/07-composer-multiline.png` });
+  await ta.fill("").catch(() => {});
+}
+
 // ── Vues principales via le rail ──────────────────────────────────────────
 const views = [
   ["Editor", "03-editor"],
