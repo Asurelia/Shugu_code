@@ -10,6 +10,7 @@ import { LspStatusIndicator } from "./LspStatusIndicator";
 // Items d'activité partagés avec la statusbar globale (agents actifs,
 // génération chat, indexation) — même information dans l'éditeur qu'ailleurs.
 import { ShellStatusExtras } from "@/components/StatusBar";
+import { ConfirmDialog } from "@/components/trust";
 import { ShortcutsSettings, InterfaceSettings } from "@/features/settings/settings-extras";
 import { ShuguProfileView } from "@/features/settings/ShuguProfileView";
 import { CommandRulesSection } from "@/features/settings/CommandRulesSection";
@@ -646,15 +647,12 @@ export function SettingsEditor() {
 
 export function SettingsPrivacy() {
   const [clearing, setClearing] = useState(false);
+  // Confirmation via ConfirmDialog (trust) — window.confirm remplacé : l'action
+  // la plus destructive de l'app mérite le modal danger uniforme.
+  const [confirmClear, setConfirmClear] = useState(false);
 
   const handleClearAll = async () => {
-    const confirmed = window.confirm(
-      "Effacer TOUTES les données ?\n\n" +
-      "Conversations, messages, projets, générations, jobs, logs et agents " +
-      "seront supprimés définitivement.\n\n" +
-      "Vos paramètres (clés API, préférences) seront conservés."
-    );
-    if (!confirmed) return;
+    setConfirmClear(false);
     setClearing(true);
     try {
       await db.clearAll();
@@ -678,13 +676,22 @@ export function SettingsPrivacy() {
               className="lgb"
               style={{color:"var(--danger)", borderColor:"rgba(255,106,138,0.4)"}}
               disabled={clearing}
-              onClick={handleClearAll}
+              onClick={() => setConfirmClear(true)}
             >
               {clearing ? "Effacement…" : "Effacer"}
             </button>
           </SettingRow>
         </div>
       </div>
+      <ConfirmDialog
+        open={confirmClear}
+        title="Effacer TOUTES les données ?"
+        body={<>Conversations, messages, projets, générations, jobs, logs et agents seront supprimés <b>définitivement</b>. Vos paramètres (clés API, préférences) seront conservés.</>}
+        confirmLabel="Tout effacer"
+        tone="danger"
+        onCancel={() => setConfirmClear(false)}
+        onConfirm={() => void handleClearAll()}
+      />
     </div>
   );
 }

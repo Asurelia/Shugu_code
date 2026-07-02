@@ -236,6 +236,23 @@ button.sb-btn:focus-visible {
   pointer-events: none;
 }
 
+/* ── Contrôles sémantiques (audit a11y) ─────────────────────────────────── */
+/* .cx-action-file est devenu un <button> (était un div onClick) : reset du
+   chrome bouton pour préserver le rendu défini dans chat-codex.css. */
+button.cx-action-file {
+  background: none;
+  border: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  width: 100%;
+}
+button.cx-action-file:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+
 /* ── Raccourci clavier dans les tooltips du rail ────────────────────────── */
 .rail-tip-kbd {
   margin-left: 8px;

@@ -1383,7 +1383,7 @@ function ActionCard({ action, onOpenFile }: { action: MessageAction; onOpenFile:
       {open && (
         <div className="cx-action-files">
           {action.files.map((f) => (
-            <div key={f.name} className="cx-action-file" onClick={() => onOpenFile(f.name)} title="Ouvrir dans l'éditeur">
+            <button type="button" key={f.name} className="cx-action-file" onClick={() => onOpenFile(f.name)} title="Ouvrir dans l'éditeur" aria-label={`Ouvrir ${f.name} dans l'éditeur`}>
               <span className={"dot " + f.st} />
               <span className="name">{f.name}</span>
               <span className="stats">
@@ -1391,7 +1391,7 @@ function ActionCard({ action, onOpenFile }: { action: MessageAction; onOpenFile:
                 <span className="rem">−{f.rem}</span>
               </span>
               <span className="open-hint">Ouvrir ›</span>
-            </div>
+            </button>
           ))}
         </div>
       )}
@@ -1421,11 +1421,11 @@ function WorkspaceDiffCard({ onOpenFile }: { onOpenFile: (path: string) => void 
       {open && (
         <div className="cx-action-files">
           {files.map((f) => (
-            <div key={f.name} className="cx-action-file" onClick={() => onOpenFile(f.name)} title="Ouvrir dans l'éditeur">
+            <button type="button" key={f.name} className="cx-action-file" onClick={() => onOpenFile(f.name)} title="Ouvrir dans l'éditeur" aria-label={`Ouvrir ${f.name} dans l'éditeur`}>
               <span className={"dot " + f.st} />
               <span className="name">{f.name}</span>
               <span className="open-hint">Ouvrir ›</span>
-            </div>
+            </button>
           ))}
         </div>
       )}

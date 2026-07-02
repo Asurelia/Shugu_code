@@ -8,6 +8,7 @@
 
 import { useState } from "react";
 import { Icon } from "@/components/components";
+import { ConfirmDialog } from "@/components/trust";
 import { formatBytes } from "@/lib/modelBundle";
 import {
   useStorageBreakdown,
@@ -150,16 +151,11 @@ function BackupCenter() {
     }
   };
 
+  // Confirmation via ConfirmDialog (trust) — window.confirm remplacé.
+  const [confirmImport, setConfirmImport] = useState(false);
   const onImport = async () => {
+    setConfirmImport(false);
     setMsg(null);
-    if (
-      !window.confirm(
-        "Restaurer une sauvegarde ?\n\n" +
-          "La base actuelle sera REMPLACÉE (une copie de sécurité est prise " +
-          "automatiquement). Un redémarrage de l'application sera nécessaire."
-      )
-    )
-      return;
     try {
       const res = await importData.mutateAsync();
       if (res) {
@@ -222,11 +218,21 @@ function BackupCenter() {
           className="lgb lgb-sm"
           style={{ color: "var(--warn, #f5c451)", borderColor: "rgba(245,196,81,0.4)" }}
           disabled={importData.isPending}
-          onClick={() => void onImport()}
+          onClick={() => setConfirmImport(true)}
         >
           <Icon name="revert" size={12} /> {importData.isPending ? " Restauration…" : " Restaurer une sauvegarde…"}
         </button>
       </div>
+
+      <ConfirmDialog
+        open={confirmImport}
+        title="Restaurer une sauvegarde ?"
+        body={<>La base actuelle sera <b>remplacée</b> (une copie de sécurité est prise automatiquement). Un redémarrage de l'application sera nécessaire.</>}
+        confirmLabel="Restaurer"
+        tone="danger"
+        onCancel={() => setConfirmImport(false)}
+        onConfirm={() => void onImport()}
+      />
 
       {msg && (
         <p
