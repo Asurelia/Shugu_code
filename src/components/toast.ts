@@ -8,6 +8,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { queryClient } from "@/lib/queryClient";
+import { recordNotification } from "./notifications";
 
 export type ToastKind = "info" | "success" | "error";
 
@@ -30,6 +31,9 @@ function setToasts(next: Toast[]): void {
 /** Affiche un toast. Auto-retrait après `ttlMs`. Retourne l'id (pour dismiss). */
 export function pushToast(message: string, kind: ToastKind = "info", ttlMs = 5000): string {
   const id = `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  // Journal persistant : le toast disparaît en `ttlMs`, la notification reste
+  // consultable dans le panneau cloche (titlebar) — rien ne se perd.
+  recordNotification(message, kind);
   setToasts([...getToasts(), { id, message, kind }]);
   setTimeout(() => {
     setToasts(getToasts().filter((t) => t.id !== id));

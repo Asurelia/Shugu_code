@@ -129,7 +129,7 @@ async function windowToggleMaximize(): Promise<void> {
   }
 }
 
-export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettings, sideCollapsed, onToggleSide, menu }: any) {
+export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettings, sideCollapsed, onToggleSide, menu, onHistory, onBell, bellCount = 0 }: any) {
   return (
     <div className="titlebar">
       <div className="traffic">
@@ -167,10 +167,18 @@ export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettin
           its toggle button here so it sits with History/Bell, mirroring the left
           side-panel toggle. display:contents — same trick as tb-ctx-slot. */}
       <span id="tb-right-panel-slot" className="tb-ctx-slot" />
-      {/* TODO(Pass 2): wire to command */}
-      <button className="tb-action" title="History"><Icon name="history" size={15}/></button>
-      {/* TODO(Pass 2): wire to command */}
-      <button className="tb-action" title="Notifications"><Icon name="bell" size={15}/></button>
+      {/* Projets récents — le même picker que la commande « Open Recent
+          Folder… » de la palette. L'icône horloge = « reprendre où j'en
+          étais », geste central dans Codex/Cursor. */}
+      <button className="tb-action" title="Projets récents" aria-label="Projets récents" onClick={onHistory}>
+        <Icon name="history" size={15}/>
+      </button>
+      {/* Cloche — ouvre le centre de notifications (journal des toasts).
+          Badge = notifications non lues. */}
+      <button className="tb-action tb-bell" title="Notifications" aria-label={bellCount > 0 ? `Notifications — ${bellCount} non lue(s)` : "Notifications"} onClick={onBell}>
+        <Icon name="bell" size={15}/>
+        {bellCount > 0 && <span className="tb-badge">{bellCount > 99 ? "99+" : bellCount}</span>}
+      </button>
       {/* Compte — le popover .account-pop s'ancre en haut-droite (top:48px right:12px),
           sous la titlebar : son déclencheur vit donc ICI. L'avatar « SH » du Rail est
           devenu la mini-chibi (→ Profil de Shugu), on ne perd donc aucun accès. */}
@@ -181,15 +189,18 @@ export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettin
 
 // ── Activity Rail ───────────────────────────────────────────
 export function Rail({ view, setView, onProfile }: any) {
+  // `kbd` = raccourci par défaut de la commande view-* correspondante dans
+  // src/lib/commands.ts (⌘ = Ctrl sous Windows/Linux, cf. keybindings.ts).
+  // Affiché dans le tooltip pour rendre la navigation clavier découvrable.
   const items = [
-    { id: "chat",    icon: "chat",    label: "Chat" },
-    { id: "code",    icon: "code",    label: "Editor" },
+    { id: "chat",    icon: "chat",    label: "Chat",           kbd: "⌘⇧C" },
+    { id: "code",    icon: "code",    label: "Editor",         kbd: "⌘⇧E" },
     { id: "git",     icon: "git",     label: "Source Control" },
-    { id: "image",   icon: "image",   label: "Image" },
+    { id: "image",   icon: "image",   label: "Image",          kbd: "⌘⇧I" },
     { id: "studio",  icon: "palette", label: "Studio" },
-    { id: "agents",  icon: "agent",   label: "Agents" },
-    { id: "gallery", icon: "gallery", label: "Gallery" },
-  ];
+    { id: "agents",  icon: "agent",   label: "Agents",         kbd: "⌘⇧A" },
+    { id: "gallery", icon: "gallery", label: "Gallery",        kbd: "⌘⇧G" },
+  ] as { id: string; icon: string; label: string; kbd?: string }[];
   return (
     <nav className="rail">
       {items.map((it, i) => (
@@ -201,7 +212,10 @@ export function Rail({ view, setView, onProfile }: any) {
             aria-label={it.label}
           >
             <Icon name={it.icon} size={18}/>
-            <span className="rail-tip">{it.label}</span>
+            <span className="rail-tip">
+              {it.label}
+              {it.kbd && <span className="rail-tip-kbd">{it.kbd}</span>}
+            </span>
           </button>
         </React.Fragment>
       ))}
@@ -212,7 +226,10 @@ export function Rail({ view, setView, onProfile }: any) {
           aria-label="Settings"
         >
           <Icon name="gear" size={18}/>
-          <span className="rail-tip">Settings</span>
+          <span className="rail-tip">
+            Settings
+            <span className="rail-tip-kbd">⌘,</span>
+          </span>
         </button>
         <RailChibi onClick={onProfile} />
       </div>

@@ -14,6 +14,7 @@ import "./styles/chat-codex.css";
 import "./styles/forge-integrations.css";
 import "./styles/design.css";
 import "./styles/studio.css";
+import "./styles/shell-extras.css";
 
 import { RouterProvider } from "@tanstack/react-router";
 import { ThemeBootstrap } from "./lib/ThemeBootstrap";
