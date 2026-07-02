@@ -408,8 +408,35 @@ CREATE INDEX IF NOT EXISTS idx_message_sources_conv ON message_sources(conversat
 // Faits que Shugu retient de l'utilisateur. `source`='user' (saisi à la main,
 // validated=1 d'office) vs 'extracted' (déduit par un futur extracteur LLM,
 // validated=0 jusqu'à validation dans le panneau « Ce que Shugu sait de toi »).
+//
+// ⚠ NE JAMAIS modifier le texte d'une migration déjà appliquée : sqlx vérifie
+// le checksum SHA-384 à chaque démarrage et rejette toute la base sinon
+// (« migration 16 was previously applied but has been modified »). Le
+// durcissement CHECK écrit ici EN PLACE par 8dcfbc9 a cassé les bases déjà
+// migrées pendant deux semaines — il vit désormais en V17.
 const MIGRATION_V16: &str = "
 CREATE TABLE IF NOT EXISTS mascot_memory (
+  id         TEXT    PRIMARY KEY,
+  category   TEXT    NOT NULL DEFAULT 'general',
+  key        TEXT    NOT NULL,
+  value      TEXT    NOT NULL,
+  source     TEXT    NOT NULL DEFAULT 'user',
+  confidence REAL    NOT NULL DEFAULT 1.0,
+  validated  INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mascot_memory_cat       ON mascot_memory(category);
+CREATE INDEX IF NOT EXISTS idx_mascot_memory_validated ON mascot_memory(validated);
+";
+
+// V17 — durcissement du socle mascot_memory (revue 8dcfbc9), rejoué comme une
+// VRAIE migration : 8dcfbc9 avait modifié la V16 en place, donc les bases déjà
+// migrées n'ont JAMAIS reçu les contraintes (et rejetaient le checksum).
+// Rebuild SQLite classique (pas d'ALTER ADD CHECK) avec copie assainissante :
+// valeurs hors bornes clampées, lignes invalides (key/value vides) écartées.
+const MIGRATION_V17: &str = "
+CREATE TABLE IF NOT EXISTS mascot_memory_v17 (
   id         TEXT    PRIMARY KEY,
   category   TEXT    NOT NULL DEFAULT 'general',
   key        TEXT    NOT NULL CHECK (length(key) BETWEEN 1 AND 80),
@@ -420,6 +447,20 @@ CREATE TABLE IF NOT EXISTS mascot_memory (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+INSERT OR IGNORE INTO mascot_memory_v17
+SELECT id,
+       category,
+       substr(key, 1, 80),
+       substr(value, 1, 2000),
+       CASE WHEN source IN ('user', 'extracted') THEN source ELSE 'user' END,
+       MIN(MAX(confidence, 0.0), 1.0),
+       CASE WHEN validated IN (0, 1) THEN validated ELSE 1 END,
+       created_at,
+       updated_at
+FROM mascot_memory
+WHERE length(key) >= 1 AND length(value) >= 1;
+DROP TABLE mascot_memory;
+ALTER TABLE mascot_memory_v17 RENAME TO mascot_memory;
 CREATE INDEX IF NOT EXISTS idx_mascot_memory_cat       ON mascot_memory(category);
 CREATE INDEX IF NOT EXISTS idx_mascot_memory_validated ON mascot_memory(validated);
 ";
@@ -521,6 +562,12 @@ pub fn run() {
             version: 16,
             description: "mascot_memory",
             sql: MIGRATION_V16,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 17,
+            description: "mascot_memory_hardening",
+            sql: MIGRATION_V17,
             kind: MigrationKind::Up,
         },
     ];
