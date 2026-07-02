@@ -23,6 +23,18 @@ REM   tauri-dev.cmd          runs pnpm tauri dev
 REM   tauri-dev.cmd build    runs pnpm tauri build
 REM   tauri-dev.cmd info     runs pnpm tauri info
 
+REM ─── Toujours s'exécuter depuis le dossier du script ─────────
+REM Sans ça, un raccourci Windows avec un « Démarrer dans » différent
+REM (ou un lancement depuis un autre clone) compile UN AUTRE dossier
+REM que celui-ci — symptôme : « je viens de lancer et c'est l'ancienne
+REM version ». %~dp0 = dossier de CE fichier .cmd.
+cd /d "%~dp0"
+
+REM ─── Afficher le code réellement exécuté ─────────────────────
+REM Branche + commit imprimés à chaque lancement : plus jamais de doute
+REM sur la version qui tourne. (PowerShell, pas de sub-cmd — AutoRun.)
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Write-Host ('[tauri-dev.cmd] Dossier : ' + (Get-Location)); Write-Host ('[tauri-dev.cmd] Code    : ' + (git rev-parse --abbrev-ref HEAD) + ' @ ' + (git log -1 --format='%%h %%s'))"
+
 set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
 
 if not exist "%VCVARS%" (
@@ -46,6 +58,16 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
+
+REM ─── Pré-balayage du port 1420 ────────────────────────────────
+REM Le nettoyage post-exécution (plus bas) ne tourne PAS si la fenêtre
+REM du terminal est fermée à la main — le vite orphelin garde alors le
+REM port, et au lancement suivant la fenêtre Tauri peut se connecter à
+REM CET ANCIEN vite (strictPort fait échouer le nouveau) → l'app
+REM « fraîchement lancée » sert du vieux code. On balaie donc AUSSI
+REM avant de démarrer.
+echo [tauri-dev.cmd] Pre-sweep du port 1420 (vite orphelin d'une session precedente)...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$h = Get-NetTCPConnection -LocalPort 1420 -State Listen -ErrorAction SilentlyContinue; if ($h) { foreach ($c in $h) { $p = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue; if ($p) { Write-Host ('  killing ' + $p.Name + ' PID ' + $p.Id + ' (+ children)'); & taskkill /PID $p.Id /T /F | Out-Null } } } else { Write-Host '  port 1420 clean' }"
 
 echo [tauri-dev.cmd] MSVC env loaded. Starting Tauri...
 echo.
