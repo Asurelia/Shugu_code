@@ -10,6 +10,7 @@
 
 import { useState, useEffect } from "react";
 import { ModelPicker } from "@/features/panels/panels";
+import { ConfirmDialog } from "@/components/trust";
 import {
   useAgentDefs,
   useWriteAgentDef,
@@ -74,8 +75,11 @@ export function AgentDefsManager() {
   const onToggle = async (def: AgentDef) => {
     await writeMutation.mutateAsync({ ...def, enabled: !def.enabled });
   };
-  const onDelete = async (def: AgentDef) => {
-    if (!window.confirm(`Supprimer l'agent "${def.name}" ?`)) return;
+  // Confirmation destructive via ConfirmDialog (trust) — plus de window.confirm.
+  const [confirmDelete, setConfirmDelete] = useState<AgentDef | null>(null);
+  const onDelete = (def: AgentDef) => setConfirmDelete(def);
+  const doDelete = async (def: AgentDef) => {
+    setConfirmDelete(null);
     await deleteMutation.mutateAsync(def.path);
     setEditing(null);
   };
@@ -135,6 +139,16 @@ export function AgentDefsManager() {
           onDelete={editing.isNew ? undefined : () => onDelete(editing)}
         />
       )}
+
+      <ConfirmDialog
+        open={confirmDelete !== null}
+        title="Supprimer cet agent ?"
+        body={<>Le fichier de l'agent <b>{confirmDelete?.name}</b> sera supprimé du disque. Cette action est irréversible.</>}
+        confirmLabel="Supprimer"
+        tone="danger"
+        onCancel={() => setConfirmDelete(null)}
+        onConfirm={() => { if (confirmDelete) void doDelete(confirmDelete); }}
+      />
     </div>
   );
 }

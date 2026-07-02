@@ -19,6 +19,7 @@ import { vecIndex, vecClear } from "@/lib/vector";
 import { chunkSource, chunkId } from "./chunker";
 import { db } from "@/lib/db";
 import { pushToast } from "@/components/toast";
+import { startIndexing, setIndexingProgress, finishIndexing } from "./indexingStore";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -180,6 +181,10 @@ async function runIndex(force = false): Promise<number> {
     }
 
     // 4. Index each file (best-effort).
+    // Progression publiée vers la statusbar globale (indexingStore) — la
+    // passe peut durer plusieurs minutes sur un gros repo, l'utilisateur
+    // doit voir que le travail avance (pas seulement deux toasts éphémères).
+    startIndexing(paths.length);
     // Yield to the event loop between files so the renderer thread can keep
     // up with chat streaming, fs watcher events, and Tauri IPC traffic. The
     // indexer is background work — slow + responsive UI > fast + frozen UI.
@@ -212,6 +217,7 @@ async function runIndex(force = false): Promise<number> {
       }
       // Yield every 5 files to keep the UI responsive.
       if (i > 0 && i % 5 === 0) {
+        setIndexingProgress(i + 1);
         await new Promise((r) => setTimeout(r, 50));
       }
     }
@@ -244,6 +250,9 @@ async function runIndex(force = false): Promise<number> {
       "error",
       9000,
     );
+  } finally {
+    // Succès, échec ou passe sautée (TTL) : la statusbar redevient silencieuse.
+    finishIndexing();
   }
   return count;
 }

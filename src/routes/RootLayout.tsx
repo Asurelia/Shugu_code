@@ -75,6 +75,9 @@ import { runImmediate } from "@/features/code/ai-edit/aiEditController";
 import { setApplyRequest } from "@/features/code/ai-edit/applyController";
 import { detectBlockPath, stripPathComment } from "@/lib/markdown";
 import { ToastHost } from "@/components/ToastHost";
+import { StatusBar } from "@/components/StatusBar";
+import { NotificationCenter } from "@/components/NotificationCenter";
+import { useUnreadNotificationCount } from "@/components/notifications";
 import { ReviewDialog } from "@/features/git/components/ReviewDialog";
 import { useLlamaLifecycle } from "@/features/llama/useLlamaLifecycle";
 import { COMMANDS, getCommandById, fmtKbd, type CommandContext } from "@/lib/commands";
@@ -530,6 +533,9 @@ export function RootLayout() {
   const [annotations, setAnnotations] = useState<any[]>([]);
   const [pinnedAnno, setPinnedAnno] = useState<any>(null);
   const [accountOpen, setAccountOpen] = useState(false);
+  // Centre de notifications (cloche titlebar) — journal persistant des toasts.
+  const [notifOpen, setNotifOpen] = useState(false);
+  const unreadNotifications = useUnreadNotificationCount();
 
   // Hydrate generations from SQLite on mount (Tauri mode only).
   // seedIfEmpty() ensures a fresh DB has prototype data on first run.
@@ -1231,6 +1237,8 @@ export function RootLayout() {
     // LOT 3 — compare mode
     compareFile,
     setCompareFile,
+    // Lot ergonomie composer — le chip workspace ouvre le picker récents.
+    openRecentPicker: () => setRecentOpen(true),
   }), [
     openFiles, activeFile, fileContents, generations, agents,
     setOpenFiles, setActiveFile, setFileContents, setGenerationsPersisted,
@@ -1283,9 +1291,17 @@ export function RootLayout() {
             sideCollapsed={sideCollapsed}
             onToggleSide={() => setSideCollapsed(c => !c)}
             menu={view === "code" ? <MenuBar ctx={cmdCtx}/> : null}
+            onHistory={() => setRecentOpen(true)}
+            onBell={() => setNotifOpen(o => !o)}
+            bellCount={unreadNotifications}
           />
           <div className="main">
-            <Rail view={view} setView={navigateTo} onProfile={() => navigate({ to: "/settings/mascot" as any })}/>
+            <Rail
+              view={view}
+              setView={navigateTo}
+              onProfile={() => navigate({ to: "/settings/mascot" as any })}
+              runningAgents={agents.filter((a: any) => a.status === "running").length}
+            />
             <SidePanel width={sideWidth} setWidth={setSideWidth} collapsed={sideCollapsed}>
               {sidePanel}
             </SidePanel>
@@ -1299,7 +1315,14 @@ export function RootLayout() {
                   <div className="content-sub">{heading.sub}</div>
                   <div style={{ flex: 1 }}/>
                   {view === "code" && <>
-                    <button className="lgb lgb-sm"><Icon name="git" size={11}/> Commit</button>
+                    {/* Ouvre Source Control (stage + message + commit y vivent).
+                        Était un bouton mort — un contrôle inerte détruit la
+                        confiance plus qu'un contrôle absent. */}
+                    <button
+                      className="lgb lgb-sm"
+                      onClick={() => navigateTo("git")}
+                      title="Ouvrir Source Control pour committer"
+                    ><Icon name="git" size={11}/> Commit</button>
                     <button
                       className="lgb lgb-sm"
                       onClick={() => getCommandById("ai-inline-edit")?.run(cmdCtx)}
@@ -1307,10 +1330,9 @@ export function RootLayout() {
                     ><Icon name="sparkle" size={11}/> Ask Shugu</button>
                     <DockToggleButton dockState={dockState} setDockState={setDockState}/>
                   </>}
-                  {view === "image" && <>
-                    <button className="lgb lgb-sm"><Icon name="thumbs" size={11}/> Variations</button>
-                    <button className="lgb lgb-sm"><Icon name="download" size={11}/> Export</button>
-                  </>}
+                  {/* Les boutons « Variations » / « Export » de la vue Image
+                      (maquette) étaient inertes — retirés tant qu'aucun flux
+                      réel ne les sous-tend. */}
                 </div>
               )}
               {isCode ? (
@@ -1366,6 +1388,18 @@ export function RootLayout() {
               )}
             </div>
           </div>
+          {/* Barre de statut globale — projet, branche, agents actifs,
+              génération en cours, indexation. Masquée sur code/git : la
+              `.statusbar` de l'éditeur y joue déjà ce rôle (elle reçoit les
+              items d'activité via <ShellStatusExtras/> dans views-code). */}
+          {view !== "code" && view !== "git" && (
+            <StatusBar
+              navigateTo={navigateTo}
+              onOpenRecent={() => setRecentOpen(true)}
+              onNotifications={() => setNotifOpen(true)}
+              onPalette={() => setPaletteOpen(true)}
+            />
+          )}
         </div>
 
         <ContextMenu
@@ -1380,6 +1414,11 @@ export function RootLayout() {
           open={accountOpen}
           onClose={() => setAccountOpen(false)}
           onView={navigateTo}
+        />
+        {/* Centre de notifications — journal des toasts (cloche titlebar). */}
+        <NotificationCenter
+          open={notifOpen}
+          onClose={() => setNotifOpen(false)}
         />
         {/* FloatChat moved to the dedicated mascot window (src/mascot.tsx) —
             the chibi now lives in its own transparent Tauri window instead

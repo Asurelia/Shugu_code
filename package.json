@@ -19,6 +19,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test",
+    "ui:tour": "node scripts/ui-tour.mjs",
     "test:eval": "node evals/run.mjs --self-check",
     "test:eval:dry": "node evals/run.mjs --dry-run",
     "test:eval:live": "node evals/run.mjs",

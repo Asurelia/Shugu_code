@@ -1,0 +1,63 @@
+/* Shugu Forge — passe typographique « sobriété » (2026-07-02).
+
+   Diagnostic (comparaison captures vs Cursor / Codex / Claude Desktop) : la
+   quasi-totalité du chrome UI (listes, labels, boutons, statusbars, chips,
+   panneaux) héritait de --font-mono — JetBrains Mono en 9-11 px, souvent
+   uppercase + letter-spacing large. Les références réservent la monospace au
+   CODE et composent tout le chrome en sans-serif ~12-13 px : c'est LA
+   différence visuelle flagrante ressentie (« rendu maquette terminal »).
+
+   Levier systémique plutôt que 200 retouches : --font-mono est de fait la
+   variable du chrome → on la re-pointe vers la sans (Inter, déjà chargée),
+   et on ré-épingle les VRAIES surfaces de code sur la nouvelle --font-code.
+   styles.css (Celestial Veil) reste intact — ce fichier est chargé en
+   dernier et ne fait que surcharger. Supprimer cet import restaure
+   exactement l'ancien rendu. */
+
+:root {
+  /* La vraie monospace, pour le code uniquement. */
+  --font-code: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  /* Le chrome qui se déclarait « mono » compose désormais en sans. */
+  --font-mono: 'Inter', system-ui, sans-serif;
+
+  /* Contraste : textes secondaires légèrement relevés — le violet-gris
+     d'origine passait sous les seuils de confort sur fond sombre. */
+  --on-surface-variant: #b0abc9;
+  --on-surface-muted: #7f7a9c;
+}
+
+/* ── Vraies surfaces de code : ré-épinglées sur la monospace ────────────── */
+pre,
+code,
+kbd,
+.kbd,
+.cm-editor,
+.term-shell,
+.output-pane,
+.diff-side,
+.ctx-diff,
+.ctx-review-diff,
+.ctx-diffstat,
+.cx-md-pre,
+.cx-md-pre code,
+.cx-code-inline,
+.cx-code-block,
+.cx-code-block pre,
+.cx-code-block code,
+.design-md-code,
+.design-md-pre code {
+  font-family: var(--font-code);
+}
+/* styles.css met !important sur .cm-scroller — on doit le re-déclarer ici
+   (fichier chargé après : même spécificité + !important → celui-ci gagne). */
+.cm-scroller {
+  font-family: var(--font-code) !important;
+}
+
+/* ── Labels de section : uppercase conservé, mais moins « criard » ──────── */
+.side-section-label {
+  letter-spacing: 0.09em;
+}
+.rail-group-label {
+  letter-spacing: 0.1em;
+}

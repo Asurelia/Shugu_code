@@ -33,6 +33,8 @@ import { useAgentTranscript } from "@/features/agents/queries";
 import { BrowserTestResultViewer } from "./BrowserTestResultViewer";
 import { CommandRiskCard } from "./CommandRiskCard";
 import { AgentPlan } from "./AgentPlan";
+import { QuickOpenPalette } from "@/features/code/QuickOpenPalette";
+import { useChatMentionRequests, clearChatMentionRequests } from "./chatMentionStore";
 import { Markdown } from "./markdownView";
 import { useShell } from "@/routes/shell-context";
 import { detectBlockPath } from "@/lib/markdown";
@@ -123,7 +125,7 @@ export function ChatView({
   const toolActivity = useChatToolActivity(activeConv);
 
   const navigate = useNavigate();
-  const { activeFile, openFiles, openFile, fileContents, setFileContents, editorPrefs, compareFile, setCompareFile, applyCodeToFile } = useShell();
+  const { activeFile, openFiles, openFile, fileContents, setFileContents, editorPrefs, compareFile, setCompareFile, applyCodeToFile, openRecentPicker } = useShell();
 
   // Phase 2 — Chat→Editor handoff. When a file is opened from an action card,
   // we reveal an in-chat split (chat left, CodeMirror right) instead of
@@ -184,6 +186,32 @@ export function ChatView({
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
+
+  // Auto-grow du composer : la hauteur suit le contenu (borne CSS max-height,
+  // scroll interne au-delà) — comme dans tous les harness de référence. Sans
+  // ça, un prompt multi-lignes scrollait dans une bulle figée à 56px.
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [input]);
+
+  // Ajout de sources — le « + » du composer ouvre un picker de fichiers du
+  // workspace et insère une @-mention `@"chemin"` (résolue à l'envoi par le
+  // flux mentions.ts existant : contenu joint au modèle, texte UI propre).
+  const [mentionPickerOpen, setMentionPickerOpen] = useState(false);
+  const insertMention = useCallback((path: string) => {
+    setInput((i) => (i && !/\s$/.test(i) ? i + " " : i) + `@"${path}" `);
+    inputRef.current?.focus();
+  }, []);
+  // Demandes venues d'ailleurs (clic droit explorateur → « Ajouter au chat »).
+  const mentionRequests = useChatMentionRequests();
+  useEffect(() => {
+    if (mentionRequests.length === 0) return;
+    mentionRequests.forEach(insertMention);
+    clearChatMentionRequests();
+  }, [mentionRequests, insertMention]);
 
   // Agents disponibles via slash commands (`/code-reviewer ...`). Source =
   // `.md` sur disque (`~/.claude/agents/*.md` + workspace), refetch on focus.
@@ -501,6 +529,20 @@ export function ChatView({
           rows={1}
         />
         <div className="cx-composer-bar">
+          {/* « + » = ajouter des sources (pattern Cursor/Claude Desktop) :
+              ouvre un picker de fichiers du workspace, insère une @-mention. */}
+          <button
+            className="cx-tool"
+            title="Ajouter un fichier comme source (@fichier) — son contenu sera joint au message"
+            aria-label="Ajouter un fichier comme source"
+            onClick={() => setMentionPickerOpen(true)}
+          >
+            <Icon name="plus" size={15} />
+          </button>
+          {/* Le mode (Chat / Plan / Agent) est LE contrat du message qu'on
+              s'apprête à envoyer : il vit DANS le composer (pattern Cursor /
+              Codex), pas dans la rangée de contexte flottante en dessous. */}
+          <ModeSelector />
           <button className="cx-tool" title="Joindre une image" onClick={() => fileInputRef.current?.click()}>
             <Icon name="attach" size={15} />
           </button>
@@ -513,7 +555,8 @@ export function ChatView({
           >
             <Icon name="image" size={15} />
           </button>
-          <button className="cx-tool" title="Voix"><Icon name="mic" size={15} /></button>
+          {/* Le bouton micro « Voix » (inerte, aucun flux derrière) est retiré —
+              un contrôle mort abîme la confiance plus qu'un contrôle absent. */}
           <div className="cx-spacer" />
           <ModelPicker model={model} onChange={setModel} className="composer-model" />
           {typing ? (
@@ -530,8 +573,10 @@ export function ChatView({
             </button>
           )}
         </div>
-      </div>
-      <div className="cx-ctx-row">
+        {/* Rangée de contexte INTÉGRÉE à la bulle (retour utilisateur : des
+            chips flottants sous le composer « font étranges ») — un pied de
+            carte discret, séparé par un fin trait, comme Cursor/Claude. */}
+        <div className="cx-ctx-row">
         {/* Lot A — chip contexte éditeur retirable. Montre le fichier actif (+
             sélection) qui sera joint au prochain message. Le × le retire pour
             ce tour (réactivé après envoi). Réutilise .cx-chip (charte glass). */}
@@ -565,16 +610,24 @@ export function ChatView({
             </button>
           </span>
         )}
-        {/* Vrai sélecteur de mode (Chat / Plan / Agent) — remplace l'ancienne
-            pastille décorative « Accès complet ». Le mode pilote le routage
-            (chat-sync) + l'enforcement read-only en mode Plan (runner Rust). */}
-        <ModeSelector />
-        <button className="cx-chip" title="Espace de travail">
+        {/* Le ModeSelector a migré DANS la barre du composer (ci-dessus) — cette
+            rangée ne porte plus que du CONTEXTE (fichier joint, workspace,
+            branche, isolation, permission). Chaque chip cliquable mène à la
+            surface qui le gère (fini les pseudo-boutons inertes). */}
+        <button
+          className="cx-chip"
+          title={`Projet ouvert : ${cwd ?? "aucun"} — cliquer pour changer de projet (récents)`}
+          onClick={openRecentPicker}
+        >
           <Icon name="folder" size={11} />
           {cwd}
         </button>
         {branch && (
-          <button className="cx-chip branch" title="Branche git courante">
+          <button
+            className="cx-chip branch"
+            title={`Branche git : ${branch} — cliquer pour ouvrir Source Control (diff, commit, historique)`}
+            onClick={() => navigate({ to: "/git" })}
+          >
             <span className="dot" />
             {branch}
           </button>
@@ -607,7 +660,8 @@ export function ChatView({
           <PermissionBadge
             kind="guarded"
             label="Filet git"
-            title="Mode Agent — l'agent peut écrire et exécuter sur ton projet. Chaque modification reste réversible dans l'onglet Git (le filet de sécurité)."
+            title="Mode Agent — l'agent peut écrire et exécuter sur ton projet. Chaque modification reste réversible dans Source Control (le filet de sécurité). Cliquer pour voir le diff."
+            onClick={() => navigate({ to: "/git" })}
           />
         ) : (
           <PermissionBadge
@@ -616,6 +670,7 @@ export function ChatView({
             title="Mode lecture seule — l'inférence et tes données restent locales ; aucun fichier n'est modifié ni aucune commande exécutée ce tour-ci."
           />
         )}
+        </div>
       </div>
     </>
   );
@@ -712,6 +767,13 @@ export function ChatView({
           the whole chat view incl. the empty state; chatMain isn't rendered
           during the handoff split, so that case is already excluded. */}
       <ContextBubble convId={activeConv} />
+      {/* Picker « + » du composer — réutilise QuickOpen (fuzzy sur le
+          workspace) mais insère une @-mention au lieu d'ouvrir l'éditeur. */}
+      <QuickOpenPalette
+        open={mentionPickerOpen}
+        onClose={() => setMentionPickerOpen(false)}
+        onOpen={insertMention}
+      />
     </div>
   );
 
@@ -1369,7 +1431,7 @@ function ActionCard({ action, onOpenFile }: { action: MessageAction; onOpenFile:
       {open && (
         <div className="cx-action-files">
           {action.files.map((f) => (
-            <div key={f.name} className="cx-action-file" onClick={() => onOpenFile(f.name)} title="Ouvrir dans l'éditeur">
+            <button type="button" key={f.name} className="cx-action-file" onClick={() => onOpenFile(f.name)} title="Ouvrir dans l'éditeur" aria-label={`Ouvrir ${f.name} dans l'éditeur`}>
               <span className={"dot " + f.st} />
               <span className="name">{f.name}</span>
               <span className="stats">
@@ -1377,7 +1439,7 @@ function ActionCard({ action, onOpenFile }: { action: MessageAction; onOpenFile:
                 <span className="rem">−{f.rem}</span>
               </span>
               <span className="open-hint">Ouvrir ›</span>
-            </div>
+            </button>
           ))}
         </div>
       )}
