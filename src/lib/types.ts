@@ -15,9 +15,11 @@ export interface MessageActionFile {
 }
 
 /** Structured "N files modified" action card attached to an AI message.
- * Renderer-ready field; precise per-message attribution requires agent-level
- * diff capture (deferred). The chat currently surfaces a live workspace-diff
- * card on the latest agent message instead (see views-chat WorkspaceDiffCard). */
+ * Renderer-ready field. L'attribution PAR MESSAGE vit dans ChatWritesCard
+ * (events `write` du run agent / store chat-direct). L'ancienne
+ * WorkspaceDiffCard — statut git GLOBAL du workspace affiché sur le dernier
+ * message agent — a été SUPPRIMÉE (2026-07-02) : elle montrait le bazar
+ * pré-existant du workspace sans aucun lien avec ce que le run avait fait. */
 export interface MessageAction {
   title: string;
   add: number;

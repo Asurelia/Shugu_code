@@ -918,13 +918,16 @@ pub async fn agent_spawn(
     // Mode Plan → lecture seule. Le sélecteur de chat envoie `mode: "plan"` ;
     // tout le reste (agent / Atelier / Studio) reste en exécution complète.
     let read_only_for_task = args.mode.as_deref() == Some("plan");
-    // Phase 7 #4 — isolation par DÉFAUT en mode Agent (chat/cockpit). L'agent
-    // travaille seul dans un worktree, l'utilisateur relit le diff puis merge ou
-    // jette, son checkout reste intact. `unwrap_or(true)` : le frontend peut
-    // explicitement passer `isolate:false` pour rester in-place, mais le défaut
-    // est l'isolation. JAMAIS en Plan/read-only (rien à isoler). Si la création
-    // du worktree échoue, le runner retombe in-place + émet WorktreeSkipped.
-    let isolate_for_task = args.isolate.unwrap_or(true) && !read_only_for_task;
+    // Exécution DIRECTE par défaut (décision utilisateur 2026-07-02, retour au
+    // pivot 2026-06-10 « exec directe + filet git ») : l'agent travaille sur le
+    // VRAI checkout, comme Claude Code. L'isolation worktree (Phase 7 #4) reste
+    // disponible en OPT-IN (`isolate: true`) mais n'est plus le défaut : le
+    // worktree démarre du dernier COMMIT, donc les fichiers non commités du
+    // user y sont INVISIBLES (agent « aveugle » : fichiers introuvables, croit
+    // qu'ils sont sur une autre branche) et son résultat reste parqué sur une
+    // branche tant que rien n'est mergé — deux pièges fatals pour un
+    // utilisateur qui ne commit pas. JAMAIS en Plan/read-only (rien à isoler).
+    let isolate_for_task = args.isolate.unwrap_or(false) && !read_only_for_task;
     // Mémoire de conversation : le chemin chat passe la conv pour recharger les
     // tours précédents dans l'historique de l'agent.
     let conversation_id_for_task = args.conversation_id.clone();

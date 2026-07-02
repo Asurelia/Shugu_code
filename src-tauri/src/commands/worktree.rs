@@ -275,6 +275,25 @@ pub(crate) async fn create_inner(
     let root_buf = strip_extended_prefix(root.to_path_buf());
     let root: &Path = &root_buf;
 
+    // Best-effort : exclure `.shugu/` du statut git du dépôt SANS toucher au
+    // .gitignore de l'utilisateur (`.git/info/exclude` = exclusion locale au
+    // repo). Évite que les worktrees d'isolation, qui vivent SOUS le workspace,
+    // apparaissent comme des dizaines de « fichiers modifiés » dans l'UI.
+    let git_dir = root.join(".git");
+    if git_dir.is_dir() {
+        let exclude = git_dir.join("info").join("exclude");
+        let cur = std::fs::read_to_string(&exclude).unwrap_or_default();
+        if !cur.lines().any(|l| l.trim() == ".shugu/") {
+            let mut c = cur;
+            if !c.is_empty() && !c.ends_with('\n') {
+                c.push('\n');
+            }
+            c.push_str(".shugu/\n");
+            let _ = std::fs::create_dir_all(git_dir.join("info"));
+            let _ = std::fs::write(&exclude, c);
+        }
+    }
+
     // Resolve the base ref to a concrete OID so the branch is reproducible even
     // if HEAD moves later.
     let base_ref = base.unwrap_or("HEAD");
@@ -531,7 +550,7 @@ pub(crate) async fn commit_worktree(
 /// Paths reported as changed by `git status --porcelain` in `root` (working
 /// tree + index). Each porcelain line is `XY <path>` — we take everything after
 /// the first 3 chars and normalize. Rename lines (`R  old -> new`) keep both.
-async fn dirty_paths(root: &Path) -> Result<Vec<String>, String> {
+pub(crate) async fn dirty_paths(root: &Path) -> Result<Vec<String>, String> {
     let out = run_git(root, &["status", "--porcelain"]).await?;
     let mut paths = Vec::new();
     for line in out.lines() {

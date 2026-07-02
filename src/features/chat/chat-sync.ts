@@ -993,14 +993,13 @@ async function handleDelegate(
       advisorProtocol: advisor?.protocol,
       advisorBaseUrl: advisor?.baseUrl,
       advisorApiKey: advisor?.apiKey,
-      // Phase 7 #4 — worktree-per-agent isolation est le DÉFAUT en mode Agent.
-      // On NE passe PAS `isolate` ici → le backend applique `unwrap_or(true)` :
-      // l'orchestrateur chat/cockpit travaille seul dans un worktree, l'utilisateur
-      // relit le diff puis merge ou jette (UI panneau Agents + bandeau timeline),
-      // son checkout reste intact. Si l'isolation échoue (pas de dépôt git), le
-      // runner retombe in-place et émet `worktreeSkipped` (toast). Pour FORCER
-      // l'in-place sur un flux précis, passer `isolate: false` explicitement (cf.
-      // Studio / superviseurs qui le font).
+      // Exécution DIRECTE par défaut (2026-07-02) : on NE passe PAS `isolate`
+      // → le backend applique `unwrap_or(false)` et l'orchestrateur travaille
+      // sur le VRAI checkout, comme Claude Code — les fichiers non commités du
+      // user restent visibles pour l'agent, et son résultat atterrit
+      // directement dans les fichiers (pas de branche parquée à merger).
+      // Pour ISOLER un flux précis (worktree + revue/merge via panneau
+      // Agents), passer `isolate: true` explicitement.
     });
   } catch (err) {
     await appendMessage(convId, {

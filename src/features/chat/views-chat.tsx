@@ -41,7 +41,6 @@ import { GitDiffView } from "@/features/code/DiffView";
 import { ContextBubble } from "@/features/context-cards/ContextBubble";
 import { loadProviderConfig } from "@/lib/credentials";
 import { useGitBranches } from "@/features/git/queries";
-import { useWorkspaceChanges } from "@/features/git/useWorkspaceChanges";
 import { fsGetWorkspaceRoot } from "@/lib/fs";
 import { fsKeys } from "@/features/fs/keys";
 import { CommentTray } from "@/features/cockpit/CommentTray";
@@ -160,16 +159,6 @@ export function ChatView({
   const cwd = basename(wsRoot);
 
   const isEmpty = !messages || messages.length === 0;
-
-  // Most-recent agent-relay message id — the live workspace-diff action card
-  // is attached only to it (avoids implying stale per-message attribution on
-  // historical turns).
-  const latestAgentId = (() => {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].viaAgent) return messages[i].id;
-    }
-    return null;
-  })();
 
   // Phase 7 #4 — badge « 🔒 isolé » près du composer pendant un run isolé EN
   // COURS. On suit le transcript du DERNIER message agent (celui qui tourne, le
@@ -659,7 +648,6 @@ export function ChatView({
                   key={String(m.id)}
                   m={m}
                   model={model}
-                  isLatestAgent={m.id === latestAgentId}
                   onOpenFile={handleOpenFile}
                   onOpenSnippet={onOpenSnippet}
                   activeFile={activeFile}
@@ -1171,7 +1159,6 @@ function WorktreeBanner({
 function CxMessage({
   m,
   model,
-  isLatestAgent,
   onOpenFile,
   onOpenSnippet,
   activeFile,
@@ -1179,7 +1166,6 @@ function CxMessage({
 }: {
   m: Message;
   model: string;
-  isLatestAgent: boolean;
   onOpenFile: (path: string) => void;
   onOpenSnippet?: (code: string, lang: string) => void;
   /** Lot A (Task 8) — active editor file: the Apply fallback target. */
@@ -1306,7 +1292,6 @@ function CxMessage({
               />
             )}
             {m.action && <ActionCard action={m.action} onOpenFile={onOpenFile} />}
-            {isLatestAgent && !m.action && <WorkspaceDiffCard onOpenFile={onOpenFile} />}
           </>
         )}
         {/* Lot C3 — Carte d'opération in-chat : "✏️ N fichier(s) modifié(s)"
@@ -1391,40 +1376,6 @@ function ActionCard({ action, onOpenFile }: { action: MessageAction; onOpenFile:
                 <span className="add">+{f.add}</span>
                 <span className="rem">−{f.rem}</span>
               </span>
-              <span className="open-hint">Ouvrir ›</span>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// Live workspace-diff card: real working-tree changes from git, attached to
-// the latest agent-relay message. Files are clickable → editor. Renders
-// nothing outside a repo or with a clean tree.
-function WorkspaceDiffCard({ onOpenFile }: { onOpenFile: (path: string) => void }) {
-  const { files, isRepo } = useWorkspaceChanges();
-  const [open, setOpen] = useState(true);
-  if (!isRepo || files.length === 0) return null;
-  return (
-    <div className="cx-action">
-      <div className="cx-action-head">
-        <div className="cx-action-ico"><Icon name="diff" size={15} /></div>
-        <div style={{ minWidth: 0, flex: 1 }}>
-          <div className="cx-action-title">{files.length} fichier{files.length > 1 ? "s" : ""} modifié{files.length > 1 ? "s" : ""}</div>
-          <div className="cx-action-sub"><span style={{ opacity: 0.6 }}>espace de travail · git</span></div>
-        </div>
-        <div className="cx-action-actions">
-          <button className="cx-action-btn" onClick={() => setOpen((o) => !o)}>{open ? "Masquer" : "Détails"}</button>
-        </div>
-      </div>
-      {open && (
-        <div className="cx-action-files">
-          {files.map((f) => (
-            <div key={f.name} className="cx-action-file" onClick={() => onOpenFile(f.name)} title="Ouvrir dans l'éditeur">
-              <span className={"dot " + f.st} />
-              <span className="name">{f.name}</span>
               <span className="open-hint">Ouvrir ›</span>
             </div>
           ))}

@@ -1416,11 +1416,12 @@ const MAX_DELEGATION_DEPTH: u32 = 2;
 const DELEGATE_TIMEOUT_SECS: u64 = 600;
 
 /// System prompt du sous-agent délégué : contexte isolé + contrat de handoff.
-const DELEGATE_CHILD_PROMPT: &str = "Tu es un SOUS-AGENT à contexte ISOLÉ, lancé par un agent parent pour une sous-tâche précise et auto-suffisante. Tu n'as AUCUN accès à la conversation du parent — tout ce dont tu as besoin est dans la tâche ci-dessous. Exécute-la, VÉRIFIE ton travail avec run_command (build/tests) quand c'est pertinent, puis termine par un bloc :\n\n## RÉSULTAT\n<2-4 phrases : ce que tu as fait + le verdict de ta vérification>\n\n## FAITS\n- fichiers : <file:line des points clés à inspecter>\n- vérif : <commande lancée → résultat observé>\n\nLes FAITS seront RE-VÉRIFIÉS par l'environnement (diff git réel) — ne prétends pas un succès que tu n'as pas obtenu.";
+const DELEGATE_CHILD_PROMPT: &str = "Tu es un SOUS-AGENT à contexte ISOLÉ, lancé par un agent parent pour une sous-tâche précise et auto-suffisante. Tu n'as AUCUN accès à la conversation du parent — tout ce dont tu as besoin est dans la tâche ci-dessous. Exécute-la, VÉRIFIE ton travail avec run_command (build/tests) quand c'est pertinent, puis termine par un bloc :\n\n## RÉSULTAT\n<2-4 phrases : ce que tu as fait + le verdict de ta vérification>\n\n## FAITS\n- fichiers : <file:line des points clés à inspecter>\n- vérif : <commande lancée → résultat observé>\n\nLes FAITS seront RE-VÉRIFIÉS par l'environnement (delta du statut git réel) — ne prétends pas un succès que tu n'as pas obtenu.";
 
 /// Compose le handoff renvoyé au PARENT : prose compressée (étiquetée NON
-/// vérifiée) + bloc FAITS capté de l'environnement (le diff git réel est la
-/// vérité-terrain que la prose de l'enfant ne peut pas falsifier).
+/// vérifiée) + bloc FAITS capté de l'environnement (le delta du statut git —
+/// chemins touchés PENDANT le sous-run — est la vérité-terrain que la prose
+/// de l'enfant ne peut pas falsifier).
 fn format_delegate_handoff(
     output: &str,
     diff_stat: Option<&str>,
@@ -1435,14 +1436,14 @@ fn format_delegate_handoff(
     s.push_str("\n\n## FAITS (capturés de l'environnement — vérifiables)\n");
     match diff_stat {
         Some(d) if !d.trim().is_empty() => {
-            s.push_str("- diff (git --stat) :\n");
+            s.push_str("- fichiers touchés pendant le sous-run (delta git status) :\n");
             for line in d.lines() {
                 s.push_str("    ");
                 s.push_str(line);
                 s.push('\n');
             }
         }
-        _ => s.push_str("- diff : AUCUN fichier modifié\n"),
+        _ => s.push_str("- fichiers touchés pendant le sous-run : AUCUN\n"),
     }
     s.push_str(&format!(
         "- itérations : {iterations}   tool errors : {tool_errors}\n"
@@ -1548,27 +1549,25 @@ pub(super) async fn run_delegated_child(
         },
     );
 
-    // Worktree isolé best-effort. `iso` porte (root, entry) pour le diff + finalize.
-    let mut workspace_override: Option<PathBuf> = None;
-    let mut iso: Option<(PathBuf, crate::commands::worktree::WorktreeEntry)> = None;
-    if let Some(root) = get_workspace_root(app) {
-        if root.join(".git").exists() {
-            if let Ok(entry) =
-                crate::commands::worktree::create_inner(&root, None, Some("delegate")).await
-            {
-                let _ = persist_and_emit(
-                    app,
-                    &AgentEvent::WorktreeStarted {
-                        agent_id: child_id.clone(),
-                        path: entry.path.clone(),
-                        branch: entry.branch.clone(),
-                    },
-                );
-                workspace_override = Some(PathBuf::from(&entry.path));
-                iso = Some((root, entry));
-            }
+    // Exécution DIRECTE (comme le run parent — décision 2026-07-02) : le
+    // sous-agent travaille sur le VRAI workspace, pas sur une photo du dernier
+    // commit où les fichiers non commités du user n'existent pas (sous-agent
+    // aveugle). Aucune écriture concurrente : le parent ATTEND son enfant
+    // (doctrine single-writer). Pour les FAITS du handoff, on capture le statut
+    // git AVANT le sous-run ; le delta après coup liste les chemins réellement
+    // touchés pendant le run (vérité-terrain non falsifiable par la prose).
+    let workspace_override: Option<PathBuf> = None;
+    let ws_root = get_workspace_root(app);
+    let dirty_before: std::collections::HashSet<String> = match ws_root.as_ref() {
+        Some(root) if root.join(".git").exists() => {
+            crate::commands::worktree::dirty_paths(root)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
         }
-    }
+        _ => Default::default(),
+    };
 
     // Historique enfant : prompt de délégation + tâche (contexte vierge).
     let mut history: Vec<AgentMessage> = vec![
@@ -1622,29 +1621,24 @@ pub(super) async fn run_delegated_child(
     // un handle « zombie » qu'un second agent_kill retrouverait.
     registry_remove(app, &child_id);
 
-    // Faits objectifs : diff git RÉEL du worktree enfant (vérité-terrain non
-    // falsifiable par la prose). 3-points → seuls les commits de l'enfant.
+    // Faits objectifs : chemins passés « dirty » PENDANT le sous-run (delta de
+    // `git status` avant/après). Moins riche qu'un diff de branche, mais honnête
+    // pour une exécution directe — les fichiers déjà modifiés AVANT le run sont
+    // exclus, et la prose de l'enfant ne peut pas inventer ce delta.
     let mut diff_stat: Option<String> = None;
-    let mut child_branch: Option<String> = None;
-    if let Some((root, entry)) = iso.as_ref() {
-        child_branch = Some(entry.branch.clone());
-        let target = crate::commands::worktree::current_branch(root)
-            .await
-            .unwrap_or_else(|| "HEAD".to_string());
-        diff_stat = crate::commands::worktree::diff_summary(root, &entry.branch, &target)
-            .await
-            .ok();
-    }
-
-    // Finalize : commit + keep-for-review (JAMAIS auto-merge — le parent/user
-    // merge via la tuile Git).
-    if let Some((root, entry)) = iso.as_ref() {
-        let kind = if outcome.is_ok() {
-            IsolationKind::Success
-        } else {
-            IsolationKind::Error
-        };
-        finalize_isolation(app, root, entry, &child_id, kind).await;
+    let child_branch: Option<String> = None;
+    if let Some(root) = ws_root.as_ref() {
+        if root.join(".git").exists() {
+            if let Ok(after) = crate::commands::worktree::dirty_paths(root).await {
+                let delta: Vec<String> = after
+                    .into_iter()
+                    .filter(|p| !dirty_before.contains(p))
+                    .collect();
+                if !delta.is_empty() {
+                    diff_stat = Some(delta.join("\n"));
+                }
+            }
+        }
     }
 
     // MAJ DB + event terminal + handoff.

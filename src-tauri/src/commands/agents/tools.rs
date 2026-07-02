@@ -625,13 +625,15 @@ fn agent_tools() -> &'static [ToolDef] {
             ToolDef {
                 name: "delegate",
                 description: "Délègue une sous-tâche AUTONOME à un sous-agent à contexte ISOLÉ \
-                    (fenêtre vierge, son propre worktree git). Sert à GARDER TON contexte propre : \
-                    décharge une exploration profonde, une édition risquée, ou un cycle build/test. \
-                    Le sous-agent va au bout et tu reçois un HANDOFF VÉRIFIÉ — les fichiers \
-                    réellement changés (diff git --stat) + le nombre d'itérations — PAS seulement \
-                    une affirmation en prose. La sous-tâche doit être descriptible SANS ton \
-                    contexte actuel (le sous-agent ne voit pas cette conversation : inclus chaque \
-                    chemin de fichier, exigence et critère d'acceptation dont il a besoin).",
+                    (fenêtre vierge — il travaille DIRECTEMENT sur le même projet que toi, \
+                    fichiers non commités inclus). Sert à GARDER TON contexte propre : décharge \
+                    une exploration profonde, une édition risquée, ou un cycle build/test. \
+                    Le sous-agent va au bout et tu reçois un HANDOFF VÉRIFIÉ — les chemins \
+                    réellement touchés pendant son run (delta git status) + le nombre \
+                    d'itérations — PAS seulement une affirmation en prose. La sous-tâche doit \
+                    être descriptible SANS ton contexte actuel (le sous-agent ne voit pas cette \
+                    conversation : inclus chaque chemin de fichier, exigence et critère \
+                    d'acceptation dont il a besoin).",
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
