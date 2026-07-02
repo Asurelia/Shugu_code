@@ -42,6 +42,19 @@ cmd /c "\"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\B
 - **Rust** unit tests run via `cargo test` (through the VS Developer env on Windows — see above).
 - Verification gates before merge: `pnpm typecheck` + `pnpm test` + `cargo check`/`cargo test`.
 
+## Vérification visuelle sans Tauri — `pnpm ui:tour`
+
+Le binaire Tauri ne tourne pas dans les sessions cloud (Claude/Codex web), mais
+**la couche web se vérifie en vrai navigateur** : `pnpm build` puis
+`pnpm ui:tour` (scripts/ui-tour.mjs) sert `dist/` via vite preview, déroule le
+shell headless (skip onboarding → chat → notifications → éditeur → git →
+agents → settings), vérifie la présence des éléments structurels (rail,
+statusbar, cloche…) et dépose des captures dans `dev-logs/ui-tour/`. Les
+erreurs « Tauri absent » (invoke, transformCallback) sont attendues et
+n'échouent pas le tour. Chromium : registre Playwright du projet si installé,
+sinon `$CHROMIUM`, sinon `/opt/pw-browsers/chromium` (conteneurs Claude).
+Utilise ce tour pour valider toute modification de chrome/UI avant de pousser.
+
 ## Tauri-only — there is NO web fallback
 
 This is the single most important architectural fact, and it changed: **the app ships as a Tauri
