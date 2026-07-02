@@ -24,6 +24,10 @@ REM   tauri-dev-log.cmd          runs `pnpm tauri dev`, logged
 REM   tauri-dev-log.cmd build    runs `pnpm tauri build`, logged
 REM   tauri-dev-log.cmd info     runs `pnpm tauri info`, logged
 
+REM ─── Toujours s'exécuter depuis le dossier du script (cf. tauri-dev.cmd) ──
+cd /d "%~dp0"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Write-Host ('[tauri-dev-log.cmd] Dossier : ' + (Get-Location)); Write-Host ('[tauri-dev-log.cmd] Code    : ' + (git rev-parse --abbrev-ref HEAD) + ' @ ' + (git log -1 --format='%%h %%s'))"
+
 set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
 
 if not exist "%VCVARS%" (
@@ -52,6 +56,12 @@ if not exist "dev-logs" mkdir "dev-logs"
 set "TAURI_SUBCMD=dev"
 if not "%~1"=="" set "TAURI_SUBCMD=%*"
 
+REM Pré-balayage du port 1420 — même rationale que tauri-dev.cmd : un vite
+REM orphelin d'une session précédente peut capter la fenêtre Tauri et servir
+REM du vieux code.
+echo [tauri-dev-log.cmd] Pre-sweep du port 1420...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$h = Get-NetTCPConnection -LocalPort 1420 -State Listen -ErrorAction SilentlyContinue; if ($h) { foreach ($c in $h) { $p = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue; if ($p) { Write-Host ('  killing ' + $p.Name + ' PID ' + $p.Id + ' (+ children)'); & taskkill /PID $p.Id /T /F | Out-Null } } } else { Write-Host '  port 1420 clean' }"
+
 echo [tauri-dev-log.cmd] MSVC env loaded. Starting Tauri (subcmd: %TAURI_SUBCMD%) with logging...
 echo.
 
@@ -69,11 +79,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
 set "TAURI_EXIT=%errorlevel%"
 
 REM Orphan cleanup — same rationale as tauri-dev.cmd: `pnpm tauri dev` leaks
-REM the vite node process holding port 5173 on shutdown. Kill ONLY that tree
-REM (not all node.exe — the user may run vault/MCP node services). PowerShell,
-REM not `for /f`, to avoid spawning a sub-cmd.exe.
-echo [tauri-dev-log.cmd] Sweeping port 5173 for orphaned vite...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$h = Get-NetTCPConnection -LocalPort 5173 -State Listen -ErrorAction SilentlyContinue; if ($h) { foreach ($c in $h) { $p = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue; if ($p) { Write-Host ('  killing ' + $p.Name + ' PID ' + $p.Id + ' (+ children)'); & taskkill /PID $p.Id /T /F | Out-Null } } } else { Write-Host '  port 5173 clean' }"
+REM the vite node process on shutdown. Kill ONLY that tree (not all node.exe —
+REM the user may run vault/MCP node services). PowerShell, not `for /f`, to
+REM avoid spawning a sub-cmd.exe.
+REM FIX : le port vite de Shugu est 1420 (vite.config.ts, strictPort) — ce
+REM script balayait 5173, c'est-à-dire… le port du projet taptapshugu, qu'il
+REM risquait de tuer, tout en laissant vivre le vrai orphelin sur 1420.
+echo [tauri-dev-log.cmd] Sweeping port 1420 for orphaned vite...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$h = Get-NetTCPConnection -LocalPort 1420 -State Listen -ErrorAction SilentlyContinue; if ($h) { foreach ($c in $h) { $p = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue; if ($p) { Write-Host ('  killing ' + $p.Name + ' PID ' + $p.Id + ' (+ children)'); & taskkill /PID $p.Id /T /F | Out-Null } } } else { Write-Host '  port 1420 clean' }"
 
 echo.
 echo [tauri-dev-log.cmd] Done (exit code %TAURI_EXIT%).
