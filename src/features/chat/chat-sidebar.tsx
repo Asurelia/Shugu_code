@@ -348,7 +348,6 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
     <aside className="side chat-side">
       <div className="side-head">
         <div className="side-title">Conversations</div>
-        <button className="side-new" title="New conversation" onClick={newConvo}><Icon name="plus" size={11}/></button>
         <button
           className={"side-filter-btn" + (searchOpen ? " on" : "")}
           onClick={() => { setSearchOpen(o => !o); setTimeout(() => searchInputRef.current?.focus(), 60); }}
@@ -405,6 +404,13 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
 
       {filtersOpen && <FiltersPanel filters={filters} setFilters={setFilters} groups={groups} onClose={() => setFiltersOpen(false)}/>}
 
+      {/* Action primaire de la vue, en pleine largeur (pattern Codex/Claude
+          Desktop « New chat ») — remplace le micro-« + » du header, trop
+          discret pour LE geste le plus fréquent. */}
+      <button className="chat-new-cta" onClick={newConvo}>
+        <Icon name="plus" size={12}/> Nouvelle conversation
+      </button>
+
       <div className="side-list scroll">
         {groupsForRender.map((g: any) => {
           const isCustom = !g.pinnedSection && g.id !== "ungrouped" && groups.some((gg: any) => gg.id === g.id);
@@ -449,8 +455,11 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
                 </div>
               )
             )}
-            {g.items.length === 0 && (
-              <div className="chat-group-empty">Drop a conversation here</div>
+            {/* Zone de drop visible SEULEMENT pendant un drag — affichée en
+                permanence, elle encombrait la sidebar de placeholders
+                (3 groupes vides = 3 « Drop a conversation here »). */}
+            {g.items.length === 0 && draggingId && (
+              <div className="chat-group-empty">Déposer la conversation ici</div>
             )}
             {g.items.map((c: any) => (
               <ChatRow

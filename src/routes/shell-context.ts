@@ -119,6 +119,12 @@ export interface ShellContextValue {
   // no disk read. Matches the editorPrefs / findPanelOpen pattern.
   compareFile: { left: string; right: string } | null;
   setCompareFile: Dispatch<SetStateAction<{ left: string; right: string } | null>>;
+
+  // ─── Lot ergonomie composer ──────────────────────────────────────────
+  // Ouvre le picker « projets récents » (RecentWorkspacesPalette, montée
+  // dans RootLayout). Exposé ici pour que le chip workspace du composer
+  // soit un vrai contrôle (changer de projet) et non un pseudo-bouton.
+  openRecentPicker: () => void;
 }
 
 // ─── Context ──────────────────────────────────────────────────
@@ -172,5 +178,7 @@ export function createDetachedShell(openInMain: (path: string) => void): ShellCo
       const next = typeof v === "function" ? null : v;
       if (next) void openFile(next.right).catch(() => {});
     },
+    // Pas de RecentWorkspacesPalette dans la fenêtre mascotte — no-op.
+    openRecentPicker: noop,
   };
 }

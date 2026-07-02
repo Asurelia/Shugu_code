@@ -13,6 +13,10 @@ import { useDirChildren } from "@/features/fs/queries";
 import { FileTypeIcon } from "@/components/fileIcons";
 // Mini-chibi mood-sync dans le Rail (S1a) — remplace l'avatar générique « SH ».
 import { RailChibi } from "@/features/mascot/RailChibi";
+// Clic droit « Ajouter au chat (@source) » — file d'attente consommée par le
+// composer du ChatView (insertion d'une @-mention).
+import { requestChatMention } from "@/features/chat/chatMentionStore";
+import { pushToast } from "@/components/toast";
 
 // ── Icons (24x24 stroke) ────────────────────────────────────
 export function Icon({ name, size = 18, className = "" }: { name: string; size?: number; className?: string }) {
@@ -65,6 +69,7 @@ export function Icon({ name, size = 18, className = "" }: { name: string; size?:
     case "chevron-left":  return p(<><path d="m15 18-6-6 6-6"/></>);
     case "chevron-right": return p(<><path d="m9 18 6-6-6-6"/></>);
     case "list":   return p(<><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></>);
+    case "plug":   return p(<><path d="M12 22v-4"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M6 8h12v4a6 6 0 0 1-12 0V8Z"/></>);
     default: return p(<circle cx="12" cy="12" r="6"/>);
   }
 }
@@ -129,7 +134,7 @@ async function windowToggleMaximize(): Promise<void> {
   }
 }
 
-export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettings, sideCollapsed, onToggleSide, menu }: any) {
+export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettings, sideCollapsed, onToggleSide, menu, onHistory, onBell, bellCount = 0 }: any) {
   return (
     <div className="titlebar">
       <div className="traffic">
@@ -167,10 +172,18 @@ export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettin
           its toggle button here so it sits with History/Bell, mirroring the left
           side-panel toggle. display:contents — same trick as tb-ctx-slot. */}
       <span id="tb-right-panel-slot" className="tb-ctx-slot" />
-      {/* TODO(Pass 2): wire to command */}
-      <button className="tb-action" title="History"><Icon name="history" size={15}/></button>
-      {/* TODO(Pass 2): wire to command */}
-      <button className="tb-action" title="Notifications"><Icon name="bell" size={15}/></button>
+      {/* Projets récents — le même picker que la commande « Open Recent
+          Folder… » de la palette. L'icône horloge = « reprendre où j'en
+          étais », geste central dans Codex/Cursor. */}
+      <button className="tb-action" title="Projets récents" aria-label="Projets récents" onClick={onHistory}>
+        <Icon name="history" size={15}/>
+      </button>
+      {/* Cloche — ouvre le centre de notifications (journal des toasts).
+          Badge = notifications non lues. */}
+      <button className="tb-action tb-bell" title="Notifications" aria-label={bellCount > 0 ? `Notifications — ${bellCount} non lue(s)` : "Notifications"} onClick={onBell}>
+        <Icon name="bell" size={15}/>
+        {bellCount > 0 && <span className="tb-badge">{bellCount > 99 ? "99+" : bellCount}</span>}
+      </button>
       {/* Compte — le popover .account-pop s'ancre en haut-droite (top:48px right:12px),
           sous la titlebar : son déclencheur vit donc ICI. L'avatar « SH » du Rail est
           devenu la mini-chibi (→ Profil de Shugu), on ne perd donc aucun accès. */}
@@ -180,39 +193,89 @@ export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettin
 }
 
 // ── Activity Rail ───────────────────────────────────────────
-export function Rail({ view, setView, onProfile }: any) {
-  const items = [
-    { id: "chat",    icon: "chat",    label: "Chat" },
-    { id: "code",    icon: "code",    label: "Editor" },
-    { id: "git",     icon: "git",     label: "Source Control" },
-    { id: "image",   icon: "image",   label: "Image" },
-    { id: "studio",  icon: "palette", label: "Studio" },
-    { id: "agents",  icon: "agent",   label: "Agents" },
-    { id: "gallery", icon: "gallery", label: "Gallery" },
+type RailItem = { id: string; icon: string; label: string; kbd?: string; badge?: number };
+
+// Audit UI/UX 2026-06-21 (phase Navigation) : le rail plat à 8 entrées ne
+// hiérarchisait rien — l'utilisateur ne savait pas quelle surface est
+// principale. Regroupé en Work (le cœur agent-IDE) / Agents (les runs) /
+// Create (périphérie créative), micro-labels affichés dans le rail.
+// `kbd` = raccourci par défaut de la commande view-* correspondante dans
+// src/lib/commands.ts (⌘ = Ctrl sous Windows/Linux, cf. keybindings.ts).
+export function Rail({ view, setView, onProfile, runningAgents = 0 }: any) {
+  const groups: { label: string; items: RailItem[] }[] = [
+    {
+      label: "Work",
+      items: [
+        { id: "chat", icon: "chat", label: "Chat", kbd: "⌘⇧C" },
+        { id: "code", icon: "code", label: "Editor", kbd: "⌘⇧E" },
+        { id: "git",  icon: "git",  label: "Source Control" },
+      ],
+    },
+    {
+      label: "Agents",
+      items: [
+        // Badge = nombre d'agents en cours d'exécution : l'activité de fond
+        // reste visible même depuis une autre vue (pattern Cursor).
+        { id: "agents", icon: "agent", label: "Agents", kbd: "⌘⇧A", badge: runningAgents },
+      ],
+    },
+    {
+      label: "Create",
+      items: [
+        { id: "image",   icon: "image",   label: "Image",   kbd: "⌘⇧I" },
+        { id: "studio",  icon: "palette", label: "Studio" },
+        { id: "gallery", icon: "gallery", label: "Gallery", kbd: "⌘⇧G" },
+      ],
+    },
   ];
+
+  const renderBtn = (it: RailItem) => (
+    <button
+      key={it.id}
+      className={"rail-btn" + (view === it.id ? " active" : "")}
+      onClick={() => setView(it.id)}
+      aria-label={it.badge ? `${it.label} — ${it.badge} en cours` : it.label}
+    >
+      <Icon name={it.icon} size={18}/>
+      {!!it.badge && <span className="rail-badge">{it.badge > 9 ? "9+" : it.badge}</span>}
+      <span className="rail-tip">
+        {it.label}
+        {it.kbd && <span className="rail-tip-kbd">{it.kbd}</span>}
+      </span>
+    </button>
+  );
+
   return (
     <nav className="rail">
-      {items.map((it, i) => (
-        <React.Fragment key={it.id}>
-          {i === 3 && <div className="rail-divider"/>}
-          <button
-            className={"rail-btn" + (view === it.id ? " active" : "")}
-            onClick={() => setView(it.id)}
-            aria-label={it.label}
-          >
-            <Icon name={it.icon} size={18}/>
-            <span className="rail-tip">{it.label}</span>
-          </button>
+      {groups.map((g, gi) => (
+        <React.Fragment key={g.label}>
+          {gi > 0 && <div className="rail-divider"/>}
+          <div className="rail-group-label" aria-hidden="true">{g.label}</div>
+          {g.items.map(renderBtn)}
         </React.Fragment>
       ))}
       <div className="rail-bottom">
+        {/* Groupe Configure — accès direct aux Connections (clés API, MCP,
+            providers) : surface de setup centrale pour un IDE agentique,
+            auparavant enfouie dans Settings. */}
+        <button
+          className={"rail-btn" + (view === "connections" ? " active" : "")}
+          onClick={() => setView("connections")}
+          aria-label="Connections"
+        >
+          <Icon name="plug" size={18}/>
+          <span className="rail-tip">Connections</span>
+        </button>
         <button
           className={"rail-btn" + (view === "settings" ? " active" : "")}
           onClick={() => setView("settings")}
           aria-label="Settings"
         >
           <Icon name="gear" size={18}/>
-          <span className="rail-tip">Settings</span>
+          <span className="rail-tip">
+            Settings
+            <span className="rail-tip-kbd">⌘,</span>
+          </span>
         </button>
         <RailChibi onClick={onProfile} />
       </div>
@@ -221,42 +284,8 @@ export function Rail({ view, setView, onProfile }: any) {
 }
 
 // ── Side panel (varies by view) ─────────────────────────────
-export function SideHistory({ items, active, onPick, onNew }: any) {
-  return (
-    <aside className="side">
-      <div className="side-head">
-        <div className="side-title">Conversations</div>
-        <button className="side-new" onClick={onNew}><Icon name="plus" size={11}/> New</button>
-      </div>
-      <div className="side-list scroll">
-        <div className="side-section-label">Today</div>
-        {items.slice(0, 3).map((c: any) => (
-          <button type="button" key={c.id} className={"side-item" + (c.id === active ? " active" : "")} onClick={() => onPick(c.id)} aria-current={c.id === active ? "true" : undefined} aria-label={c.title}>
-            <Icon name="chat" size={13} className="ico"/>
-            <span className="label">{c.title}</span>
-            <span className="meta">{c.time}</span>
-          </button>
-        ))}
-        <div className="side-section-label">Yesterday</div>
-        {items.slice(3, 6).map((c: any) => (
-          <button type="button" key={c.id} className={"side-item" + (c.id === active ? " active" : "")} onClick={() => onPick(c.id)} aria-current={c.id === active ? "true" : undefined} aria-label={c.title}>
-            <Icon name="chat" size={13} className="ico"/>
-            <span className="label">{c.title}</span>
-            <span className="meta">{c.time}</span>
-          </button>
-        ))}
-        <div className="side-section-label">Older</div>
-        {items.slice(6).map((c: any) => (
-          <button type="button" key={c.id} className={"side-item" + (c.id === active ? " active" : "")} onClick={() => onPick(c.id)} aria-current={c.id === active ? "true" : undefined} aria-label={c.title}>
-            <Icon name="chat" size={13} className="ico"/>
-            <span className="label">{c.title}</span>
-            <span className="meta">{c.time}</span>
-          </button>
-        ))}
-      </div>
-    </aside>
-  );
-}
+// (SideHistory — maquette de sidebar chat à faux groupes temporels — supprimé :
+//  jamais importé ; la vraie sidebar est features/chat/chat-sidebar.tsx.)
 
 // ── File tree (controlled expansion + CRUD UX) ─────────────
 //
@@ -267,7 +296,7 @@ export function SideHistory({ items, active, onPick, onNew }: any) {
 // from the parent. We track *collapsed* paths (default = open) so newly
 // arrived folders from a tree refresh feel "open by default" as before.
 
-type FileCtxAction = "newFile" | "newFolder" | "rename" | "delete";
+type FileCtxAction = "newFile" | "newFolder" | "rename" | "delete" | "addToChat";
 
 export function SideFiles({ active, onPick }: any) {
   // LOT 3 git-ui — per-path git status char (no-op outside a git repo).
@@ -313,6 +342,12 @@ export function SideFiles({ active, onPick }: any) {
       setRenaming(node.path);
     } else if (action === "delete") {
       setConfirmDelete(node);
+    } else if (action === "addToChat") {
+      // Insère une @-mention dans le composer chat (flux mentions.ts : le
+      // contenu du fichier est joint au modèle à l'envoi). Si le chat n'est
+      // pas monté, la demande attend la prochaine ouverture du composer.
+      requestChatMention(node.path);
+      pushToast(`@${node.path.split("/").pop()} ajouté comme source du prochain message`, "success", 3500);
     } else if (action === "newFile" || action === "newFolder") {
       const isDir = node.isDir ?? Array.isArray(node.children);
       // New file in a folder = child; new file on a file = sibling.
@@ -737,6 +772,10 @@ function FileCtxMenu({ node, x, y, onClose, onAction }: { node: any; x: number; 
       <button onClick={() => onAction("newFile")}>New File…</button>
       <button onClick={() => onAction("newFolder")}>New Folder…</button>
       <div className="file-ctx-sep" />
+      {/* Fichiers seulement — une @-mention de dossier ne se résout pas. */}
+      {!isDir && (
+        <button onClick={() => onAction("addToChat")}>Ajouter au chat (@source)</button>
+      )}
       <button onClick={() => onAction("rename")}>Rename…</button>
       <button onClick={() => onAction("delete")} className="danger">Delete</button>
       {/* Hint at the bottom so the user knows what they're targeting. */}
@@ -778,7 +817,7 @@ export function SideGallery({ folders, active, onPick }: any) {
     <aside className="side">
       <div className="side-head">
         <div className="side-title">Collections</div>
-        <button className="side-new"><Icon name="plus" size={11}/></button>
+        {/* Le « + » inerte (aucun flux de création de collection) est retiré. */}
       </div>
       <div className="side-list scroll">
         {folders.map((f: any) => (
@@ -794,23 +833,37 @@ export function SideGallery({ folders, active, onPick }: any) {
 }
 
 export function SideAgents({ agents, active, onPick }: any) {
+  const running = agents.filter((a: any) => a.status === "running");
+  const idle = agents.filter((a: any) => a.status !== "running");
   return (
     <aside className="side">
       <div className="side-head">
         <div className="side-title">Workers</div>
-        <button className="side-new"><Icon name="plus" size={11}/> New</button>
+        {/* L'ancien « + New » était inerte — la création d'agent vit dans la
+            page (« + Nouvel agent » d'AgentDefsManager). */}
       </div>
       <div className="side-list scroll">
-        <div className="side-section-label">Running</div>
-        {agents.filter((a: any) => a.status === 'running').map((a: any) => (
+        {/* Sections affichées seulement si peuplées ; à vide, un état
+            pédagogique remplace deux labels RUNNING/IDLE orphelins. */}
+        {agents.length === 0 && (
+          <div className="side-empty">
+            <p>Aucun agent en cours.</p>
+            <p className="muted">
+              Lance une tâche en mode <b>Agent</b> depuis le Chat — les runs
+              et leurs transcripts apparaîtront ici.
+            </p>
+          </div>
+        )}
+        {running.length > 0 && <div className="side-section-label">Running</div>}
+        {running.map((a: any) => (
           <button type="button" key={a.id} className={"side-item" + (a.id === active ? " active" : "")} onClick={() => onPick(a.id)} aria-current={a.id === active ? "true" : undefined} aria-label={a.name}>
             <span className="ico" style={{display:'inline-flex',alignItems:'center',justifyContent:'center',width:14,height:14,fontSize:11}} aria-hidden="true">{a.icon}</span>
             <span className="label">{a.name}</span>
             <span className="meta" style={{color:'var(--tertiary)'}} aria-hidden="true">●</span>
           </button>
         ))}
-        <div className="side-section-label">Idle</div>
-        {agents.filter((a: any) => a.status !== 'running').map((a: any) => (
+        {idle.length > 0 && <div className="side-section-label">Idle</div>}
+        {idle.map((a: any) => (
           <button type="button" key={a.id} className={"side-item" + (a.id === active ? " active" : "")} onClick={() => onPick(a.id)} aria-current={a.id === active ? "true" : undefined} aria-label={a.name}>
             <span className="ico" style={{display:'inline-flex',alignItems:'center',justifyContent:'center',width:14,height:14,fontSize:11}} aria-hidden="true">{a.icon}</span>
             <span className="label">{a.name}</span>

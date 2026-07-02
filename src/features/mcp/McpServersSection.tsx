@@ -13,6 +13,7 @@
 
 import { useState, type ReactNode } from "react";
 import { Icon } from "@/components/components";
+import { ConfirmDialog } from "@/components/trust";
 import {
   useMcpServers,
   useMcpToggle,
@@ -116,6 +117,8 @@ export function McpServersSection() {
   const [testingName, setTestingName] = useState<string | null>(null);
   // Per-server probe results (tools or error).
   const [testResults, setTestResults] = useState<Record<string, TestResult>>({});
+  // Serveur en attente de confirmation de suppression (null = aucun).
+  const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
 
   const onTest = async (name: string) => {
     setTestingName(name);
@@ -138,10 +141,9 @@ export function McpServersSection() {
     }
   };
 
+  // Confirmation destructive via ConfirmDialog (trust) — uniformise avec le
+  // reste de l'app (audit UI/UX : plus de window.confirm disparate).
   const onRemove = async (name: string) => {
-    // Simple confirmation (no modal) — matches the rest of the destructive
-    // actions in Settings and the task spec ("confirmation simple").
-    if (!window.confirm(`Supprimer le serveur MCP « ${name} » de .mcp.json ?`)) return;
     try {
       await remove.mutateAsync(name);
       setTestResults((r) => {
@@ -262,10 +264,24 @@ export function McpServersSection() {
             result={testResults[s.name]}
             onToggle={(enabled) => void onToggle(s, enabled)}
             onTest={() => void onTest(s.name)}
-            onRemove={() => void onRemove(s.name)}
+            onRemove={() => setConfirmRemove(s.name)}
           />
         ))}
       </div>
+
+      <ConfirmDialog
+        open={confirmRemove !== null}
+        title="Supprimer ce serveur MCP ?"
+        body={<>Le serveur <b>{confirmRemove}</b> sera retiré de <code>.mcp.json</code>. Ses outils ne seront plus proposés au chat ni aux agents.</>}
+        confirmLabel="Supprimer"
+        tone="danger"
+        onCancel={() => setConfirmRemove(null)}
+        onConfirm={() => {
+          const name = confirmRemove;
+          setConfirmRemove(null);
+          if (name) void onRemove(name);
+        }}
+      />
 
       {/* Inventaire multi-source : ce que les autres outils (Claude Desktop,
           Codex, OpenCode) ont déjà configuré, importable en un clic. */}
