@@ -813,6 +813,10 @@ pub fn run() {
             commands::vector::vec_index_file,
             commands::vector::semantic_search,
             commands::vector::vec_remove_file,
+            // Boot-time diff — reconcile the existing index instead of re-embedding
+            // the whole workspace at every start, then GC untracked chunks.
+            commands::vector::vec_stale_paths,
+            commands::vector::vec_code_gc,
             commands::model_bundle::model_bundle_catalog,
             commands::model_bundle::model_bundle_status,
             commands::model_bundle::model_bundle_download,

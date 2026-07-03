@@ -626,10 +626,11 @@ export function RootLayout() {
   useEffect(() => {
     const t = setTimeout(() => { void indexWorkspace(); }, 5000);
     // Ré-index quand l'utilisateur OUVRE UN AUTRE dossier sans relancer l'app
-    // (Rust émet `workspace://changed` depuis fs_open_folder). Le hash de la
-    // liste de fichiers change → nouveau stamp TTL → vraie ré-indexation ;
-    // sur le même workspace, le TTL 24 h + le guard in-flight rendent l'appel
-    // no-op. Petit délai pour laisser le file tree se recharger d'abord.
+    // (Rust émet `workspace://changed` depuis fs_open_folder). L'indexeur est
+    // DIFFÉRENTIEL (vec_stale_paths : mtime vs indexed_at) : seuls les fichiers
+    // nouveaux/modifiés sont ré-embeddés, le reste de l'index est réutilisé —
+    // l'appel est donc quasi gratuit quand rien n'a changé. Petit délai pour
+    // laisser le file tree se recharger d'abord.
     let unlisten: (() => void) | null = null;
     void (async () => {
       try {

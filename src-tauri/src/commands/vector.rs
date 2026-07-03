@@ -647,10 +647,13 @@ fn now_ms() -> i64 {
 
 /// (Re)index a single workspace-relative file into `vec_code`.
 ///
-/// Returns the number of chunks indexed (0 for a no-op: missing/binary/too-large
-/// file, or an ineligible/empty one — these are NORMAL outcomes, not errors, so
-/// the watcher loop doesn't log-spam on every deleted or binary file). Only a
-/// genuine failure (embedding model not ready, DB error) returns `Err`.
+/// Returns the number of chunks indexed. Zero is a NORMAL outcome, not an
+/// error, with two distinct shapes: a file that cannot be READ (missing,
+/// binary, too large for the reader) leaves its prior index untouched, while a
+/// file that reads fine but is INELIGIBLE (emptied, blank, past
+/// MAX_FILE_BYTES) gets its prior chunks purged and an empty tracking row
+/// stamped — so stale hits die and the boot diff sees it fresh. Only a genuine
+/// failure (embedding model not ready, DB error) returns `Err`.
 ///
 /// Stale-purge correctness: vec0 exposes no DELETE-by-range, so we read the file's
 /// PRIOR chunk ids from `vec_code_files`, delete each by EXACT id from `vec_code`,
@@ -673,14 +676,20 @@ pub(crate) fn index_file_internal(
         Err(_) => return Ok(0),
     };
 
-    if !is_code_eligible(rel, &text) {
-        return Ok(0);
-    }
-
-    let chunks = chunk_source(&text);
-    if chunks.is_empty() {
-        return Ok(0);
-    }
+    // A file that READS fine but is (or became) ineligible — emptied, grew past
+    // MAX_FILE_BYTES, blank — flows through with ZERO chunks instead of
+    // early-returning: the transaction below then purges its prior chunks and
+    // records an EMPTY tracking row with a fresh `indexed_at`. Early-returning
+    // here (the old behaviour) left a shrunk/emptied file's stale chunks
+    // searchable forever AND its `indexed_at` frozen, so the boot diff
+    // re-listed it stale at every start. Only a failed READ keeps the prior
+    // index untouched (could be a transient lock; Remove events go through
+    // `delete_file_index_internal`).
+    let chunks = if is_code_eligible(rel, &text) {
+        chunk_source(&text)
+    } else {
+        Vec::new()
+    };
 
     // Embed every chunk OUTSIDE the conn lock. A single embed failure (model not
     // ready) aborts the whole file with Err so the caller can log-once-and-skip;
@@ -1100,6 +1109,189 @@ pub fn vec_remove_file(
     // clean "no workspace open" rather than silently no-op'ing when none is set.
     let _root = lock_workspace_root(&root_state)?;
     delete_file_index_internal(&app, &path)
+}
+
+// ---------------------------------------------------------------------------
+// Boot-time diff — reuse the existing index instead of re-embedding everything
+//
+// `vec_code_files.indexed_at` records WHEN each file was last (re)indexed. At
+// boot the walker compares each candidate file's mtime against that stamp and
+// only re-embeds the files that actually changed while the app was closed —
+// the watcher (`index_file_internal`) keeps the index current DURING a session,
+// so the boot pass is a pure reconciliation, not a rebuild.
+// ---------------------------------------------------------------------------
+
+/// The boot-reconcile verdict for a workspace file listing.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StaleReport {
+    /// Files that must be (re)indexed: never tracked, or modified since their
+    /// `indexed_at` stamp (mtime unreadable counts as stale — the reindex
+    /// no-ops safely on a genuinely unreadable file).
+    pub stale: Vec<String>,
+    /// Tracked files that no longer exist in the candidate listing — their
+    /// chunks must be removed. Always empty when the listing was TRUNCATED
+    /// (a capped listing proves nothing about absence).
+    pub deleted: Vec<String>,
+    /// Files whose index is up to date and is reused as-is.
+    pub fresh: usize,
+}
+
+/// Pure partition logic behind `vec_stale_paths` — separated from the command
+/// so the decision table (untracked/modified/fresh/deleted/truncated) is unit-
+/// testable without an AppHandle or a real filesystem.
+///
+/// DELIBERATE: `vec_code` is ONE global collection keyed by workspace-relative
+/// path, without a workspace id. Opening workspace B therefore reports every
+/// path of workspace A as `deleted` → A's chunks are purged, and switching
+/// back to A re-embeds it from scratch. This is the chosen trade-off: search
+/// results can never mix hits from another workspace (which the pre-diff
+/// full-walk allowed), at the cost of a full re-index on each workspace
+/// switch. Scoping the index per-workspace (path prefix or side column) is the
+/// follow-up if that cost ever matters.
+fn partition_stale(
+    candidates: &[String],
+    tracked: &std::collections::HashMap<String, i64>,
+    mtime_ms_of: impl Fn(&str) -> Option<i64>,
+    truncated: bool,
+) -> StaleReport {
+    let mut stale: Vec<String> = Vec::new();
+    let mut fresh = 0usize;
+    for rel in candidates {
+        match tracked.get(rel) {
+            None => stale.push(rel.clone()),
+            Some(&indexed_at) => match mtime_ms_of(rel) {
+                // Unreadable mtime → treat as stale: `index_file_internal`
+                // no-ops (Ok(0)) if the file is truly gone/unreadable, so this
+                // can never corrupt the index — it only errs towards freshness.
+                None => stale.push(rel.clone()),
+                Some(mtime) if mtime > indexed_at => stale.push(rel.clone()),
+                Some(_) => fresh += 1,
+            },
+        }
+    }
+    let deleted = if truncated {
+        // The candidate list was cut by the MAX_INDEX_FILES budget: a tracked
+        // path missing from it may simply have been dropped by the cap, NOT
+        // deleted from disk. Deleting on that evidence would purge live files'
+        // chunks — skip deletion detection entirely on truncated listings.
+        Vec::new()
+    } else {
+        let present: std::collections::HashSet<&str> =
+            candidates.iter().map(String::as_str).collect();
+        tracked
+            .keys()
+            .filter(|p| !present.contains(p.as_str()))
+            .cloned()
+            .collect()
+    };
+    StaleReport { stale, deleted, fresh }
+}
+
+/// mtime of `root/rel` in ms since epoch, or `None` when unreadable.
+fn file_mtime_ms(root: &Path, rel: &str) -> Option<i64> {
+    let modified = std::fs::metadata(root.join(rel)).ok()?.modified().ok()?;
+    modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as i64)
+}
+
+/// Given the workspace file listing (`paths` from `fs_list_files`, plus its
+/// `truncated` flag), return which files need (re)indexing, which tracked files
+/// disappeared, and how many are fresh (index reused). The connection lock is
+/// held only for the single `vec_code_files` read — the per-file `stat` loop
+/// (thousands of syscalls on a big repo) runs unlocked.
+#[tauri::command(async)]
+pub fn vec_stale_paths(
+    app: tauri::AppHandle,
+    root_state: tauri::State<'_, Mutex<Option<std::path::PathBuf>>>,
+    paths: Vec<String>,
+    truncated: bool,
+) -> Result<StaleReport, String> {
+    let root = lock_workspace_root(&root_state)?;
+    let tracked: std::collections::HashMap<String, i64> = {
+        let guard = get_conn(&app)?.lock().map_err(|e| format!("lock: {e}"))?;
+        let mut stmt = guard
+            .prepare("SELECT path, indexed_at FROM vec_code_files")
+            .map_err(|e| format!("vec_stale_paths prepare: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(|e| format!("vec_stale_paths query: {e}"))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("vec_stale_paths row: {e}"))?;
+        rows
+    };
+    Ok(partition_stale(
+        &paths,
+        &tracked,
+        |rel| file_mtime_ms(&root, rel),
+        truncated,
+    ))
+}
+
+/// Delete every `vec_code` chunk whose id is NOT tracked by any
+/// `vec_code_files` row, in one IMMEDIATE transaction. Returns the number of
+/// orphans purged.
+///
+/// Orphans come from the pre-diff era (the old TS full-walk upserted chunks
+/// without recording them in the side table, so a changed file's old-range ids
+/// were never deleted) and from any tracked file whose reindex crashed between
+/// eras. Run AFTER a reconcile pass, when every live file has a side-table row
+/// — anything untracked at that point is garbage by construction.
+pub(crate) fn gc_untracked_chunks(conn: &mut Connection) -> Result<usize, String> {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("vec_code_gc begin: {e}"))?;
+
+    let tracked: std::collections::HashSet<String> = {
+        let mut stmt = tx
+            .prepare("SELECT chunk_ids FROM vec_code_files")
+            .map_err(|e| format!("vec_code_gc prepare side: {e}"))?;
+        let lists = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("vec_code_gc query side: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("vec_code_gc row side: {e}"))?;
+        let mut set = std::collections::HashSet::new();
+        for json in lists {
+            let ids: Vec<String> =
+                serde_json::from_str(&json).map_err(|e| format!("parse chunk ids: {e}"))?;
+            set.extend(ids);
+        }
+        set
+    };
+
+    let all_ids: Vec<String> = {
+        let mut stmt = tx
+            .prepare("SELECT id FROM vec_code")
+            .map_err(|e| format!("vec_code_gc prepare scan: {e}"))?;
+        let ids = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("vec_code_gc query scan: {e}"))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("vec_code_gc row scan: {e}"))?;
+        ids
+    };
+
+    let mut purged = 0usize;
+    for id in &all_ids {
+        if !tracked.contains(id) {
+            tx.execute("DELETE FROM vec_code WHERE id = ?1", params![id])
+                .map_err(|e| format!("vec_code_gc delete: {e}"))?;
+            purged += 1;
+        }
+    }
+    tx.commit().map_err(|e| format!("vec_code_gc commit: {e}"))?;
+    Ok(purged)
+}
+
+/// Frontend-facing GC — purge untracked `vec_code` chunks. Cheap when there is
+/// nothing to purge (one scan); called once per boot after the reconcile pass.
+#[tauri::command(async)]
+pub fn vec_code_gc(app: tauri::AppHandle) -> Result<usize, String> {
+    let mut guard = get_conn(&app)?.lock().map_err(|e| format!("lock: {e}"))?;
+    gc_untracked_chunks(&mut guard)
 }
 
 /// Standalone semantic search over the indexed `code` collection — the command
@@ -1859,6 +2051,146 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM vec_code_files WHERE path = ?1", params![rel], |r| r.get(0))
             .unwrap();
         assert_eq!(side_count, 0, "side-table row dropped");
+
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // Boot-time diff — partition_stale decision table + orphan-chunk GC.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn partition_stale_decision_table() {
+        use std::collections::HashMap;
+        let tracked: HashMap<String, i64> = [
+            ("src/fresh.ts".to_string(), 1_000i64),
+            ("src/modified.ts".to_string(), 1_000i64),
+            ("src/unstattable.ts".to_string(), 1_000i64),
+            ("src/gone.ts".to_string(), 1_000i64),
+        ]
+        .into_iter()
+        .collect();
+        let candidates: Vec<String> = vec![
+            "src/fresh.ts".into(),       // mtime < indexed_at → fresh
+            "src/modified.ts".into(),    // mtime > indexed_at → stale
+            "src/unstattable.ts".into(), // no mtime → stale (errs towards freshness)
+            "src/new.ts".into(),         // untracked → stale
+            // "src/gone.ts" absent → deleted
+        ];
+        let mtimes = |rel: &str| -> Option<i64> {
+            match rel {
+                "src/fresh.ts" => Some(500),
+                "src/modified.ts" => Some(2_000),
+                "src/unstattable.ts" => None,
+                "src/new.ts" => Some(3_000),
+                _ => None,
+            }
+        };
+
+        let r = partition_stale(&candidates, &tracked, mtimes, false);
+        assert_eq!(r.fresh, 1);
+        assert_eq!(
+            {
+                let mut s = r.stale.clone();
+                s.sort();
+                s
+            },
+            vec![
+                "src/modified.ts".to_string(),
+                "src/new.ts".to_string(),
+                "src/unstattable.ts".to_string(),
+            ]
+        );
+        assert_eq!(r.deleted, vec!["src/gone.ts".to_string()]);
+
+        // mtime EXACTLY equal to indexed_at is fresh (strict >): the stamp is
+        // written AFTER the read, so an equal mtime means the indexed content
+        // is at least as new as the file.
+        let eq = partition_stale(
+            &["src/fresh.ts".to_string()],
+            &tracked,
+            |_| Some(1_000),
+            false,
+        );
+        assert_eq!(eq.fresh, 1);
+        assert!(eq.stale.is_empty());
+    }
+
+    #[test]
+    fn partition_stale_truncated_listing_never_deletes() {
+        use std::collections::HashMap;
+        let tracked: HashMap<String, i64> =
+            [("src/kept-by-cap-cut.ts".to_string(), 1_000i64)].into_iter().collect();
+        // The tracked file is missing from the candidates because the listing
+        // was CAPPED — with truncated=true it must NOT be reported as deleted.
+        let r = partition_stale(&["src/other.ts".to_string()], &tracked, |_| Some(1), true);
+        assert!(r.deleted.is_empty(), "truncated listing proves nothing about absence");
+        let r2 = partition_stale(&["src/other.ts".to_string()], &tracked, |_| Some(1), false);
+        assert_eq!(r2.deleted, vec!["src/kept-by-cap-cut.ts".to_string()]);
+    }
+
+    #[test]
+    fn gc_purges_only_untracked_chunks() {
+        let db = temp_db("gc_orphans");
+        let (mut conn, _) = open_configured(&db);
+        create_code_schema(&conn);
+
+        // Two tracked files with their current chunk ids…
+        let a = vec![chunk_id("src/a.ts", 1, 6), chunk_id("src/a.ts", 7, 12)];
+        let b = vec![chunk_id("src/b.ts", 1, 9)];
+        reindex_pair(&mut conn, "src/a.ts", &a, false).unwrap();
+        reindex_pair(&mut conn, "src/b.ts", &b, false).unwrap();
+        // …plus two ORPHAN chunks straight into vec_code (the pre-diff-era TS
+        // full-walk shape: upserted without any side-table row).
+        for orphan in [chunk_id("src/a.ts", 1, 40), chunk_id("src/deleted.ts", 1, 8)] {
+            conn.execute(
+                "INSERT OR REPLACE INTO vec_code(id, embedding) VALUES (?1, ?2)",
+                params![orphan, vec![0u8, 1, 2, 3]],
+            )
+            .unwrap();
+        }
+        assert_eq!(code_ids(&conn).len(), 5);
+
+        let purged = gc_untracked_chunks(&mut conn).unwrap();
+        assert_eq!(purged, 2, "exactly the two orphans purged");
+        let remaining = code_ids(&conn);
+        assert_eq!(remaining.len(), 3);
+        for id in a.iter().chain(b.iter()) {
+            assert!(remaining.contains(id), "tracked chunk {id} must survive GC");
+        }
+
+        // Idempotent: a second GC finds nothing.
+        assert_eq!(gc_untracked_chunks(&mut conn).unwrap(), 0);
+
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    #[test]
+    fn reindex_with_zero_chunks_purges_and_stamps_empty_row() {
+        let db = temp_db("empty_reindex");
+        let (mut conn, _) = open_configured(&db);
+        create_code_schema(&conn);
+
+        let rel = "src/emptied.ts";
+        let v1 = vec![chunk_id(rel, 1, 6), chunk_id(rel, 7, 12)];
+        reindex_pair(&mut conn, rel, &v1, false).unwrap();
+        assert_eq!(code_ids(&conn).len(), 2);
+
+        // The file was emptied / became ineligible → `index_file_internal`
+        // flows through the same transaction with ZERO chunks: priors purged,
+        // tracking row upserted with an empty list (fresh `indexed_at`), so
+        // stale hits die AND the boot diff stops re-listing the file forever.
+        let none: Vec<String> = Vec::new();
+        reindex_pair(&mut conn, rel, &none, false).unwrap();
+        assert!(code_ids(&conn).is_empty(), "prior chunks purged");
+        let stored: String = conn
+            .query_row(
+                "SELECT chunk_ids FROM vec_code_files WHERE path = ?1",
+                params![rel],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "[]", "empty tracking row recorded");
 
         let _ = std::fs::remove_dir_all(db.parent().unwrap());
     }

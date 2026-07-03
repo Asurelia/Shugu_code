@@ -119,3 +119,39 @@ export async function vecRemoveFile(path: string): Promise<void> {
 export async function semanticSearch(query: string, k = 8): Promise<VecHit[]> {
   return invoke<VecHit[]>("semantic_search", { query, k });
 }
+
+// ---------------------------------------------------------------------------
+// Boot-time diff — reuse the existing index instead of re-embedding everything.
+// ---------------------------------------------------------------------------
+
+/** Verdict of {@link vecStalePaths} over a workspace file listing. */
+export interface StaleReport {
+  /** Files needing (re)indexing: never tracked, or modified since indexed. */
+  stale: string[];
+  /** Tracked files gone from the listing (empty when it was truncated). */
+  deleted: string[];
+  /** Files whose existing index is reused as-is. */
+  fresh: number;
+}
+
+/**
+ * Compare the workspace file listing against the `vec_code_files` tracking
+ * table (file mtime vs `indexed_at`) and return only what actually needs work.
+ * Pass the `truncated` flag from {@link fsListFiles} verbatim — a capped
+ * listing disables deletion detection Rust-side (absence proves nothing).
+ */
+export async function vecStalePaths(
+  paths: string[],
+  truncated: boolean,
+): Promise<StaleReport> {
+  return invoke<StaleReport>("vec_stale_paths", { paths, truncated });
+}
+
+/**
+ * Purge every `code` chunk not tracked by any `vec_code_files` row (orphans
+ * from the pre-diff full-walk era, or from deleted files). Returns the number
+ * of chunks removed. Cheap when there is nothing to purge.
+ */
+export async function vecCodeGc(): Promise<number> {
+  return invoke<number>("vec_code_gc");
+}
