@@ -625,9 +625,9 @@ export function RootLayout() {
 
   // Garde-fou anti-Codex : si shugu.db dépasse le seuil Rust (300 Mo), un
   // toast long au boot pointe vers Réglages → Stockage. Un seul check, deux
-  // stats de fichier — la maintenance Rust (purge + VACUUM) tourne déjà en
-  // fond au setup ; on lui laisse 12 s pour que le toast ne crie pas au loup
-  // sur une base que le VACUUM en cours est en train de dégonfler.
+  // stats de fichier — la maintenance Rust (purge par lots + VACUUM) tourne en
+  // fond au setup après un délai de 10 s ; on attend 45 s pour ne pas crier au
+  // loup sur une base que la maintenance est justement en train de dégonfler.
   useEffect(() => {
     const t = setTimeout(() => {
       void (async () => {
@@ -646,7 +646,7 @@ export function RootLayout() {
           /* best-effort : jamais bloquant au boot */
         }
       })();
-    }, 12_000);
+    }, 45_000);
     return () => clearTimeout(t);
   }, []);
 

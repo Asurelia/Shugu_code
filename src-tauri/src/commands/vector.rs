@@ -1311,55 +1311,92 @@ pub fn vec_code_gc(app: tauri::AppHandle) -> Result<usize, String> {
 /// Helper PUR (testable sans DB) ; DOIT rester aligné sur le filtre du walk
 /// (`fs::is_index_ignored`) — même définition, sinon la purge supprime ce que
 /// le walk ré-insère (ou l'inverse).
+///
+/// Le suffixe de chunk est retiré SEULEMENT s'il a la forme exacte
+/// `#L<digits>-<digits>` en QUEUE d'id : `#` est un caractère légal dans un
+/// nom de fichier (`dist#v2/x.ts`), couper au premier `#` tronquerait le
+/// chemin en `dist` → purge à chaque boot d'un fichier que le walk ré-indexe
+/// aussitôt (churn permanent, revue fa27ff6).
 fn id_is_ignored(id: &str) -> bool {
-    let path = id.split('#').next().unwrap_or(id);
+    let path = match id.rsplit_once('#') {
+        Some((head, suffix)) if is_chunk_line_suffix(suffix) => head,
+        _ => id,
+    };
     path.split(['/', '\\'])
         .any(|seg| !seg.is_empty() && crate::commands::fs::is_index_ignored(seg))
 }
+
+/// `true` ssi `suffix` a la forme `L<digits>-<digits>` (le suffixe produit par
+/// `chunk_id`).
+fn is_chunk_line_suffix(suffix: &str) -> bool {
+    let Some(rest) = suffix.strip_prefix('L') else {
+        return false;
+    };
+    match rest.split_once('-') {
+        Some((a, b)) => {
+            !a.is_empty()
+                && !b.is_empty()
+                && a.bytes().all(|c| c.is_ascii_digit())
+                && b.bytes().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// Taille des lots de DELETE de la purge. Une transaction IMMEDIATE unique
+/// sur ~113k lignes vec0 tiendrait le verrou d'écriture ~19 s mesurées (revue
+/// fa27ff6 : benchmark sqlite-vec 0.1.9 sur la forme exacte 130k × FLOAT[384])
+/// — pendant que le pool sqlx (migrations lazy du front) et AGENTS_CONN n'ont
+/// que 5 s de busy_timeout. Par lots de 2 000, le verrou n'est jamais tenu
+/// plus d'une fraction de seconde et les autres handles s'intercalent (AM-5).
+const PURGE_BATCH: usize = 2_000;
 
 /// Purge de `vec_code` tous les chunks dont le chemin traverse un répertoire
 /// exclu de l'indexation (venv, .claude, node_modules…), et les lignes
 /// `vec_code_files` correspondantes. Idempotente et bon marché à vide (un scan
 /// d'ids) → appelée à CHAQUE boot : c'est le filet anti-régression si un
 /// indexeur d'une version antérieure a laissé entrer des déchets.
+///
+/// Le scan se fait HORS transaction (lecture seule — en WAL elle ne bloque
+/// personne), puis les DELETE partent par lots (`PURGE_BATCH`). L'atomicité
+/// globale n'a aucune valeur ici : la purge est idempotente, un boot
+/// interrompu à mi-lot reprend simplement au boot suivant.
 pub(crate) fn purge_ignored_chunks(conn: &mut Connection) -> Result<usize, String> {
-    let tx = conn
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| format!("purge_ignored begin: {e}"))?;
-
-    let doomed_ids: Vec<String> = {
-        let mut stmt = tx
-            .prepare("SELECT id FROM vec_code")
-            .map_err(|e| format!("purge_ignored prepare scan: {e}"))?;
-        let ids = stmt
+    let scan = |sql: &str| -> Result<Vec<String>, String> {
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| format!("purge_ignored prepare ({sql}): {e}"))?;
+        let rows = stmt
             .query_map([], |r| r.get::<_, String>(0))
-            .map_err(|e| format!("purge_ignored query scan: {e}"))?
+            .map_err(|e| format!("purge_ignored query ({sql}): {e}"))?
             .collect::<Result<Vec<String>, _>>()
-            .map_err(|e| format!("purge_ignored row scan: {e}"))?;
-        ids.into_iter().filter(|id| id_is_ignored(id)).collect()
+            .map_err(|e| format!("purge_ignored row ({sql}): {e}"))?;
+        Ok(rows.into_iter().filter(|v| id_is_ignored(v)).collect())
     };
-    for id in &doomed_ids {
-        tx.execute("DELETE FROM vec_code WHERE id = ?1", params![id])
-            .map_err(|e| format!("purge_ignored delete chunk: {e}"))?;
-    }
+    let doomed_ids = scan("SELECT id FROM vec_code")?;
+    let doomed_paths = scan("SELECT path FROM vec_code_files")?;
 
-    let doomed_paths: Vec<String> = {
-        let mut stmt = tx
-            .prepare("SELECT path FROM vec_code_files")
-            .map_err(|e| format!("purge_ignored prepare side: {e}"))?;
-        let paths = stmt
-            .query_map([], |r| r.get::<_, String>(0))
-            .map_err(|e| format!("purge_ignored query side: {e}"))?
-            .collect::<Result<Vec<String>, _>>()
-            .map_err(|e| format!("purge_ignored row side: {e}"))?;
-        paths.into_iter().filter(|p| id_is_ignored(p)).collect()
-    };
-    for path in &doomed_paths {
-        tx.execute("DELETE FROM vec_code_files WHERE path = ?1", params![path])
-            .map_err(|e| format!("purge_ignored delete side: {e}"))?;
+    for batch in doomed_ids.chunks(PURGE_BATCH) {
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| format!("purge_ignored begin: {e}"))?;
+        for id in batch {
+            tx.execute("DELETE FROM vec_code WHERE id = ?1", params![id])
+                .map_err(|e| format!("purge_ignored delete chunk: {e}"))?;
+        }
+        tx.commit().map_err(|e| format!("purge_ignored commit: {e}"))?;
     }
-
-    tx.commit().map_err(|e| format!("purge_ignored commit: {e}"))?;
+    for batch in doomed_paths.chunks(PURGE_BATCH) {
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| format!("purge_ignored begin side: {e}"))?;
+        for path in batch {
+            tx.execute("DELETE FROM vec_code_files WHERE path = ?1", params![path])
+                .map_err(|e| format!("purge_ignored delete side: {e}"))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("purge_ignored commit side: {e}"))?;
+    }
     Ok(doomed_ids.len())
 }
 
@@ -1515,6 +1552,27 @@ pub(crate) fn cap_agent_memory(conn: &mut Connection, cap: usize) -> Result<usiz
 /// réconciliation (`vec_code_gc`), qui ne tourne qu'après une passe
 /// d'indexation sans échec.
 pub(crate) fn boot_maintenance(app: &tauri::AppHandle) -> Result<(), String> {
+    // Garde ANTI-COLLISION (revue fa27ff6, HIGH confirmé) : les migrations
+    // sqlx sont LAZY — elles partent au premier `db.load()` du front, ~2 s
+    // après le setup. Si une migration est EN ATTENTE, la purge tiendrait le
+    // verrou d'écriture pendant qu'elle tourne → « database is locked » après
+    // les 5 s de busy_timeout du pool → base front morte pour la session
+    // (classe d'incident 8dcfbc9). Dans ce cas on SAUTE la maintenance de ce
+    // boot ; le boot suivant (schéma à jour) la fera.
+    if let Ok(db) = crate::commands::backup::live_db_path(app) {
+        if matches!(
+            crate::commands::backup::schema_version_of(&db),
+            Some(v) if v < crate::commands::backup::TARGET_SCHEMA_VERSION
+        ) {
+            eprintln!("[vector] maintenance sautée : migration de schéma en attente (priorité au front)");
+            return Ok(());
+        }
+    }
+    // Même sans migration en attente, laisse le front écrire ses premières
+    // lignes (seed des settings, premier chargement) hors de toute contention :
+    // la maintenance n'est pas urgente à la seconde près.
+    std::thread::sleep(std::time::Duration::from_secs(10));
+
     let conn_mutex = get_conn(app)?;
     let mut guard = conn_mutex.lock().map_err(|e| format!("lock: {e}"))?;
 
@@ -1846,6 +1904,17 @@ mod tests {
         assert!(!id_is_ignored("src/main.rs#L1-40"));
         assert!(!id_is_ignored("public/index.html"));
         assert!(!id_is_ignored("packages/env/index.ts#L1-3"), "`env` n'est pas bloqué en dur");
+        // `#` est LÉGAL dans un nom de fichier : seul un suffixe terminal
+        // `#L<d>-<d>` est retiré. Couper au premier `#` tronquerait
+        // `src/dist#v2/x.ts#L1-10` en `src/dist` → purge/ré-index en boucle
+        // à chaque boot (revue fa27ff6, low confirmé).
+        assert!(!id_is_ignored("src/dist#v2/x.ts#L1-10"), "dist#v2 est un vrai dossier");
+        assert!(!id_is_ignored("notes/build#2.md"), "id legacy avec # légitime");
+        assert!(!id_is_ignored("venv#py311/lib/x.py#L1-2"), "venv#py311 ≠ venv");
+        assert!(is_chunk_line_suffix("L1-40"));
+        assert!(!is_chunk_line_suffix("v2"));
+        assert!(!is_chunk_line_suffix("L1"));
+        assert!(!is_chunk_line_suffix("Lx-y"));
     }
 
     #[test]

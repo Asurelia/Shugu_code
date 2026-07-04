@@ -181,16 +181,25 @@ pub(crate) fn is_index_ignored(name: &str) -> bool {
 /// Seul le `.gitignore` RACINE est lu (pas les imbriqués ni les excludes
 /// globaux) : c'est lui qui porte `venv/`, `dist/`, les dossiers de données…
 /// dans l'immense majorité des repos, et un seul fichier à parser garde le
-/// coût négligeable au flush du watcher. `None` si absent ou illisible ; les
-/// lignes invalides sont ignorées une à une par le builder (comportement git).
+/// coût négligeable au flush du watcher. `None` seulement si le fichier est
+/// absent.
+///
+/// ATTENTION sémantique de la crate `ignore` (revue fa27ff6, confirmé sur
+/// 0.4.25) : `add()` renvoie `Some(err)` aussi pour une erreur PARTIELLE —
+/// UNE ligne au glob invalide — alors que toutes les lignes valides sont déjà
+/// dans le builder. Jeter le matcher entier sur ce signal désactiverait
+/// silencieusement tout le filtre pour le workspace ; on logge et on `build()`
+/// quand même (comportement git : les lignes invalides sont ignorées).
 pub(crate) fn build_workspace_gitignore(root: &Path) -> Option<ignore::gitignore::Gitignore> {
     let file = root.join(".gitignore");
     if !file.is_file() {
         return None;
     }
     let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
-    if builder.add(&file).is_some() {
-        return None; // erreur I/O sur le fichier entier
+    if let Some(err) = builder.add(&file) {
+        eprintln!(
+            "[fs] .gitignore : ligne(s) invalide(s) ignorée(s) ({err}) — les règles valides restent appliquées"
+        );
     }
     builder.build().ok()
 }
@@ -1473,6 +1482,26 @@ mod tests {
         let root = make_temp_dir("gitignore_absent");
         let _ = fs::remove_file(root.join(".gitignore"));
         assert!(build_workspace_gitignore(&root).is_none());
+        cleanup(&root);
+    }
+
+    #[test]
+    fn workspace_gitignore_survives_one_invalid_line() {
+        // Revue fa27ff6 (medium confirmé) : dans la crate `ignore`, add()
+        // renvoie Some(err) même pour une erreur PARTIELLE (une seule ligne au
+        // glob invalide) alors que les lignes valides sont déjà chargées.
+        // Jeter le matcher entier désactivait silencieusement tout le filtre.
+        let root = make_temp_dir("gitignore_partial");
+        // `[z-a]` = classe de caractères à intervalle invalide → erreur de
+        // parse de ligne garantie sur ignore 0.4.x.
+        fs::write(root.join(".gitignore"), "env/\n[z-a]\ndata/\n").unwrap();
+
+        let gi = build_workspace_gitignore(&root)
+            .expect("une ligne invalide ne doit pas jeter le matcher");
+        assert!(gi.matched(Path::new("env"), true).is_ignore(), "règle AVANT la ligne invalide");
+        assert!(gi.matched(Path::new("data"), true).is_ignore(), "règle APRÈS la ligne invalide");
+        assert!(!gi.matched(Path::new("src"), true).is_ignore());
+
         cleanup(&root);
     }
 

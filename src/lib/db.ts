@@ -20,6 +20,14 @@ export async function getDb(): Promise<Database> {
     _dbPromise = import("@tauri-apps/plugin-sql").then((mod) =>
       mod.default.load("sqlite:shugu.db")
     );
+    // Un échec de load() (ex. « database is locked » pendant qu'une tâche de
+    // fond tient brièvement le verrou d'écriture) ne doit PAS être mis en
+    // cache : sinon toute la couche données reste morte pour la session alors
+    // que l'appel suivant aurait réussi. On purge le cache sur rejet — le
+    // rejet lui-même est propagé à l'appelant, qui gère déjà ses erreurs.
+    _dbPromise.catch(() => {
+      _dbPromise = null;
+    });
   }
   return _dbPromise;
 }

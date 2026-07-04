@@ -238,12 +238,28 @@ pub async fn shugu_storage_breakdown(app: AppHandle) -> Result<StorageBreakdown,
         ));
 
         // appConfig = le RESTE du dossier de config (settings exportés, presets…),
-        // base et backups exclus pour ne compter chaque octet qu'une fois.
+        // TOUT poste ventilé ailleurs étant exclu pour ne compter chaque octet
+        // qu'une fois. Piège plateforme (revue fa27ff6, confirmé) : sur Windows,
+        // app_config_dir() et app_data_dir() résolvent le MÊME dossier physique
+        // (%APPDATA%\dev.shugu.forge) — les médias/captures y vivent donc AUSSI ;
+        // sur macOS, app_local_data_dir() coïncide en plus (Application Support)
+        // → modèles/embeddings. D'où la liste d'exclusion complète.
+        const VENTILATED_ELSEWHERE: &[&str] = &[
+            "backups",
+            "video-assets",
+            "music-assets",
+            "image-assets",
+            "captures",
+            "browser-tests",
+            "models",
+            "fastembed_cache",
+            ".fastembed_cache",
+        ];
         let mut cfg_rest: u64 = 0;
         if let Ok(entries) = std::fs::read_dir(&cfg) {
             for e in entries.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
-                if name == "backups" || name.starts_with("shugu.db") {
+                if name.starts_with("shugu.db") || VENTILATED_ELSEWHERE.contains(&name.as_str()) {
                     continue;
                 }
                 cfg_rest = cfg_rest.saturating_add(path_size_bytes(&e.path()));

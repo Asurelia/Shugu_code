@@ -122,6 +122,10 @@ export function useStorageBreakdown() {
 
 export function invalidateStorage() {
   void queryClient.invalidateQueries({ queryKey: STORAGE_KEY });
+  // La taille de base et son chip d'alerte doivent suivre le même cycle de
+  // rafraîchissement que les barres — sinon « Recalculer » dégonfle la barre
+  // mais laisse le chip « très grosse » contredire l'affichage.
+  void queryClient.invalidateQueries({ queryKey: DB_SIZE_KEY });
 }
 
 /** Résultat d'un nettoyage de zone (commande `shugu_storage_cleanup`). */
@@ -158,9 +162,11 @@ export function fetchDbSize(): Promise<DbSizeReport> {
   return invoke<DbSizeReport>("shugu_db_size");
 }
 
+const DB_SIZE_KEY = ["ops", "dbSize"] as const;
+
 export function useDbSize() {
   return useQuery<DbSizeReport>({
-    queryKey: ["ops", "dbSize"],
+    queryKey: DB_SIZE_KEY,
     queryFn: fetchDbSize,
     staleTime: 15_000,
   });

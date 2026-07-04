@@ -210,8 +210,10 @@ fn snapshot_db(src: &Path, dest: &Path) -> Result<(), String> {
 }
 
 /// MAX(version) de `_sqlx_migrations` sur une base donnée. `None` si la table
-/// n'existe pas (base jamais migrée par sqlx) ou base absente.
-fn schema_version_of(db: &Path) -> Option<i64> {
+/// n'existe pas (base jamais migrée par sqlx) ou base absente. Exposé au
+/// module `vector` : la maintenance de boot se SAUTE quand une migration est
+/// en attente (elle tiendrait le verrou d'écriture pendant la migration lazy).
+pub(crate) fn schema_version_of(db: &Path) -> Option<i64> {
     if !db.exists() {
         return None;
     }
