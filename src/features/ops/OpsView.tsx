@@ -17,6 +17,8 @@ import {
   useImportData,
   useBackupNow,
   useDiagBundle,
+  useStorageCleanup,
+  useDbSize,
   invalidateStorage,
   type StorageItem,
   type ExportResult,
@@ -24,17 +26,66 @@ import {
   type DiagBundle,
 } from "./queries";
 
+// ─── Zones nettoyables ────────────────────────────────────────────────────────
+//
+// Miroir de l'allowlist Rust (`shugu_storage_cleanup`). `confirm: true` = zone
+// « créations utilisateur » : le bouton passe par un ConfirmDialog explicite —
+// on ne supprime JAMAIS une création sans confirmation (politique projet).
+const CLEANABLE_ZONES: Record<string, { confirm: boolean; what: string }> = {
+  captures: { confirm: false, what: "les captures d'écran techniques des agents" },
+  browserTests: { confirm: false, what: "les artefacts de tests navigateur" },
+  logs: { confirm: false, what: "les journaux de Shugu" },
+  backups: {
+    confirm: false,
+    what: "les anciennes sauvegardes automatiques (la plus récente est conservée)",
+  },
+  videoAssets: { confirm: true, what: "TOUTES les vidéos que tu as générées" },
+  musicAssets: { confirm: true, what: "TOUTES les musiques que tu as générées" },
+  imageAssets: { confirm: true, what: "TOUTES les images que tu as générées" },
+  snippets: { confirm: true, what: "tous les snippets de code sauvegardés" },
+};
+
 // ─── Barre proportionnelle pour un poste de stockage ─────────────────────────
 
-function StorageBar({ item, total }: { item: StorageItem; total: number }) {
+function StorageBar({
+  item,
+  total,
+  cleaning,
+  onClean,
+  alert,
+}: {
+  item: StorageItem;
+  total: number;
+  cleaning: boolean;
+  onClean?: (item: StorageItem) => void;
+  alert?: boolean;
+}) {
   const pct = total > 0 && item.present ? Math.max(2, Math.round((item.bytes / total) * 100)) : 0;
+  const cleanable = onClean && item.present && item.bytes > 0 && CLEANABLE_ZONES[item.key];
   return (
     <div style={{ marginBottom: 14 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 12 }}>
-        <span style={{ fontWeight: 600, fontSize: 13 }}>{item.label}</span>
-        <span className="sub" style={{ fontSize: 12, whiteSpace: "nowrap" }}>
+        <span style={{ fontWeight: 600, fontSize: 13 }}>
+          {item.label}
+          {alert && (
+            <span className="chip warn" style={{ marginLeft: 8, fontSize: 10.5 }}>
+              inhabituellement grosse
+            </span>
+          )}
+        </span>
+        <span className="sub" style={{ fontSize: 12, whiteSpace: "nowrap", display: "inline-flex", alignItems: "center", gap: 8 }}>
           {item.present ? formatBytes(item.bytes) : "absent"}
           {item.present && total > 0 ? ` · ${pct}%` : ""}
+          {cleanable && (
+            <button
+              className="lgb lgb-sm"
+              disabled={cleaning}
+              onClick={() => onClean(item)}
+              title={`Supprimer ${CLEANABLE_ZONES[item.key].what}`}
+            >
+              {cleaning ? "…" : "Nettoyer"}
+            </button>
+          )}
         </span>
       </div>
       <div
@@ -73,6 +124,41 @@ function StorageBar({ item, total }: { item: StorageItem; total: number }) {
 
 function StorageCenter() {
   const { data, isLoading, error, refetch, isFetching } = useStorageBreakdown();
+  const cleanup = useStorageCleanup();
+  const dbSize = useDbSize();
+
+  // Zone en attente de confirmation (créations utilisateur uniquement).
+  const [confirmItem, setConfirmItem] = useState<StorageItem | null>(null);
+  const [cleanMsg, setCleanMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+
+  const doClean = async (item: StorageItem) => {
+    setCleanMsg(null);
+    try {
+      const res = await cleanup.mutateAsync({ zone: item.key });
+      setCleanMsg({
+        kind: "ok",
+        text: `${item.label} : ${formatBytes(res.freedBytes)} libérés (${res.deletedCount} élément(s)).`,
+      });
+    } catch (e) {
+      setCleanMsg({
+        kind: "err",
+        text: `Nettoyage « ${item.label} » impossible : ${String((e as Error)?.message ?? e)}`,
+      });
+    }
+  };
+
+  const onClean = (item: StorageItem) => {
+    if (CLEANABLE_ZONES[item.key]?.confirm) {
+      setConfirmItem(item);
+    } else {
+      void doClean(item);
+    }
+  };
+
+  // Garde-fou anti-Codex : la base au-delà du seuil Rust (300 Mo) = chip
+  // d'alerte sur le poste « Base + index vectoriel ».
+  const dbAlert =
+    !!dbSize.data && dbSize.data.bytes > dbSize.data.alertThresholdBytes;
 
   return (
     <div className="setting-section">
@@ -87,8 +173,9 @@ function StorageCenter() {
         </button>
       </div>
       <p className="sub">
-        D'où vient l'espace consommé par Shugu. Mesure best-effort ; les postes
-        régénérables (build Rust, node_modules) sont sûrs à supprimer.
+        D'où vient l'espace consommé par Shugu, avec un bouton « Nettoyer » là où
+        c'est sans risque. Tes créations (vidéos, musiques, images, snippets) ne
+        sont jamais supprimées sans confirmation.
       </p>
 
       {isLoading && <p className="sub" style={{ marginTop: 12 }}>Calcul des tailles…</p>}
@@ -100,17 +187,62 @@ function StorageCenter() {
 
       {data && (
         <div style={{ marginTop: 14 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 14 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 14, flexWrap: "wrap", gap: 8 }}>
             <span className="chip primary">Total mesuré · {formatBytes(data.totalBytes)}</span>
+            {dbAlert && dbSize.data && (
+              <span className="chip warn">
+                La base devient très grosse ({formatBytes(dbSize.data.bytes)}) — regarde le poste « Base + index vectoriel »
+              </span>
+            )}
             {!data.hasWorkspace && (
               <span className="chip warn">Aucun workspace ouvert — postes workspace masqués</span>
             )}
           </div>
           {data.items.map((it) => (
-            <StorageBar key={it.key} item={it} total={data.totalBytes} />
+            <StorageBar
+              key={it.key}
+              item={it}
+              total={data.totalBytes}
+              cleaning={cleanup.isPending}
+              onClean={onClean}
+              alert={it.key === "vector" && dbAlert}
+            />
           ))}
+          {cleanMsg && (
+            <p
+              className="sub"
+              style={{
+                marginTop: 4,
+                color: cleanMsg.kind === "ok" ? "var(--success, #7ee29a)" : "var(--danger)",
+              }}
+            >
+              {cleanMsg.text}
+            </p>
+          )}
         </div>
       )}
+
+      <ConfirmDialog
+        open={confirmItem !== null}
+        title={confirmItem ? `Supprimer ${confirmItem.label.toLowerCase()} ?` : ""}
+        body={
+          confirmItem ? (
+            <>
+              Cette action supprime <b>définitivement</b>{" "}
+              {CLEANABLE_ZONES[confirmItem.key]?.what} ({formatBytes(confirmItem.bytes)}).
+              Il n'y a pas de corbeille : ce qui est supprimé est perdu.
+            </>
+          ) : null
+        }
+        confirmLabel="Supprimer définitivement"
+        tone="danger"
+        onCancel={() => setConfirmItem(null)}
+        onConfirm={() => {
+          const item = confirmItem;
+          setConfirmItem(null);
+          if (item) void doClean(item);
+        }}
+      />
     </div>
   );
 }

@@ -572,6 +572,17 @@ pub fn run() {
         },
     ];
 
+    // Garde anti-dérive : le backup pré-migration (backup.rs) décide « une
+    // migration est-elle en attente ? » en comparant la version sur disque à
+    // TARGET_SCHEMA_VERSION. La constante est restée à 16 après l'ajout de la
+    // V17 → le backup v16→v17 n'a jamais été pris. Tout run de dev/test échoue
+    // désormais si une migration est ajoutée sans bump de la constante.
+    debug_assert_eq!(
+        migrations.last().map(|m| m.version),
+        Some(commands::backup::TARGET_SCHEMA_VERSION),
+        "TARGET_SCHEMA_VERSION (backup.rs) doit suivre la dernière migration de lib.rs"
+    );
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_fs::init())
@@ -613,6 +624,29 @@ pub fn run() {
             // snapshot atomique horodaté AVANT que le front ne déclenche la
             // migration. Best-effort : une erreur ici n'empêche jamais le boot.
             let _ = commands::backup::auto_backup_before_migration(app.handle());
+
+            // Régime de la base — purge des chunks d'index ignorés (venv,
+            // .claude…) puis VACUUM conditionnel qui REND l'espace au disque.
+            // Côté Rust et non dans workspaceIndexer.ts : ne dépend ni d'un
+            // workspace ouvert ni du modèle d'embedding, donc tourne même
+            // quand la réconciliation front échoue (la raison exacte pour
+            // laquelle l'ancien GC ne s'est jamais déclenché). spawn_blocking :
+            // un VACUUM de quelques secondes ne doit jamais retarder le setup
+            // ni geler l'UI — et il part AVANT le timer d'indexation de 5 s de
+            // RootLayout, fenêtre où la base est encore calme.
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    if let Err(e) = commands::vector::boot_maintenance(&handle) {
+                        eprintln!("[vector] boot maintenance: {e}");
+                    }
+                    // Rétention : artefacts techniques > 7 j (captures d'agents,
+                    // tests navigateur) + backups automatiques au-delà des 2
+                    // plus récents. Jamais les créations utilisateur.
+                    commands::storage::boot_retention(&handle);
+                    let _ = commands::backup::prune_auto_backups(&handle, 2);
+                });
+            }
 
             // Debug instrumentation — relay JS uncaught errors into stdout.
             //
@@ -817,6 +851,8 @@ pub fn run() {
             // the whole workspace at every start, then GC untracked chunks.
             commands::vector::vec_stale_paths,
             commands::vector::vec_code_gc,
+            // Régime de la base — VACUUM conditionnel après un GC qui a purgé.
+            commands::vector::vec_maybe_vacuum,
             commands::model_bundle::model_bundle_catalog,
             commands::model_bundle::model_bundle_status,
             commands::model_bundle::model_bundle_download,
@@ -937,8 +973,11 @@ pub fn run() {
             commands::backup::shugu_import_data,
             commands::backup::shugu_db_integrity_check,
             commands::backup::shugu_backup_now,
-            // Lane OPÉRABILITÉ — Storage Center (ventilation des tailles).
+            // Lane OPÉRABILITÉ — Storage Center (ventilation des tailles,
+            // nettoyage par zone, taille de base pour le bandeau d'alerte).
             commands::storage::shugu_storage_breakdown,
+            commands::storage::shugu_storage_cleanup,
+            commands::storage::shugu_db_size,
             // Lane OPÉRABILITÉ — Diagnostics Center (bundle redacté).
             commands::diagnostics::shugu_diag_bundle,
         ])

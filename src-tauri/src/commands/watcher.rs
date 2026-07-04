@@ -31,8 +31,13 @@
 //! ## Ignore filter
 //!
 //! Events whose paths fall entirely under ignored directory names (`.git`,
-//! `node_modules`, `target`, etc.) are dropped before hitting the debouncer.
-//! Reuses `super::fs::is_ignored` so the filter is identical to `fs_read_dir`.
+//! `node_modules`, `target`, etc.) are dropped before hitting the debouncer
+//! (`super::fs::is_ignored` — identical to `fs_read_dir`, so the visible tree
+//! keeps refreshing for everything it shows). The REINDEX stage is stricter:
+//! `plan_reindex` re-filters with `is_index_ignored` (adds `.claude`, `.shugu*`…)
+//! plus the workspace root `.gitignore`, mirroring exactly what `fs_list_files`
+//! feeds to the semantic index — otherwise the watcher would re-insert chunks
+//! the boot purge just deleted.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -44,7 +49,7 @@ use std::time::{Duration, Instant};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
 use tauri::{Emitter, Manager};
 
-use super::fs::is_ignored;
+use super::fs::{build_workspace_gitignore, is_ignored, is_index_ignored};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -287,10 +292,15 @@ fn flush_reindex(app: &tauri::AppHandle, pending: &mut HashMap<PathBuf, ChangeKi
         Err(_) => return,
     };
 
+    // Matcher .gitignore reconstruit à CHAQUE flush (débounce 1,5 s → un parse
+    // de fichier par rafale, négligeable) : pas de cache à invalider quand
+    // l'utilisateur édite son .gitignore.
+    let gitignore = build_workspace_gitignore(&root);
+
     // The relativize / filter / dedupe / storm-guard DECISION is the pure
     // `plan_reindex` — the SAME function the unit tests exercise, so the tests
     // now cover the real flush path (no duplicated logic to drift out of sync).
-    match plan_reindex(&root, &drained) {
+    match plan_reindex(&root, &drained, gitignore.as_ref()) {
         ReindexPlan::Storm { unique_files } => {
             // STORM — a checkout / branch switch / mass install touches far more
             // files than an interactive edit. Skip per-file work and tell the UI
@@ -398,18 +408,36 @@ enum ReindexPlan {
 /// Pure planner that IS the reindex-window decision logic — `flush_reindex`
 /// calls this directly (so the watcher tests below cover the real path, with no
 /// duplicated logic to drift). Relativizes each abs path against `root`, drops
-/// ignored / out-of-root paths, dedupes by rel path (last writer wins), and
-/// applies the storm guard. The returned `Files` vec is sorted by rel path for
-/// deterministic ordering.
-fn plan_reindex(root: &Path, events: &[(ChangeKind, PathBuf)]) -> ReindexPlan {
+/// index-ignored / gitignored / out-of-root paths, dedupes by rel path (last
+/// writer wins), and applies the storm guard. The returned `Files` vec is
+/// sorted by rel path for deterministic ordering.
+///
+/// `gitignore` : matcher du `.gitignore` racine (voir
+/// `fs::build_workspace_gitignore`) ; `None` = pas de fichier. On matche « le
+/// chemin ou l'un de ses parents » car une règle répertoire (`venv/`) doit
+/// couvrir un événement fichier (`venv/lib/x.py`) — pendant un walk on élague
+/// le dossier, mais ici on reçoit des chemins de fichiers isolés.
+fn plan_reindex(
+    root: &Path,
+    events: &[(ChangeKind, PathBuf)],
+    gitignore: Option<&ignore::gitignore::Gitignore>,
+) -> ReindexPlan {
     let mut rel_changes: HashMap<String, ChangeKind> = HashMap::new();
     for (kind, abs) in events {
         if let Some(rel) = relativize(root, abs) {
             if rel
                 .split('/')
-                .any(|seg| !seg.is_empty() && is_ignored(seg))
+                .any(|seg| !seg.is_empty() && is_index_ignored(seg))
             {
                 continue;
+            }
+            if let Some(gi) = gitignore {
+                if gi
+                    .matched_path_or_any_parents(Path::new(&rel), false)
+                    .is_ignore()
+                {
+                    continue;
+                }
             }
             rel_changes.insert(rel, *kind);
         }
@@ -562,7 +590,7 @@ mod tests {
             // outside root → dropped
             (ChangeKind::AddedOrModified, PathBuf::from("/other/c.ts")),
         ];
-        match plan_reindex(&root, &events) {
+        match plan_reindex(&root, &events, None) {
             ReindexPlan::Files(files) => {
                 assert_eq!(
                     files,
@@ -586,7 +614,7 @@ mod tests {
             (ChangeKind::AddedOrModified, PathBuf::from("/ws/src/a.ts")),
             (ChangeKind::Removed, PathBuf::from("/ws/src/a.ts")),
         ];
-        match plan_reindex(&root, &events) {
+        match plan_reindex(&root, &events, None) {
             ReindexPlan::Files(files) => {
                 assert_eq!(files, vec![("src/a.ts".to_string(), ChangeKind::Removed)]);
             }
@@ -607,7 +635,7 @@ mod tests {
             })
             .collect();
         assert!(events.len() > REINDEX_MAX_FILES);
-        match plan_reindex(&root, &events) {
+        match plan_reindex(&root, &events, None) {
             ReindexPlan::Storm { unique_files } => {
                 assert_eq!(unique_files, REINDEX_MAX_FILES + 1);
             }
@@ -628,9 +656,67 @@ mod tests {
             })
             .collect();
         assert_eq!(events.len(), REINDEX_MAX_FILES);
-        match plan_reindex(&root, &events) {
+        match plan_reindex(&root, &events, None) {
             ReindexPlan::Files(files) => assert_eq!(files.len(), REINDEX_MAX_FILES),
             ReindexPlan::Storm { .. } => panic!("exactly 50 files is at the boundary, not over"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Régime de l'index — is_index_ignored + .gitignore dans plan_reindex
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn plan_reindex_drops_index_ignored_but_watcher_still_forwards_them() {
+        let root = PathBuf::from("/ws");
+        // `.claude`/`venv` : le reindex les JETTE (ils ne nourrissent jamais
+        // vec_code)…
+        let events = vec![
+            (ChangeKind::AddedOrModified, PathBuf::from("/ws/.claude/plans/p.md")),
+            (ChangeKind::AddedOrModified, PathBuf::from("/ws/venv/lib/x.py")),
+            (ChangeKind::AddedOrModified, PathBuf::from("/ws/src/ok.ts")),
+        ];
+        match plan_reindex(&root, &events, None) {
+            ReindexPlan::Files(files) => {
+                assert_eq!(
+                    files,
+                    vec![("src/ok.ts".to_string(), ChangeKind::AddedOrModified)]
+                );
+            }
+            ReindexPlan::Storm { .. } => panic!("3 files is not a storm"),
+        }
+        // …mais l'arbre de fichiers doit continuer à se rafraîchir pour
+        // `.claude` (visible dans l'explorateur) → should_forward reste vrai.
+        let evt = make_event(
+            EventKind::Create(CreateKind::File),
+            vec![PathBuf::from("/ws/.claude/plans/p.md")],
+        );
+        assert!(should_forward(&evt), ".claude doit rafraîchir l'arbre");
+    }
+
+    #[test]
+    fn plan_reindex_respects_root_gitignore_including_dir_rules() {
+        let root = PathBuf::from("/ws");
+        // Matcher construit en mémoire — même API que build_workspace_gitignore.
+        let mut b = ignore::gitignore::GitignoreBuilder::new(&root);
+        b.add_line(None, "env/").unwrap();
+        b.add_line(None, "*.gen.ts").unwrap();
+        let gi = b.build().unwrap();
+
+        let events = vec![
+            // Règle RÉPERTOIRE : doit couvrir un événement FICHIER en dessous.
+            (ChangeKind::AddedOrModified, PathBuf::from("/ws/env/lib/site.py")),
+            (ChangeKind::AddedOrModified, PathBuf::from("/ws/src/api.gen.ts")),
+            (ChangeKind::AddedOrModified, PathBuf::from("/ws/src/api.ts")),
+        ];
+        match plan_reindex(&root, &events, Some(&gi)) {
+            ReindexPlan::Files(files) => {
+                assert_eq!(
+                    files,
+                    vec![("src/api.ts".to_string(), ChangeKind::AddedOrModified)]
+                );
+            }
+            ReindexPlan::Storm { .. } => panic!("3 files is not a storm"),
         }
     }
 }

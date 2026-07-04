@@ -54,11 +54,12 @@ use tauri_plugin_dialog::DialogExt;
 // ---------------------------------------------------------------------------
 
 /// Version de schéma cible = nombre de migrations déclarées dans `lib.rs`.
-/// Tenue À JOUR ici en miroir de la liste `migrations` de `run()`. Sert
-/// uniquement à décider « une migration est-elle en attente ? » au boot.
-/// Si la valeur sous-estime la réalité, on rate un backup pré-migration (sans
-/// danger) ; si elle la sur-estime, on prend un backup superflu (sans danger).
-pub const TARGET_SCHEMA_VERSION: i64 = 16;
+/// Tenue À JOUR ici en miroir de la liste `migrations` de `run()` — et
+/// VERROUILLÉE par le `debug_assert_eq!` de `lib.rs::run()` : une V18 ajoutée
+/// sans bump ici fait échouer tout run de dev/test. (La dérive est déjà
+/// arrivée : la constante est restée à 16 après l'ajout de la V17, donc le
+/// backup pré-migration v16→v17 n'a jamais été pris.)
+pub const TARGET_SCHEMA_VERSION: i64 = 17;
 
 /// Nom du fichier base dans un bundle.
 const DB_FILE: &str = "shugu.db";
@@ -438,6 +439,59 @@ pub fn auto_backup_before_migration(app: &AppHandle) -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// Rétention des backups automatiques
+// ---------------------------------------------------------------------------
+
+/// Supprime les sous-dossiers de `dir` au-delà des `keep` plus récents (mtime
+/// décroissant). Renvoie le nombre de dossiers supprimés. Helper pur vis-à-vis
+/// de l'app (testable sur un dossier temporaire).
+fn prune_dir_keep_newest(dir: &Path, keep: usize) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0; // dossier absent = rien à faire
+    };
+    let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| {
+            let mtime = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(UNIX_EPOCH);
+            (mtime, e.path())
+        })
+        .collect();
+    dirs.sort_by(|a, b| b.0.cmp(&a.0)); // plus récent d'abord
+    let mut removed = 0usize;
+    for (_, path) in dirs.into_iter().skip(keep) {
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => removed += 1,
+            Err(e) => eprintln!("[backup] prune {} : {e}", path.display()),
+        }
+    }
+    removed
+}
+
+/// Rétention des backups AUTOMATIQUES : garde les `keep` plus récents de
+/// `backups/pre-migration/` et `backups/pre-restore/`. Les backups MANUELS
+/// (exportés par l'utilisateur vers le dossier de son choix) ne sont jamais
+/// touchés — ils ne vivent pas sous `backups_root`. Best-effort, appelée au
+/// boot après `auto_backup_before_migration`. (Constat 2026-07 : deux bundles
+/// v15→v16 identiques de 96 Mo dormaient là sans limite.)
+pub fn prune_auto_backups(app: &AppHandle, keep: usize) -> usize {
+    let Ok(root) = backups_root(app) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for sub in ["pre-migration", "pre-restore"] {
+        removed += prune_dir_keep_newest(&root.join(sub), keep);
+    }
+    if removed > 0 {
+        eprintln!("[backup] rétention : {removed} ancien(s) backup(s) automatique(s) supprimé(s)");
+    }
+    removed
+}
+
+// ---------------------------------------------------------------------------
 // Commandes Tauri
 // ---------------------------------------------------------------------------
 
@@ -664,6 +718,35 @@ mod tests {
             params![schema_version],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn prune_keeps_newest_dirs_only() {
+        let root = temp_dir("prune");
+        // 4 « bundles » horodatés, mtimes distincts (NTFS résout bien < 20 ms).
+        for name in ["b1", "b2", "b3", "b4"] {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("shugu.db"), b"x").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Un FICHIER parasite au premier niveau ne doit ni compter ni casser.
+        std::fs::write(root.join("notes.txt"), b"y").unwrap();
+
+        assert_eq!(prune_dir_keep_newest(&root, 2), 2, "b1 et b2 partent");
+        let mut left: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["b3", "b4"], "les 2 plus récents survivent");
+
+        // Idempotence + dossier absent.
+        assert_eq!(prune_dir_keep_newest(&root, 2), 0);
+        assert_eq!(prune_dir_keep_newest(&root.join("absent"), 2), 0);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

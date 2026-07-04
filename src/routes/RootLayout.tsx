@@ -623,6 +623,33 @@ export function RootLayout() {
     })();
   }, [invalidateFileTree, setOpenFiles, setActiveFile, setFileContents]);
 
+  // Garde-fou anti-Codex : si shugu.db dépasse le seuil Rust (300 Mo), un
+  // toast long au boot pointe vers Réglages → Stockage. Un seul check, deux
+  // stats de fichier — la maintenance Rust (purge + VACUUM) tourne déjà en
+  // fond au setup ; on lui laisse 12 s pour que le toast ne crie pas au loup
+  // sur une base que le VACUUM en cours est en train de dégonfler.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      void (async () => {
+        try {
+          const { fetchDbSize } = await import("@/features/ops/queries");
+          const size = await fetchDbSize();
+          if (size.bytes > size.alertThresholdBytes) {
+            pushToast(
+              `La base de Shugu devient très grosse (${Math.round(size.bytes / 1048576)} Mo). ` +
+                `Ouvre Réglages → Stockage pour voir pourquoi.`,
+              "error",
+              15000,
+            );
+          }
+        } catch {
+          /* best-effort : jamais bloquant au boot */
+        }
+      })();
+    }, 12_000);
+    return () => clearTimeout(t);
+  }, []);
+
   useEffect(() => {
     const t = setTimeout(() => { void indexWorkspace(); }, 5000);
     // Ré-index quand l'utilisateur OUVRE UN AUTRE dossier sans relancer l'app

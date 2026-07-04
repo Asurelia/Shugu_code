@@ -27,7 +27,14 @@
 //     before the MAX_INDEX_FILES budget; truncation is always announced.
 
 import { fsListFiles } from "@/lib/fs";
-import { vecClear, vecIndexFile, vecRemoveFile, vecStalePaths, vecCodeGc } from "@/lib/vector";
+import {
+  vecClear,
+  vecIndexFile,
+  vecRemoveFile,
+  vecStalePaths,
+  vecCodeGc,
+  vecMaybeVacuum,
+} from "@/lib/vector";
 import { pushToast } from "@/components/toast";
 import { startIndexing, setIndexingProgress, finishIndexing } from "./indexingStore";
 
@@ -254,6 +261,20 @@ async function runIndex(force = false): Promise<number> {
         const purged = await vecCodeGc();
         if (purged > 0) {
           console.info(`[workspaceIndexer] GC: ${purged} chunk(s) orphelins purgés`);
+          // Le DELETE du GC ne rend l'espace qu'à la freelist interne de
+          // SQLite — seul un VACUUM rétrécit le fichier. Conditionnel côté
+          // Rust (seuil 32 Mo / 25 %) : un petit GC de routine ne paie
+          // jamais le coût d'une réécriture complète de la base.
+          try {
+            const v = await vecMaybeVacuum();
+            if (v.ran) {
+              console.info(
+                `[workspaceIndexer] VACUUM: ${(v.beforeBytes / 1048576).toFixed(1)} Mo → ${(v.afterBytes / 1048576).toFixed(1)} Mo`,
+              );
+            }
+          } catch (err) {
+            console.warn("[workspaceIndexer] vec_maybe_vacuum failed:", err);
+          }
         }
       } catch (err) {
         console.warn("[workspaceIndexer] vec_code_gc failed:", err);

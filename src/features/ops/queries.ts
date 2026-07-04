@@ -124,6 +124,48 @@ export function invalidateStorage() {
   void queryClient.invalidateQueries({ queryKey: STORAGE_KEY });
 }
 
+/** Résultat d'un nettoyage de zone (commande `shugu_storage_cleanup`). */
+export interface CleanupResult {
+  freedBytes: number;
+  deletedCount: number;
+}
+
+/**
+ * Nettoie UNE zone du Storage Center (clé = `StorageItem.key`, allowlist côté
+ * Rust). Les zones « créations » (vidéos, musiques, images, snippets) doivent
+ * être confirmées par l'UI AVANT d'appeler — la commande, elle, exécute.
+ */
+export function useStorageCleanup() {
+  return useMutation<CleanupResult, unknown, { zone: string }>({
+    mutationFn: ({ zone }) => invoke<CleanupResult>("shugu_storage_cleanup", { zone }),
+    onSuccess: () => invalidateStorage(),
+  });
+}
+
+/** Taille instantanée de la base + seuil d'alerte (constante Rust). */
+export interface DbSizeReport {
+  bytes: number;
+  walBytes: number;
+  alertThresholdBytes: number;
+}
+
+/**
+ * Deux stats de fichier, appelable à chaque boot — contrairement au breakdown
+ * complet qui walke node_modules. Fonction nue (pas un hook) pour l'appel
+ * hors-React du boot (RootLayout) ; l'UI Ops la consomme via `useDbSize`.
+ */
+export function fetchDbSize(): Promise<DbSizeReport> {
+  return invoke<DbSizeReport>("shugu_db_size");
+}
+
+export function useDbSize() {
+  return useQuery<DbSizeReport>({
+    queryKey: ["ops", "dbSize"],
+    queryFn: fetchDbSize,
+    staleTime: 15_000,
+  });
+}
+
 // ─── Diagnostics Center ──────────────────────────────────────────────────────
 
 export interface DiagFact {

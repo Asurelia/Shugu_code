@@ -45,11 +45,33 @@ const IGNORED_NAMES: &[&str] = &[
     ".turbo",
     ".cache",
     ".venv",
+    // `venv` SANS point : convention Python tout aussi répandue que `.venv`.
+    // Son absence a laissé un virtualenv de 76k fichiers entrer dans l'index
+    // sémantique (2026-07). PAS de `env` en revanche : trop de faux positifs
+    // (`src/env/`…) — ce cas est couvert par le .gitignore du workspace.
+    "venv",
+    "site-packages",
+    ".tox",
+    ".nox",
+    "__pypackages__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
     "__pycache__",
+    ".playwright-mcp",
+    ".pcc",
     ".DS_Store",
     ".svn",
     ".hg",
 ];
+
+/// Noms exclus de l'INDEXATION sémantique mais VISIBLES dans l'arbre de
+/// fichiers : internes à Shugu ou aux harnais d'agents, jamais du code du
+/// projet. `.shugu-snippets` doit rester navigable (la fonctionnalité
+/// « ouvrir dans l'éditeur » y écrit des fichiers que l'utilisateur édite),
+/// et `.claude/` peut contenir des worktrees entiers — les indexer
+/// dupliquerait tout le repo dans `vec_code` (36k vecteurs constatés).
+const INDEX_IGNORED_NAMES: &[&str] = &[".claude", ".shugu", ".shugu-forge", ".shugu-snippets"];
 
 /// Suffixes (extensions) ignored to prevent feedback loops with the
 /// debug `trace-*.log` files captured by `tauri-dev.cmd > trace.log`
@@ -130,6 +152,47 @@ pub(crate) fn is_ignored(name: &str) -> bool {
         }
         return IGNORED_SUFFIXES.iter().any(|&s| name.ends_with(s));
     }
+}
+
+/// Filtre d'INDEXATION : tout ce que `is_ignored` couvre, PLUS les répertoires
+/// internes (`INDEX_IGNORED_NAMES`) qui restent visibles dans l'arbre mais ne
+/// doivent jamais nourrir `vec_code`. Utilisé par `fs_list_files` (walk de
+/// l'indexeur), `watcher::plan_reindex` (reindex incrémental) et
+/// `vector::purge_ignored_chunks` (purge au boot) — les trois DOIVENT partager
+/// la même définition, sinon le watcher ré-insère ce que la purge supprime.
+pub(crate) fn is_index_ignored(name: &str) -> bool {
+    if is_ignored(name) {
+        return true;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        INDEX_IGNORED_NAMES
+            .iter()
+            .any(|&n| n.eq_ignore_ascii_case(name))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        INDEX_IGNORED_NAMES.contains(&name)
+    }
+}
+
+/// Matcher `.gitignore` du workspace pour l'INDEXATION sémantique.
+///
+/// Seul le `.gitignore` RACINE est lu (pas les imbriqués ni les excludes
+/// globaux) : c'est lui qui porte `venv/`, `dist/`, les dossiers de données…
+/// dans l'immense majorité des repos, et un seul fichier à parser garde le
+/// coût négligeable au flush du watcher. `None` si absent ou illisible ; les
+/// lignes invalides sont ignorées une à une par le builder (comportement git).
+pub(crate) fn build_workspace_gitignore(root: &Path) -> Option<ignore::gitignore::Gitignore> {
+    let file = root.join(".gitignore");
+    if !file.is_file() {
+        return None;
+    }
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
+    if builder.add(&file).is_some() {
+        return None; // erreur I/O sur le fichier entier
+    }
+    builder.build().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -694,7 +757,8 @@ pub fn fs_read_dir_scoped(
 /// Flat list of workspace-relative FILE paths (no directories), for the vector
 /// indexer. Walks WITHOUT the 5000-entry tree cap — that cap guards the eager
 /// DOM render of the file explorer, irrelevant to a background indexer. Applies:
-///   - `is_ignored` (dirs like node_modules/target/.git, pruned mid-walk),
+///   - `is_index_ignored` (node_modules/target/venv/.claude/…, pruned mid-walk),
+///   - le `.gitignore` RACINE du workspace (répertoires élagués pendant le walk),
 ///   - an `exclude_exts` filter (binaries/models/datasets) BEFORE counting, so
 ///     a 98k-file ML project's `.safetensors`/`.png` never enter the budget,
 ///   - a `max_files` budget; when exceeded, returns what fit + `truncated:true`
@@ -737,12 +801,37 @@ pub fn fs_list_files(
     let mut scored: Vec<(String, u8)> = Vec::new();
     let mut total_seen = 0usize;
 
+    // Matcher .gitignore racine construit UNE fois avant le walk. Il prune les
+    // RÉPERTOIRES ignorés pendant la descente (pas seulement les fichiers) —
+    // sans quoi on traverserait 76k entrées d'un venv pour les jeter une à une.
+    let gitignore = build_workspace_gitignore(&root);
+    let root_for_filter = root.clone();
     let walker = WalkDir::new(&root)
         .follow_links(false)
-        .max_depth(24) // deep enough for real source trees; dirs pruned by is_ignored
+        .max_depth(24) // deep enough for real source trees; dirs pruned by the filter
         .min_depth(1)
         .into_iter()
-        .filter_entry(|e| !is_ignored(&e.file_name().to_string_lossy()));
+        .filter_entry(move |e| {
+            // depth 0 = la racine elle-même : toujours traversée, même si le
+            // dossier du workspace porte lui-même un nom « ignoré » (workspace
+            // ouvert directement sur un dossier nommé build/, dist/…).
+            if e.depth() == 0 {
+                return true;
+            }
+            if is_index_ignored(&e.file_name().to_string_lossy()) {
+                return false;
+            }
+            if let Some(gi) = &gitignore {
+                // Chemin RELATIF au root : le matcher est ancré là, et cela
+                // neutralise le préfixe verbatim `\\?\` des chemins canonisés
+                // Windows (les deux côtés du strip_prefix le portent).
+                let rel = e.path().strip_prefix(&root_for_filter).unwrap_or(e.path());
+                if gi.matched(rel, e.file_type().is_dir()).is_ignore() {
+                    return false;
+                }
+            }
+            true
+        });
 
     for result in walker {
         let entry = match result {
@@ -1322,6 +1411,69 @@ mod tests {
         // Avec extension → délègue à index_tier (le nom n'override pas).
         assert_eq!(index_tier_for_file("main.rs", "rs"), 0);
         assert_eq!(index_tier_for_file("dataset.csv", "csv"), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // is_ignored / is_index_ignored / .gitignore (régime de l'index sémantique)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_ignored_covers_python_and_tooling_junk() {
+        // Le trou historique : `venv` SANS point (76k fichiers indexés en 2026-07).
+        for name in [
+            "venv",
+            ".venv",
+            "site-packages",
+            ".tox",
+            "__pycache__",
+            ".playwright-mcp",
+            ".pcc",
+            "node_modules",
+        ] {
+            assert!(is_ignored(name), "{name} devrait être ignoré partout");
+        }
+        // Pas de sur-blocage : ces noms légitimes restent indexables.
+        for name in ["env", "src", "envelope", "environment.ts"] {
+            assert!(!is_ignored(name), "{name} ne doit PAS être ignoré");
+        }
+    }
+
+    #[test]
+    fn is_index_ignored_hides_internals_from_index_only() {
+        // Exclus de l'INDEX…
+        for name in [".claude", ".shugu", ".shugu-forge", ".shugu-snippets"] {
+            assert!(is_index_ignored(name), "{name} ne doit pas être indexé");
+            // …mais PAS de l'arbre de fichiers (is_ignored reste faux).
+            assert!(!is_ignored(name), "{name} doit rester visible dans l'arbre");
+        }
+        // is_index_ignored est un SUR-ensemble de is_ignored.
+        assert!(is_index_ignored("venv"));
+        assert!(is_index_ignored("node_modules"));
+        assert!(!is_index_ignored("src"));
+    }
+
+    #[test]
+    fn workspace_gitignore_matches_dirs_and_files() {
+        let root = make_temp_dir("gitignore_match");
+        fs::write(root.join(".gitignore"), "env/\n*.onnx\n!keep.onnx\n").unwrap();
+
+        let gi = build_workspace_gitignore(&root).expect("matcher construit");
+        // Règle répertoire : `env/` matche le DOSSIER (élagué pendant le walk).
+        assert!(gi.matched(Path::new("env"), true).is_ignore());
+        assert!(!gi.matched(Path::new("src"), true).is_ignore());
+        // Règle fichier + négation git standard.
+        assert!(gi.matched(Path::new("model.onnx"), false).is_ignore());
+        assert!(!gi.matched(Path::new("keep.onnx"), false).is_ignore());
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn workspace_gitignore_absent_is_none() {
+        let root = make_temp_dir("gitignore_absent");
+        let _ = fs::remove_file(root.join(".gitignore"));
+        assert!(build_workspace_gitignore(&root).is_none());
+        cleanup(&root);
     }
 
     // -----------------------------------------------------------------------

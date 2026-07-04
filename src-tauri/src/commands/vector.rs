@@ -220,7 +220,9 @@ fn get_conn(app: &tauri::AppHandle) -> Result<&'static Mutex<Connection>, String
             ts              INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_agent_memory_conv
-            ON agent_memory(conversation_id);",
+            ON agent_memory(conversation_id);
+        CREATE INDEX IF NOT EXISTS idx_agent_memory_ts
+            ON agent_memory(ts);",
     )
     .map_err(|e| format!("create agent_memory: {e}"))?;
 
@@ -1294,6 +1296,267 @@ pub fn vec_code_gc(app: tauri::AppHandle) -> Result<usize, String> {
     gc_untracked_chunks(&mut guard)
 }
 
+// ---------------------------------------------------------------------------
+// Régime de la base — purge des chunks ignorés + VACUUM conditionnel
+//
+// Constat 2026-07 : 130k vecteurs dont 87 % venaient de `venv/` et `.claude/`
+// (l'ignore-list d'indexation avait des trous), et AUCUN DELETE du module ne
+// rendait jamais l'espace au système de fichiers — SQLite recycle les pages
+// libérées en interne (freelist) mais le fichier ne rétrécit qu'au VACUUM.
+// La base était montée à 229 Mo pour ~3k chunks utiles.
+// ---------------------------------------------------------------------------
+
+/// Un id de chunk `vec_code` (`path#Lstart-end`, ou chemin nu pour les ids de
+/// l'ère pré-chunks) pointe-t-il sous un répertoire exclu de l'indexation ?
+/// Helper PUR (testable sans DB) ; DOIT rester aligné sur le filtre du walk
+/// (`fs::is_index_ignored`) — même définition, sinon la purge supprime ce que
+/// le walk ré-insère (ou l'inverse).
+fn id_is_ignored(id: &str) -> bool {
+    let path = id.split('#').next().unwrap_or(id);
+    path.split(['/', '\\'])
+        .any(|seg| !seg.is_empty() && crate::commands::fs::is_index_ignored(seg))
+}
+
+/// Purge de `vec_code` tous les chunks dont le chemin traverse un répertoire
+/// exclu de l'indexation (venv, .claude, node_modules…), et les lignes
+/// `vec_code_files` correspondantes. Idempotente et bon marché à vide (un scan
+/// d'ids) → appelée à CHAQUE boot : c'est le filet anti-régression si un
+/// indexeur d'une version antérieure a laissé entrer des déchets.
+pub(crate) fn purge_ignored_chunks(conn: &mut Connection) -> Result<usize, String> {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("purge_ignored begin: {e}"))?;
+
+    let doomed_ids: Vec<String> = {
+        let mut stmt = tx
+            .prepare("SELECT id FROM vec_code")
+            .map_err(|e| format!("purge_ignored prepare scan: {e}"))?;
+        let ids = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("purge_ignored query scan: {e}"))?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|e| format!("purge_ignored row scan: {e}"))?;
+        ids.into_iter().filter(|id| id_is_ignored(id)).collect()
+    };
+    for id in &doomed_ids {
+        tx.execute("DELETE FROM vec_code WHERE id = ?1", params![id])
+            .map_err(|e| format!("purge_ignored delete chunk: {e}"))?;
+    }
+
+    let doomed_paths: Vec<String> = {
+        let mut stmt = tx
+            .prepare("SELECT path FROM vec_code_files")
+            .map_err(|e| format!("purge_ignored prepare side: {e}"))?;
+        let paths = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("purge_ignored query side: {e}"))?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|e| format!("purge_ignored row side: {e}"))?;
+        paths.into_iter().filter(|p| id_is_ignored(p)).collect()
+    };
+    for path in &doomed_paths {
+        tx.execute("DELETE FROM vec_code_files WHERE path = ?1", params![path])
+            .map_err(|e| format!("purge_ignored delete side: {e}"))?;
+    }
+
+    tx.commit().map_err(|e| format!("purge_ignored commit: {e}"))?;
+    Ok(doomed_ids.len())
+}
+
+/// Seuils du VACUUM conditionnel : on ne compacte que si l'espace récupérable
+/// (freelist) dépasse 32 Mo OU 25 % du fichier. Un usage sain ne déclenche
+/// jamais ; une purge massive (changement de workspace, correctif d'ignore-
+/// list) déclenche largement. En dessous, la freelist reste réutilisée en
+/// interne par SQLite — aucune urgence à payer un VACUUM.
+const VACUUM_MIN_FREE_BYTES: u64 = 32 * 1024 * 1024;
+const VACUUM_MIN_FREE_RATIO: f64 = 0.25;
+
+/// Décision pure du VACUUM (testable sans DB).
+fn vacuum_needed(free_bytes: u64, total_bytes: u64) -> bool {
+    if total_bytes == 0 {
+        return false;
+    }
+    free_bytes > VACUUM_MIN_FREE_BYTES
+        || (free_bytes as f64 / total_bytes as f64) > VACUUM_MIN_FREE_RATIO
+}
+
+/// Résultat de `maybe_vacuum`, pour les logs et le front.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VacuumOutcome {
+    /// Le VACUUM a-t-il tourné ?
+    pub ran: bool,
+    /// Taille du fichier AVANT (octets, pages × page_size).
+    pub before_bytes: u64,
+    /// Taille APRÈS (== before quand `ran` est faux).
+    pub after_bytes: u64,
+}
+
+/// VACUUM conditionnel : mesure la freelist et ne compacte que si le seuil est
+/// franchi. Rend l'espace au système de fichiers puis tronque le WAL
+/// (`wal_checkpoint(TRUNCATE)`).
+///
+/// ATTENTION coût : un VACUUM réécrit toute la base (quelques secondes sur
+/// ~200 Mo) et DOUBLE temporairement l'empreinte disque (copie de travail).
+/// Il exige aussi l'exclusivité : les deux autres handles (AGENTS_CONN, pool
+/// sqlx — spec AM-5 en tête de fichier) sont arbitrés par SQLite ; le
+/// `busy_timeout` de 5 s absorbe une contention courte, et au-delà on RETENTE
+/// 3 fois espacées de 2 s avant d'abandonner en loggant — la freelist restant
+/// réutilisable en interne, on retentera simplement au boot suivant. Jamais
+/// appelé dans une transaction (VACUUM le refuse).
+pub(crate) fn maybe_vacuum(conn: &Connection) -> Result<VacuumOutcome, String> {
+    let page_size: u64 = conn
+        .query_row("PRAGMA page_size", [], |r| r.get::<_, i64>(0))
+        .map_err(|e| format!("page_size: {e}"))? as u64;
+    let page_count: u64 = conn
+        .query_row("PRAGMA page_count", [], |r| r.get::<_, i64>(0))
+        .map_err(|e| format!("page_count: {e}"))? as u64;
+    let freelist: u64 = conn
+        .query_row("PRAGMA freelist_count", [], |r| r.get::<_, i64>(0))
+        .map_err(|e| format!("freelist_count: {e}"))? as u64;
+
+    let before_bytes = page_count * page_size;
+    let free_bytes = freelist * page_size;
+    if !vacuum_needed(free_bytes, before_bytes) {
+        return Ok(VacuumOutcome {
+            ran: false,
+            before_bytes,
+            after_bytes: before_bytes,
+        });
+    }
+
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        match conn.execute_batch("VACUUM;") {
+            Ok(()) => break,
+            Err(e) => {
+                let busy = matches!(
+                    e.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy)
+                        | Some(rusqlite::ErrorCode::DatabaseLocked)
+                );
+                if busy && attempt < 3 {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    continue;
+                }
+                // Abandon SANS erreur fatale : base d'origine intacte par
+                // conception (SQLITE_FULL/BUSY avortent proprement), l'espace
+                // reste réutilisable en interne, retentative au boot suivant.
+                eprintln!("[vector] VACUUM différé (tentative {attempt}): {e}");
+                return Ok(VacuumOutcome {
+                    ran: false,
+                    before_bytes,
+                    after_bytes: before_bytes,
+                });
+            }
+        }
+    }
+    // Tronque le WAL pour que le sidecar -wal ne conserve pas l'image de la
+    // réécriture complète qu'est le VACUUM.
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+
+    let after_pages: u64 = conn
+        .query_row("PRAGMA page_count", [], |r| r.get::<_, i64>(0))
+        .map_err(|e| format!("page_count after: {e}"))? as u64;
+    let after_bytes = after_pages * page_size;
+    eprintln!(
+        "[vector] VACUUM: {:.1} Mo → {:.1} Mo",
+        before_bytes as f64 / 1_048_576.0,
+        after_bytes as f64 / 1_048_576.0
+    );
+    Ok(VacuumOutcome {
+        ran: true,
+        before_bytes,
+        after_bytes,
+    })
+}
+
+/// La mémoire orchestrée (`agent_memory` + `vec_memory`) n'expire jamais par
+/// l'âge — un fait ancien mais pertinent doit pouvoir remonter — mais elle est
+/// BORNÉE : au-delà de `AGENT_MEMORY_CAP` lignes, les plus anciennes (FIFO par
+/// `ts`) partent au boot. 5 000 × (embedding 1,5 Ko + texte) ≈ 10-15 Mo à vie ;
+/// sans cap, `remember()` en boucle d'orchestrateur gonflait sans limite.
+const AGENT_MEMORY_CAP: usize = 5_000;
+
+/// Applique le cap FIFO sur la paire `(agent_memory, vec_memory)`. Les deux
+/// tables bougent ensemble dans UNE transaction IMMEDIATE (pattern
+/// `vec_delete`) : jamais de vecteur orphelin ni de payload fantôme.
+pub(crate) fn cap_agent_memory(conn: &mut Connection, cap: usize) -> Result<usize, String> {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("cap_memory begin: {e}"))?;
+    let doomed: Vec<String> = {
+        let mut stmt = tx
+            .prepare("SELECT id FROM agent_memory ORDER BY ts DESC LIMIT -1 OFFSET ?1")
+            .map_err(|e| format!("cap_memory prepare: {e}"))?;
+        let ids = stmt
+            .query_map(params![cap as i64], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("cap_memory query: {e}"))?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(|e| format!("cap_memory row: {e}"))?;
+        ids
+    };
+    for id in &doomed {
+        tx.execute("DELETE FROM vec_memory WHERE id = ?1", params![id])
+            .map_err(|e| format!("cap_memory vec delete: {e}"))?;
+        tx.execute("DELETE FROM agent_memory WHERE id = ?1", params![id])
+            .map_err(|e| format!("cap_memory payload delete: {e}"))?;
+    }
+    tx.commit().map_err(|e| format!("cap_memory commit: {e}"))?;
+    Ok(doomed.len())
+}
+
+/// Maintenance de boot — appelée par `lib.rs::setup` dans un `spawn_blocking` :
+/// purge des chunks ignorés, cap de la mémoire d'agent, VACUUM si rentable, et
+/// UNE ligne de log métrique (la jauge consultable dans `trace.log` pour
+/// détecter une régression de croissance). Ne dépend ni d'un workspace ouvert
+/// ni du modèle d'embedding — c'est ce qui la distingue du GC de
+/// réconciliation (`vec_code_gc`), qui ne tourne qu'après une passe
+/// d'indexation sans échec.
+pub(crate) fn boot_maintenance(app: &tauri::AppHandle) -> Result<(), String> {
+    let conn_mutex = get_conn(app)?;
+    let mut guard = conn_mutex.lock().map_err(|e| format!("lock: {e}"))?;
+
+    let purged = purge_ignored_chunks(&mut guard)?;
+    if purged > 0 {
+        eprintln!("[vector] purge ignorés: {purged} chunks (venv/.claude/node_modules…)");
+    }
+    match cap_agent_memory(&mut guard, AGENT_MEMORY_CAP) {
+        Ok(n) if n > 0 => {
+            eprintln!("[vector] mémoire agent : {n} entrée(s) au-delà du cap {AGENT_MEMORY_CAP} purgée(s)");
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("[vector] cap mémoire agent : {e}"),
+    }
+    let outcome = maybe_vacuum(&guard)?;
+
+    let chunks: i64 = guard
+        .query_row("SELECT COUNT(*) FROM vec_code", [], |r| r.get(0))
+        .unwrap_or(-1);
+    let freelist: i64 = guard
+        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+        .unwrap_or(0);
+    let page_size: i64 = guard
+        .query_row("PRAGMA page_size", [], |r| r.get(0))
+        .unwrap_or(4096);
+    eprintln!(
+        "[storage] shugu.db={:.1} Mo, vec_code={chunks} chunks, freelist={:.1} Mo",
+        outcome.after_bytes as f64 / 1_048_576.0,
+        (freelist * page_size) as f64 / 1_048_576.0
+    );
+    Ok(())
+}
+
+/// Commande front : VACUUM conditionnel après un GC de réconciliation qui a
+/// réellement purgé des chunks (`workspaceIndexer.ts`, étape 6) — sans elle,
+/// l'espace libéré par le GC ne serait rendu au disque qu'au boot suivant.
+#[tauri::command(async)]
+pub fn vec_maybe_vacuum(app: tauri::AppHandle) -> Result<VacuumOutcome, String> {
+    let guard = get_conn(&app)?.lock().map_err(|e| format!("lock: {e}"))?;
+    maybe_vacuum(&guard)
+}
+
 /// Standalone semantic search over the indexed `code` collection — the command
 /// the palette's "Search semantically" action and the parity work call directly,
 /// without going through the generic `vec_search` (which exposes every
@@ -1556,6 +1819,133 @@ mod tests {
         assert_eq!(vec_n, expected, "all vec rows committed");
         assert_eq!(pay_n, expected, "all payload rows committed");
         assert_eq!(orphans, 0, "no vec row left without its payload (atomic pairs)");
+
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    // =======================================================================
+    // Régime de la base — purge des chunks ignorés + VACUUM conditionnel
+    //
+    // Comme les tests AM-5, on reste hermétique : `purge_ignored_chunks` et
+    // `maybe_vacuum` n'émettent que du SQL standard (SELECT/DELETE/PRAGMA/
+    // VACUUM), donc la table `vec_code` ORDINAIRE de `create_code_schema`
+    // (définie plus bas, section Phase 5) suffit — pas besoin de l'extension
+    // sqlite-vec ni du modèle d'embedding.
+    // =======================================================================
+
+    #[test]
+    fn id_is_ignored_matches_walk_filter() {
+        // Format chunk (`path#Lx-y`) ET format legacy (chemin nu) — les deux
+        // coexistent dans une base héritée de l'ère pré-chunks.
+        assert!(id_is_ignored("venv/lib/site.py#L1-10"));
+        assert!(id_is_ignored(".claude/plans/plan.md"));
+        assert!(id_is_ignored("sub/node_modules/x/i.js#L3-9"));
+        assert!(id_is_ignored("venv\\lib\\win.py#L1-2"), "séparateur Windows");
+        assert!(id_is_ignored(".shugu-snippets/snippet-1.ts#L1-4"));
+        // Le code légitime ne matche jamais.
+        assert!(!id_is_ignored("src/main.rs#L1-40"));
+        assert!(!id_is_ignored("public/index.html"));
+        assert!(!id_is_ignored("packages/env/index.ts#L1-3"), "`env` n'est pas bloqué en dur");
+    }
+
+    #[test]
+    fn purge_ignored_chunks_removes_junk_keeps_code() {
+        let db = temp_db("purge");
+        let (mut conn, _) = open_configured(&db);
+        create_code_schema(&conn);
+
+        for id in [
+            "venv/lib/a.py#L1-5",
+            "venv/lib/b.py#L1-9",
+            ".claude/worktrees/w/src/x.rs#L1-7",
+            ".claude/old-plan.md", // id legacy sans #L
+            "src/main.rs#L1-40",
+            "docs/guide.md#L1-12",
+        ] {
+            conn.execute(
+                "INSERT INTO vec_code(id, embedding) VALUES (?1, x'00')",
+                params![id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO vec_code_files(path, chunk_ids, indexed_at) VALUES \
+             ('venv/lib/a.py', '[\"venv/lib/a.py#L1-5\"]', 1), \
+             ('src/main.rs', '[\"src/main.rs#L1-40\"]', 1)",
+            [],
+        )
+        .unwrap();
+
+        let purged = purge_ignored_chunks(&mut conn).unwrap();
+        assert_eq!(purged, 4, "les 4 chunks venv/.claude partent");
+
+        let remaining: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT id FROM vec_code ORDER BY id").unwrap();
+            let ids = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<String>, _>>()
+                .unwrap();
+            ids
+        };
+        assert_eq!(remaining, vec!["docs/guide.md#L1-12", "src/main.rs#L1-40"]);
+
+        // La ligne de tracking du fichier venv est partie, celle de src reste.
+        let tracked: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vec_code_files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tracked, 1);
+
+        // Idempotence : une seconde passe ne trouve plus rien.
+        assert_eq!(purge_ignored_chunks(&mut conn).unwrap(), 0);
+
+        let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    #[test]
+    fn vacuum_needed_thresholds() {
+        const MB: u64 = 1024 * 1024;
+        assert!(!vacuum_needed(0, 0), "base vide");
+        assert!(!vacuum_needed(0, 100 * MB), "rien à récupérer");
+        // Déclencheur absolu : > 32 Mo récupérables, même sur un gros fichier.
+        assert!(vacuum_needed(33 * MB, 1024 * MB));
+        assert!(!vacuum_needed(31 * MB, 1024 * MB));
+        // Déclencheur relatif : > 25 % du fichier, même sous 32 Mo.
+        assert!(vacuum_needed(10 * MB, 30 * MB));
+        assert!(!vacuum_needed(10 * MB, 100 * MB));
+    }
+
+    #[test]
+    fn maybe_vacuum_reclaims_space_then_noops() {
+        let db = temp_db("vacuum");
+        let (conn, _) = open_configured(&db);
+        create_code_schema(&conn);
+
+        // ~40 Mo de blobs, puis DELETE intégral → grosse freelist, fichier
+        // toujours à sa taille de pic (c'est le bug que maybe_vacuum répare).
+        let blob = vec![0u8; 1024 * 1024];
+        for i in 0..40 {
+            conn.execute(
+                "INSERT INTO vec_code(id, embedding) VALUES (?1, ?2)",
+                params![format!("big/{i}.bin#L1-1"), blob],
+            )
+            .unwrap();
+        }
+        conn.execute("DELETE FROM vec_code", []).unwrap();
+
+        let outcome = maybe_vacuum(&conn).unwrap();
+        assert!(outcome.ran, "40 Mo de freelist doivent déclencher le VACUUM");
+        assert!(
+            outcome.after_bytes < outcome.before_bytes / 4,
+            "le fichier doit rétrécir massivement ({} → {})",
+            outcome.before_bytes,
+            outcome.after_bytes
+        );
+
+        // Seconde passe : plus rien à récupérer → no-op.
+        let again = maybe_vacuum(&conn).unwrap();
+        assert!(!again.ran, "sans freelist, pas de VACUUM");
+        assert_eq!(again.before_bytes, again.after_bytes);
 
         let _ = std::fs::remove_dir_all(db.parent().unwrap());
     }

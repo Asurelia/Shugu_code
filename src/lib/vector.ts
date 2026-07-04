@@ -155,3 +155,23 @@ export async function vecStalePaths(
 export async function vecCodeGc(): Promise<number> {
   return invoke<number>("vec_code_gc");
 }
+
+/** Résultat du VACUUM conditionnel Rust ({@link vecMaybeVacuum}). */
+export interface VacuumOutcome {
+  /** Le VACUUM a-t-il réellement tourné (seuil franchi + pas de contention) ? */
+  ran: boolean;
+  /** Taille du fichier de base avant (octets). */
+  beforeBytes: number;
+  /** Taille après — égale à `beforeBytes` quand `ran` est faux. */
+  afterBytes: number;
+}
+
+/**
+ * VACUUM conditionnel de shugu.db : ne compacte que si l'espace récupérable
+ * dépasse le seuil Rust (32 Mo ou 25 % du fichier). À appeler après un GC qui a
+ * réellement purgé des chunks — un DELETE seul ne rend jamais l'espace au
+ * disque, SQLite le recycle seulement en interne.
+ */
+export async function vecMaybeVacuum(): Promise<VacuumOutcome> {
+  return invoke<VacuumOutcome>("vec_maybe_vacuum");
+}
