@@ -120,6 +120,9 @@ function railTargetFor(v: string): string {
     chat: "/chat", code: "/code", git: "/git", image: "/image",
     studio: "/studio", agents: "/agents", gallery: "/gallery",
     settings: "/settings", profile: "/profile", connections: "/connections",
+    // Settings sub-sections reachable from the account dropdown. Without
+    // `privacy` here, "Privacy & data" silently fell through to /chat.
+    privacy: "/settings/privacy", interface: "/settings/interface", about: "/settings/about",
   };
   return map[v] ?? "/chat";
 }

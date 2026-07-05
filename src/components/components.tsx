@@ -70,6 +70,7 @@ export function Icon({ name, size = 18, className = "" }: { name: string; size?:
     case "chevron-right": return p(<><path d="m9 18 6-6-6-6"/></>);
     case "list":   return p(<><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></>);
     case "plug":   return p(<><path d="M12 22v-4"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M6 8h12v4a6 6 0 0 1-12 0V8Z"/></>);
+    case "lock":   return p(<><rect x="4.5" y="11" width="15" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></>);
     default: return p(<circle cx="12" cy="12" r="6"/>);
   }
 }
