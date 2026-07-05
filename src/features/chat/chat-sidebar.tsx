@@ -2,11 +2,19 @@
 // Ported from chat-sidebar.jsx.
 
 import { useState, useEffect, useRef, useMemo } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Icon } from "@/components/components";
 import { db, convoToRow } from "@/lib/db";
 import { seedIfEmpty } from "@/lib/db";
 import { vecSearch } from "@/lib/vector";
+import { fsSetWorkspaceRoot } from "@/lib/fs";
+import {
+  useCurrentProject,
+  useProjects,
+  useProjectCounts,
+} from "@/features/projects/projectsQueries";
+import { ProjectSwitcher, type ProjectViewMode } from "@/features/projects/ProjectSwitcher";
+import { projectKeys } from "@/features/projects/keys";
 
 export const SEED_GROUPS = [
   { id: "pinned",    label: "Pinned",    pinnedSection: true },
@@ -67,6 +75,21 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
   const [convos, setConvos]   = useState<any[]>(() => convosCache ?? []);
   const [filtersOpen, setFiltersOpen] = useState(false);
 
+  // ─── Project scope (V18) ─────────────────────────────────────────────
+  // A project = the opened folder. The sidebar shows one scope at a time:
+  //   "project" → the current folder's conversations (default)
+  //   "all"     → every conversation, all projects
+  //   "global"  → conversations with no project (incl. pre-V18 history)
+  const queryClient = useQueryClient();
+  const { data: currentProject } = useCurrentProject();
+  const { data: projectList = [] } = useProjects();
+  const { data: projectCounts = {} } = useProjectCounts();
+  const [viewMode, setViewMode] = useState<ProjectViewMode>("project");
+  const scope =
+    viewMode === "all" ? undefined
+    : viewMode === "global" ? null
+    : (currentProject?.id ?? null);
+
   // ─────────────────────────────────────────────────────────────────
   // NOT TanStack because:
   //   1. searchQuery is ephemeral local UI state (input value for a single
@@ -116,17 +139,28 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
   // conversation would leave the stale in-memory list on screen. seedIfEmpty()
   // re-seeds a genuinely empty table first, so a fresh install still shows the
   // onboarding demo (loaded from SQLite, persistent — not a flashing placeholder).
+  // Reset to the current-project view whenever the open folder changes, so
+  // opening a project surfaces its conversations (not a stale "all"/"global").
+  const prevProjectId = useRef<string | null | undefined>(undefined);
+  useEffect(() => {
+    const id = currentProject?.id ?? null;
+    if (prevProjectId.current !== undefined && prevProjectId.current !== id) {
+      setViewMode("project");
+    }
+    prevProjectId.current = id;
+  }, [currentProject?.id]);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
       await seedIfEmpty();
-      const nested = await db.conversations.listNested();
+      const nested = await db.conversations.listNested(scope);
       if (!cancelled) {
         setConvos(nested);
       }
     })();
     return () => { cancelled = true; };
-  }, []);
+  }, [scope]);
 
   const visible = useMemo(() => {
     return convos.filter((c: any) => {
@@ -246,9 +280,10 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
     setConvos(cs => [newConvoData, ...cs]);
     void db.conversations.create(convoToRow(newConvoData));
   };
+  // Sidebar groups are in-session organizers only (V18: decoupled from the
+  // persisted project scope) — this no longer writes to the DB.
   const moveTo   = (id: string, groupId: string) => {
     patch(id, { group: groupId, updated: Date.now() });
-    void db.conversations.setGroup(id, groupId);
   };
   const addGroup = (label: string) => {
     const id = "g-" + Date.now();
@@ -337,9 +372,14 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
     const id = "c-" + Date.now();
     const titles = ["New conversation", "Untitled chat", "Fresh thread", "amazing-grothendieck-" + Math.random().toString(36).slice(2, 8), "vibrant-noether-" + Math.random().toString(36).slice(2, 8)];
     const title = titles[Math.floor(Math.random() * titles.length)];
-    const newConvoData = { id, title, group: "ungrouped", status: "active" as const, env: "dev", updated: Date.now(), unread: false };
+    // Stamp the new conversation with the current project (open folder), and
+    // snap the view to it so the fresh conversation is visible.
+    const projectId = currentProject?.id ?? null;
+    const newConvoData = { id, title, project_id: projectId, group: "ungrouped", status: "active" as const, env: "dev", updated: Date.now(), unread: false };
+    setViewMode("project");
     setConvos(cs => [newConvoData, ...cs]);
     void db.conversations.create(convoToRow(newConvoData));
+    void queryClient.invalidateQueries({ queryKey: projectKeys.counts() });
     setActiveId(id);
     setRenaming(id);
   };
@@ -403,6 +443,22 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
       )}
 
       {filtersOpen && <FiltersPanel filters={filters} setFilters={setFilters} groups={groups} onClose={() => setFiltersOpen(false)}/>}
+
+      <ProjectSwitcher
+        projects={projectList}
+        counts={projectCounts}
+        currentProjectId={currentProject?.id ?? null}
+        viewMode={viewMode}
+        onOpenProject={async (root) => {
+          setViewMode("project");
+          try {
+            await fsSetWorkspaceRoot(root);
+          } catch (e) {
+            console.warn("[projects] open folder failed (stale path?):", e);
+          }
+        }}
+        onSetMode={setViewMode}
+      />
 
       {/* Action primaire de la vue, en pleine largeur (pattern Codex/Claude
           Desktop « New chat ») — remplace le micro-« + » du header, trop

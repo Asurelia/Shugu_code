@@ -74,10 +74,20 @@ export interface MessageRow {
   parent_id: string | null;
 }
 
+/**
+ * A project = an opened folder. Ex-vestigial `projects` table (V1), resurrected
+ * in V18 into the real registry. `root_path` is the canonical key (display form:
+ * no `\\?\` prefix, forward slashes), matching what `fsGetWorkspaceRoot()` returns.
+ * `color`/`sort_order` (unused V1 columns) finally drive the project switcher.
+ */
 export interface ProjectRow {
   id: string;
   name: string;
-  created_at: number;
+  root_path: string | null;
+  color: string | null;
+  sort_order: number;
+  last_opened_at: number | null;
+  created_at: number | null;
 }
 
 export interface GenerationRow {
@@ -170,7 +180,12 @@ export interface MascotMemoryRow {
 export interface ConvoUI {
   id: string;
   title: string;
-  group: string;          // maps to project_id (null → "ungrouped")
+  /** Real project the conversation belongs to (V18 FK → projects.id), or null
+   *  for global/unassigned. This is the persisted scope. */
+  project_id: string | null;
+  /** Purely in-session sidebar organizer (pinned/custom buckets). NOT persisted
+   *  — decoupled from project_id in V18; resets to "ungrouped" on reload. */
+  group: string;
   pinned?: boolean;
   archived?: boolean;
   unread?: boolean;
@@ -186,7 +201,8 @@ export function rowToConvo(r: ConversationRow): ConvoUI {
   return {
     id: r.id,
     title: r.title,
-    group: r.project_id ?? "ungrouped",
+    project_id: r.project_id,
+    group: "ungrouped",
     pinned: r.pinned === 1,
     archived: r.archived === 1,
     unread: r.unread === 1,
@@ -202,7 +218,7 @@ export function convoToRow(c: ConvoUI): ConversationRow {
   return {
     id: c.id,
     title: c.title,
-    project_id: c.group === "ungrouped" ? null : c.group,
+    project_id: c.project_id ?? null,
     pinned: c.pinned ? 1 : 0,
     archived: c.status === "archived" || c.archived ? 1 : 0,
     unread: c.unread ? 1 : 0,
@@ -239,9 +255,25 @@ export function toGenerationRow(g: Generation): GenerationRow {
 // ---------------------------------------------------------------------------
 
 const conversations = {
-  async list(): Promise<ConversationRow[]> {
+  /**
+   * List conversations, scoped by project.
+   *   - `scope` omitted (undefined) → all conversations (backward-compatible).
+   *   - `scope === null`            → only unassigned/global conversations.
+   *   - `scope` a project id string → only that project's conversations.
+   */
+  async list(scope?: string | null): Promise<ConversationRow[]> {
     const db = await getDb();
-    return db.select("SELECT * FROM conversations ORDER BY updated_at DESC") as Promise<ConversationRow[]>;
+    if (scope === undefined) {
+      return db.select("SELECT * FROM conversations ORDER BY updated_at DESC") as Promise<ConversationRow[]>;
+    }
+    if (scope === null) {
+      return db.select(
+        "SELECT * FROM conversations WHERE project_id IS NULL ORDER BY updated_at DESC"
+      ) as Promise<ConversationRow[]>;
+    }
+    return db.select(
+      "SELECT * FROM conversations WHERE project_id = $1 ORDER BY updated_at DESC", [scope]
+    ) as Promise<ConversationRow[]>;
   },
 
   async get(id: string): Promise<ConversationRow | null> {
@@ -287,12 +319,12 @@ const conversations = {
     );
   },
 
-  async setGroup(id: string, groupId: string): Promise<void> {
+  /** Move a conversation to a project (or `null` to unassign / make global). */
+  async setProject(id: string, projectId: string | null): Promise<void> {
     const db = await getDb();
-    const project_id = groupId === "ungrouped" ? null : groupId;
     await db.execute(
       "UPDATE conversations SET project_id = $1, updated_at = $2 WHERE id = $3",
-      [project_id, Date.now(), id]
+      [projectId, Date.now(), id]
     );
   },
 
@@ -331,8 +363,8 @@ const conversations = {
    *
    * The existing flat list() is left untouched for callers that want flat rows.
    */
-  async listNested(): Promise<ConvoUI[]> {
-    const rows = await conversations.list();
+  async listNested(scope?: string | null): Promise<ConvoUI[]> {
+    const rows = await conversations.list(scope);
     const byId = new Map<string, ConvoUI>();
     const ui = rows.map(rowToConvo);
     for (const c of ui) {
@@ -483,21 +515,94 @@ const messages = {
 };
 
 // ---------------------------------------------------------------------------
-// projects
+// projects  (V18 — the project registry, keyed by opened folder)
 // ---------------------------------------------------------------------------
 
+/** Key used by conversationCounts() for the "no project" (NULL) bucket. */
+export const GLOBAL_BUCKET = "__global__";
+
+/** Auto-assigned project dot colors (mid-ramp hexes, readable in both modes). */
+const PROJECT_COLORS = [
+  "#1D9E75", "#D85A30", "#378ADD", "#7F77DD", "#BA7517", "#D4537E", "#639922",
+];
+
+/** Last path segment of a folder path — the default project name. */
+function basename(p: string): string {
+  const parts = p.replace(/[\\/]+$/, "").split(/[\\/]/);
+  return parts[parts.length - 1] || p;
+}
+
+/**
+ * Canonical project key: strip the Windows extended-length prefix (`\\?\`),
+ * convert backslashes to forward slashes, drop the trailing slash. Mirrors the
+ * Rust `norm_display()` so a key computed from `fsGetWorkspaceRoot()` and one
+ * computed from a `studio_projects.workspace_root` (canonical Rust form) match.
+ */
+export function normalizeRoot(p: string): string {
+  return p.replace(/^\\\\\?\\/, "").replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
 const projects = {
+  /** Registered projects (those with a folder), most-recently-opened first. */
   async list(): Promise<ProjectRow[]> {
     const db = await getDb();
-    return db.select("SELECT * FROM projects ORDER BY created_at DESC") as Promise<ProjectRow[]>;
+    return db.select(
+      "SELECT * FROM projects WHERE root_path IS NOT NULL ORDER BY last_opened_at DESC, sort_order ASC"
+    ) as Promise<ProjectRow[]>;
   },
 
-  async create(row: ProjectRow): Promise<void> {
+  async getByRoot(rootPath: string): Promise<ProjectRow | null> {
     const db = await getDb();
-    await db.execute(
-      "INSERT OR IGNORE INTO projects (id, name, created_at) VALUES ($1, $2, $3)",
-      [row.id, row.name, row.created_at]
+    const key = normalizeRoot(rootPath);
+    const rows: ProjectRow[] = await db.select(
+      "SELECT * FROM projects WHERE root_path = $1 LIMIT 1", [key]
     );
+    return rows[0] ?? null;
+  },
+
+  /** Ensure a project exists for this folder and bump last_opened_at. Idempotent. */
+  async upsertForRoot(rootPath: string): Promise<ProjectRow> {
+    const db = await getDb();
+    const key = normalizeRoot(rootPath);
+    const now = Date.now();
+    const existing = await projects.getByRoot(key);
+    if (existing) {
+      await db.execute("UPDATE projects SET last_opened_at = $1 WHERE id = $2", [now, existing.id]);
+      return { ...existing, last_opened_at: now };
+    }
+    const countRows: { n: number }[] = await db.select(
+      "SELECT COUNT(*) AS n FROM projects WHERE root_path IS NOT NULL"
+    );
+    const idx = countRows[0]?.n ?? 0;
+    const row: ProjectRow = {
+      id: `p-${now}-${Math.random().toString(36).slice(2, 8)}`,
+      name: basename(key),
+      root_path: key,
+      color: PROJECT_COLORS[idx % PROJECT_COLORS.length],
+      sort_order: idx,
+      last_opened_at: now,
+      created_at: now,
+    };
+    await db.execute(
+      `INSERT OR IGNORE INTO projects
+         (id, name, root_path, color, sort_order, last_opened_at, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [row.id, row.name, row.root_path, row.color, row.sort_order, row.last_opened_at, row.created_at]
+    );
+    // A concurrent writer may have inserted the same root_path (UNIQUE index):
+    // re-read so both callers converge on the same row.
+    return (await projects.getByRoot(key)) ?? row;
+  },
+
+  /** Active-conversation count per project id (+ GLOBAL_BUCKET for unassigned). */
+  async conversationCounts(): Promise<Record<string, number>> {
+    const db = await getDb();
+    const rows: { project_id: string | null; n: number }[] = await db.select(
+      "SELECT project_id, COUNT(*) AS n FROM conversations WHERE archived = 0 GROUP BY project_id"
+    );
+    const out: Record<string, number> = {};
+    for (const r of rows) out[r.project_id ?? GLOBAL_BUCKET] = r.n;
+    return out;
   },
 
   async rename(id: string, name: string): Promise<void> {
@@ -505,9 +610,46 @@ const projects = {
     await db.execute("UPDATE projects SET name = $1 WHERE id = $2", [name, id]);
   },
 
-  async remove(id: string): Promise<void> {
+  async setColor(id: string, color: string): Promise<void> {
     const db = await getDb();
-    await db.execute("DELETE FROM projects WHERE id = $1", [id]);
+    await db.execute("UPDATE projects SET color = $1 WHERE id = $2", [color, id]);
+  },
+
+  /**
+   * One-shot, flag-guarded, best-effort reclamation of EXISTING conversations
+   * into their real project. Runs POST-boot (never in the migration — avoids the
+   * boot write-lock). Two steps:
+   *   1. NULL out legacy `project_id` values that were ephemeral group ids (they
+   *      don't map to a real project row) — otherwise those conversations would
+   *      be orphaned (invisible outside "All").
+   *   2. Reassign via `studio_projects` links: a studio project ties a
+   *      conversation to a `workspace_root`, so we know its real folder.
+   * Conversations with no studio link stay NULL → "Global" (honest limit).
+   */
+  async backfillFromStudio(): Promise<void> {
+    const db = await getDb();
+    if ((await settings.get("projects_backfill_done")) === "1") return;
+    try {
+      await db.execute(
+        `UPDATE conversations SET project_id = NULL
+           WHERE project_id IS NOT NULL
+             AND project_id NOT IN (SELECT id FROM projects WHERE root_path IS NOT NULL)`
+      );
+      const links: { conversation_id: string; workspace_root: string }[] = await db.select(
+        `SELECT DISTINCT conversation_id, workspace_root FROM studio_projects
+           WHERE conversation_id IS NOT NULL AND workspace_root IS NOT NULL AND deleted_at IS NULL`
+      );
+      for (const l of links) {
+        const proj = await projects.upsertForRoot(l.workspace_root);
+        await db.execute(
+          "UPDATE conversations SET project_id = $1 WHERE id = $2 AND project_id IS NULL",
+          [proj.id, l.conversation_id]
+        );
+      }
+      await settings.set("projects_backfill_done", "1");
+    } catch (e) {
+      console.error("[projects] backfill failed (will retry next boot):", e);
+    }
   },
 };
 

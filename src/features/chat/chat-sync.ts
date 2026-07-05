@@ -29,6 +29,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { db } from "@/lib/db";
+import { resolveCurrentProjectId } from "@/features/projects/projectsQueries";
 import { invoke } from "@/lib/tauri";
 import { resolveProvider, type Protocol } from "@/lib/providers";
 import { loadProviderConfig, getConfig, getProviderEnabled } from "@/lib/credentials";
@@ -1436,12 +1437,15 @@ export function useChatMode(): [ChatMode, (m: ChatMode) => void] {
 }
 
 // ─── createConversation — insert a fresh conv row + return its id ──────
+// Stamps the conversation with the current project (the open folder) so the
+// sidebar's per-project scoping picks it up. null → global (no folder open).
 export async function createConversation(title: string = "New chat"): Promise<string> {
   const id = `c${Date.now()}`;
+  const projectId = await resolveCurrentProjectId();
   await db.conversations.create({
     id,
     title,
-    project_id: null,
+    project_id: projectId,
     pinned: 0,
     archived: 0,
     unread: 0,

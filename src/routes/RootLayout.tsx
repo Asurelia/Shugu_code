@@ -58,6 +58,7 @@ import { invalidateFileTree } from "@/features/fs/queries";
 import { queryClient } from "@/lib/queryClient";
 import { fsKeys } from "@/features/fs/keys";
 import { gitKeys } from "@/features/git/keys";
+import { projectKeys } from "@/features/projects/keys";
 import { useFsEvents } from "@/features/fs/useEvents";
 import { useGitEvents } from "@/features/git/useEvents";
 import { useRefreshOpenFiles } from "@/features/fs/useRefreshOpenFiles";
@@ -671,6 +672,11 @@ export function RootLayout() {
           // le chip (staleTime Infinity → invalidate force le refetch).
           void queryClient.invalidateQueries({ queryKey: gitKeys.all });
           void queryClient.invalidateQueries({ queryKey: fsKeys.workspaceRoot() });
+          // V18 — le projet courant est dérivé du workspace root : rafraîchit le
+          // sélecteur de projets, le compteur, et la résolution du projet courant
+          // (upsert du nouveau dossier). La sidebar re-scope ses conversations dès
+          // que `currentProject.id` change.
+          void queryClient.invalidateQueries({ queryKey: projectKeys.all });
           // Self-contained (revue MEDIUM) : invalide AUSSI l'arbre de fichiers ici
           // pour que ce listener soit l'unique point canonique de nettoyage au
           // changement de workspace (les appelants actuels le faisaient déjà ;
@@ -686,6 +692,24 @@ export function RootLayout() {
       clearTimeout(t);
       unlisten?.();
     };
+  }, []);
+
+  // V18 — one-shot backfill: reclaim existing conversations into their real
+  // project (via studio_projects links) and null out legacy ephemeral group
+  // ids. Runs POST-boot (8 s) and is flag-guarded internally, so it never
+  // touches the DB during the migration/boot write-lock window.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      void (async () => {
+        try {
+          await db.projects.backfillFromStudio();
+          void queryClient.invalidateQueries({ queryKey: projectKeys.all });
+        } catch (e) {
+          console.warn("[RootLayout] projects backfill failed:", e);
+        }
+      })();
+    }, 8000);
+    return () => clearTimeout(t);
   }, []);
 
   // Restore the previously open tabs + active file from SQLite.

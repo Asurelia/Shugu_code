@@ -465,6 +465,24 @@ CREATE INDEX IF NOT EXISTS idx_mascot_memory_cat       ON mascot_memory(category
 CREATE INDEX IF NOT EXISTS idx_mascot_memory_validated ON mascot_memory(validated);
 ";
 
+// V18 — Le Projet comme entité de première classe. La table `projects` (V1)
+// était morte (colonnes color/sort_order jamais utilisées) ; on la ressuscite en
+// REGISTRE réel des projets, clé = `root_path` (le dossier ouvert, forme
+// d'affichage). La colonne EXISTANTE `conversations.project_id` (qui servait
+// jusqu'ici d'id de « groupe » éphémère non persisté) devient une vraie référence
+// vers `projects.id` → les conversations sont enfin scopées au dossier ouvert.
+// Additif pur (ADD COLUMN O(1) + index) : aucune réécriture de lignes, pas de
+// grosse transaction au boot (respecte la contrainte verrou/migration-lazy). Le
+// backfill des conversations existantes se fait APRÈS le boot, côté TS, par lots
+// et flag-gardé (jamais dans la migration).
+const MIGRATION_V18: &str = "
+ALTER TABLE projects ADD COLUMN root_path      TEXT;
+ALTER TABLE projects ADD COLUMN last_opened_at INTEGER;
+ALTER TABLE projects ADD COLUMN created_at     INTEGER;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_root       ON projects(root_path);
+CREATE INDEX        IF NOT EXISTS idx_conversations_project ON conversations(project_id, updated_at);
+";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = vec![
@@ -568,6 +586,12 @@ pub fn run() {
             version: 17,
             description: "mascot_memory_hardening",
             sql: MIGRATION_V17,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 18,
+            description: "projects_first_class_entity",
+            sql: MIGRATION_V18,
             kind: MigrationKind::Up,
         },
     ];
