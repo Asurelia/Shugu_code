@@ -70,6 +70,7 @@ export function Icon({ name, size = 18, className = "" }: { name: string; size?:
     case "chevron-right": return p(<><path d="m9 18 6-6-6-6"/></>);
     case "list":   return p(<><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></>);
     case "plug":   return p(<><path d="M12 22v-4"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M6 8h12v4a6 6 0 0 1-12 0V8Z"/></>);
+    case "lock":   return p(<><rect x="4.5" y="11" width="15" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></>);
     default: return p(<circle cx="12" cy="12" r="6"/>);
   }
 }
@@ -134,7 +135,7 @@ async function windowToggleMaximize(): Promise<void> {
   }
 }
 
-export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettings, sideCollapsed, onToggleSide, menu, onHistory, onBell, bellCount = 0 }: any) {
+export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettings, sideCollapsed, onToggleSide, menu, onHistory, onBell, bellCount = 0, avatar }: any) {
   return (
     <div className="titlebar">
       <div className="traffic">
@@ -187,7 +188,9 @@ export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettin
       {/* Compte — le popover .account-pop s'ancre en haut-droite (top:48px right:12px),
           sous la titlebar : son déclencheur vit donc ICI. L'avatar « SH » du Rail est
           devenu la mini-chibi (→ Profil de Shugu), on ne perd donc aucun accès. */}
-      <button className="tb-avatar" title="Compte" aria-label="Compte" onClick={onAvatar}>VU</button>
+      {/* Contenu piloté par RootLayout (initiales réelles du profil, ou glyphe
+          générique si aucun nom). Fallback "VU" pour les rendus hors-app (design-kit). */}
+      <button className="tb-avatar" title="Compte" aria-label="Compte" onClick={onAvatar}>{avatar ?? "VU"}</button>
     </div>
   );
 }
