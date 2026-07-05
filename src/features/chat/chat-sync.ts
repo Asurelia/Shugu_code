@@ -39,7 +39,7 @@ import { fireMoodReaction } from "@/features/mascot/moodReactionStore";
 import { SHUGU_PERSONA_PROMPT, personaEnabled } from "@/features/chat/persona";
 import { parseThinkingMode, resolveThinking } from "@/lib/thinkingHeuristic";
 import { resolveRoute, parseDelegateOverride, type Route } from "@/lib/routingHeuristic";
-import { spawnAgent, awaitAgentComplete } from "@/lib/agents";
+import { spawnAgent, agentContinue, awaitAgentComplete } from "@/lib/agents";
 import { readAgentDef } from "@/lib/agentDefs";
 import { superviseDeliverable, resolveReviewerArgs, resolveAdvisorArgs } from "@/lib/supervisors";
 import { getActiveDesignSystem, buildDesignSystemPrompt } from "@/features/design/activeDesignSystem";
@@ -823,6 +823,16 @@ async function handleDelegate(
   // sinon « merci » + un fichier ouvert ⇒ `task` long ⇒ resolveThinking=true ⇒
   // advisor déclenché à tort. Défaut = task (rétro-compat si non fourni).
   userText: string = task,
+  // Human-in-the-loop : quand fourni, la relance passe par `agent_continue`
+  // (idempotent) au lieu de `spawnAgent`. Renseigné par `continueAgent` après une
+  // réponse à `ask_user` ou une décision sur `submit_plan`. Le reste du pipeline
+  // (placeholder, await, relay, review S1) est identique au chemin délégué normal.
+  resume?: {
+    interactionId?: string;
+    kind?: "ask_user" | "submit_plan";
+    verdict?: "approved" | "continue";
+    response?: string;
+  },
 ): Promise<void> {
   // fallbackModel = modèle de chat actif, utilisé comme orchestrateur si aucun
   // n'est configuré (délégation « out of the box »). Un agent custom (.md)
@@ -983,35 +993,56 @@ async function handleDelegate(
   // output is sitting in the agents table.
   let agentId: string;
   try {
-    agentId = await spawnAgent({
-      role: "orchestrator",
-      task: execTask,
-      model: realModel,
-      conversationId: convId,
-      protocol,
-      baseUrl,
-      apiKey,
-      // Si l'utilisateur a choisi un agent custom dans le sélecteur du chat,
-      // le backend charge ce `.md` et remplace role/model/system_prompt par
-      // ses valeurs (cf. agent_spawn + agent_defs::load_def).
-      agentDefPath,
-      // Mode Plan → read_only côté runner (outils mutants retirés). Le défaut
-      // "agent" laisse l'exécution directe complète.
-      mode,
-      // v2 : modèle conseiller distinct pour l'outil `advisor` (sinon
-      // auto-consultation côté runner). Les 4 champs vont ensemble.
-      advisorModel: advisor?.model,
-      advisorProtocol: advisor?.protocol,
-      advisorBaseUrl: advisor?.baseUrl,
-      advisorApiKey: advisor?.apiKey,
-      // Exécution DIRECTE par défaut (2026-07-02) : on NE passe PAS `isolate`
-      // → le backend applique `unwrap_or(false)` et l'orchestrateur travaille
-      // sur le VRAI checkout, comme Claude Code — les fichiers non commités du
-      // user restent visibles pour l'agent, et son résultat atterrit
-      // directement dans les fichiers (pas de branche parquée à merger).
-      // Pour ISOLER un flux précis (worktree + revue/merge via panneau
-      // Agents), passer `isolate: true` explicitement.
-    });
+    agentId = resume
+      ? // Human-in-the-loop : relance idempotente (l'interaction consommée ne
+        // relance pas deux fois). Pas d'agentDefPath ni d'isolate — une relance
+        // reprend l'orchestrateur sur le vrai checkout.
+        await agentContinue({
+          conversationId: convId,
+          model: realModel,
+          answer: execTask,
+          mode,
+          protocol,
+          baseUrl,
+          apiKey,
+          advisorModel: advisor?.model,
+          advisorProtocol: advisor?.protocol,
+          advisorBaseUrl: advisor?.baseUrl,
+          advisorApiKey: advisor?.apiKey,
+          interactionId: resume.interactionId,
+          kind: resume.kind,
+          verdict: resume.verdict,
+          response: resume.response,
+        })
+      : await spawnAgent({
+          role: "orchestrator",
+          task: execTask,
+          model: realModel,
+          conversationId: convId,
+          protocol,
+          baseUrl,
+          apiKey,
+          // Si l'utilisateur a choisi un agent custom dans le sélecteur du chat,
+          // le backend charge ce `.md` et remplace role/model/system_prompt par
+          // ses valeurs (cf. agent_spawn + agent_defs::load_def).
+          agentDefPath,
+          // Mode Plan → read_only côté runner (outils mutants retirés). Le défaut
+          // "agent" laisse l'exécution directe complète.
+          mode,
+          // v2 : modèle conseiller distinct pour l'outil `advisor` (sinon
+          // auto-consultation côté runner). Les 4 champs vont ensemble.
+          advisorModel: advisor?.model,
+          advisorProtocol: advisor?.protocol,
+          advisorBaseUrl: advisor?.baseUrl,
+          advisorApiKey: advisor?.apiKey,
+          // Exécution DIRECTE par défaut (2026-07-02) : on NE passe PAS `isolate`
+          // → le backend applique `unwrap_or(false)` et l'orchestrateur travaille
+          // sur le VRAI checkout, comme Claude Code — les fichiers non commités du
+          // user restent visibles pour l'agent, et son résultat atterrit
+          // directement dans les fichiers (pas de branche parquée à merger).
+          // Pour ISOLER un flux précis (worktree + revue/merge via panneau
+          // Agents), passer `isolate: true` explicitement.
+        });
   } catch (err) {
     await appendMessage(convId, {
       id: newMessageId("e"),
@@ -1155,6 +1186,30 @@ async function handleDelegate(
       agentId,
     });
   }
+}
+
+/** Human-in-the-loop — relance l'agent après une réponse de l'utilisateur à un
+ *  `ask_user`, ou une décision sur un `submit_plan`. Réutilise TOUT le pipeline de
+ *  délégation (résolution provider, placeholder, await, relay verbatim, review S1)
+ *  via `handleDelegate`, mais route le spawn vers `agent_continue` (idempotent).
+ *
+ *  - Réponse à une question / « Continuer à planifier » → `mode: "plan"`.
+ *  - « Approuver et exécuter » → `mode: "agent"` + le plan réinjecté dans `answer`.
+ *
+ *  Le modèle est celui de l'orchestrateur configuré, avec repli sur le modèle de
+ *  chat actif (`getActiveModel()`) — même résolution que le chemin délégué normal. */
+export async function continueAgent(
+  convId: string,
+  answer: string,
+  mode: "plan" | "agent",
+  resume: {
+    interactionId?: string;
+    kind?: "ask_user" | "submit_plan";
+    verdict?: "approved" | "continue";
+    response?: string;
+  },
+): Promise<void> {
+  await handleDelegate(convId, answer, undefined, getActiveModel(), mode, answer, resume);
 }
 
 /**

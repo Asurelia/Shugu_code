@@ -32,6 +32,8 @@ import { useMessageDisplay, type AgentActivityItem } from "./useMessageDisplay";
 import { useAgentTranscript } from "@/features/agents/queries";
 import { BrowserTestResultViewer } from "./BrowserTestResultViewer";
 import { CommandRiskCard } from "./CommandRiskCard";
+import { QuestionCard } from "./QuestionCard";
+import { PlanApprovalCard } from "./PlanApprovalCard";
 import { AgentPlan } from "./AgentPlan";
 import { QuickOpenPalette } from "@/features/code/QuickOpenPalette";
 import { useChatMentionRequests, clearChatMentionRequests } from "./chatMentionStore";
@@ -658,6 +660,7 @@ export function ChatView({
                 <CxMessage
                   key={String(m.id)}
                   m={m}
+                  convId={activeConv}
                   model={model}
                   onOpenFile={handleOpenFile}
                   onOpenSnippet={onOpenSnippet}
@@ -1176,6 +1179,7 @@ function WorktreeBanner({
 // ─── Per-message renderer ───────────────────────────────────
 function CxMessage({
   m,
+  convId,
   model,
   onOpenFile,
   onOpenSnippet,
@@ -1183,6 +1187,8 @@ function CxMessage({
   onApply,
 }: {
   m: Message;
+  /** Conversation active — nécessaire aux cartes human-in-the-loop (relance). */
+  convId: string;
   model: string;
   onOpenFile: (path: string) => void;
   onOpenSnippet?: (code: string, lang: string) => void;
@@ -1202,6 +1208,8 @@ function CxMessage({
     activity,
     plan,
     writeRecords,
+    questionData,
+    planApprovalData,
     startedAt,
     finishedAt,
     worktree,
@@ -1285,6 +1293,14 @@ function CxMessage({
           finishedAt={finishedAt}
           agentId={m.agentId}
         />
+      )}
+
+      {/* Human-in-the-loop — cartes interactives (ask_user / submit_plan). Rendues
+          dès que le transcript porte l'event ; le clic relance l'agent via
+          continueAgent (réponse aux questions ou approbation/refus du plan). */}
+      {questionData && <QuestionCard data={questionData} convId={convId} />}
+      {planApprovalData && (
+        <PlanApprovalCard data={planApprovalData} convId={convId} />
       )}
 
       {/* Phase 7 #4 — bandeau d'isolation worktree. Non bloquant : il signale

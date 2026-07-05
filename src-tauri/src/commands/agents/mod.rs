@@ -411,6 +411,28 @@ pub enum AgentEvent {
         agent_id: String,
         reason: String,
     },
+    /// Human-in-the-loop — l'agent a appelé `ask_user` : 1 à 4 questions à choix
+    /// à présenter en carte CLIQUABLE dans le fil. Le tour se termine (fin-de-tour)
+    /// via le sentinel `AGENT_PAUSE_SENTINEL` ; la réponse relance l'agent via la
+    /// commande `agent_continue`. `questions` = le JSON brut de l'outil (tableau
+    /// d'objets { id?, question, multiSelect?, options[] }). Persisté dans
+    /// `agent_events` → la carte se reconstruit après un reload.
+    QuestionAsked {
+        agent_id: String,
+        tool_call_id: String,
+        questions: serde_json::Value,
+    },
+    /// Human-in-the-loop — l'agent a appelé `submit_plan` : son plan final (Markdown)
+    /// à présenter en carte avec « Approuver et exécuter » / « Continuer à planifier ».
+    /// Le tour se termine ; l'approbation bascule le mode en Agent et relance via
+    /// `agent_continue`. Persisté → survit au reload.
+    PlanSubmitted {
+        agent_id: String,
+        tool_call_id: String,
+        plan: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
 }
 
 impl AgentEvent {
@@ -434,6 +456,8 @@ impl AgentEvent {
             AgentEvent::WorktreeStarted { .. } => "worktreeStarted",
             AgentEvent::WorktreeFinalized { .. } => "worktreeFinalized",
             AgentEvent::WorktreeSkipped { .. } => "worktreeSkipped",
+            AgentEvent::QuestionAsked { .. } => "questionAsked",
+            AgentEvent::PlanSubmitted { .. } => "planSubmitted",
         }
     }
 
@@ -456,7 +480,9 @@ impl AgentEvent {
             | AgentEvent::Screenshot { agent_id, .. }
             | AgentEvent::WorktreeStarted { agent_id, .. }
             | AgentEvent::WorktreeFinalized { agent_id, .. }
-            | AgentEvent::WorktreeSkipped { agent_id, .. } => agent_id,
+            | AgentEvent::WorktreeSkipped { agent_id, .. }
+            | AgentEvent::QuestionAsked { agent_id, .. }
+            | AgentEvent::PlanSubmitted { agent_id, .. } => agent_id,
         }
     }
 }
@@ -512,6 +538,41 @@ pub struct SpawnArgs {
     /// (read-only never mutates, so it never isolates). Serializes from the
     /// camelCase `isolate` field.
     pub isolate: Option<bool>,
+}
+
+/// Arguments for `agent_continue` — human-in-the-loop resume after the user
+/// answered an `ask_user` or approved/declined a `submit_plan`. The previous
+/// turn ended cleanly (fin-de-tour) ; `answer` becomes the new run's `task`, and
+/// `mode` governs read-only (a plan approval passes `mode: "agent"` to execute).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContinueArgs {
+    pub conversation_id: String,
+    pub model: String,
+    /// Message user synthétique injecté (réponse aux questions, ou « exécute le
+    /// plan approuvé » avec le plan réinjecté). Devient la `task` du nouveau run.
+    pub answer: String,
+    /// "plan" (relance après `ask_user` en Plan) ou "agent" (approbation de plan
+    /// → bascule exécution). Passé tel quel à `SpawnArgs.mode`.
+    pub mode: Option<String>,
+    /// `tool_call_id` de l'interaction consommée — clé d'idempotence (une réponse
+    /// déjà consommée ne relance pas). None ⇒ pas de garde (relance directe).
+    pub interaction_id: Option<String>,
+    /// "ask_user" | "submit_plan" — trace dans `agent_interactions`.
+    pub kind: Option<String>,
+    /// Réponse brute (JSON des choix, ou feedback) — trace.
+    pub response: Option<String>,
+    /// "approved" | "continue" — verdict d'approbation d'un plan.
+    pub verdict: Option<String>,
+    // Provider routing — miroir de `SpawnArgs`, résolu côté TS.
+    pub protocol: Option<String>,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub chat_template_kwargs: Option<serde_json::Value>,
+    pub advisor_model: Option<String>,
+    pub advisor_protocol: Option<String>,
+    pub advisor_base_url: Option<String>,
+    pub advisor_api_key: Option<String>,
 }
 
 /// Arguments for an Atelier run (env-grounded build→test→learn loop). Mirrors the
@@ -985,6 +1046,79 @@ pub async fn agent_spawn(
     });
 
     Ok(agent_id)
+}
+
+/// Human-in-the-loop — relance un agent après une réponse de l'utilisateur à un
+/// `ask_user`, ou l'approbation d'un `submit_plan`. Le tour précédent s'est terminé
+/// proprement (fin-de-tour via le sentinel) ; ici on injecte la réponse comme
+/// nouvelle `task` et on relance via le chemin `agent_spawn` habituel — qui recharge
+/// l'historique de la conversation. L'idempotence (double-clic / reload+re-clic)
+/// repose sur la table `agent_interactions` : un `tool_call_id` déjà consommé rend
+/// l'appel no-op (erreur douce).
+#[tauri::command]
+pub async fn agent_continue(
+    app: tauri::AppHandle,
+    state: State<'_, AgentManagerState>,
+    args: ContinueArgs,
+) -> Result<String, String> {
+    // Idempotence + trace : UPSERT conditionnel sur `agent_interactions`. La
+    // PREMIÈRE relance insère la ligne (answered_at = created_at) ou passe le
+    // WHERE answered_at IS NULL ⇒ 1 ligne touchée. Toute relance ultérieure voit
+    // answered_at déjà rempli ⇒ 0 ligne ⇒ on refuse (la carte est déjà consommée).
+    if let Some(tcid) = args.interaction_id.as_deref() {
+        if !tcid.is_empty() {
+            let conn_mutex = get_conn(&app)?;
+            let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
+            let now = now_ms();
+            let changed = conn
+                .execute(
+                    "INSERT INTO agent_interactions
+                        (interaction_id, conversation_id, kind, response, verdict, created_at, answered_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                     ON CONFLICT(interaction_id) DO UPDATE SET
+                        answered_at = excluded.answered_at,
+                        response    = excluded.response,
+                        verdict     = excluded.verdict
+                     WHERE agent_interactions.answered_at IS NULL",
+                    params![
+                        tcid,
+                        args.conversation_id,
+                        args.kind,
+                        args.response,
+                        args.verdict,
+                        now
+                    ],
+                )
+                .map_err(|e| format!("agent_interactions upsert: {e}"))?;
+            if changed == 0 {
+                return Err("Cette interaction a déjà été traitée.".to_string());
+            }
+        }
+    }
+
+    // Relance : réutilise INTÉGRALEMENT le chemin `agent_spawn` (cap, INSERT row,
+    // Spawn, run_agent_task avec rechargement d'historique par conversation_id).
+    // La réponse de l'utilisateur devient la `task`. Un nouvel agent_id est créé.
+    let spawn_args = SpawnArgs {
+        role: "orchestrator".to_string(),
+        task: args.answer,
+        model: args.model,
+        parent_id: None,
+        conversation_id: Some(args.conversation_id),
+        protocol: args.protocol,
+        base_url: args.base_url,
+        api_key: args.api_key,
+        chat_template_kwargs: args.chat_template_kwargs,
+        design_context: None,
+        agent_def_path: None,
+        mode: args.mode,
+        advisor_model: args.advisor_model,
+        advisor_protocol: args.advisor_protocol,
+        advisor_base_url: args.advisor_base_url,
+        advisor_api_key: args.advisor_api_key,
+        isolate: None,
+    };
+    agent_spawn(app, state, spawn_args).await
 }
 
 /// Atelier run — the env-grounded learning loop. Spawns an `atelier` agent in a
