@@ -23,7 +23,7 @@ import { useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { listen } from "@/lib/tauri";
 import { queryClient } from "@/lib/queryClient";
-import { AI_EDIT_CONV_PREFIX } from "@/features/code/ai-edit/types";
+import { isOutOfBandConvId } from "@/features/code/ai-edit/types";
 
 interface ChatDelta {
   conversationId?: string;
@@ -56,10 +56,11 @@ export function useChatToolActivityListener(): void {
         // — le callback reçoit donc directement la payload, comme useChatStream.
         unlisten = await listen<ChatDelta>("chat://delta", (p) => {
           if (cancelled) return;
-          // Les éditions inline AI (convId `aiedit:*`) réutilisent chat_send mais
-          // ne déclenchent pas d'outils ; on les ignore par cohérence avec
-          // useChatStreamListener (pas de pollution du store d'activité).
-          if (p.conversationId?.startsWith(AI_EDIT_CONV_PREFIX)) return;
+          // Les appels chat_send hors-flux (éditions inline `aiedit:*`, synthèse
+          // vocale `speak:*`) réutilisent chat_send mais ne déclenchent pas
+          // d'outils ; on les ignore par cohérence avec useChatStreamListener
+          // (pas de pollution du store d'activité).
+          if (isOutOfBandConvId(p.conversationId)) return;
           const convId = p.conversationId ?? "__none__";
           if (p.done) {
             // Fin du tour — on vide l'activité de cette conv (le message final

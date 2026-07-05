@@ -56,7 +56,10 @@ export const DEFAULT_INTERFACE = {
 };
 
 const LS_SHORTCUTS = "shugu.shortcuts.v1";
-const LS_INTERFACE = "shugu.interface.v1";
+// Exported so the Profile view can read/write the SAME interface blob (the
+// "Default language" field there is a view onto this single source of truth,
+// not a second copy).
+export const LS_INTERFACE = "shugu.interface.v1";
 
 /**
  * Settings persistence strategy — localStorage-primary + SQLite mirror.

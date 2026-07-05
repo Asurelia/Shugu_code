@@ -37,7 +37,8 @@ import { setChatBusy, useChatBusy } from "@/features/chat/chatBusy";
 import { setChatUnread } from "@/features/chat/chatUnread";
 import { bumpInteract } from "@/features/mascot/idleStore";
 import { MascotTabBar, CardsHub, isCardTab, type MascotTab } from "@/features/mascot/MascotNav";
-import { ttsSpeak, useTtsEnabled } from "@/features/mascot/useTts";
+import { useTtsEnabled } from "@/features/mascot/useTts";
+import { speakReply } from "@/features/mascot/speakableRewrite";
 import { CaptureButton } from "./CaptureButton";
 import { useMessageDisplay } from "./useMessageDisplay";
 import { ReviewFeedback } from "./views-chat";
@@ -454,10 +455,17 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
       if (newest?.role === "ai" && (mode !== "full" || edge)) {
         setChatUnread(true);
       }
-      // Voix (lot voix bloc A) : lire la réponse AI fraîche si voice.tts est
-      // ON (ttsSpeak no-op sinon). Garde lastMsgCount > 0 : au premier mount
-      // l'historique chargé ne doit pas déclencher de lecture. Ni les
-      // placeholders agent ni les messages-image ne sont lus.
+      // Voix (couche affective — Palier 2) : lire la réponse AI fraîche si
+      // voice.tts est ON (speakReply no-op sinon, AVANT tout appel LLM). Garde
+      // lastMsgCount > 0 : au premier mount l'historique chargé ne doit pas
+      // déclencher de lecture. Ni les placeholders agent ni les messages-image
+      // ne sont lus.
+      //
+      // speakReply fait la SYNTHÈSE ORALE : un appel LLM condense la réponse en
+      // 1-3 phrases parlables + choisit une émotion, qui pilote À LA FOIS la
+      // voix (MiniMax) ET l'expression du chibi (fireMoodDirect) → voix et
+      // visage synchronisés sur le même état. La demande d'origine est passée en
+      // contexte pour cibler l'essentiel. Fallback déterministe garanti.
       if (
         lastMsgCount > 0 &&
         newest?.role === "ai" &&
@@ -465,7 +473,11 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
         newest.body &&
         newest.body !== "Orchestrateur au travail…"
       ) {
-        void ttsSpeak(String(newest.text ?? newest.body));
+        const rawText = String(newest.text ?? newest.body);
+        const prior = msgs.slice(0, -1);
+        const lastUserMsg = [...prior].reverse().find((m) => m.role !== "ai" && (m.body || m.text));
+        const userPrompt = lastUserMsg ? String(lastUserMsg.text ?? lastUserMsg.body) : undefined;
+        void speakReply(rawText, userPrompt);
       }
     }
     setLastMsgCount(msgs.length);

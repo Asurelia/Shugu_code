@@ -77,6 +77,25 @@ export const INITIAL_AI_EDIT_SESSION: AiEditSession = {
 /** Préfixe des conversationId synthétiques pour isoler le stream inline du chat. */
 export const AI_EDIT_CONV_PREFIX = "aiedit:";
 
+/** Préfixe des conversationId synthétiques de la SYNTHÈSE VOCALE (mascotte) :
+ *  speakableRewrite réutilise `chat_send` hors du flux chat principal, ses deltas
+ *  ne doivent donc PAS alimenter le streaming UI. Même mécanique que aiedit. */
+export const SPEAK_CONV_PREFIX = "speak:";
+
+/**
+ * Un conversationId est-il « hors-flux » — c'est-à-dire produit par un appel
+ * `chat_send` technique (édition inline, synthèse vocale…) dont les deltas
+ * `chat://delta` ne doivent JAMAIS alimenter l'état de streaming du chat
+ * principal ni le store d'activité ? Centralisé ici pour que tout nouveau
+ * call-site hors-flux soit couvert par les listeners d'un seul geste.
+ */
+export function isOutOfBandConvId(convId?: string | null): boolean {
+  return (
+    !!convId &&
+    (convId.startsWith(AI_EDIT_CONV_PREFIX) || convId.startsWith(SPEAK_CONV_PREFIX))
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Lot 2 — apply-to-file
 // ---------------------------------------------------------------------------
