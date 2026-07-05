@@ -18,6 +18,42 @@ use base64::{engine::general_purpose, Engine as _};
 /// ~400 caractères) : la bulle de la mascotte parle court, pas un audiobook.
 const MAX_TTS_CHARS: usize = 600;
 
+/// Émotions acceptées par `voice_setting.emotion` (API T2A v2). Une valeur
+/// hors de cet ensemble (ou « auto », ou vide) est IGNORÉE : le champ est alors
+/// omis et MiniMax auto-sélectionne d'après le texte. Réf : platform.minimax.io
+/// /docs/api-reference/speech-t2a-http.
+///
+/// ⚠ SYNCHRO : doit rester identique à `MINIMAX_EMOTIONS` dans
+/// src/features/mascot/affect.ts (côté TS). Toute divergence = une émotion
+/// choisie côté TS mais droppée ici en silence.
+const VALID_EMOTIONS: [&str; 9] = [
+    "happy", "sad", "angry", "fearful", "disgusted", "surprised", "calm", "fluent", "whisper",
+];
+
+fn is_valid_emotion(e: &str) -> bool {
+    VALID_EMOTIONS.contains(&e)
+}
+
+/// speed ∈ [0.5, 2.0], défaut 1.0.
+fn clamp_speed(s: Option<f64>) -> f64 {
+    s.unwrap_or(1.0).clamp(0.5, 2.0)
+}
+
+/// vol ∈ (0, 10], défaut 1.0 (0 exclu par l'API → on ramène à 1.0).
+fn clamp_vol(v: Option<f64>) -> f64 {
+    let v = v.unwrap_or(1.0);
+    if v <= 0.0 {
+        1.0
+    } else {
+        v.min(10.0)
+    }
+}
+
+/// pitch ∈ [-12, 12], ENTIER (piège de sérialisation : jamais f32/f64), défaut 0.
+fn clamp_pitch(p: Option<i64>) -> i64 {
+    p.unwrap_or(0).clamp(-12, 12)
+}
+
 pub(crate) fn decode_hex_or_b64(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();
     // Hex (défaut t2a_v2). Décodage manuel — pas la peine d'une crate `hex`
@@ -44,10 +80,19 @@ pub(crate) fn decode_hex_or_b64(s: &str) -> Result<Vec<u8>, String> {
 /// Synthèse vocale MiniMax → data URL `data:audio/mp3;base64,…` prête pour
 /// `new Audio(url).play()` côté webview (zéro crate audio Rust).
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn voice_tts(
     text: String,
     voice_id: Option<String>,
     model: Option<String>,
+    // Couche affective (Palier 1) : émotion + prosodie. Tous optionnels et
+    // rétro-compatibles — un appelant qui n'en passe aucun retombe sur le
+    // comportement historique (voix plate, émotion auto-sélectionnée).
+    emotion: Option<String>,
+    speed: Option<f64>,
+    pitch: Option<i64>,
+    vol: Option<f64>,
+    language_boost: Option<String>,
     base_url: String,
     api_key: String,
 ) -> Result<String, String> {
@@ -71,7 +116,20 @@ pub async fn voice_tts(
         format!("{base}/v1/t2a_v2")
     };
 
-    let body = serde_json::json!({
+    // voice_setting construit dynamiquement : l'émotion n'est ajoutée QUE si
+    // elle est valide (jamais « auto » ni une valeur inventée par le LLM) — sinon
+    // le champ reste absent et MiniMax auto-sélectionne d'après le texte.
+    let mut voice_setting = serde_json::json!({
+        "voice_id": voice_id.as_deref().filter(|v| !v.trim().is_empty()).unwrap_or("female-shaonv"),
+        "speed": clamp_speed(speed),
+        "vol": clamp_vol(vol),
+        "pitch": clamp_pitch(pitch),
+    });
+    if let Some(e) = emotion.as_deref().map(str::trim).filter(|e| is_valid_emotion(e)) {
+        voice_setting["emotion"] = serde_json::Value::String(e.to_string());
+    }
+
+    let mut body = serde_json::json!({
         // Défaut bumpé speech-02-turbo → speech-2.6-turbo (génération récente,
         // bon compromis latence/qualité pour la voix interactive de la mascotte ;
         // dispo dès le tier Plus). Surchargeable via l'argument `model`.
@@ -79,14 +137,14 @@ pub async fn voice_tts(
         "text": text,
         "stream": false,
         "output_format": "hex",
-        "voice_setting": {
-            "voice_id": voice_id.as_deref().filter(|v| !v.trim().is_empty()).unwrap_or("female-shaonv"),
-            "speed": 1.0,
-            "vol": 1.0,
-            "pitch": 0
-        },
+        "voice_setting": voice_setting,
         "audio_setting": { "format": "mp3", "sample_rate": 32000, "bitrate": 128000 }
     });
+    // language_boost optionnel (ex. "French") : améliore la prononciation d'une
+    // langue cible. Absent → l'API reste en détection automatique.
+    if let Some(lb) = language_boost.as_deref().map(str::trim).filter(|lb| !lb.is_empty()) {
+        body["language_boost"] = serde_json::Value::String(lb.to_string());
+    }
 
     let client = crate::commands::chat::request_client(60)?;
     let resp = client
@@ -136,7 +194,7 @@ pub async fn voice_tts(
 
 #[cfg(test)]
 mod tests {
-    use super::decode_hex_or_b64;
+    use super::{clamp_pitch, clamp_speed, clamp_vol, decode_hex_or_b64, is_valid_emotion};
 
     #[test]
     fn decodes_hex() {
@@ -152,5 +210,28 @@ mod tests {
     #[test]
     fn rejects_garbage() {
         assert!(decode_hex_or_b64("not valid !!!").is_err());
+    }
+
+    #[test]
+    fn emotion_enum_gate() {
+        // Les 9 valeurs MiniMax passent ; « auto », vide et inventé sont rejetés.
+        assert!(is_valid_emotion("happy"));
+        assert!(is_valid_emotion("whisper"));
+        assert!(!is_valid_emotion("auto"));
+        assert!(!is_valid_emotion(""));
+        assert!(!is_valid_emotion("excited"));
+    }
+
+    #[test]
+    fn prosody_clamps() {
+        assert_eq!(clamp_speed(None), 1.0);
+        assert_eq!(clamp_speed(Some(5.0)), 2.0); // borne haute
+        assert_eq!(clamp_speed(Some(0.1)), 0.5); // borne basse
+        assert_eq!(clamp_pitch(None), 0);
+        assert_eq!(clamp_pitch(Some(99)), 12);
+        assert_eq!(clamp_pitch(Some(-99)), -12);
+        assert_eq!(clamp_vol(None), 1.0);
+        assert_eq!(clamp_vol(Some(0.0)), 1.0); // 0 exclu → défaut
+        assert_eq!(clamp_vol(Some(50.0)), 10.0);
     }
 }

@@ -8,18 +8,20 @@
 import { useQuery } from "@tanstack/react-query";
 import { queryClient } from "@/lib/queryClient";
 import { reactionFor, type MoodEvent, type ActiveReaction } from "./moodReactions";
+import type { ChibiMood } from "./Chibi";
 
 const REACTION_KEY = ["mascot", "reaction"] as const;
 
-/** Déclenche une réaction d'humeur transitoire (fire-and-forget). */
-export function fireMoodReaction(event: MoodEvent): void {
-  const r = reactionFor(event);
+/**
+ * Pose une expression DIRECTE (hors table d'événements) avec auto-effacement.
+ * Utilisé par la couche affective de la voix : l'émotion effective (dérivée en
+ * Palier 1, choisie par le LLM en Palier 2) pilote la MÊME ActiveReaction que
+ * les événements, donc voix et visage restent synchronisés. TTL par défaut
+ * calé sur la durée d'une lecture vocale courte.
+ */
+export function fireMoodDirect(mood: ChibiMood, ttlMs = 4000): void {
   const firedAt = Date.now();
-  queryClient.setQueryData<ActiveReaction>(REACTION_KEY, {
-    mood: r.mood,
-    firedAt,
-    ttlMs: r.ttlMs,
-  });
+  queryClient.setQueryData<ActiveReaction>(REACTION_KEY, { mood, firedAt, ttlMs });
   // Auto-efface après le TTL — mais SEULEMENT si aucune réaction plus récente
   // n'a pris la place entre-temps (comparaison par firedAt). Ainsi un nouvel
   // événement n'est pas effacé par le timer d'un ancien.
@@ -28,7 +30,13 @@ export function fireMoodReaction(event: MoodEvent): void {
     if (cur && cur.firedAt === firedAt) {
       queryClient.setQueryData<ActiveReaction | null>(REACTION_KEY, null);
     }
-  }, r.ttlMs);
+  }, ttlMs);
+}
+
+/** Déclenche une réaction d'humeur transitoire depuis un événement (fire-and-forget). */
+export function fireMoodReaction(event: MoodEvent): void {
+  const r = reactionFor(event);
+  fireMoodDirect(r.mood, r.ttlMs);
 }
 
 /** Lecture non-réactive (snapshot ponctuel). */
