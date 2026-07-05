@@ -1,167 +1,210 @@
-# Partition des conversations par projet — Design (Phase 1)
+# Le Projet comme entité de première classe — Design (Phase 1)
 
 - **Date** : 2026-07-05
-- **Statut** : design validé, en attente de relecture avant plan d'implémentation
-- **Périmètre** : Phase 1 d'un chantier plus large « Mémoire & données scopées par projet »
+- **Statut** : design validé (niveau « colonne vertébrale »), en attente de relecture avant plan
+- **Périmètre** : Phase 1 du chantier « Mémoire & données scopées par projet »
+- **Historique** : première version « rustine » (ajout d'une colonne `workspace_root`) écartée par
+  l'utilisateur (« tu ne peux pas faire beaucoup mieux ? »). Ce design attaque la cause racine.
 
 ---
 
-## 1. Problème
+## 1. Problème (racine)
 
-La base `shugu.db` est un **ramasse-tout global**. Concrètement :
+`shugu.db` est un **ramasse-tout global** parce que **Shugu n'a aucune notion de « projet » de première
+classe** :
 
-- La table `conversations` a une colonne `project_id` qui pointe vers une table `projects`
-  **cosmétique et 100 % morte** (`name`/`color`/`sort_order` jamais lus ni écrits — vestige MVP).
-- Les « groupes » de la sidebar sont **en mémoire seule** (`SEED_GROUPS`, état React), **remis à zéro
-  à chaque reload** (`chat-sidebar.tsx:65`). Aucune persistance solide.
-- Les conversations sont lues via `db.conversations.listNested()` **sans aucun filtre workspace**
-  (`db.ts:334`) → **toute la soupe s'affiche quel que soit le dossier ouvert.**
-- Il existe **deux notions de « projet » déconnectées** : le `workspace_root` (le vrai dossier ouvert,
-  déjà utilisé par `studio_projects` V8, les fichiers, le git) et cette étiquette colorée manuelle.
+- La table `projects` (`id, name, color, sort_order`) est **100 % morte** — jamais lue ni écrite. Or ses
+  colonnes `color` et `sort_order` prouvent qu'elle a été **conçue pour un sélecteur de projets** jamais
+  construit.
+- La colonne `conversations.project_id` sert aujourd'hui à stocker des ids de **« groupes » éphémères**
+  (`chat-sidebar.tsx` : `SEED_GROUPS`, état React, **remis à zéro à chaque reload**). Pseudo-projets
+  sans persistance.
+- Les conversations sont lues **sans filtre** (`db.ts:334`) → toute la soupe s'affiche quel que soit le
+  dossier ouvert.
+- Le seul vrai scope-projet existant (`studio_projects.workspace_root`, V8) vit **à part**, déconnecté du
+  chat.
 
-Résultat, du point de vue utilisateur : « les conversations ne sont pas vraiment liées à leur projet,
-c'est un ramasse-tout sans logique ».
+Deux notions de « projet » déconnectées + une table morte + des groupes volatils = « ramasse-tout sans
+logique ».
 
 ## 2. Objectif
 
-Les conversations (et donc leurs messages) doivent être **scopées au dossier réellement ouvert**
-(`workspace_root`), façon Claude Code (qui range l'historique par chemin de projet). Ouvrir le dossier A
-ne montre que les conversations de A ; ouvrir B bascule sur celles de B ; une vue « Tous » permet de
-tout revoir.
+Faire du **Projet une entité de première classe** : la colonne vertébrale à laquelle se rattachent les
+conversations (et, plus tard, la mémoire, les agents, le studio). Un Projet = un dossier ouvert.
 
-### Décisions produit (validées)
+### Décisions validées
 
-1. **`.shugu/` canonique** (Phase 3) — hors périmètre ici, mais oriente l'ensemble.
-2. **Conversations dans la base globale, partitionnées par `workspace_root`** — pas de base par projet
-   (modèle Claude Code : stockage global, clé = chemin de projet).
-3. **Identité projet = chemin exact du dossier.** Un worktree est un projet distinct (comme Claude Code).
-   Pas de résolution de racine git en Phase 1.
-4. **Vue « Projet courant » stricte** : uniquement `workspace_root = dossier ouvert`. Les conversations
-   globales/legacy (`workspace_root IS NULL`) n'apparaissent que dans l'onglet « Tous ».
+1. **Ressusciter la table `projects`** au lieu de la supprimer → registre réel des projets, clé =
+   chemin du dossier.
+2. **Ré-animer `conversations.project_id`** comme **vraie référence** vers `projects.id` (au lieu d'y
+   coller une nouvelle colonne `workspace_root`).
+3. **Identité projet = chemin exact du dossier** (forme d'affichage). Un worktree est un projet distinct
+   (comme Claude Code). Pas de résolution git.
+4. **Vue « Projet courant » stricte** : uniquement les conversations du projet ouvert. Les orphelines
+   (`project_id IS NULL`) n'apparaissent que dans « Tous ».
+5. **Backfill intelligent** : réattribuer les conversations *existantes* à leur vrai projet via les liens
+   `studio_projects (conversation_id ↔ workspace_root)`. On nettoie la soupe actuelle, pas seulement la
+   future.
+6. **Vrai sélecteur de projets** visible (récents, couleur auto, compteur de convs, clic = ouvrir).
 
 ## 3. Non-objectifs (Phase 1)
 
-- **Ne pas** persister les groupes colorés (`project_id`) — laissés tels quels comme sous-groupe optionnel
-  *dans* un projet. Persistance des groupes = éventuelle phase ultérieure.
-- **Ne pas** toucher à Convex (schéma cosmétique, jamais appelé depuis le TS pour les conversations).
-- **Ne pas** scoper `agents`/`agent_events` explicitement (ils héritent via `conversation_id`).
-- **Ne pas** dénormaliser `workspace_root` sur `messages` (ils sont toujours lus par `conversation_id`,
-  donc déjà scopés par héritage — YAGNI).
-- **Ne pas** auto-assigner les conversations legacy à un dossier (on ignore leur provenance — honnête).
+- **Ne pas** scoper la mémoire / les agents / le MCP maintenant (option « convergence totale » écartée) —
+  ils rejoindront le `project_id` en Phase 2/3, sur cette même fondation.
+- **Ne pas** dénormaliser `messages` (scopés par héritage via `conversation_id`).
+- **Ne pas** toucher Convex (cosmétique, jamais appelé côté TS pour les conversations).
 - **Ne pas** unifier repo + worktrees (décision #3).
 
-## 4. Le modèle de scoping
+## 4. Modèle
 
 ```
-conversation.workspace_root = "C:/Dev/shugu_code"
-   └─ clé = chemin d'AFFICHAGE : sans préfixe \\?\, séparateurs '/'
-      = exactement ce que renvoie fsGetWorkspaceRoot()  (source unique, déjà normalisée)
+projects  (registre, ex-table morte ressuscitée)
+   id            ← PK
+   root_path     ← clé UNIQUE = dossier ouvert, forme d'affichage (sans \\?\, en /)
+   name          ← défaut = basename(root_path), éditable
+   color         ← auto-assignée (palette), éditable
+   sort_order    ← réordonnancement manuel
+   last_opened_at, created_at
+        ▲
+        │  project_id  (colonne EXISTANTE ré-animée, = FK réel vers projects.id)
+        │
+conversations ──< messages           (messages hérités via conversation_id, inchangés)
 
-  • ouvre dossier A  → sidebar ne montre que les convs de A
-  • ouvre dossier B  → sidebar bascule sur les convs de B
-  • chat sans dossier → workspace_root = NULL → bucket « Global / Sans projet »
-  • bouton « Tous »   → montre tout (toutes workspaces + global)
-
-  messages → hérités via conversation_id  (AUCUN changement de schéma)
+  ouvre dossier → upsert projects(root_path), devient le « projet courant »
+  nouvelle conv → project_id = id du projet courant  (NULL si aucun dossier ouvert)
+  sidebar       → WHERE project_id = <courant>   (+ switch « Tous »)
 ```
 
-**Point clé de cohérence** : la clé stockée est la **forme d'affichage** (préfixe Windows `\\?\` retiré,
-`/`), telle que `fsGetWorkspaceRoot()` / l'event `workspace://changed` la fournissent côté TS. On évite
-ainsi le piège récurrent du préfixe `\\?\`. NB : `studio_projects` stocke, lui, la forme canonique
-Rust (avec `\\?\`) car il ne fait ses requêtes qu'en Rust. Les deux systèmes ne se croisent pas — on ne
-tente PAS d'unifier ces deux formes en Phase 1 (noté comme divergence connue, sans impact fonctionnel).
+**Clé = forme d'affichage** (`fsGetWorkspaceRoot()`, préfixe `\\?\` retiré, `/`). NB : `studio_projects`
+stocke la forme canonique Rust ; les deux ne se croisent que dans le backfill, où l'on **normalise** la
+valeur studio en forme d'affichage avant comparaison (voir §5.5).
 
 ## 5. Design détaillé
 
 ### 5.1 Schéma — migration V18 (additive & immuable)
 
-Nouvelle migration `MIGRATION_V18` (on **n'édite jamais** une migration déjà appliquée — checksum) :
+On **n'édite jamais** une migration livrée. Nouvelle `MIGRATION_V18` :
 
 ```sql
-ALTER TABLE conversations ADD COLUMN workspace_root TEXT;               -- nullable = legacy/global
-CREATE INDEX IF NOT EXISTS idx_conversations_ws
-    ON conversations(workspace_root, updated_at);
-DROP TABLE IF EXISTS projects;                                         -- table morte, zéro perte
+ALTER TABLE projects ADD COLUMN root_path      TEXT;
+ALTER TABLE projects ADD COLUMN last_opened_at INTEGER;
+ALTER TABLE projects ADD COLUMN created_at     INTEGER;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_root ON projects(root_path);
+CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project_id, updated_at);
 ```
 
-- Enregistrer la migration dans le tableau `migrations` de `lib.rs` (version 18).
-- **Bumper `TARGET_SCHEMA_VERSION` → 18** dans `backup.rs` (le `debug_assert` de `lib.rs:580` l'exige,
-  et garantit qu'un backup pré-migration est pris).
-- **Sécurité verrou/boot** : `ADD COLUMN` est O(1) (métadonnée, pas de réécriture de lignes) ;
-  `CREATE INDEX` est léger. **Aucun `UPDATE` de masse, aucune grosse transaction au boot** → respecte
-  la contrainte connue (migration lazy ~2 s + `busy_timeout` 5 s sans retry).
+- Aucune colonne ajoutée à `conversations` (on réutilise `project_id`).
+- Enregistrer la migration (version 18) dans `lib.rs` ; **bumper `TARGET_SCHEMA_VERSION` → 18**
+  (`backup.rs`, exigé par le `debug_assert` de `lib.rs:580`).
+- **Sécurité boot** : uniquement des `ALTER ADD COLUMN` (O(1)) + index → pas de réécriture de lignes,
+  pas de grosse transaction. Respecte la contrainte verrou/migration-lazy. **Le backfill n'est PAS dans
+  la migration** (cf. §5.5).
 
-### 5.2 Écriture — création scopée
+### 5.2 Le registre Projet (couche TS `db.projects`)
 
-Deux points de création existent ; **les deux** stampent `workspace_root` en lisant le workspace courant
-(`fsGetWorkspaceRoot()`), `NULL` si aucun dossier n'est ouvert :
+Les projets/conversations sont manipulés côté TS (SQL direct via `db.ts`) — on garde ce pattern, pas de
+commande Rust.
 
-- `newConvo()` — `chat-sidebar.tsx:336`
-- `createConversation()` — `chat-sync.ts:1438`
+- `db.projects.upsertForRoot(rootPath) → ProjectRow` : `SELECT … WHERE root_path=?` sinon `INSERT`
+  (`name = basename(rootPath)`, `color` auto depuis une palette fixe indexée par nombre de projets,
+  `created_at`, `last_opened_at = now`). Idempotent grâce à l'index unique.
+- `db.projects.list() → ProjectRow[]` : ordonné `last_opened_at DESC` (ou `sort_order`).
+- `db.projects.conversationCounts() → Map<projectId, n>` : badges du sélecteur.
+- `db.projects.setProject(convId, projectId | null)` : déplacer une conversation vers un projet.
+- `ProjectRow` (db.ts) : ajouter `root_path`, `color`, `sort_order`, `last_opened_at`, `created_at`.
+- Hook `useCurrentProject()` : `fsGetWorkspaceRoot()` → `upsertForRoot` → projet courant (`null` si aucun
+  dossier ouvert).
 
-`db.ts` reste une **couche de données pure** : le champ `workspace_root` est ajouté à `ConversationRow`
-et à `db.conversations.create(row)` ; le *caller* fournit la valeur (jamais `db.ts` qui appelle
-`fsGetWorkspaceRoot`). Un petit helper partagé (ex. `newConversationRow({ title })`) peut factoriser la
-lecture du workspace pour éviter la divergence entre les deux points de création.
+### 5.3 Écriture — création scopée
 
-### 5.3 Lecture — sidebar filtrée + vue « Tous »
+Les 2 points de création (`newConvo()` `chat-sidebar.tsx:336`, `createConversation()` `chat-sync.ts:1438`)
+stampent `project_id = id du projet courant` (via `useCurrentProject()` / un helper partagé), `NULL` si
+aucun dossier. `db.ts` reste pur : le caller fournit la valeur.
 
-- `db.conversations.list()` / `listNested()` prennent un paramètre `workspaceRoot?: string | null` :
-  - chaîne non vide → `WHERE workspace_root = $1` (vue « Projet courant », **stricte**),
-  - `null` (aucun dossier ouvert) → `WHERE workspace_root IS NULL` (le « projet courant » est alors le
-    bucket global — comportement voulu quand on chatte sans dossier),
-  - sentinelle `"__all__"` → pas de filtre workspace (vue « Tous »).
-- La sidebar lit le workspace courant via la query TanStack déjà existante `fsKeys.workspaceRoot()`
-  (`views-chat.tsx:155`) et le passe au filtre.
-- Nouveau switch d'en-tête de sidebar : **« Projet courant / Tous »** (2 états).
-- La query key du chat inclut le `workspaceRoot` (variante de `chatKeys.conversations`) pour un cache
-  correct par projet.
+### 5.4 Lecture + sélecteur de projets
 
-### 5.4 Rafraîchissement au changement de dossier
+- `db.conversations.list(projectId?)` / `listNested(projectId?)` :
+  - `projectId` (chaîne) → `WHERE project_id = ?` (vue « Projet courant » stricte),
+  - `null` (aucun dossier / bucket global) → `WHERE project_id IS NULL`,
+  - sentinelle `"__all__"` → pas de filtre.
+- **Sélecteur** (nouveau composant `ProjectSwitcher`, en tête de sidebar) : liste `db.projects.list()`
+  avec pastille couleur + compteur ; entrée « Global · sans projet » ; switch **« Projet courant / Tous »**.
+  Cliquer un projet ≠ courant → `fsSetWorkspaceRoot(root_path)` (ouvre le dossier ; si `root_path`
+  n'existe plus sur disque, marquer « indisponible », ne pas planter).
 
-Le listener `workspace://changed` de `RootLayout.tsx:665` invalide déjà les caches scopés (git, arbre
-fichiers, workspaceRoot). **Ajouter** l'invalidation de la query conversations
-(`chatKeys.conversations`). Bascule de dossier ⇒ la sidebar se met à jour automatiquement.
+### 5.5 Backfill intelligent (post-boot, best-effort, one-shot)
+
+**Pas dans la migration** (évite le verrou boot). Routine TS `backfillProjectsFromStudio()` déclenchée
+après le démarrage (idle), gardée par un flag `settings.projects_backfill_done`, par **lots** :
+
+1. **Normaliser le legacy** : `UPDATE conversations SET project_id = NULL WHERE project_id NOT IN
+   (SELECT id FROM projects)` — vide les anciens ids de groupes éphémères (sinon ces conversations
+   seraient orphelines, invisibles hors « Tous »).
+2. **Réattribuer via studio** : pour chaque `studio_projects(conversation_id, workspace_root)` non nul,
+   normaliser `workspace_root` en forme d'affichage, `upsertForRoot`, puis
+   `UPDATE conversations SET project_id = <projet> WHERE id = <conversation_id> AND project_id IS NULL`.
+3. Poser le flag. Les conversations sans lien studio restent `NULL` → « Global » (limite assumée : on ne
+   peut pas deviner le dossier d'une conversation jamais passée par le studio).
+
+### 5.6 Retrait des groupes éphémères
+
+Le système de groupes en mémoire (`SEED_GROUPS`, `addGroup`/`renameGroup`/`deleteGroup`, `setGroup`)
+disparaît : il était volatil et détournait `project_id`. Le vrai projet devient l'organisation de premier
+niveau ; `pinned` (colonne existante) gère l'épinglage *dans* un projet. `setGroup` → remplacé par
+`setProject` (déplacer une conv vers un projet). C'est une **simplification**, pas une perte de données
+(les groupes n'étaient jamais persistés).
+
+### 5.7 Rafraîchissement au changement de dossier
+
+Le listener `workspace://changed` (`RootLayout.tsx:665`) : `upsertForRoot` (maj `last_opened_at`) +
+invalider `chatKeys.conversations` et `projectKeys.list`. Bascule de dossier ⇒ sidebar + sélecteur à jour.
 
 ## 6. Fichiers touchés (prévision)
 
 | Fichier | Changement |
 |---|---|
-| `src-tauri/src/lib.rs` | Ajouter `MIGRATION_V18` + entrée `Migration { version: 18, … }` |
+| `src-tauri/src/lib.rs` | `MIGRATION_V18` + entrée `Migration { version: 18, … }` |
 | `src-tauri/src/commands/backup.rs` | `TARGET_SCHEMA_VERSION` 17 → 18 |
-| `src/lib/db.ts` | `ConversationRow.workspace_root` ; `create()` ; `list()`/`listNested()` param `workspaceRoot` ; **supprimer** le CRUD mort `db.projects.*` (db.ts:489-512) qui pointait vers la table droppée |
-| `src/features/chat/chat-sync.ts` | `createConversation()` stampe `workspace_root` |
-| `src/features/chat/chat-sidebar.tsx` | `newConvo()` stampe `workspace_root` ; switch « Projet courant / Tous » ; filtre |
-| `src/features/chat/keys.ts` | `chatKeys.conversations(workspaceRoot)` |
-| `src/routes/RootLayout.tsx` | Invalider `chatKeys.conversations` dans le listener `workspace://changed` |
+| `src/lib/db.ts` | `ProjectRow` enrichi ; `db.projects` réécrit (upsertForRoot/list/counts/setProject) ; `conversations.create()` (project_id) ; `list()/listNested(projectId)` ; `backfillProjectsFromStudio()` |
+| `src/features/projects/*` (nouveau) | `useCurrentProject`, `useProjects`, `ProjectSwitcher`, `projectKeys` |
+| `src/features/chat/chat-sync.ts` | `createConversation()` stampe `project_id` |
+| `src/features/chat/chat-sidebar.tsx` | retrait des groupes éphémères ; intégration `ProjectSwitcher` + filtre projet courant ; `setProject` |
+| `src/features/chat/keys.ts` | `chatKeys.conversations(projectId)` |
+| `src/routes/RootLayout.tsx` | listener `workspace://changed` : upsert projet + invalidations ; déclenchement one-shot du backfill |
 
 ## 7. Plan de test
 
-- **Rust (headless, `cargo test` via vcvars64)** : migration V18 idempotente ; base V17→V18 conserve les
-  conversations existantes (`workspace_root` NULL) ; `TARGET_SCHEMA_VERSION` == dernière migration
-  (`debug_assert`).
+- **Rust (headless, `cargo test` via vcvars64)** : V18 idempotente ; base V17→V18 conserve conversations
+  et projets ; unicité `root_path` ; `TARGET_SCHEMA_VERSION` == dernière migration.
+- **TS (unit)** : `upsertForRoot` idempotent ; backfill = normalisation NULL + réattribution studio,
+  idempotent (flag), lots.
 - **Manuel / GUI (l'utilisateur juge au rendu)** :
-  1. Ouvrir dossier A, créer 2 conversations → visibles.
-  2. Ouvrir dossier B → la sidebar ne montre que les convs de B (les 2 de A disparaissent).
-  3. Re-ouvrir A → les 2 convs de A reviennent.
-  4. Onglet « Tous » → A + B + legacy visibles ensemble.
-  5. Chat sans dossier ouvert → conv en « Global », absente de la vue « Projet courant » de A/B.
-  6. Les conversations d'avant migration apparaissent dans « Tous » (legacy), jamais perdues.
+  1. Ouvrir dossier A → un projet apparaît dans le sélecteur (nom = basename, couleur). Créer 2 convs.
+  2. Ouvrir dossier B → sélecteur ajoute B ; sidebar ne montre que les convs de B.
+  3. Cliquer A dans le sélecteur → rouvre A, ses 2 convs reviennent.
+  4. « Tous » → A + B + Global.
+  5. Chat sans dossier → conv en « Global », absente des vues projet.
+  6. Backfill : des conversations d'avant migration passées par le studio réapparaissent **sous leur
+     projet** (pas dans Global).
+  7. Aucune conversation perdue (les autres legacy sont dans « Global »).
 
-## 8. Risques & points de vigilance
+## 8. Risques & vigilance
 
-- **Migration immuable** : ne jamais rééditer une `MIGRATION_Vx` déjà livrée (checksum SHA-384 → base
-  front morte). V18 est purement additive.
-- **Verrou SQLite au boot** : pas d'écriture massive dans la migration (cf. §5.1).
-- **Préfixe `\\?\`** : toujours stocker/filtrer sur la forme d'affichage (`fsGetWorkspaceRoot()`), jamais
-  la forme canonique Rust.
-- **Deux points de création** : risque d'en oublier un → factoriser via un helper partagé.
-- **Worktrees = projets distincts** (décision assumée) : une conversation démarrée pendant qu'un agent
-  travaille dans un worktree n'apparaîtra pas depuis le repo principal. Acceptable en Phase 1 ;
-  réévaluable si gênant.
+- **Migration immuable** : ne jamais rééditer une `MIGRATION_Vx` livrée. V18 additive.
+- **Verrou SQLite au boot** : aucune écriture de masse dans la migration ; backfill = post-boot, lots,
+  flag-gardé, best-effort.
+- **`project_id` legacy pollué** (ids de groupes) : normalisés à NULL avant réattribution (§5.5 étape 1),
+  sinon conversations orphelines.
+- **Préfixe `\\?\`** : clé projet = forme d'affichage ; normaliser la valeur studio avant comparaison.
+- **Deux points de création de conversation** : factoriser via un helper pour ne pas en oublier un.
+- **Worktrees = projets distincts** (assumé) : une conv d'un agent en worktree n'apparaît pas depuis le
+  repo principal.
+- **`root_path` disparu** (dossier déplacé/supprimé) : le sélecteur marque le projet indisponible sans
+  planter.
 
 ## 9. Suite
 
-Phase 2 = mémoire projet + globale (`.shugu/memory.md` + `~/.shugu/memory.md`). Phase 3 = `.shugu/`
-canonique + export `.claude` (agents/MCP) + nettoyage (junction mort, dossiers vides, commentaire
-périmé 5→7). Chaque phase : spec → plan → implémentation propre.
+Même fondation `project_id` réutilisée par : Phase 2 = mémoire projet + globale
+(`.shugu/memory.md` + `~/.shugu/memory.md`, liées au projet) ; Phase 3 = `.shugu/` canonique + export
+`.claude` (agents/MCP) + nettoyage (junction mort, dossiers vides, commentaire périmé 5→7). Chaque
+phase : spec → plan → implémentation.
