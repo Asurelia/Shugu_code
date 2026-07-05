@@ -24,6 +24,7 @@ import {
   sendChatMessage,
   createConversation,
   reconcileOrphanPlaceholders,
+  ORCHESTRATOR_PLACEHOLDER,
 } from "@/features/chat/chat-sync";
 import { useChatStream } from "@/features/chat/useChatStream";
 import { useEditMessage, useDeleteMessage, useRegenerateFrom } from "@/features/chat/mutations";
@@ -38,7 +39,7 @@ import { setChatUnread } from "@/features/chat/chatUnread";
 import { bumpInteract } from "@/features/mascot/idleStore";
 import { MascotTabBar, CardsHub, isCardTab, type MascotTab } from "@/features/mascot/MascotNav";
 import { useTtsEnabled } from "@/features/mascot/useTts";
-import { speakReply } from "@/features/mascot/speakableRewrite";
+import { speakReply, computeSpeechTrigger } from "@/features/mascot/speakableRewrite";
 import { CaptureButton } from "./CaptureButton";
 import { useMessageDisplay } from "./useMessageDisplay";
 import { ReviewFeedback } from "./views-chat";
@@ -307,8 +308,13 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
   const [model] = useActiveModel();
   const [activeConv, setActiveConv] = useActiveConv();
 
-  const { data: msgs } = useMessages(activeConv);
+  const { data: msgs, isFetching: msgsFetching } = useMessages(activeConv);
   const [lastMsgCount, setLastMsgCount] = useState(0);
+  // Vocalisation (couche affective) — état de déclenchement robuste, cf. l'effet
+  // « Voix » plus bas : clé id+body du dernier énoncé lu + baseline MUETTE
+  // ré-armée à chaque conversation, UNIQUEMENT sur des données stabilisées.
+  const lastSpokenKeyRef = useRef<string | null>(null);
+  const speechConvRef = useRef<string | null | undefined>(undefined);
   const [input, setInput] = useState("");
   // ─────────────────────────────────────────────────────────────────
   // NOT TanStack because:
@@ -455,34 +461,57 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
       if (newest?.role === "ai" && (mode !== "full" || edge)) {
         setChatUnread(true);
       }
-      // Voix (couche affective — Palier 2) : lire la réponse AI fraîche si
-      // voice.tts est ON (speakReply no-op sinon, AVANT tout appel LLM). Garde
-      // lastMsgCount > 0 : au premier mount l'historique chargé ne doit pas
-      // déclencher de lecture. Ni les placeholders agent ni les messages-image
-      // ne sont lus.
-      //
-      // speakReply fait la SYNTHÈSE ORALE : un appel LLM condense la réponse en
-      // 1-3 phrases parlables + choisit une émotion, qui pilote À LA FOIS la
-      // voix (MiniMax) ET l'expression du chibi (fireMoodDirect) → voix et
-      // visage synchronisés sur le même état. La demande d'origine est passée en
-      // contexte pour cibler l'essentiel. Fallback déterministe garanti.
-      if (
-        lastMsgCount > 0 &&
-        newest?.role === "ai" &&
-        newest.image !== true &&
-        newest.body &&
-        newest.body !== "Orchestrateur au travail…"
-      ) {
-        const rawText = String(newest.text ?? newest.body);
-        const prior = msgs.slice(0, -1);
-        const lastUserMsg = [...prior].reverse().find((m) => m.role !== "ai" && (m.body || m.text));
-        const userPrompt = lastUserMsg ? String(lastUserMsg.text ?? lastUserMsg.body) : undefined;
-        void speakReply(rawText, userPrompt);
-      }
     }
     setLastMsgCount(msgs.length);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [msgs.length]);
+
+  // Voix (couche affective) — déclenchement ROBUSTE, y compris pour le chemin
+  // ORCHESTRATEUR. On n'observe PAS msgs.length : le placeholder « Orchestrateur
+  // au travail… » est remplacé EN PLACE (même id → length inchangée), donc un
+  // déclencheur sur la longueur raterait la vraie réponse (bug historique). On
+  // suit une clé `id + body` du dernier message (speechDep) :
+  //   - baseline MUETTE ré-établie à chaque conversation → l'historique et les
+  //     conversations qu'on ouvre ne se vocalisent jamais tout seuls ;
+  //   - une fois la baseline posée, computeSpeechTrigger ignore le placeholder et
+  //     ne lit qu'UNE fois quand le body devient final (le streaming live de
+  //     l'agent n'altère pas msgs.body — rendu depuis un cache séparé — donc
+  //     aucun fragment n'est vocalisé).
+  // speakReply est no-op si la voix est OFF (garde AVANT tout appel LLM) et fait
+  // la synthèse orale : émotion choisie → voix MiniMax + expression du chibi.
+  const newestMsg = msgs.length > 0 ? msgs[msgs.length - 1] : undefined;
+  const speechDep =
+    newestMsg && newestMsg.role === "ai"
+      ? `${newestMsg.id} ${newestMsg.body ?? ""}`
+      : `empty:${msgs.length}`;
+  useEffect(() => {
+    const newest = msgs.length > 0 ? msgs[msgs.length - 1] : undefined;
+    const trig = computeSpeechTrigger(newest, lastSpokenKeyRef.current, ORCHESTRATOR_PLACEHOLDER);
+
+    // Conversation pas encore « baselinée » (mount ou changement de conv) : on
+    // n'arme la baseline MUETTE que sur des données STABILISÉES (isFetching
+    // false). Sans ça, un cache TanStack PÉRIMÉ (staleTime:0) servirait de
+    // référence, et le refetch qui l'actualise passerait pour un nouveau message
+    // — un orchestrateur qui termine sur une conv en arrière-plan se ferait
+    // alors lire à l'ouverture de cette conv. On attend le settle.
+    if (speechConvRef.current !== activeConv) {
+      if (msgsFetching) return; // fetch de la nouvelle conv en vol → attendre
+      speechConvRef.current = activeConv;
+      lastSpokenKeyRef.current = trig.key;
+      return; // baseline posée sur l'état stabilisé, muette
+    }
+
+    // Conversation baselinée → on lit les VRAIS changements du dernier message
+    // (nouveau message, ou body du placeholder orchestrateur devenu final).
+    lastSpokenKeyRef.current = trig.key;
+    if (trig.speak && trig.text) {
+      const prior = msgs.slice(0, -1);
+      const lastUserMsg = [...prior].reverse().find((m) => m.role !== "ai" && (m.body || m.text));
+      const userPrompt = lastUserMsg ? String(lastUserMsg.text ?? lastUserMsg.body) : undefined;
+      void speakReply(trig.text, userPrompt);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [speechDep, activeConv, msgsFetching]);
 
   useEffect(() => {
     if (mode === "full") setChatUnread(false);

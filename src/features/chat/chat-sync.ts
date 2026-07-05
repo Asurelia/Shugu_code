@@ -64,6 +64,13 @@ const KEY_CODEX_EFFORT = "shugu.chat.codexEffort.v1";
 // d'envoi) verrait une valeur périmée après un changement de mode fait ailleurs.
 export const KEY_CHAT_MODE = "shugu.chat.mode.v1";
 
+/** Corps du message-placeholder posé pendant qu'un orchestrateur travaille, puis
+ *  remplacé EN PLACE (même id) par la sortie finale. Exporté car (a) le
+ *  reconciler d'orphelins le compare, et (b) la vocalisation (ChatPanel) doit
+ *  l'ignorer jusqu'à ce que le vrai contenu arrive. UNE seule source de vérité :
+ *  toute divergence de cette string casserait la détection. */
+export const ORCHESTRATOR_PLACEHOLDER = "Orchestrateur au travail…";
+
 // Fallback when no model has ever been chosen. We default to llama.cpp local
 // because (a) it doesn't need an API key, (b) it's the smoke-test target, and
 // (c) anything cloud-shaped would fail silently without a configured key,
@@ -160,6 +167,10 @@ function messageToRow(m: Message, convId: string): DbMessageRow {
 export interface MessagesResult {
   data: Message[];
   isLoading: boolean;
+  /** true tant qu'un fetch (initial OU refetch d'invalidation) est en vol. Permet
+   *  aux consommateurs de distinguer un cache PÉRIMÉ (isFetching true) de données
+   *  STABILISÉES — ex. la vocalisation n'arme sa baseline que sur du stabilisé. */
+  isFetching: boolean;
   source: "sqlite";
 }
 
@@ -175,7 +186,7 @@ export interface MessagesResult {
  *  - React 18 batching natif quand plusieurs events arrivent rapidement.
  */
 export function useMessages(convId: string | null): MessagesResult {
-  const { data = [], isLoading } = useQuery<Message[]>({
+  const { data = [], isLoading, isFetching } = useQuery<Message[]>({
     queryKey: chatKeys.messagesByConv(convId ?? "__none__"),
     queryFn: async () => {
       if (!convId) return [];
@@ -185,7 +196,7 @@ export function useMessages(convId: string | null): MessagesResult {
     enabled: !!convId,
     staleTime: 0,
   });
-  return { data, isLoading, source: "sqlite" };
+  return { data, isLoading, isFetching, source: "sqlite" };
 }
 
 // ─── appendMessage — single-message write + broadcast ──────────────────
@@ -1049,7 +1060,7 @@ async function handleDelegate(
   const placeholderMsg: Message = {
     id: placeholderId,
     role: "ai",
-    body: "Orchestrateur au travail…",
+    body: ORCHESTRATOR_PLACEHOLDER,
     ts: placeholderTs,
     viaAgent: true,
     agentId,
@@ -1177,7 +1188,7 @@ export async function reconcileOrphanPlaceholders(convId: string): Promise<void>
     // stable (INSERT OR REPLACE), so ordering is preserved by id, not ts.
     for (const msg of messages) {
       if (msg.role !== "ai") continue;
-      if (msg.body !== "Orchestrateur au travail…") continue;
+      if (msg.body !== ORCHESTRATOR_PLACEHOLDER) continue;
       if (!msg.agent_id) continue;
       try {
         const t = await getAgentTranscript(msg.agent_id);
@@ -1211,7 +1222,7 @@ export async function reconcileOrphanPlaceholders(convId: string): Promise<void>
     // single most-recent complete agent of this conv that no message
     // currently links to.
     const orphanLegacy = messages.find(
-      (m) => m.role === "ai" && m.body === "Orchestrateur au travail…" && !m.agent_id,
+      (m) => m.role === "ai" && m.body === ORCHESTRATOR_PLACEHOLDER && !m.agent_id,
     );
     if (orphanLegacy) {
       try {

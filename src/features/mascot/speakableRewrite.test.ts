@@ -1,6 +1,61 @@
 import { describe, it, expect } from "vitest";
-import { parseSpokenPlan, deterministicPlan } from "./speakableRewrite";
+import { parseSpokenPlan, deterministicPlan, computeSpeechTrigger } from "./speakableRewrite";
 import { isOutOfBandConvId, SPEAK_CONV_PREFIX } from "@/features/code/ai-edit/types";
+
+describe("computeSpeechTrigger (déclenchement — corrige le trou orchestrateur)", () => {
+  const PH = "Orchestrateur au travail…";
+
+  it("un nouveau message AI est prêt à lire", () => {
+    const t = computeSpeechTrigger({ id: "a1", role: "ai", body: "Voici la réponse." }, null, PH);
+    expect(t.speak).toBe(true);
+    expect(t.text).toBe("Voici la réponse.");
+  });
+
+  it("le placeholder orchestrateur n'est JAMAIS lu", () => {
+    expect(computeSpeechTrigger({ id: "a1", role: "ai", body: PH }, null, PH).speak).toBe(false);
+  });
+
+  it("détecte la transition placeholder → réponse finale (même id, body remplacé en place)", () => {
+    // 1) placeholder vu → pas lu
+    const t1 = computeSpeechTrigger({ id: "a1", role: "ai", body: PH }, "prev", PH);
+    expect(t1.speak).toBe(false);
+    // 2) même id, body devenu final → clé différente → lu UNE fois
+    const t2 = computeSpeechTrigger({ id: "a1", role: "ai", body: "Le jeu est prêt." }, t1.key, PH);
+    expect(t2.speak).toBe(true);
+    expect(t2.text).toBe("Le jeu est prêt.");
+    // 3) reconciler ré-append le MÊME body → pas de re-lecture
+    const t3 = computeSpeechTrigger({ id: "a1", role: "ai", body: "Le jeu est prêt." }, t2.key, PH);
+    expect(t3.speak).toBe(false);
+  });
+
+  it("ne relit pas le même message (dédup par clé id+body)", () => {
+    const msg = { id: "a2", role: "ai", body: "Idem." };
+    const first = computeSpeechTrigger(msg, "x", PH);
+    expect(first.speak).toBe(true);
+    expect(computeSpeechTrigger(msg, first.key, PH).speak).toBe(false);
+  });
+
+  it("ignore les non-AI, les images, le vide et l'absence de message", () => {
+    expect(computeSpeechTrigger({ id: "u1", role: "user", body: "salut" }, null, PH).speak).toBe(false);
+    expect(computeSpeechTrigger({ id: "i1", role: "ai", body: "x", image: true }, null, PH).speak).toBe(false);
+    expect(computeSpeechTrigger(undefined, null, PH).speak).toBe(false);
+    expect(computeSpeechTrigger({ id: "e1", role: "ai", body: "" }, null, PH).speak).toBe(false);
+  });
+
+  it("lit un message d'échec orchestrateur (contenu final ; l'émotion est gérée en aval)", () => {
+    const t = computeSpeechTrigger(
+      { id: "a3", role: "ai", body: "⚠ Orchestrator a échoué : timeout" },
+      "prev",
+      PH,
+    );
+    expect(t.speak).toBe(true);
+  });
+
+  it("préfère text à body quand les deux existent", () => {
+    const t = computeSpeechTrigger({ id: "a4", role: "ai", body: "corps", text: "texte" }, null, PH);
+    expect(t.text).toBe("texte");
+  });
+});
 
 describe("isOutOfBandConvId (fix streaming — la synthèse vocale ne doit pas clobber le chat)", () => {
   it("reconnaît le préfixe de synthèse vocale speak: comme hors-flux", () => {

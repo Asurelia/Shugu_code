@@ -29,6 +29,7 @@ import type { ChatWriteRecord } from "./chatWritesStore";
 import type { Message } from "@/lib/types";
 import { parseRiskFlag, type RiskFlag } from "@/lib/commandRules";
 import { extractWorktreeStatus, type WorktreeStatus } from "@/lib/worktree";
+import { ORCHESTRATOR_PLACEHOLDER } from "./chat-sync";
 
 /** Une ligne du journal d'activité de l'agent — un appel d'outil + son issue. */
 export interface AgentActivityItem {
@@ -320,7 +321,7 @@ export function useMessageDisplay(m: Message): MessageDisplay {
     }
   }
 
-  const stillPlaceholder = isAgentRun && m.body === "Orchestrateur au travail…";
+  const stillPlaceholder = isAgentRun && m.body === ORCHESTRATOR_PLACEHOLDER;
   const isStreamingAgent = stillPlaceholder && (liveContent.length > 0 || liveReasoning.length > 0);
 
   const displayBody =

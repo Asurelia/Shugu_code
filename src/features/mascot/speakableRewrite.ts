@@ -51,6 +51,59 @@ const MAX_SPOKEN_CHARS = 500;
  *  reconnu hors-flux par isOutOfBandConvId. */
 let speakSeq = 0;
 
+// ---------------------------------------------------------------------------
+// Déclenchement de la vocalisation (corrige le trou orchestrateur)
+// ---------------------------------------------------------------------------
+
+/** Message minimal observé par la vocalisation (sous-ensemble de Message). */
+export interface SpeakableMessage {
+  id: string | number;
+  role: string;
+  body?: string;
+  text?: string;
+  image?: boolean;
+}
+
+export interface SpeechTrigger {
+  /** Faut-il vocaliser ce message maintenant ? */
+  speak: boolean;
+  /** Clé (id + body) de l'état courant du dernier message — à mémoriser pour le
+   *  prochain calcul (dédup + détection de la transition placeholder→final). */
+  key: string;
+  /** Texte à vocaliser (défini seulement si speak). */
+  text?: string;
+}
+
+/**
+ * Décide s'il faut vocaliser le DERNIER message, à partir de son état courant et
+ * de la clé du dernier énoncé déjà émis. Pur + testable.
+ *
+ * Corrige le trou orchestrateur : le message-placeholder est remplacé EN PLACE
+ * (même id → longueur du tableau inchangée) ; un déclencheur sur `msgs.length`
+ * rate donc la vraie réponse. On suit à la place une clé `id + body` — le
+ * placeholder n'est jamais « prêt » (garde), et quand le body devient final la
+ * clé change → on lit UNE fois. Le body ne prend jamais d'états partiels (le
+ * streaming live de l'agent est rendu depuis un cache séparé, pas via msgs),
+ * donc aucun risque de vocaliser un fragment.
+ */
+export function computeSpeechTrigger(
+  newest: SpeakableMessage | undefined,
+  lastSpokenKey: string | null,
+  placeholder: string,
+): SpeechTrigger {
+  const key = newest ? String(newest.id) + " " + (newest.body ?? "") : "";
+  const ready =
+    !!newest &&
+    newest.role === "ai" &&
+    newest.image !== true &&
+    !!newest.body &&
+    newest.body !== placeholder;
+  const speak = ready && key !== lastSpokenKey;
+  return speak
+    ? { speak: true, key, text: String(newest!.text ?? newest!.body) }
+    : { speak: false, key };
+}
+
 /** Plan de secours SANS LLM : nettoyage markdown + émotion heuristique. Toujours
  *  disponible, jamais en échec. */
 export function deterministicPlan(reply: string): SpokenPlan {
