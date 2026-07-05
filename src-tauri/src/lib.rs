@@ -469,10 +469,13 @@ CREATE INDEX IF NOT EXISTS idx_mascot_memory_validated ON mascot_memory(validate
 // La question/plan EUX-MÊMES vivent dans `agent_events` (déjà persistés/rechargés) ;
 // cette table ne stocke que l'ÉTAT muté par l'utilisateur (réponse choisie, verdict
 // d'approbation) + sert de VERROU d'idempotence de la relance (`agent_continue` :
-// un `tool_call_id` déjà `answered_at` ne relance pas). Calqué sur `message_sources`.
+// une interaction déjà `answered_at` ne relance pas). Calqué sur `message_sources`.
+// `interaction_id` = clé GLOBALEMENT UNIQUE composée côté frontend (`agentId:toolCallId`) :
+// le `tool_call_id` seul ne suffit pas car certains providers (MiniMax M3) réémettent
+// le même id (`mm_call_0`) d'un tour/agent à l'autre → sinon la 2e carte serait rejetée.
 const MIGRATION_V18: &str = "
 CREATE TABLE IF NOT EXISTS agent_interactions (
-  tool_call_id    TEXT    PRIMARY KEY,
+  interaction_id  TEXT    PRIMARY KEY,
   conversation_id TEXT,
   kind            TEXT,
   response        TEXT,

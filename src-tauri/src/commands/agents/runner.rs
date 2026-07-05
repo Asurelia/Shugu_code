@@ -2143,6 +2143,13 @@ pub(super) async fn tool_use_loop(
                     || tc.name == "advisor"
                     || tc.name == "browser_test"
                     || tc.name == "delegate"
+                    // HITL : ask_user / submit_plan n'écrivent qu'un event + sentinel
+                    // et n'ont PAS besoin d'un workspace → routés sur le chemin
+                    // séquentiel (traité AVANT le gate workspace), sinon un tour ne
+                    // contenant qu'eux tomberait en « no workspace open » et casserait
+                    // le mode Plan interactif sans dossier ouvert.
+                    || tc.name == "ask_user"
+                    || tc.name == "submit_plan"
             });
 
         let results: Vec<ToolResult> = if any_async {
@@ -2337,6 +2344,11 @@ pub(super) async fn tool_use_loop(
                         is_error,
                         content,
                     });
+                } else if tc.name == "ask_user" || tc.name == "submit_plan" {
+                    // HITL — émet l'event (carte question/plan) + renvoie le sentinel
+                    // qui termine le tour (break plus bas). Aucun workspace requis,
+                    // donc traité ICI, avant le gate `workspace_root`.
+                    acc.push(super::tools::execute_hitl_tool(tc, app, agent_id));
                 } else if read_only && is_write_tool(&tc.name) {
                     // Plan mode : outil mutant refusé (defense-in-depth — déjà
                     // hors manifest, mais M3 peut l'émettre en texte).

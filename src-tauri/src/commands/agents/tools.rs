@@ -861,6 +861,82 @@ pub(super) fn execute_tool(
     }
 }
 
+/// Exécute un outil HUMAN-IN-THE-LOOP (`ask_user` / `submit_plan`). Séparé de
+/// `execute_tool` car ces outils n'écrivent qu'un EVENT (rendu en carte dans le
+/// chat) puis renvoient le sentinel `AGENT_PAUSE_SENTINEL` — ils n'ont PAS besoin
+/// d'un workspace. Le runner les route sur le chemin séquentiel AVANT le gate
+/// workspace (via `any_async`), sinon le mode Plan interactif serait cassé quand
+/// aucun dossier n'est ouvert (« planifie-moi un nouveau projet »).
+pub(super) fn execute_hitl_tool(call: &ToolCall, app: &AppHandle, agent_id: &str) -> ToolResult {
+    let args: serde_json::Value =
+        serde_json::from_str(&call.arguments).unwrap_or_else(|_| serde_json::json!({}));
+    let (content, is_error) = match call.name.as_str() {
+        "ask_user" => {
+            let questions = args
+                .get("questions")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
+            if !questions.as_array().is_some_and(|a| !a.is_empty()) {
+                (
+                    "ask_user : `questions` doit être une liste non vide (1 à 4 questions)."
+                        .to_string(),
+                    true,
+                )
+            } else {
+                let _ = super::persist_and_emit(
+                    app,
+                    &super::AgentEvent::QuestionAsked {
+                        agent_id: agent_id.to_string(),
+                        tool_call_id: call.id.clone(),
+                        questions,
+                    },
+                );
+                (
+                    format!(
+                        "{AGENT_PAUSE_SENTINEL}:ask_user — question posée à l'utilisateur. \
+                         Ton tour se termine ici ; tu seras relancé avec ses réponses."
+                    ),
+                    false,
+                )
+            }
+        }
+        "submit_plan" => {
+            let plan = args["plan"].as_str().unwrap_or("").to_string();
+            if plan.trim().is_empty() {
+                (
+                    "submit_plan : le champ `plan` (Markdown) est requis et non vide.".to_string(),
+                    true,
+                )
+            } else {
+                let title = args["title"].as_str().map(|s| s.to_string());
+                let _ = super::persist_and_emit(
+                    app,
+                    &super::AgentEvent::PlanSubmitted {
+                        agent_id: agent_id.to_string(),
+                        tool_call_id: call.id.clone(),
+                        plan,
+                        title,
+                    },
+                );
+                (
+                    format!(
+                        "{AGENT_PAUSE_SENTINEL}:submit_plan — plan soumis pour approbation. \
+                         Ton tour se termine ici."
+                    ),
+                    false,
+                )
+            }
+        }
+        other => (format!("execute_hitl_tool : outil non-HITL : {other}"), true),
+    };
+    ToolResult {
+        id: call.id.clone(),
+        name: call.name.clone(),
+        is_error,
+        content,
+    }
+}
+
 fn dispatch_inner(
     call: &ToolCall,
     root: &Path,
@@ -1203,57 +1279,9 @@ fn dispatch_inner(
                 "skill '{name}' saved for role '{role}' — it will load automatically in future runs"
             ))
         }
-        "ask_user" => {
-            // Human-in-the-loop : émet l'event QuestionAsked (rendu en carte
-            // cliquable dans le chat) puis renvoie le sentinel — le runner
-            // termine le tour et l'utilisateur répond via `agent_continue`.
-            let questions = args
-                .get("questions")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!([]));
-            if !questions.as_array().is_some_and(|a| !a.is_empty()) {
-                return Err(
-                    "ask_user : `questions` doit être une liste non vide (1 à 4 questions)."
-                        .to_string(),
-                );
-            }
-            let _ = super::persist_and_emit(
-                app,
-                &super::AgentEvent::QuestionAsked {
-                    agent_id: agent_id.to_string(),
-                    tool_call_id: call.id.clone(),
-                    questions,
-                },
-            );
-            Ok(format!(
-                "{AGENT_PAUSE_SENTINEL}:ask_user — question posée à l'utilisateur. \
-                 Ton tour se termine ici ; tu seras relancé avec ses réponses."
-            ))
-        }
-        "submit_plan" => {
-            // Human-in-the-loop : émet l'event PlanSubmitted (carte plan +
-            // boutons Approuver / Continuer) puis renvoie le sentinel.
-            let plan = args["plan"].as_str().unwrap_or("").to_string();
-            if plan.trim().is_empty() {
-                return Err(
-                    "submit_plan : le champ `plan` (Markdown) est requis et non vide.".to_string(),
-                );
-            }
-            let title = args["title"].as_str().map(|s| s.to_string());
-            let _ = super::persist_and_emit(
-                app,
-                &super::AgentEvent::PlanSubmitted {
-                    agent_id: agent_id.to_string(),
-                    tool_call_id: call.id.clone(),
-                    plan,
-                    title,
-                },
-            );
-            Ok(format!(
-                "{AGENT_PAUSE_SENTINEL}:submit_plan — plan soumis pour approbation. \
-                 Ton tour se termine ici."
-            ))
-        }
+        // NB : `ask_user` / `submit_plan` NE sont PAS dispatchés ici — ils passent
+        // par `execute_hitl_tool` (chemin séquentiel du runner, pré-gate workspace),
+        // car ils n'ont pas besoin d'un dossier ouvert.
         other => Err(format!("unknown tool: {other}")),
     }
 }

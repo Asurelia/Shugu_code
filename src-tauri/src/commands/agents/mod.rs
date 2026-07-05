@@ -1073,9 +1073,9 @@ pub async fn agent_continue(
             let changed = conn
                 .execute(
                     "INSERT INTO agent_interactions
-                        (tool_call_id, conversation_id, kind, response, verdict, created_at, answered_at)
+                        (interaction_id, conversation_id, kind, response, verdict, created_at, answered_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-                     ON CONFLICT(tool_call_id) DO UPDATE SET
+                     ON CONFLICT(interaction_id) DO UPDATE SET
                         answered_at = excluded.answered_at,
                         response    = excluded.response,
                         verdict     = excluded.verdict

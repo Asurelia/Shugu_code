@@ -76,6 +76,10 @@ export interface AgentPlanStep {
 /** Human-in-the-loop — données d'une carte de question (`ask_user`). */
 export interface QuestionData {
   toolCallId: string;
+  /** Agent émetteur — combiné au toolCallId pour une clé d'idempotence GLOBALEMENT
+   *  unique (certains providers, ex. MiniMax M3, réutilisent le toolCallId `mm_call_0`
+   *  d'un tour à l'autre). */
+  agentId: string;
   questions: {
     id?: string;
     question: string;
@@ -87,6 +91,8 @@ export interface QuestionData {
 /** Human-in-the-loop — données d'une carte de plan (`submit_plan`). */
 export interface PlanApprovalData {
   toolCallId: string;
+  /** Agent émetteur — cf. QuestionData.agentId (clé d'idempotence unique). */
+  agentId: string;
   plan: string;
   title?: string;
 }
@@ -344,10 +350,19 @@ export function useMessageDisplay(m: Message): MessageDisplay {
         }
       } else if (ev.kind === "questionAsked") {
         // Human-in-the-loop — dernier `ask_user` gagne (carte de question courante).
-        questionData = { toolCallId: ev.toolCallId, questions: ev.questions };
+        questionData = {
+          toolCallId: ev.toolCallId,
+          agentId: ev.agentId,
+          questions: ev.questions,
+        };
       } else if (ev.kind === "planSubmitted") {
         // Human-in-the-loop — dernier `submit_plan` gagne (carte de plan courante).
-        planApprovalData = { toolCallId: ev.toolCallId, plan: ev.plan, title: ev.title };
+        planApprovalData = {
+          toolCallId: ev.toolCallId,
+          agentId: ev.agentId,
+          plan: ev.plan,
+          title: ev.title,
+        };
       }
     }
   }

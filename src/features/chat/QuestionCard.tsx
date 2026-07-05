@@ -58,7 +58,7 @@ export function QuestionCard({
     setBusy(true);
     try {
       await continueAgent(convId, answer, "plan", {
-        interactionId: data.toolCallId,
+        interactionId: `${data.agentId}:${data.toolCallId}`,
         kind: "ask_user",
         response: answer,
       });

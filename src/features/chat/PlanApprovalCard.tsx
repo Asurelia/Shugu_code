@@ -38,7 +38,7 @@ export function PlanApprovalCard({
         (data.title ? `# ${data.title}\n\n` : "") +
         data.plan;
       await continueAgent(convId, answer, "agent", {
-        interactionId: data.toolCallId,
+        interactionId: `${data.agentId}:${data.toolCallId}`,
         kind: "submit_plan",
         verdict: "approved",
       });
@@ -59,7 +59,7 @@ export function PlanApprovalCard({
         ? `Continue à affiner le plan avant de le re-soumettre. Retour de l'utilisateur : ${fb}`
         : "Continue à affiner le plan avant de le re-soumettre via submit_plan.";
       await continueAgent(convId, answer, "plan", {
-        interactionId: data.toolCallId,
+        interactionId: `${data.agentId}:${data.toolCallId}`,
         kind: "submit_plan",
         verdict: "continue",
         response: fb || undefined,
