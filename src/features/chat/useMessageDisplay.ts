@@ -73,6 +73,24 @@ export interface AgentPlanStep {
   doneWhen?: string;
 }
 
+/** Human-in-the-loop — données d'une carte de question (`ask_user`). */
+export interface QuestionData {
+  toolCallId: string;
+  questions: {
+    id?: string;
+    question: string;
+    multiSelect?: boolean;
+    options: { label: string; description?: string }[];
+  }[];
+}
+
+/** Human-in-the-loop — données d'une carte de plan (`submit_plan`). */
+export interface PlanApprovalData {
+  toolCallId: string;
+  plan: string;
+  title?: string;
+}
+
 export interface MessageDisplay {
   /** Le body à afficher — soit le streaming live de l'agent, soit m.body. */
   displayBody: string;
@@ -100,6 +118,12 @@ export interface MessageDisplay {
    *  PREMIER `before` (= état d'avant le run, pour un undo cohérent). Alimente la
    *  carte « ✏️ N fichiers modifiés » (ChatWritesCard) + Annuler. */
   writeRecords: ChatWriteRecord[];
+  /** Human-in-the-loop — présent quand l'agent a appelé `ask_user` (dernier gagne).
+   *  Rendu en carte cliquable ; la réponse relance via `continueAgent`. */
+  questionData?: QuestionData;
+  /** Human-in-the-loop — présent quand l'agent a appelé `submit_plan` (dernier
+   *  gagne). Rendu en carte « Approuver et exécuter » / « Continuer à planifier ». */
+  planApprovalData?: PlanApprovalData;
   /** Populated when the message is an image attachment (m.image === true and
    *  body starts with "data:"). Renderers should show an <img> tag instead of
    *  interpreting displayBody as text. */
@@ -250,6 +274,8 @@ export function useMessageDisplay(m: Message): MessageDisplay {
   let liveReasoning = "";
   const activity: AgentActivityItem[] = [];
   let plan: AgentPlanStep[] | undefined;
+  let questionData: QuestionData | undefined;
+  let planApprovalData: PlanApprovalData | undefined;
   const writeRecords: ChatWriteRecord[] = [];
   const seenWritePaths = new Set<string>();
   // Phase 7 #4 — statut d'isolation worktree, dérivé des events du transcript.
@@ -316,6 +342,12 @@ export function useMessageDisplay(m: Message): MessageDisplay {
           seenWritePaths.add(ev.path);
           writeRecords.push({ path: ev.path, before: ev.before ?? null });
         }
+      } else if (ev.kind === "questionAsked") {
+        // Human-in-the-loop — dernier `ask_user` gagne (carte de question courante).
+        questionData = { toolCallId: ev.toolCallId, questions: ev.questions };
+      } else if (ev.kind === "planSubmitted") {
+        // Human-in-the-loop — dernier `submit_plan` gagne (carte de plan courante).
+        planApprovalData = { toolCallId: ev.toolCallId, plan: ev.plan, title: ev.title };
       }
     }
   }
@@ -346,6 +378,8 @@ export function useMessageDisplay(m: Message): MessageDisplay {
     activity,
     plan,
     writeRecords,
+    questionData,
+    planApprovalData,
     imageDataUrl,
     worktree,
   };

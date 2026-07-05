@@ -465,6 +465,24 @@ CREATE INDEX IF NOT EXISTS idx_mascot_memory_cat       ON mascot_memory(category
 CREATE INDEX IF NOT EXISTS idx_mascot_memory_validated ON mascot_memory(validated);
 ";
 
+// V18 — human-in-the-loop : état des cartes interactives (ask_user / submit_plan).
+// La question/plan EUX-MÊMES vivent dans `agent_events` (déjà persistés/rechargés) ;
+// cette table ne stocke que l'ÉTAT muté par l'utilisateur (réponse choisie, verdict
+// d'approbation) + sert de VERROU d'idempotence de la relance (`agent_continue` :
+// un `tool_call_id` déjà `answered_at` ne relance pas). Calqué sur `message_sources`.
+const MIGRATION_V18: &str = "
+CREATE TABLE IF NOT EXISTS agent_interactions (
+  tool_call_id    TEXT    PRIMARY KEY,
+  conversation_id TEXT,
+  kind            TEXT,
+  response        TEXT,
+  verdict         TEXT,
+  created_at      INTEGER NOT NULL,
+  answered_at     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_agent_interactions_conv ON agent_interactions(conversation_id);
+";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = vec![
@@ -568,6 +586,12 @@ pub fn run() {
             version: 17,
             description: "mascot_memory_hardening",
             sql: MIGRATION_V17,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 18,
+            description: "agent_interactions",
+            sql: MIGRATION_V18,
             kind: MigrationKind::Up,
         },
     ];
@@ -860,6 +884,7 @@ pub fn run() {
             commands::model_bundle::model_bundle_path,
             commands::model_bundle::model_bundle_installed_ids,
             commands::agents::agent_spawn,
+            commands::agents::agent_continue,
             commands::agents::agent_kill,
             commands::agents::agent_list_active,
             commands::agents::agent_get_transcript,

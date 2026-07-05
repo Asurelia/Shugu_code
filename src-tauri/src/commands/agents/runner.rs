@@ -2459,6 +2459,18 @@ pub(super) async fn tool_use_loop(
             );
         }
 
+        // Human-in-the-loop par FIN DE TOUR : `ask_user` / `submit_plan` ont émis
+        // leur event au dispatch et renvoyé le sentinel. On termine le tour
+        // proprement (pas de pause in-process) — l'utilisateur répond via
+        // `agent_continue`, qui relance un nouvel agent. La carte est rendue depuis
+        // le transcript (event déjà persisté), donc l'output vide n'efface rien.
+        if results
+            .iter()
+            .any(|r| !r.is_error && r.content.starts_with(super::tools::AGENT_PAUSE_SENTINEL))
+        {
+            return Ok((String::new(), reasoning));
+        }
+
         // Stall signal #2 — consecutive rounds where at least one tool errored.
         let round_errors = results.iter().filter(|r| r.is_error).count() as u32;
         metrics.tool_errors += round_errors;
@@ -2932,7 +2944,7 @@ const GENERATION_MODE_PROMPT: &str = "=== GENERATION MODE (a design system is ac
 /// and proposes, but never mutates. The HARD enforcement is tool filtering +
 /// the dispatch guard in `tool_use_loop`; this just keeps the model honest so
 /// it doesn't promise edits it cannot perform.
-const PLAN_MODE_PROMPT: &str = "\n\n=== PLAN MODE (READ-ONLY) ===\nYou are in PLAN MODE. The write/exec tools (fs_write_file, fs_edit, run_command) are DISABLED for this turn — calling them will fail. Do NOT promise to write files or run commands.\n\nYour job is to UNDERSTAND and PROPOSE, not to act:\n1. Use the read tools (fs_list_dir, fs_read_file, fs_search) to investigate the real code as needed.\n2. Optionally use todo_write to sketch the steps you WOULD take.\n3. Finish with a clear, concrete PLAN in plain text: which files you'd create/change, what each change does, and how you'd verify it. The user will switch you to Agent mode to actually execute it.";
+const PLAN_MODE_PROMPT: &str = "\n\n=== PLAN MODE (READ-ONLY) ===\nYou are in PLAN MODE. The write/exec tools (fs_write_file, fs_edit, run_command) are DISABLED for this turn — calling them will fail. Do NOT promise to write files or run commands.\n\nYour job is to UNDERSTAND and PROPOSE, not to act:\n1. Use the read tools (fs_list_dir, fs_read_file, fs_search) to investigate the real code as needed.\n2. If a choice is genuinely ambiguous (which stack, scope, or design direction), call `ask_user` with 1-4 clickable questions BEFORE finalizing — your turn ends and you are resumed with the user's answers.\n3. Use `todo_write` to sketch the steps you would take (it renders as a live checklist).\n4. When your plan is concrete, FINISH by calling `submit_plan(plan, title)` with the full plan in Markdown (which files you'd create/change, what each change does, how you'd verify it). Do NOT end in free text — `submit_plan` presents the plan to the user with « Approuver et exécuter » / « Continuer à planifier » buttons; approving switches you to Agent mode to execute it.";
 
 /// System prompt for a Grounded Run — the env-grounded loop on the user's REAL
 /// project (exec directe depuis le pivot 2026-06-10 ; le filet de sécurité est

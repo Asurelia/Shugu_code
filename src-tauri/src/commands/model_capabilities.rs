@@ -258,6 +258,9 @@ pub fn is_core_small_tool(name: &str) -> bool {
     matches!(
         name,
         "fs_read_file" | "fs_list_dir" | "fs_search" | "fs_write_file" | "fs_edit" | "run_command"
+            // Human-in-the-loop : dispo même en toolset réduit (surtout en Plan, où
+            // `submit_plan` est le SEUL moyen de finir proprement). Ne mutent rien.
+            | "ask_user" | "submit_plan"
     )
 }
 
@@ -282,7 +285,7 @@ pub fn tier_prompt(tier: Tier, has_tools: bool) -> Option<&'static str> {
 /// reflètent exactement la whitelist `is_core_small_tool`.
 const SMALL_TIER_PROMPT_TOOLS: &str = "You are running as a smaller model. Work in small, verifiable steps:\n\
 - Call ONE tool at a time, then read its result before deciding the next step.\n\
-- Only the core tools exist (fs_read_file, fs_list_dir, fs_search, fs_write_file, fs_edit, run_command). Do not assume others.\n\
+- Only the core tools exist (fs_read_file, fs_list_dir, fs_search, fs_write_file, fs_edit, run_command; plus ask_user and submit_plan in Plan mode). Do not assume others.\n\
 - Keep each action tightly scoped; prefer the smallest change that makes progress.\n\
 - After each tool result, restate in one line what you learned and what you'll do next.\n\
 - If the task is too large to do reliably in one pass, ask for a smaller, more specific instruction instead of guessing.\n\
