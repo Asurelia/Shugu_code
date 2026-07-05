@@ -2084,9 +2084,8 @@
   box-shadow: 0 0 0 3px rgba(138,239,199,0.10);
   transition: border-color 400ms ease, box-shadow 400ms ease;
 }
-/* ModelPicker embedded as the "Default model" control. */
-.profile-model { display: flex; }
-.profile-model .composer-model { max-width: 100%; }
+/* "Default model" native <select> — full width inside the profile field. */
+.profile-field select.lgi-select { width: 100%; }
 
 @media (prefers-reduced-motion: reduce) {
   .account-pop,

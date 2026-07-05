@@ -93,6 +93,7 @@ import { SideGit } from "@/features/git/SideGit";
 import { ShellContext, type ShellContextValue, type EditorPrefs, DEFAULT_EDITOR_PREFS } from "./shell-context";
 import { setLspBridge } from "@/features/code/lsp/lspBridge";
 import { loadJSON, saveJSON } from "@/features/settings/settings-extras";
+import { useProfileFields, initialsOf } from "@/features/profile/profileQueries";
 import { formatCurrentDocumentCli, formatCodeDirect } from "@/features/code/format";
 
 // ─── Path → view string (derived navigation) ─────────────────
@@ -354,6 +355,11 @@ export function RootLayout() {
   // Derive view and settings section from path
   const view = pathToView(pathname);
   const settingsSection = pathToSettingsSection(pathname);
+
+  // Titlebar avatar — real profile initials (or a generic glyph when unset),
+  // shared with the account dropdown via the same hook so they never disagree.
+  const { data: accountProfile } = useProfileFields();
+  const accountInitials = initialsOf(accountProfile?.name ?? "");
 
   const [tweaks, setTweak] = useTweaks(TWEAK_DEFAULTS);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -1325,6 +1331,7 @@ export function RootLayout() {
             onHistory={() => setRecentOpen(true)}
             onBell={() => setNotifOpen(o => !o)}
             bellCount={unreadNotifications}
+            avatar={accountInitials || <Icon name="agent" size={14} />}
           />
           <div className="main">
             <Rail

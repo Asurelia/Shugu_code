@@ -3,14 +3,14 @@
 // Fully wired to the local profile store. Display name + email live in the
 // SQLite `settings` table (via profileQueries / db.settings) and are shared
 // with the titlebar AccountDropdown through the same hook, so the card and this
-// page can never disagree. "Default language" is a view onto the real interface
-// language setting; "Default model" is the actual active chat model. Nothing
-// here is fake, everything persists.
+// page can never disagree. "Default model" is the actual active chat model
+// (native <select> so the list is never clipped by the scrolling settings
+// container). "Default language" is the real interface language setting.
 
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "@/components/components";
-import { ModelPicker } from "@/features/panels/ModelPicker";
 import { useActiveModel } from "@/features/chat/chat-sync";
+import { useDiscoveredModels } from "@/lib/modelDiscovery";
 import {
   useProfileFields,
   saveProfileFields,
@@ -96,6 +96,68 @@ function EditableField({
   );
 }
 
+/**
+ * "Default model" — real active chat model, edited via a NATIVE <select> so the
+ * options render above everything (a popover would be clipped by the scrolling
+ * `.settings-shell`). Sources the list from live provider discovery; when no
+ * provider is configured there is genuinely nothing to pick, so we say so.
+ */
+function ModelField() {
+  const [activeModel, setActiveModel] = useActiveModel();
+  const { data: models = [], isLoading } = useDiscoveredModels();
+  const activeAvailable = models.some((m) => m.id === activeModel);
+
+  return (
+    <div className="conn-field profile-field" style={{ marginBottom: 10 }}>
+      <label>Default model</label>
+      {isLoading ? (
+        <div className="input"><span style={{ color: "var(--on-surface-muted)", fontSize: 12 }}>Découverte des modèles…</span></div>
+      ) : models.length === 0 ? (
+        <div className="input">
+          <span style={{ color: "var(--on-surface-variant)", fontSize: 12 }}>
+            Aucun provider configuré — branche-en un dans <b>Réglages → Connexions</b>.
+          </span>
+        </div>
+      ) : (
+        <select
+          className="lgi lgi-select"
+          value={activeAvailable ? activeModel : ""}
+          onChange={(e) => setActiveModel(e.target.value)}
+          style={{ width: "100%" }}
+        >
+          {!activeAvailable && <option value="" disabled>Choisir un modèle…</option>}
+          {models.map((m) => (
+            <option key={m.id} value={m.id}>{m.providerLabel} · {m.label}</option>
+          ))}
+        </select>
+      )}
+    </div>
+  );
+}
+
+/** Which AI providers are actually connected (real, from live discovery). */
+function ConnectedProviders() {
+  const { data: models = [], isLoading } = useDiscoveredModels();
+  const providers = Array.from(new Set(models.map((m) => m.providerLabel)));
+
+  return (
+    <div className="conn-field profile-field" style={{ marginBottom: 10 }}>
+      <label>Providers connectés</label>
+      {isLoading ? (
+        <span className="sub" style={{ margin: 0 }}>Découverte…</span>
+      ) : providers.length === 0 ? (
+        <span className="sub" style={{ margin: 0 }}>Aucun pour l'instant — connecte-en un dans Réglages → Connexions.</span>
+      ) : (
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {providers.map((p) => (
+            <span key={p} className="chip success">{p}</span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** "Default language" bound to the real interface language (single source).
  *  Mirrors InterfaceSettings' own merge shape so types stay `typeof
  *  DEFAULT_INTERFACE` (no index-signature widening from the loaded blob). */
@@ -128,7 +190,7 @@ function LanguageField() {
 
 export function ProfileView() {
   const { data: profile } = useProfileFields();
-  const [activeModel, setActiveModel] = useActiveModel();
+  const [activeModel] = useActiveModel();
 
   const name = profile?.name?.trim() ?? "";
   const email = profile?.email?.trim() ?? "";
@@ -178,17 +240,17 @@ export function ProfileView() {
             onCommit={(v) => saveProfileFields({ email: v })}
           />
 
-          <div className="conn-field profile-field" style={{ marginBottom: 10 }}>
+          <ModelField />
+
+          <div className="conn-field profile-field" style={{ marginBottom: 4 }}>
             <label>Default language</label>
             <LanguageField />
           </div>
+          <p className="sub" style={{ marginTop: 0, marginBottom: 10, fontSize: 11 }}>
+            Préférence enregistrée. La traduction complète de l'interface est en cours de déploiement — certaines zones restent en français/anglais.
+          </p>
 
-          <div className="conn-field profile-field">
-            <label>Default model</label>
-            <div className="profile-model">
-              <ModelPicker model={activeModel} onChange={setActiveModel} className="composer-model" />
-            </div>
-          </div>
+          <ConnectedProviders />
 
           <p className="sub" style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 6 }}>
             <Icon name="shield" size={12} /> Modifications enregistrées automatiquement, en local.

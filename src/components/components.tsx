@@ -135,7 +135,7 @@ async function windowToggleMaximize(): Promise<void> {
   }
 }
 
-export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettings, sideCollapsed, onToggleSide, menu, onHistory, onBell, bellCount = 0 }: any) {
+export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettings, sideCollapsed, onToggleSide, menu, onHistory, onBell, bellCount = 0, avatar }: any) {
   return (
     <div className="titlebar">
       <div className="traffic">
@@ -188,7 +188,9 @@ export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettin
       {/* Compte — le popover .account-pop s'ancre en haut-droite (top:48px right:12px),
           sous la titlebar : son déclencheur vit donc ICI. L'avatar « SH » du Rail est
           devenu la mini-chibi (→ Profil de Shugu), on ne perd donc aucun accès. */}
-      <button className="tb-avatar" title="Compte" aria-label="Compte" onClick={onAvatar}>VU</button>
+      {/* Contenu piloté par RootLayout (initiales réelles du profil, ou glyphe
+          générique si aucun nom). Fallback "VU" pour les rendus hors-app (design-kit). */}
+      <button className="tb-avatar" title="Compte" aria-label="Compte" onClick={onAvatar}>{avatar ?? "VU"}</button>
     </div>
   );
 }

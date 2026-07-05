@@ -85,14 +85,13 @@ export function useLocalStats() {
 }
 
 /**
- * Initials for the avatar. "" when the name is unset so callers can fall back
- * to a generic user glyph instead of rendering an empty circle.
+ * Avatar label = the first two letters of the pseudo (the user's explicit
+ * expectation), whitespace ignored: "Rafaillac Sylvain" → "RA", "Shugu" → "SH".
+ * "" when the name is unset so callers fall back to a generic user glyph.
  */
 export function initialsOf(name: string): string {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
-  if (parts.length === 0) return "";
-  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
-  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+  const letters = name.trim().replace(/\s+/g, "");
+  return letters.slice(0, 2).toUpperCase();
 }
 
 /** Short, human label for a `<provider>/<model>` id — keeps only the model part.
