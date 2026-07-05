@@ -33,4 +33,18 @@ describe("normalizeRoot", () => {
     const fromStudioCanonical = normalizeRoot("\\\\?\\C:\\Dev\\shugu_code");
     expect(fromWorkspaceRoot).toBe(fromStudioCanonical);
   });
+
+  // UNC network shares: Rust `strip_extended_prefix` collapses
+  // `\\?\UNC\server\share` to `\\server\share`, which `norm_display` then emits
+  // as `//server/share`. normalizeRoot MUST land on the same key from both the
+  // studio (raw `\\?\UNC\...`) and workspace-root (already `//server/...`) forms.
+  it("collapses the \\\\?\\UNC\\ prefix like the Rust side", () => {
+    expect(normalizeRoot("\\\\?\\UNC\\server\\share\\proj")).toBe("//server/share/proj");
+  });
+
+  it("maps both UNC source forms to the SAME key", () => {
+    const fromStudioCanonical = normalizeRoot("\\\\?\\UNC\\server\\share\\proj");
+    const fromWorkspaceRoot = normalizeRoot("//server/share/proj");
+    expect(fromWorkspaceRoot).toBe(fromStudioCanonical);
+  });
 });

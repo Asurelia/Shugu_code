@@ -533,13 +533,20 @@ function basename(p: string): string {
 }
 
 /**
- * Canonical project key: strip the Windows extended-length prefix (`\\?\`),
- * convert backslashes to forward slashes, drop the trailing slash. Mirrors the
- * Rust `norm_display()` so a key computed from `fsGetWorkspaceRoot()` and one
- * computed from a `studio_projects.workspace_root` (canonical Rust form) match.
+ * Canonical project key: strip the Windows extended-length prefix (`\\?\`,
+ * including its `\\?\UNC\` network-share variant), convert backslashes to
+ * forward slashes, drop the trailing slash. Mirrors Rust `pathutil::norm_display`
+ * (which builds on `strip_extended_prefix`) so a key from `fsGetWorkspaceRoot()`
+ * and one from a `studio_projects.workspace_root` (canonical Rust form) match —
+ * including UNC shares, where `\\?\UNC\server\share` must collapse to
+ * `//server/share` exactly like the Rust side does.
  */
 export function normalizeRoot(p: string): string {
-  return p.replace(/^\\\\\?\\/, "").replace(/\\/g, "/").replace(/\/+$/, "");
+  return p
+    .replace(/^\\\\\?\\UNC\\/, "\\\\") // \\?\UNC\server\share -> \\server\share
+    .replace(/^\\\\\?\\/, "")          // \\?\C:\...            -> C:\...
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "");
 }
 
 const projects = {

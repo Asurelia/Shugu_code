@@ -279,6 +279,7 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
     const newConvoData = { ...c, id: c.id + "-copy-" + Date.now(), title: c.title + " (copy)", updated: Date.now() };
     setConvos(cs => [newConvoData, ...cs]);
     void db.conversations.create(convoToRow(newConvoData));
+    void queryClient.invalidateQueries({ queryKey: projectKeys.counts() });
   };
   // Sidebar groups are in-session organizers only (V18: decoupled from the
   // persisted project scope) — this no longer writes to the DB.
