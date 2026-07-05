@@ -40,7 +40,7 @@ import { fireMoodReaction } from "@/features/mascot/moodReactionStore";
 import { SHUGU_PERSONA_PROMPT, personaEnabled } from "@/features/chat/persona";
 import { parseThinkingMode, resolveThinking } from "@/lib/thinkingHeuristic";
 import { resolveRoute, parseDelegateOverride, type Route } from "@/lib/routingHeuristic";
-import { spawnAgent, awaitAgentComplete } from "@/lib/agents";
+import { spawnAgent, agentContinue, awaitAgentComplete } from "@/lib/agents";
 import { readAgentDef } from "@/lib/agentDefs";
 import { superviseDeliverable, resolveReviewerArgs, resolveAdvisorArgs } from "@/lib/supervisors";
 import { getActiveDesignSystem, buildDesignSystemPrompt } from "@/features/design/activeDesignSystem";
@@ -64,6 +64,13 @@ const KEY_CODEX_EFFORT = "shugu.chat.codexEffort.v1";
 // fenêtre réceptrice — sinon `getActiveChatMode()` (lu en direct dans le chemin
 // d'envoi) verrait une valeur périmée après un changement de mode fait ailleurs.
 export const KEY_CHAT_MODE = "shugu.chat.mode.v1";
+
+/** Corps du message-placeholder posé pendant qu'un orchestrateur travaille, puis
+ *  remplacé EN PLACE (même id) par la sortie finale. Exporté car (a) le
+ *  reconciler d'orphelins le compare, et (b) la vocalisation (ChatPanel) doit
+ *  l'ignorer jusqu'à ce que le vrai contenu arrive. UNE seule source de vérité :
+ *  toute divergence de cette string casserait la détection. */
+export const ORCHESTRATOR_PLACEHOLDER = "Orchestrateur au travail…";
 
 // Fallback when no model has ever been chosen. We default to llama.cpp local
 // because (a) it doesn't need an API key, (b) it's the smoke-test target, and
@@ -161,6 +168,10 @@ function messageToRow(m: Message, convId: string): DbMessageRow {
 export interface MessagesResult {
   data: Message[];
   isLoading: boolean;
+  /** true tant qu'un fetch (initial OU refetch d'invalidation) est en vol. Permet
+   *  aux consommateurs de distinguer un cache PÉRIMÉ (isFetching true) de données
+   *  STABILISÉES — ex. la vocalisation n'arme sa baseline que sur du stabilisé. */
+  isFetching: boolean;
   source: "sqlite";
 }
 
@@ -176,7 +187,7 @@ export interface MessagesResult {
  *  - React 18 batching natif quand plusieurs events arrivent rapidement.
  */
 export function useMessages(convId: string | null): MessagesResult {
-  const { data = [], isLoading } = useQuery<Message[]>({
+  const { data = [], isLoading, isFetching } = useQuery<Message[]>({
     queryKey: chatKeys.messagesByConv(convId ?? "__none__"),
     queryFn: async () => {
       if (!convId) return [];
@@ -186,7 +197,7 @@ export function useMessages(convId: string | null): MessagesResult {
     enabled: !!convId,
     staleTime: 0,
   });
-  return { data, isLoading, source: "sqlite" };
+  return { data, isLoading, isFetching, source: "sqlite" };
 }
 
 // ─── appendMessage — single-message write + broadcast ──────────────────
@@ -813,6 +824,16 @@ async function handleDelegate(
   // sinon « merci » + un fichier ouvert ⇒ `task` long ⇒ resolveThinking=true ⇒
   // advisor déclenché à tort. Défaut = task (rétro-compat si non fourni).
   userText: string = task,
+  // Human-in-the-loop : quand fourni, la relance passe par `agent_continue`
+  // (idempotent) au lieu de `spawnAgent`. Renseigné par `continueAgent` après une
+  // réponse à `ask_user` ou une décision sur `submit_plan`. Le reste du pipeline
+  // (placeholder, await, relay, review S1) est identique au chemin délégué normal.
+  resume?: {
+    interactionId?: string;
+    kind?: "ask_user" | "submit_plan";
+    verdict?: "approved" | "continue";
+    response?: string;
+  },
 ): Promise<void> {
   // fallbackModel = modèle de chat actif, utilisé comme orchestrateur si aucun
   // n'est configuré (délégation « out of the box »). Un agent custom (.md)
@@ -973,35 +994,56 @@ async function handleDelegate(
   // output is sitting in the agents table.
   let agentId: string;
   try {
-    agentId = await spawnAgent({
-      role: "orchestrator",
-      task: execTask,
-      model: realModel,
-      conversationId: convId,
-      protocol,
-      baseUrl,
-      apiKey,
-      // Si l'utilisateur a choisi un agent custom dans le sélecteur du chat,
-      // le backend charge ce `.md` et remplace role/model/system_prompt par
-      // ses valeurs (cf. agent_spawn + agent_defs::load_def).
-      agentDefPath,
-      // Mode Plan → read_only côté runner (outils mutants retirés). Le défaut
-      // "agent" laisse l'exécution directe complète.
-      mode,
-      // v2 : modèle conseiller distinct pour l'outil `advisor` (sinon
-      // auto-consultation côté runner). Les 4 champs vont ensemble.
-      advisorModel: advisor?.model,
-      advisorProtocol: advisor?.protocol,
-      advisorBaseUrl: advisor?.baseUrl,
-      advisorApiKey: advisor?.apiKey,
-      // Exécution DIRECTE par défaut (2026-07-02) : on NE passe PAS `isolate`
-      // → le backend applique `unwrap_or(false)` et l'orchestrateur travaille
-      // sur le VRAI checkout, comme Claude Code — les fichiers non commités du
-      // user restent visibles pour l'agent, et son résultat atterrit
-      // directement dans les fichiers (pas de branche parquée à merger).
-      // Pour ISOLER un flux précis (worktree + revue/merge via panneau
-      // Agents), passer `isolate: true` explicitement.
-    });
+    agentId = resume
+      ? // Human-in-the-loop : relance idempotente (l'interaction consommée ne
+        // relance pas deux fois). Pas d'agentDefPath ni d'isolate — une relance
+        // reprend l'orchestrateur sur le vrai checkout.
+        await agentContinue({
+          conversationId: convId,
+          model: realModel,
+          answer: execTask,
+          mode,
+          protocol,
+          baseUrl,
+          apiKey,
+          advisorModel: advisor?.model,
+          advisorProtocol: advisor?.protocol,
+          advisorBaseUrl: advisor?.baseUrl,
+          advisorApiKey: advisor?.apiKey,
+          interactionId: resume.interactionId,
+          kind: resume.kind,
+          verdict: resume.verdict,
+          response: resume.response,
+        })
+      : await spawnAgent({
+          role: "orchestrator",
+          task: execTask,
+          model: realModel,
+          conversationId: convId,
+          protocol,
+          baseUrl,
+          apiKey,
+          // Si l'utilisateur a choisi un agent custom dans le sélecteur du chat,
+          // le backend charge ce `.md` et remplace role/model/system_prompt par
+          // ses valeurs (cf. agent_spawn + agent_defs::load_def).
+          agentDefPath,
+          // Mode Plan → read_only côté runner (outils mutants retirés). Le défaut
+          // "agent" laisse l'exécution directe complète.
+          mode,
+          // v2 : modèle conseiller distinct pour l'outil `advisor` (sinon
+          // auto-consultation côté runner). Les 4 champs vont ensemble.
+          advisorModel: advisor?.model,
+          advisorProtocol: advisor?.protocol,
+          advisorBaseUrl: advisor?.baseUrl,
+          advisorApiKey: advisor?.apiKey,
+          // Exécution DIRECTE par défaut (2026-07-02) : on NE passe PAS `isolate`
+          // → le backend applique `unwrap_or(false)` et l'orchestrateur travaille
+          // sur le VRAI checkout, comme Claude Code — les fichiers non commités du
+          // user restent visibles pour l'agent, et son résultat atterrit
+          // directement dans les fichiers (pas de branche parquée à merger).
+          // Pour ISOLER un flux précis (worktree + revue/merge via panneau
+          // Agents), passer `isolate: true` explicitement.
+        });
   } catch (err) {
     await appendMessage(convId, {
       id: newMessageId("e"),
@@ -1050,7 +1092,7 @@ async function handleDelegate(
   const placeholderMsg: Message = {
     id: placeholderId,
     role: "ai",
-    body: "Orchestrateur au travail…",
+    body: ORCHESTRATOR_PLACEHOLDER,
     ts: placeholderTs,
     viaAgent: true,
     agentId,
@@ -1147,6 +1189,30 @@ async function handleDelegate(
   }
 }
 
+/** Human-in-the-loop — relance l'agent après une réponse de l'utilisateur à un
+ *  `ask_user`, ou une décision sur un `submit_plan`. Réutilise TOUT le pipeline de
+ *  délégation (résolution provider, placeholder, await, relay verbatim, review S1)
+ *  via `handleDelegate`, mais route le spawn vers `agent_continue` (idempotent).
+ *
+ *  - Réponse à une question / « Continuer à planifier » → `mode: "plan"`.
+ *  - « Approuver et exécuter » → `mode: "agent"` + le plan réinjecté dans `answer`.
+ *
+ *  Le modèle est celui de l'orchestrateur configuré, avec repli sur le modèle de
+ *  chat actif (`getActiveModel()`) — même résolution que le chemin délégué normal. */
+export async function continueAgent(
+  convId: string,
+  answer: string,
+  mode: "plan" | "agent",
+  resume: {
+    interactionId?: string;
+    kind?: "ask_user" | "submit_plan";
+    verdict?: "approved" | "continue";
+    response?: string;
+  },
+): Promise<void> {
+  await handleDelegate(convId, answer, undefined, getActiveModel(), mode, answer, resume);
+}
+
 /**
  * Sweep the conversation for orphan "Orchestrateur au travail…" placeholders
  * left behind when the JS listener died before the `complete` event arrived
@@ -1178,7 +1244,7 @@ export async function reconcileOrphanPlaceholders(convId: string): Promise<void>
     // stable (INSERT OR REPLACE), so ordering is preserved by id, not ts.
     for (const msg of messages) {
       if (msg.role !== "ai") continue;
-      if (msg.body !== "Orchestrateur au travail…") continue;
+      if (msg.body !== ORCHESTRATOR_PLACEHOLDER) continue;
       if (!msg.agent_id) continue;
       try {
         const t = await getAgentTranscript(msg.agent_id);
@@ -1212,7 +1278,7 @@ export async function reconcileOrphanPlaceholders(convId: string): Promise<void>
     // single most-recent complete agent of this conv that no message
     // currently links to.
     const orphanLegacy = messages.find(
-      (m) => m.role === "ai" && m.body === "Orchestrateur au travail…" && !m.agent_id,
+      (m) => m.role === "ai" && m.body === ORCHESTRATOR_PLACEHOLDER && !m.agent_id,
     );
     if (orphanLegacy) {
       try {

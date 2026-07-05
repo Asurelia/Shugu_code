@@ -465,7 +465,28 @@ CREATE INDEX IF NOT EXISTS idx_mascot_memory_cat       ON mascot_memory(category
 CREATE INDEX IF NOT EXISTS idx_mascot_memory_validated ON mascot_memory(validated);
 ";
 
-// V18 — Le Projet comme entité de première classe. La table `projects` (V1)
+// V18 — human-in-the-loop : état des cartes interactives (ask_user / submit_plan).
+// La question/plan EUX-MÊMES vivent dans `agent_events` (déjà persistés/rechargés) ;
+// cette table ne stocke que l'ÉTAT muté par l'utilisateur (réponse choisie, verdict
+// d'approbation) + sert de VERROU d'idempotence de la relance (`agent_continue` :
+// une interaction déjà `answered_at` ne relance pas). Calqué sur `message_sources`.
+// `interaction_id` = clé GLOBALEMENT UNIQUE composée côté frontend (`agentId:toolCallId`) :
+// le `tool_call_id` seul ne suffit pas car certains providers (MiniMax M3) réémettent
+// le même id (`mm_call_0`) d'un tour/agent à l'autre → sinon la 2e carte serait rejetée.
+const MIGRATION_V18: &str = "
+CREATE TABLE IF NOT EXISTS agent_interactions (
+  interaction_id  TEXT    PRIMARY KEY,
+  conversation_id TEXT,
+  kind            TEXT,
+  response        TEXT,
+  verdict         TEXT,
+  created_at      INTEGER NOT NULL,
+  answered_at     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_agent_interactions_conv ON agent_interactions(conversation_id);
+";
+
+// V19 — Le Projet comme entité de première classe. La table `projects` (V1)
 // était morte (colonnes color/sort_order jamais utilisées) ; on la ressuscite en
 // REGISTRE réel des projets, clé = `root_path` (le dossier ouvert, forme
 // d'affichage). La colonne EXISTANTE `conversations.project_id` (qui servait
@@ -475,7 +496,7 @@ CREATE INDEX IF NOT EXISTS idx_mascot_memory_validated ON mascot_memory(validate
 // grosse transaction au boot (respecte la contrainte verrou/migration-lazy). Le
 // backfill des conversations existantes se fait APRÈS le boot, côté TS, par lots
 // et flag-gardé (jamais dans la migration).
-const MIGRATION_V18: &str = "
+const MIGRATION_V19: &str = "
 ALTER TABLE projects ADD COLUMN root_path      TEXT;
 ALTER TABLE projects ADD COLUMN last_opened_at INTEGER;
 ALTER TABLE projects ADD COLUMN created_at     INTEGER;
@@ -590,8 +611,14 @@ pub fn run() {
         },
         Migration {
             version: 18,
-            description: "projects_first_class_entity",
+            description: "agent_interactions",
             sql: MIGRATION_V18,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 19,
+            description: "projects_first_class_entity",
+            sql: MIGRATION_V19,
             kind: MigrationKind::Up,
         },
     ];
@@ -884,6 +911,7 @@ pub fn run() {
             commands::model_bundle::model_bundle_path,
             commands::model_bundle::model_bundle_installed_ids,
             commands::agents::agent_spawn,
+            commands::agents::agent_continue,
             commands::agents::agent_kill,
             commands::agents::agent_list_active,
             commands::agents::agent_get_transcript,

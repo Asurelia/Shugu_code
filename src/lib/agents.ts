@@ -45,7 +45,9 @@ export type AgentEventKind =
   | "screenshot"
   | "worktreeStarted"
   | "worktreeFinalized"
-  | "worktreeSkipped";
+  | "worktreeSkipped"
+  | "questionAsked"
+  | "planSubmitted";
 
 // ────────────────────────────────────────────────────────────────────
 // DB row shapes (mirror Rust AgentRow / AgentEventRow)
@@ -232,6 +234,30 @@ export type AgentEvent =
       agentId: string;
       /** Pourquoi l'isolation n'a pas pu démarrer (affiché tel quel à l'user). */
       reason: string;
+    }
+  | {
+      // Human-in-the-loop — l'agent a appelé `ask_user`. Rendu en carte cliquable
+      // dans le fil ; la réponse relance l'agent via `agentContinue`.
+      kind: "questionAsked";
+      agentId: string;
+      toolCallId: string;
+      /** Le JSON brut de l'outil `ask_user` : 1 à 4 questions à choix. */
+      questions: {
+        id?: string;
+        question: string;
+        multiSelect?: boolean;
+        options: { label: string; description?: string }[];
+      }[];
+    }
+  | {
+      // Human-in-the-loop — l'agent a appelé `submit_plan`. Rendu en carte avec
+      // « Approuver et exécuter » / « Continuer à planifier ».
+      kind: "planSubmitted";
+      agentId: string;
+      toolCallId: string;
+      /** Plan final en Markdown à présenter dans la carte d'approbation. */
+      plan: string;
+      title?: string;
     };
 
 // ────────────────────────────────────────────────────────────────────
@@ -297,6 +323,40 @@ export interface SpawnArgs {
  * set. */
 export async function spawnAgent(args: SpawnArgs): Promise<string> {
   return invoke<string>("agent_spawn", { args });
+}
+
+/** Args pour `agentContinue` — relance human-in-the-loop après une réponse à
+ *  `ask_user` ou l'approbation/le refus d'un `submit_plan`. Sérialise vers le
+ *  Rust `ContinueArgs` (camelCase). */
+export interface ContinueArgs {
+  conversationId: string;
+  model: string;
+  /** Message user synthétique injecté (réponse aux questions, ou « exécute le
+   *  plan approuvé » avec le plan réinjecté). Devient la `task` du nouveau run. */
+  answer: string;
+  /** "plan" (relance après ask_user) ou "agent" (approbation → exécution). */
+  mode?: "plan" | "agent";
+  /** tool_call_id de l'interaction consommée — clé d'idempotence de la relance. */
+  interactionId?: string;
+  kind?: "ask_user" | "submit_plan";
+  response?: string;
+  verdict?: "approved" | "continue";
+  // Provider routing — miroir de SpawnArgs (résolu côté TS avant l'appel).
+  protocol?: string;
+  baseUrl?: string;
+  apiKey?: string;
+  chatTemplateKwargs?: Record<string, unknown>;
+  advisorModel?: string;
+  advisorProtocol?: string;
+  advisorBaseUrl?: string;
+  advisorApiKey?: string;
+}
+
+/** Relance un agent après une réponse de l'utilisateur (`ask_user`) ou l'approbation
+ *  d'un plan (`submit_plan`). Renvoie l'id du NOUVEL agent. Idempotent : une
+ *  interaction déjà consommée rejette (« Cette interaction a déjà été traitée. »). */
+export async function agentContinue(args: ContinueArgs): Promise<string> {
+  return invoke<string>("agent_continue", { args });
 }
 
 /** Kill a running agent. Non-cascading in Phase 0 — Phase 1+ must add

@@ -603,9 +603,16 @@
 }
 .account-head {
   display: flex; align-items: center; gap: 12px;
+  width: 100%;
   padding: 14px 14px 12px;
-  border-bottom: 1px solid rgba(255,255,255,0.05);
+  border: 0; border-bottom: 1px solid rgba(255,255,255,0.05);
+  background: transparent;
+  color: inherit; font: inherit; text-align: left;
+  cursor: pointer;
+  transition: background 140ms ease;
 }
+.account-head:hover { background: rgba(224,142,254,0.06); }
+.account-head:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
 .account-head .avatar {
   width: 44px; height: 44px; border-radius: 50%;
   background: radial-gradient(circle at 30% 30%, #ffd0fb 0%, transparent 50%), linear-gradient(135deg, var(--secondary), var(--primary), var(--tertiary));
@@ -613,10 +620,47 @@
   font-family: var(--font-display); font-weight: 700;
   color: rgba(0,0,0,0.6); font-size: 14px;
   flex-shrink: 0;
+  transition: transform 200ms cubic-bezier(0.16,1,0.3,1);
 }
+.account-head:hover .avatar { transform: scale(1.04); }
 .account-head .who { flex: 1; min-width: 0; }
 .account-head .name { font-weight: 600; font-size: 13px; }
 .account-head .email { font-size: 11px; color: var(--on-surface-variant); margin-top: 2px; }
+.account-head .name.placeholder,
+.account-head .email.placeholder { color: var(--on-surface-muted); font-style: italic; font-weight: 500; }
+.account-edit {
+  color: var(--on-surface-muted);
+  display: inline-flex; align-items: center;
+  flex-shrink: 0;
+  transition: color 140ms ease, transform 200ms cubic-bezier(0.16,1,0.3,1);
+}
+.account-head:hover .account-edit { color: var(--primary); transform: rotate(30deg); }
+
+/* Active-model row — real default model, links to appearance settings. */
+.account-model {
+  display: flex; align-items: center; gap: 8px;
+  width: calc(100% - 28px);
+  margin: 0 14px 10px;
+  padding: 8px 10px;
+  background: rgba(255,255,255,0.025);
+  border: 1px solid rgba(255,255,255,0.05);
+  border-radius: 10px;
+  color: var(--on-surface-variant);
+  cursor: pointer;
+  font-size: 11px;
+  transition: border-color 140ms ease, background 140ms ease;
+}
+.account-model:hover { border-color: rgba(224,142,254,0.28); background: rgba(224,142,254,0.05); }
+.account-model:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+.account-model .ico { color: var(--tertiary); display: inline-flex; }
+.account-model .ml-label { flex: 1; }
+.account-model .ml-value {
+  color: var(--on-surface);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  max-width: 55%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 
 .account-tier {
   margin: 10px 14px;
@@ -647,14 +691,40 @@
   border-radius: 10px;
   font-size: 11px;
 }
-.account-usage .row {
-  display: flex; justify-content: space-between;
-  margin-bottom: 5px;
-  color: var(--on-surface-variant);
+.account-usage .usage-head {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--on-surface-muted);
+  margin-bottom: 8px;
 }
-.account-usage .row .v { color: var(--on-surface); font-family: var(--font-mono); }
-.account-usage .bar { height: 4px; background: rgba(255,255,255,0.06); border-radius: 999px; overflow: hidden; margin-top: 4px; }
-.account-usage .bar .fill { height: 100%; background: linear-gradient(90deg, var(--tertiary), var(--primary)); }
+.account-usage .stat-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+.account-usage .stat {
+  display: flex; flex-direction: column; align-items: center;
+  gap: 2px;
+  padding: 6px 4px;
+  background: rgba(255,255,255,0.02);
+  border: 1px solid rgba(255,255,255,0.04);
+  border-radius: 8px;
+}
+.account-usage .stat .n {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--on-surface);
+  line-height: 1.1;
+}
+.account-usage .stat .k {
+  font-size: 9.5px;
+  color: var(--on-surface-variant);
+  text-align: center;
+}
 
 .account-menu { padding: 4px 6px 8px; }
 .account-item {
@@ -667,12 +737,50 @@
   cursor: pointer;
   font-size: 12.5px;
   text-align: left;
+  transition: background 130ms ease, transform 130ms ease;
 }
-.account-item:hover { background: rgba(224,142,254,0.08); }
-.account-item .ico { color: var(--on-surface-variant); width: 16px; }
-.account-item:hover .ico { color: var(--primary); }
+.account-item:hover { background: rgba(224,142,254,0.08); transform: translateX(2px); }
+.account-item:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.account-item .ico {
+  color: var(--on-surface-variant); width: 16px;
+  display: inline-flex;
+  transition: color 130ms ease, transform 180ms cubic-bezier(0.16,1,0.3,1);
+}
+.account-item:hover .ico { color: var(--primary); transform: scale(1.12); }
 .account-item.danger { color: var(--danger); }
 .account-item.danger .ico { color: var(--danger); }
+
+/* Greyed / disabled item — kept visible, never removed. No pointer-events:none
+   so the `title` tooltip (the "why") still shows on hover. */
+.account-item.is-disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+.account-item.is-disabled:hover { background: transparent; transform: none; }
+.account-item.is-disabled:hover .ico { color: var(--on-surface-variant); transform: none; }
+.account-item .acc-lock {
+  margin-left: auto;
+  color: var(--on-surface-muted);
+  display: inline-flex; align-items: center;
+}
+
+/* Staggered entrance for the menu items (subtle; disabled under reduced-motion). */
+@keyframes acc-item-in {
+  from { opacity: 0; transform: translateY(5px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.account-menu .account-item {
+  /* `backwards` (not `both`): apply the start frame before the delay to avoid a
+     flash, but release the transform when done so :hover translateX still works. */
+  animation: acc-item-in 220ms ease backwards;
+}
+.account-menu .account-item:nth-child(1) { animation-delay: 20ms; }
+.account-menu .account-item:nth-child(2) { animation-delay: 40ms; }
+.account-menu .account-item:nth-child(3) { animation-delay: 60ms; }
+.account-menu .account-item:nth-child(4) { animation-delay: 80ms; }
+.account-menu .account-item:nth-child(5) { animation-delay: 100ms; }
+.account-menu .account-item:nth-child(7) { animation-delay: 120ms; }
+.account-menu .account-item:nth-child(8) { animation-delay: 140ms; }
 
 /* ── Floating mini-chat — space-agent style ─────────────────────
    The mascot is the anchor (draggable button). The chat panel
@@ -1948,8 +2056,46 @@
 .profile-card .email { font-size: 12px; color: var(--on-surface-variant); margin-top: 2px; }
 .profile-card .meta {
   margin-top: 6px;
-  display: flex; gap: 6px;
+  display: flex; gap: 6px; flex-wrap: wrap;
 }
+.profile-card .name.placeholder,
+.profile-card .email.placeholder { color: var(--on-surface-muted); font-style: italic; font-weight: 500; }
+
+/* Editable profile fields — dirty dot + saved flash (success-feedback). */
+.profile-field label {
+  display: flex; align-items: center; gap: 8px;
+}
+.profile-field .field-saved {
+  display: inline-flex; align-items: center; gap: 3px;
+  color: var(--success);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: none;
+  animation: acc-item-in 200ms ease backwards;
+}
+.profile-field .field-dirty {
+  color: var(--warn);
+  font-size: 14px; line-height: 1;
+  padding-right: 2px;
+}
+.profile-field .input.just-saved {
+  border-color: rgba(138,239,199,0.5);
+  box-shadow: 0 0 0 3px rgba(138,239,199,0.10);
+  transition: border-color 400ms ease, box-shadow 400ms ease;
+}
+/* "Default model" native <select> — full width inside the profile field. */
+.profile-field select.lgi-select { width: 100%; }
+
+@media (prefers-reduced-motion: reduce) {
+  .account-pop,
+  .account-menu .account-item,
+  .profile-field .field-saved { animation: none; }
+  .account-head, .account-head .avatar, .account-edit,
+  .account-item, .account-item .ico, .account-model,
+  .profile-field .input.just-saved { transition: none; }
+}
+
 .privacy-list {
   margin-top: 12px;
   background: rgba(255,255,255,0.02);

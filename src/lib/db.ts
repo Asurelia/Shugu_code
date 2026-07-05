@@ -808,6 +808,36 @@ const settings = {
 };
 
 // ---------------------------------------------------------------------------
+// stats — real, live counts for the account/profile card
+//
+// Local-first: these are honest numbers read straight from SQLite (the source
+// of truth), NOT a fabricated subscription quota. Used by the profile card's
+// "Activité locale" panel. Kept here so the account card stays free of raw SQL.
+// ---------------------------------------------------------------------------
+
+export interface LocalCounts {
+  conversations: number;
+  messages: number;
+  images: number;
+}
+
+const stats = {
+  async counts(): Promise<LocalCounts> {
+    const database = await getDb();
+    const scalar = async (sql: string): Promise<number> => {
+      const rows = (await database.select(sql)) as Array<{ n: number }>;
+      return rows[0]?.n ?? 0;
+    };
+    // Sequential to match the plugin's single-connection usage elsewhere in
+    // this module; the three counts are cheap COUNT(*) index scans.
+    const conversations = await scalar("SELECT COUNT(*) AS n FROM conversations");
+    const messages = await scalar("SELECT COUNT(*) AS n FROM messages WHERE deleted_at IS NULL");
+    const images = await scalar("SELECT COUNT(*) AS n FROM generations");
+    return { conversations, messages, images };
+  },
+};
+
+// ---------------------------------------------------------------------------
 // reviews  (V13 migration — agent_reviews)
 // ---------------------------------------------------------------------------
 
@@ -970,6 +1000,7 @@ export const db = {
   jobs,
   logs,
   settings,
+  stats,
   reviews,
   sources,
   mascotMemory,
