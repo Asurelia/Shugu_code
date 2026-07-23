@@ -1470,10 +1470,11 @@ export function RootLayout() {
             </div>
           </div>
           {/* Barre de statut globale — projet, branche, agents actifs,
-              génération en cours, indexation. Masquée sur code/git : la
-              `.statusbar` de l'éditeur y joue déjà ce rôle (elle reçoit les
-              items d'activité via <ShellStatusExtras/> dans views-code). */}
-          {view !== "code" && view !== "git" && (
+              génération en cours, indexation. Masquée sur chat : son composer
+              expose déjà le projet, la branche, le profil d'exécution et les
+              commandes utiles. Masquée aussi sur code/git : la `.statusbar`
+              de l'éditeur y joue déjà ce rôle. */}
+          {view !== "chat" && view !== "code" && view !== "git" && (
             <StatusBar
               navigateTo={navigateTo}
               onOpenRecent={() => setRecentOpen(true)}

@@ -18,7 +18,8 @@
 //
 // Les erreurs « Tauri absent » (invoke/transformCallback/WebSocket…) sont
 // attendues en navigateur et n'échouent PAS le tour ; seuls les manques
-// STRUCTURELS (shell/rail/statusbar absents) sortent en code ≠ 0.
+// STRUCTURELS (shell/rail absents, statusbar présente au mauvais endroit)
+// sortent en code ≠ 0.
 
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { chromium } from "@playwright/test";
@@ -154,9 +155,11 @@ const need = async (sel, label) => {
 };
 await need("nav.rail", "rail");
 await need(".rail-group-label", "labels de groupes du rail");
-await need(".shell-statusbar", "statusbar globale");
 await need(".tb-bell", "cloche notifications");
 await need('nav.rail button[aria-label="Connections"]', "bouton Connections");
+if ((await page.locator(".shell-statusbar").count()) > 0) {
+  missing.push("statusbar globale visible dans le chat (doublon du composer)");
+}
 
 if (!FOCUSED) {
   await screenshot(`${OUT}/01-chat-shell.png`);
@@ -201,6 +204,7 @@ if (!FOCUSED) {
 // ── Connexions : cartes compactes, identité provider, expansion ────────────
 await fastClick(page.locator('nav.rail button[aria-label="Connections"]'));
 await page.waitForTimeout(800);
+await need(".shell-statusbar", "statusbar globale hors chat");
 await need(".conn-card-v2", "cartes provider compactes");
 await need(".conn-card-v2 .provider-mark", "identités provider");
 await need(".conn-card-v2 .conn-card-toggle", "contrôles de repli provider");

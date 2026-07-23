@@ -431,7 +431,6 @@ await auditTextContrast("chat");
 
 for (const [selector, label] of [
   ["nav.rail", "rail"],
-  [".shell-statusbar", "statusbar"],
   [".tb-bell", "notifications"],
   [".cx-composer-input", "chat composer"],
 ]) {
@@ -442,6 +441,9 @@ for (const [selector, label] of [
     .catch(() => {
       throw new Error(`missing ${label}: ${selector}`);
     });
+}
+if ((await page.locator(".shell-statusbar").count()) > 0) {
+  throw new Error("chat statusbar should be hidden because the composer already exposes the same controls");
 }
 
 // Native IPC proof: these calls cannot succeed in a Vite-only browser.
@@ -506,6 +508,13 @@ await navigateRailAndAudit(
   "01b-source-control.png",
 );
 await navigateRailAndAudit("Agents", "agents", "01c-agents.png");
+await page
+  .locator(".shell-statusbar")
+  .first()
+  .waitFor({ state: "visible", timeout: 10_000 })
+  .catch(() => {
+    throw new Error("global statusbar should remain visible outside chat/code/git");
+  });
 await navigateRailAndAudit("Studio", "studio", "01d-studio.png");
 
 await page.locator('nav.rail button[aria-label="Image"]').click();
