@@ -17,6 +17,7 @@ import { db } from "@/lib/db";
 import { queryClient } from "@/lib/queryClient";
 import { reindexWorkspace } from "@/features/fs/workspaceIndexer";
 import { pushToast } from "@/components/toast";
+import { useConfirm } from "@/components/trust/useConfirm";
 import { useShell } from "@/routes/shell-context";
 import { useGitHead, useGitBlame } from "@/features/git/queries";
 import { BranchSwitcherCompact } from "@/features/git/components/BranchSwitcher";
@@ -640,14 +641,21 @@ export function SettingsEditor() {
 
 export function SettingsPrivacy() {
   const [clearing, setClearing] = useState(false);
+  const { confirm, dialog: confirmDialog } = useConfirm();
 
   const handleClearAll = async () => {
-    const confirmed = window.confirm(
-      "Effacer TOUTES les données ?\n\n" +
-      "Conversations, messages, projets, générations, jobs, logs et agents " +
-      "seront supprimés définitivement.\n\n" +
-      "Vos paramètres (clés API, préférences) seront conservés."
-    );
+    const confirmed = await confirm({
+      title: "Effacer toutes les données",
+      body: (
+        <>
+          Conversations, messages, projets, générations, jobs, logs et agents
+          seront <strong>supprimés définitivement</strong>. Tes paramètres (clés
+          API, préférences) seront conservés.
+        </>
+      ),
+      tone: "danger",
+      confirmLabel: "Tout effacer",
+    });
     if (!confirmed) return;
     setClearing(true);
     try {
@@ -679,6 +687,7 @@ export function SettingsPrivacy() {
           </SettingRow>
         </div>
       </div>
+      {confirmDialog}
     </div>
   );
 }

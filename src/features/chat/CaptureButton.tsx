@@ -15,6 +15,8 @@ import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { invoke } from "@/lib/tauri";
 import { Icon } from "@/components/components";
+import { pushToast } from "@/components/toast";
+import { sayMascot } from "@/features/mascot/speechStore";
 
 export interface CaptureResult {
   dataUrl: string;
@@ -61,7 +63,15 @@ export function CaptureButton({ className, iconSize = 14, onCaptured }: CaptureB
     mutationFn: (monitor: number | undefined) =>
       invoke<CaptureResult>("capture_screen", monitor === undefined ? {} : { monitor }),
     onSuccess: (r) => onCaptured(r.dataUrl),
-    onError: (err) => console.warn("[CaptureButton] capture failed:", err),
+    onError: (err) => {
+      console.warn("[CaptureButton] capture failed:", err);
+      // Double canal : le composant est partagé entre les deux webviews et
+      // chaque canal ne rend que là où son host existe — ToastHost vit dans
+      // RootLayout (fenêtre principale), SpeechBubble dans la fenêtre mascotte.
+      const msg = "Capture d'écran impossible : " + String(err) + " — vérifie les permissions d'enregistrement d'écran.";
+      pushToast(msg, "error", 8000);
+      sayMascot(msg, { tone: "error", ttlMs: 8000 });
+    },
   });
 
   const trigger = (monitor: number | undefined) => {

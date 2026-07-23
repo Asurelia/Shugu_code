@@ -8,6 +8,7 @@ export { RiskBadge } from "./RiskBadge";
 export { PermissionBadge, type PermissionKind } from "./PermissionBadge";
 export { InlineNotice, type NoticeTone } from "./InlineNotice";
 export { ConfirmDialog } from "./ConfirmDialog";
+export { useConfirm, type ConfirmOptions } from "./useConfirm";
 export { ExecutionProfileCard, type SafetyNet } from "./ExecutionProfileCard";
 export { ModeBadge } from "./ModeBadge";
 export {

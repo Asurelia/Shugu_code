@@ -24,6 +24,7 @@ import { readAgentDefRaw, writeAgentDefRaw } from "@/lib/agentDefs";
 import { CodeMirrorEditor } from "@/features/code/CodeMirrorEditor";
 import { useActiveAgents } from "./queries";
 import { TranscriptDrawer } from "./AgentsPanel";
+import { useConfirm } from "@/components/trust/useConfirm";
 
 // ─────────────────────────────────────────────────────────────────────
 // Constantes d'affichage
@@ -61,6 +62,7 @@ export function AgentDefsManager() {
   const { data: defs = [], isLoading, error } = useAgentDefs(scope as AgentDefScope);
   const writeMutation = useWriteAgentDef();
   const deleteMutation = useDeleteAgentDef();
+  const { confirm, dialog: confirmDialog } = useConfirm();
 
   const onCreate = () => setEditing(blankDef("workspace"));
   const onEdit = (def: AgentDef) => setEditing({ ...def });
@@ -75,7 +77,18 @@ export function AgentDefsManager() {
     await writeMutation.mutateAsync({ ...def, enabled: !def.enabled });
   };
   const onDelete = async (def: AgentDef) => {
-    if (!window.confirm(`Supprimer l'agent "${def.name}" ?`)) return;
+    const ok = await confirm({
+      title: "Supprimer l'agent",
+      body: (
+        <>
+          L'agent <strong>« {def.name} »</strong> et son fichier{" "}
+          <code>.md</code> seront supprimés définitivement.
+        </>
+      ),
+      tone: "danger",
+      confirmLabel: "Supprimer",
+    });
+    if (!ok) return;
     await deleteMutation.mutateAsync(def.path);
     setEditing(null);
   };
@@ -135,6 +148,7 @@ export function AgentDefsManager() {
           onDelete={editing.isNew ? undefined : () => onDelete(editing)}
         />
       )}
+      {confirmDialog}
     </div>
   );
 }

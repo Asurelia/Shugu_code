@@ -25,6 +25,7 @@ import {
 } from "@/features/agents/queries";
 import {
   useIsGitRepo,
+  useIsGitRepoStatus,
   useGitBranches,
   useGitLog,
   useGitWorktrees,
@@ -211,15 +212,16 @@ function PlanCard({ convId }: { convId: string }) {
 
 // ─── Agents (active sub-agents + current activity) ──────────
 function TasksCard() {
-  const { data: agents = [] } = useActiveAgents();
+  const { data: agents = [], isPending } = useActiveAgents();
   const hasRunning = agents.some((a) => a.status === "running");
   useTick(1000, hasRunning);
 
+  if (isPending) return <CardLoading text="Recherche des agents actifs…" />;
   if (agents.length === 0) {
     return (
       <CardEmpty
         icon="agent"
-        text="Aucun agent actif. Les sous-agents lancés par l'orchestrateur apparaîtront ici avec ce qu'ils font en temps réel."
+        text="Aucun agent actif. Passe en mode Agent (sélecteur du composer) ou confie une tâche complexe : l'orchestrateur lancera des sous-agents, visibles ici avec ce qu'ils font en temps réel."
       />
     );
   }
@@ -268,8 +270,12 @@ function AgentTaskCard({ a }: { a: AgentRow }) {
 // ─── Git (récap visuel + worktrees + accès panneau complet) ──
 function GitRecapCard({ onOpenFile }: { onOpenFile: (path: string) => void }) {
   const [full, setFull] = useState(false);
-  const isRepo = useIsGitRepo();
+  const { isRepo, isPending } = useIsGitRepoStatus();
   const initMut = useGitInit();
+
+  // Distinguer « détection en cours » de « pas un dépôt » : sans ça, l'UI
+  // clignotait sur l'état init pendant le chargement puis affichait le récap.
+  if (isPending) return <CardLoading text="Détection du dépôt git…" />;
 
   if (!isRepo) {
     return (
@@ -283,7 +289,7 @@ function GitRecapCard({ onOpenFile }: { onOpenFile: (path: string) => void }) {
         >
           {initMut.isPending ? "Initialisation…" : "Initialiser un dépôt"}
         </button>
-        {initMut.isError && <div className="ctx-err">{String(initMut.error)}</div>}
+        {initMut.isError && <div className="ctx-err">{fmtMutationError("Impossible d'initialiser le dépôt", initMut.error)}</div>}
       </div>
     );
   }
@@ -467,8 +473,8 @@ function WorktreesSection() {
         </div>
       )}
       {wtErr && <div className="ctx-err">{wtErr}</div>}
-      {addMut.isError && <div className="ctx-err">{String(addMut.error)}</div>}
-      {rmMut.isError && <div className="ctx-err">{String(rmMut.error)}</div>}
+      {addMut.isError && <div className="ctx-err">{fmtMutationError("Impossible de créer le worktree", addMut.error)}</div>}
+      {rmMut.isError && <div className="ctx-err">{fmtMutationError("Impossible de supprimer le worktree", rmMut.error)}</div>}
 
       {worktrees.length === 0 ? (
         <div className="ctx-env-sub">aucun worktree lié</div>
@@ -637,13 +643,14 @@ function PreviewCard() {
 function SourcesCard({ convId, onOpenFile }: { convId: string; onOpenFile: (path: string) => void }) {
   const { data: messages = [] } = useMessages(convId);
   // Re-key on message count so the just-logged sources show up after a send.
-  const { data: srcs = [] } = useQuery({
+  const { data: srcs = [], isPending } = useQuery({
     queryKey: ["ctx-sources-used", convId, messages.length],
     queryFn: () => db.sources.listByConversation(convId),
     staleTime: 3_000,
     retry: false,
   });
 
+  if (isPending) return <CardLoading text="Lecture des sources…" />;
   if (srcs.length === 0) {
     return (
       <CardEmpty
@@ -1015,4 +1022,33 @@ function CardEmpty({ icon, text }: { icon: string; text: string }) {
       <p>{text}</p>
     </div>
   );
+}
+
+// ─── Shared loading state ───────────────────────────────────
+// Rendu tant que la query est en PREMIER chargement (isPending) — évite le
+// « teleport » (conteneur vide → contenu qui pop) ET le pire cas où la carte
+// affiche son état VIDE (« Aucun agent actif ») pendant le chargement.
+function CardLoading({ text = "Chargement…" }: { text?: string }) {
+  return (
+    <div className="ctx-empty ctx-loading" aria-live="polite" aria-busy="true">
+      <span className="ctx-loading-spin" aria-hidden="true" />
+      <p>{text}</p>
+    </div>
+  );
+}
+
+/** Message d'erreur d'une mutation, avec cause + piste de récupération quand on
+ *  la reconnaît. Évite le `String(error)` brut (« Error: … ») illisible. */
+function fmtMutationError(prefix: string, err: unknown): string {
+  const raw = String((err as { message?: string })?.message ?? err ?? "").trim();
+  const low = raw.toLowerCase();
+  let hint = "";
+  if (low.includes("permission") || low.includes("denied") || low.includes("access")) {
+    hint = " Vérifie que le dossier est accessible en écriture.";
+  } else if (low.includes("not a git") || low.includes("repository")) {
+    hint = " Initialise d'abord un dépôt git.";
+  } else if (low.includes("network") || low.includes("timeout") || low.includes("connect")) {
+    hint = " Vérifie ta connexion réseau.";
+  }
+  return prefix + (raw ? " : " + raw : "") + "." + hint;
 }

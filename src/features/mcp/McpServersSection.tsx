@@ -13,6 +13,8 @@
 
 import { useState, type ReactNode } from "react";
 import { Icon } from "@/components/components";
+import { pushToast } from "@/components/toast";
+import { useConfirm } from "@/components/trust/useConfirm";
 import {
   useMcpServers,
   useMcpToggle,
@@ -108,6 +110,7 @@ export function McpServersSection() {
   const toggle = useMcpToggle();
   const test = useMcpTest();
   const remove = useMcpRemove();
+  const { confirm, dialog: confirmDialog } = useConfirm();
 
   const [adding, setAdding] = useState(false);
   // Pré-remplissage du formulaire depuis le catalogue 1-clic (null = vierge).
@@ -135,13 +138,24 @@ export function McpServersSection() {
     } catch (err) {
       // Re-fetch will snap the switch back to truth; surface the failure too.
       console.warn("[mcp] toggle failed", err);
+      pushToast("Impossible de " + (enabled ? "activer" : "désactiver") + " le serveur MCP « " + s.name + " » : " + String(err), "error");
     }
   };
 
   const onRemove = async (name: string) => {
-    // Simple confirmation (no modal) — matches the rest of the destructive
-    // actions in Settings and the task spec ("confirmation simple").
-    if (!window.confirm(`Supprimer le serveur MCP « ${name} » de .mcp.json ?`)) return;
+    const ok = await confirm({
+      title: "Supprimer le serveur MCP",
+      body: (
+        <>
+          Le serveur <strong>« {name} »</strong> sera retiré de{" "}
+          <code>.mcp.json</code>. Ses outils ne seront plus proposés au chat ni
+          aux agents.
+        </>
+      ),
+      tone: "danger",
+      confirmLabel: "Supprimer",
+    });
+    if (!ok) return;
     try {
       await remove.mutateAsync(name);
       setTestResults((r) => {
@@ -151,6 +165,7 @@ export function McpServersSection() {
       });
     } catch (err) {
       console.warn("[mcp] remove failed", err);
+      pushToast("Impossible de supprimer le serveur MCP « " + name + " » : " + String(err), "error");
     }
   };
 
@@ -270,6 +285,7 @@ export function McpServersSection() {
       {/* Inventaire multi-source : ce que les autres outils (Claude Desktop,
           Codex, OpenCode) ont déjà configuré, importable en un clic. */}
       <McpInventorySection />
+      {confirmDialog}
     </div>
   );
 }

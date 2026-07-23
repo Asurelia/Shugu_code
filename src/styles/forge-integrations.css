@@ -175,6 +175,19 @@
 .ctx-empty svg { color: var(--on-surface-muted); opacity: 0.7; }
 .ctx-empty p { margin: 0; font-size: 12px; line-height: 1.5; max-width: 240px; }
 
+/* État de chargement d'une carte contextuelle (CardLoading) — spinner sobre
+   à la place du « teleport ». */
+.ctx-loading-spin {
+  width: 20px; height: 20px; border-radius: 99px;
+  border: 2px solid rgba(255,255,255,0.14);
+  border-top-color: var(--primary, #e08efe);
+  animation: ctx-loading-rot 0.7s linear infinite;
+}
+@keyframes ctx-loading-rot { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .ctx-loading-spin { animation: none; border-top-color: var(--on-surface-muted); }
+}
+
 /* Generic status dot */
 .ctx-env-file .dot, .ctx-step-dot { background: var(--tertiary); }
 .ctx-env-file .dot.add { background: var(--success); }
@@ -626,7 +639,9 @@
 .ctx-tile-close {
   width: 20px; height: 20px; flex-shrink: 0;
   display: inline-flex; align-items: center; justify-content: center;
-  border-radius: 5px; border: 0; cursor: pointer; background: transparent; color: var(--on-surface-muted);
+  /* --on-surface-variant (pas muted) : contrôle interactif → lisible au repos
+     (muted ≈ 3.4:1 sur le verre de la tuile, sous le seuil 4.5:1). */
+  border-radius: 5px; border: 0; cursor: pointer; background: transparent; color: var(--on-surface-variant);
 }
 .ctx-tile-close:hover { background: rgba(255,255,255,0.07); color: var(--on-surface); }
 .ctx-tile-body { flex: 1; min-height: 0; overflow: auto; padding: 10px; }

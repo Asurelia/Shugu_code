@@ -70,6 +70,22 @@ export function useIsGitRepo(): boolean {
   return data ?? false;
 }
 
+/**
+ * Variante tri-état pour l'UI qui doit distinguer « en cours de détection »
+ * (isPending) de « pas un dépôt » (isRepo === false). Sans ça, une carte affiche
+ * l'état « pas un dépôt git » pendant le chargement, puis le contenu — pire
+ * qu'un skeleton. Même queryKey/cache que `useIsGitRepo` (aucun appel en plus).
+ */
+export function useIsGitRepoStatus(): { isRepo: boolean; isPending: boolean } {
+  const { data, isPending } = useQuery<boolean>({
+    queryKey: gitKeys.isRepo(),
+    queryFn: () => invoke<boolean>("git_is_repo"),
+    staleTime: Infinity,
+    retry: false,
+  });
+  return { isRepo: data ?? false, isPending };
+}
+
 // ---------------------------------------------------------------------------
 // HEAD content hook
 // ---------------------------------------------------------------------------

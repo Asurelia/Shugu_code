@@ -3,6 +3,7 @@
 
 import { useState, useEffect } from "react";
 import { Icon } from "@/components/components";
+import { useConfirm } from "@/components/trust/useConfirm";
 import { SettingRow, Switch } from "@/features/code/views-code";
 import { db } from "@/lib/db";
 import { queryClient } from "@/lib/queryClient";
@@ -141,6 +142,7 @@ export function ShortcutsSettings() {
   const [recordingId, setRecordingId] = useState<string | null>(null);
   const [recordedKeys, setRecordedKeys] = useState<string[]>([]);
   const [conflict, setConflict] = useState<any>(null);
+  const { confirm, dialog: confirmDialog } = useConfirm();
 
   useEffect(() => saveJSON(LS_SHORTCUTS, map), [map]);
 
@@ -212,10 +214,14 @@ export function ShortcutsSettings() {
     })));
   };
 
-  const resetAll = () => {
-    if (confirm("Reset all shortcuts to defaults?")) {
-      setMap(DEFAULT_SHORTCUTS);
-    }
+  const resetAll = async () => {
+    const ok = await confirm({
+      title: "Réinitialiser les raccourcis",
+      body: "Tous les raccourcis clavier reviendront à leurs valeurs par défaut. Tes personnalisations seront perdues.",
+      tone: "danger",
+      confirmLabel: "Réinitialiser",
+    });
+    if (ok) setMap(DEFAULT_SHORTCUTS);
   };
 
   const filtered = map.map(g => ({
@@ -245,7 +251,7 @@ export function ShortcutsSettings() {
               />
             </div>
             <button className="lgb"><Icon name="download" size={11}/> Export</button>
-            <button className="lgb" onClick={resetAll}>Reset all</button>
+            <button className="lgb" onClick={() => void resetAll()}>Reset all</button>
           </div>
         </div>
 
@@ -313,6 +319,7 @@ export function ShortcutsSettings() {
           </div>
         </div>
       )}
+      {confirmDialog}
     </div>
   );
 }

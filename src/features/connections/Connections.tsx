@@ -586,7 +586,7 @@ export function CodexCard({ c }: { c: ConnCardData }) {
               <a
                 href={loginPrompt.authUrl}
                 target="_blank"
-                rel="noreferrer"
+                rel="noopener noreferrer"
                 style={{ color: "var(--primary, #7c3aed)", wordBreak: "break-all" }}
               >
                 {loginPrompt.authUrl}
@@ -603,7 +603,7 @@ export function CodexCard({ c }: { c: ConnCardData }) {
               <a
                 href={loginPrompt.verificationUrl}
                 target="_blank"
-                rel="noreferrer"
+                rel="noopener noreferrer"
                 style={{ color: "var(--primary, #7c3aed)" }}
               >
                 {loginPrompt.verificationUrl}

@@ -157,6 +157,11 @@ function useMascotClickThrough() {
       //   .float-history-shell     — conversation history dropdown
       //   .float-bubble            — speech bubbles
       //   .float-edge-tip          — edge-tucked "click to bring back" tip
+      //   .trust-confirm-overlay   — ConfirmDialog (useConfirm) : portalé sur
+      //                              document.body avec un backdrop plein écran ;
+      //                              sans cette entrée, les clics sur le modal
+      //                              (ex. supprimer une conversation) traversent
+      //                              la fenêtre mascotte vers le bureau.
       const isOverPainted = (cssX: number, cssY: number): boolean => {
         const el = document.elementFromPoint(cssX, cssY);
         if (!el) return false;
@@ -165,7 +170,8 @@ function useMascotClickThrough() {
           ".float-body, " +
           ".float-history-shell, " +
           ".float-bubble, " +
-          ".float-edge-tip"
+          ".float-edge-tip, " +
+          ".trust-confirm-overlay"
         );
       };
 

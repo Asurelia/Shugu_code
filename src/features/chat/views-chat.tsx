@@ -16,6 +16,8 @@ import { useQuery } from "@tanstack/react-query";
 import { Icon } from "@/components/components";
 import { invoke } from "@/lib/tauri";
 import { useChatStream } from "./useChatStream";
+import { useStickToBottom } from "./feed/useStickToBottom";
+import { useMessageWindow } from "./feed/useMessageWindow";
 import { useMessages, sendChatMessage, useActiveModel, useChatMode } from "./chat-sync";
 import { useEditorSelection } from "./editorSelectionStore";
 import { PermissionBadge, ModeBadge } from "@/components/trust";
@@ -107,7 +109,6 @@ export function ChatView({
   const [mode, setMode] = useState<"chat" | "image">("chat");
   const [pendingImage, setPendingImage] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const feedRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
   const chatStream = useChatStream(activeConv);
@@ -188,9 +189,22 @@ export function ChatView({
     latestAgentTranscript != null &&
     isWorktreeRunActive(extractWorktreeStatus(latestAgentTranscript.events));
 
-  useEffect(() => {
-    if (feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
-  }, [messages, typing, chatStream.streaming, chatStream.partial, chatStream.partialReasoning]);
+  // Auto-scroll respectueux : ne renvoie en bas QUE si l'utilisateur y était
+  // déjà (voir useStickToBottom) — remonter lire pendant un stream ne saute plus.
+  const feedStick = useStickToBottom([
+    messages,
+    typing,
+    chatStream.streaming,
+    chatStream.partial,
+    chatStream.partialReasoning,
+  ]);
+  // Longues conversations : ne rendre que les derniers messages (+ « afficher
+  // les précédents »), avec préservation du scroll. Évite de monter des
+  // centaines de nœuds markdown/image d'un coup.
+  const feedWindow = useMessageWindow(messages, {
+    resetKey: activeConv,
+    scrollRef: feedStick.ref,
+  });
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -652,9 +666,16 @@ export function ChatView({
         </div>
       ) : (
         <>
-          <div className="cx-feed scroll" ref={feedRef}>
+          <div className="cx-feed-wrap">
+          <div className="cx-feed scroll" ref={feedStick.ref} onScroll={feedStick.onScroll}>
             <div className="cx-feed-inner">
-              {messages.map((m) => (
+              {feedWindow.hiddenCount > 0 && (
+                <button type="button" className="cx-show-more" onClick={feedWindow.showMore}>
+                  Afficher les {Math.min(40, feedWindow.hiddenCount)} messages précédents
+                  <span className="dim"> · {feedWindow.hiddenCount} masqués</span>
+                </button>
+              )}
+              {feedWindow.windowed.map((m) => (
                 <CxMessage
                   key={String(m.id)}
                   m={m}
@@ -715,6 +736,18 @@ export function ChatView({
                 </div>
               )}
             </div>
+          </div>
+          {feedStick.isPinnedAway && (
+            <button
+              type="button"
+              className="cx-scroll-bottom"
+              title="Revenir en bas"
+              aria-label="Revenir au dernier message"
+              onClick={feedStick.scrollToBottom}
+            >
+              <Icon name="down" size={16} />
+            </button>
+          )}
           </div>
           <div className="cx-composer-wrap">{composer}</div>
         </>

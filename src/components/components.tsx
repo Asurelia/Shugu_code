@@ -17,8 +17,11 @@ import { RailChibi } from "@/features/mascot/RailChibi";
 // ── Icons (24x24 stroke) ────────────────────────────────────
 export function Icon({ name, size = 18, className = "" }: { name: string; size?: number; className?: string }) {
   const s = size;
+  // aria-hidden : les icônes sont TOUJOURS décoratives — le nom accessible
+  // vient du texte visible ou de l'aria-label du bouton parent (convention
+  // revue a11y 2026-07). focusable="false" neutralise le tab-stop IE/Edge.
   const p = (d: React.ReactNode) => (
-    <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className={className}>{d}</svg>
+    <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true" focusable="false">{d}</svg>
   );
   switch (name) {
     case "chat":   return p(<><path d="M21 12a8.5 8.5 0 0 1-12.4 7.6L3 21l1.4-5.6A8.5 8.5 0 1 1 21 12Z"/></>);
@@ -65,6 +68,7 @@ export function Icon({ name, size = 18, className = "" }: { name: string; size?:
     case "chevron-left":  return p(<><path d="m15 18-6-6 6-6"/></>);
     case "chevron-right": return p(<><path d="m9 18 6-6-6-6"/></>);
     case "list":   return p(<><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></>);
+    case "trash":  return p(<><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></>);
     default: return p(<circle cx="12" cy="12" r="6"/>);
   }
 }

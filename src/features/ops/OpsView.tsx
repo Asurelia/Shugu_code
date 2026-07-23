@@ -9,6 +9,7 @@
 import { useState } from "react";
 import { Icon } from "@/components/components";
 import { formatBytes } from "@/lib/modelBundle";
+import { useConfirm } from "@/components/trust/useConfirm";
 import {
   useStorageBreakdown,
   useIntegrityCheck,
@@ -125,6 +126,7 @@ function BackupCenter() {
   const [lastExport, setLastExport] = useState<ExportResult | null>(null);
   const [lastImport, setLastImport] = useState<ImportResult | null>(null);
   const [msg, setMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  const { confirm, dialog: confirmDialog } = useConfirm();
 
   const onExport = async () => {
     setMsg(null);
@@ -152,14 +154,19 @@ function BackupCenter() {
 
   const onImport = async () => {
     setMsg(null);
-    if (
-      !window.confirm(
-        "Restaurer une sauvegarde ?\n\n" +
-          "La base actuelle sera REMPLACÉE (une copie de sécurité est prise " +
-          "automatiquement). Un redémarrage de l'application sera nécessaire."
-      )
-    )
-      return;
+    const ok = await confirm({
+      title: "Restaurer une sauvegarde",
+      body: (
+        <>
+          La base actuelle sera <strong>remplacée</strong> par la sauvegarde
+          choisie. Une copie de sécurité est prise automatiquement au préalable,
+          et un redémarrage de l'application sera nécessaire.
+        </>
+      ),
+      tone: "danger",
+      confirmLabel: "Restaurer",
+    });
+    if (!ok) return;
     try {
       const res = await importData.mutateAsync();
       if (res) {
@@ -249,6 +256,7 @@ function BackupCenter() {
           Redémarrage requis pour appliquer la restauration
         </div>
       )}
+      {confirmDialog}
     </div>
   );
 }

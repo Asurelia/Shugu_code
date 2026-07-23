@@ -261,11 +261,29 @@ async fn ddg_fetch_and_parse(
         .await
         .ok()?;
     let html = resp.text().await.ok()?;
-    Some(if lite {
+    let items = if lite {
         parse_ddg_lite(&html, max)
     } else {
         parse_ddg_html(&html, max)
-    })
+    };
+    // Diagnostic : HTML substantiel reçu mais AUCUN résultat parsé → soit la
+    // structure a changé (regex obsolètes), soit une page anti-bot/captcha a
+    // été servie. On distingue les deux dans les logs pour ne pas confondre
+    // « 0 résultat réel » et « parseur cassé » (le message au modèle, lui, vit
+    // dans `ddg_search`). Seuil 2 Kio : une vraie SERP fait des dizaines de Kio.
+    if items.is_empty() && html.len() > 2048 {
+        let low = html.to_ascii_lowercase();
+        let blocked = low.contains("captcha")
+            || low.contains("anomaly")
+            || low.contains("challenge")
+            || low.contains("blocked");
+        eprintln!(
+            "[web_search] DDG {url} a renvoyé {} octets mais 0 résultat parsé ({}).",
+            html.len(),
+            if blocked { "anti-bot / captcha probable" } else { "classes de résultat absentes — HTML peut-être changé" }
+        );
+    }
+    Some(items)
 }
 
 /// Parse `html.duckduckgo.com` : `result__a` (href+titre) + `result__snippet`.
@@ -346,6 +364,13 @@ pub(crate) async fn web_fetch(
             format!("web_fetch: URL invalide « {url} » — elle doit commencer par http:// ou https://."),
             true,
         );
+    }
+    // Garde SSRF : bloque les cibles réseau INTERNES (IP privées, link-local
+    // dont l'endpoint de métadonnées cloud 169.254.169.254, CGNAT, ULA IPv6).
+    // Loopback/localhost RESTE autorisé — cas d'usage assumé « l'agent lit son
+    // propre serveur de dev » (doc-comment du module).
+    if let Some(msg) = blocked_fetch_target(url) {
+        return (msg, true);
     }
     let resp = client
         .get(url)
@@ -429,6 +454,75 @@ fn html_to_text(html: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Garde SSRF de web_fetch (loopback autorisé, réseau interne bloqué)
+// ────────────────────────────────────────────────────────────────────
+
+/// Retourne `Some(message)` si l'URL vise une adresse réseau INTERNE qui doit
+/// être bloquée pour `web_fetch`, `None` si elle est autorisée.
+///
+/// Politique (différente du garde provider de `chat.rs`, qui bloque TOUT
+/// l'interne) : loopback/localhost AUTORISÉ (serveur de dev), mais IP privées /
+/// link-local (dont `169.254.169.254`, métadonnées cloud) / CGNAT / ULA IPv6
+/// BLOQUÉES. Limite connue et assumée : pas de résolution DNS — un hostname
+/// public qui résout vers une IP privée passe. C'est acceptable tant que
+/// `run_command` peut déjà `curl` n'importe quelle IP (même portée réseau).
+fn blocked_fetch_target(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    // `host_str()` garde les crochets des littéraux IPv6 (`[::1]`) — les retirer
+    // avant de tenter le parse IP, sinon le littéral tombe dans la branche
+    // hostname et contourne la classification.
+    let ip_candidate = host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = ip_candidate.parse::<std::net::IpAddr>() {
+        if is_blocked_internal_ip(ip) {
+            return Some(format!(
+                "web_fetch: adresse réseau interne bloquée ({host}). web_fetch n'autorise que \
+                 l'Internet public et localhost (protection contre les requêtes vers le réseau \
+                 interne / les métadonnées cloud). Pour lire une machine du réseau local, \
+                 utilise run_command."
+            ));
+        }
+    }
+    None
+}
+
+/// Classe une IP comme « interne à bloquer » pour web_fetch. Loopback (127/8,
+/// ::1) renvoie `false` (autorisé). Le reste de l'espace non-routable renvoie
+/// `true`. Mutualise la logique v4/v6 de `chat.rs::is_internal_ip` mais avec la
+/// loopback exclue (politique propre à web_fetch).
+fn is_blocked_internal_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            if v4.is_loopback() {
+                return false; // localhost:port de dev — autorisé
+            }
+            v4.is_private()
+                || v4.is_link_local() // 169.254/16 — dont métadonnées cloud
+                || v4.is_unspecified() // 0.0.0.0
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                // 100.64.0.0/10 — CGNAT (RFC 6598) ; `is_shared` est unstable.
+                || (v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1]))
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_internal_ip(IpAddr::V4(v4));
+            }
+            if v6.is_loopback() {
+                return false; // ::1 — autorisé
+            }
+            v6.is_unspecified()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -577,5 +671,32 @@ mod tests {
         assert!(out.contains("1. T1"));
         assert!(out.contains("https://a"));
         assert!(out.contains("snip"));
+    }
+
+    #[test]
+    fn web_fetch_allows_public_and_loopback() {
+        // Internet public : autorisé.
+        assert!(blocked_fetch_target("https://example.com/page").is_none());
+        assert!(blocked_fetch_target("http://93.184.216.34/").is_none());
+        // Loopback / localhost : autorisé (serveur de dev).
+        assert!(blocked_fetch_target("http://127.0.0.1:5173/").is_none());
+        assert!(blocked_fetch_target("http://localhost:3000/").is_none());
+        assert!(blocked_fetch_target("http://[::1]:8080/").is_none());
+    }
+
+    #[test]
+    fn web_fetch_blocks_internal_targets() {
+        // IP privées.
+        assert!(blocked_fetch_target("http://10.0.0.5/").is_some());
+        assert!(blocked_fetch_target("http://192.168.1.1/").is_some());
+        assert!(blocked_fetch_target("http://172.16.0.1/").is_some());
+        // Métadonnées cloud (link-local) — la cible SSRF classique.
+        assert!(blocked_fetch_target("http://169.254.169.254/latest/meta-data/").is_some());
+        // Unspecified + CGNAT + ULA IPv6 + IPv4-mapped loopback… non, mapped
+        // loopback est autorisé ; on teste ULA et link-local v6.
+        assert!(blocked_fetch_target("http://[fd00::1]/").is_some());
+        assert!(blocked_fetch_target("http://[fe80::1]/").is_some());
+        // IPv4-mapped IPv6 d'une privée → reclassée et bloquée.
+        assert!(blocked_fetch_target("http://[::ffff:10.0.0.1]/").is_some());
     }
 }

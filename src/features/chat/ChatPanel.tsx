@@ -41,6 +41,9 @@ import { ttsSpeak, useTtsEnabled } from "@/features/mascot/useTts";
 import { CaptureButton } from "./CaptureButton";
 import { useMessageDisplay } from "./useMessageDisplay";
 import { ReviewFeedback } from "./views-chat";
+import { useStickToBottom } from "./feed/useStickToBottom";
+import { useMessageWindow } from "./feed/useMessageWindow";
+import { useConfirm } from "@/components/trust/useConfirm";
 import type { Message } from "@/lib/types";
 
 // Surface ctx → route plein écran du main IDE (bouton ⤢ de l'en-tête de carte).
@@ -141,7 +144,7 @@ function MascotMessage({ m, onEdit, onDelete, onRegenerate }: MascotMessageProps
           }}
         >
           <summary style={{ cursor: "pointer", color: "var(--on-surface-muted)", fontSize: 9, letterSpacing: 0.5, textTransform: "uppercase" }}>
-            Thinking…
+            Réflexion…
           </summary>
           <div style={{ marginTop: 4, fontStyle: "italic", color: "var(--on-surface-muted)", whiteSpace: "pre-wrap" }}>
             {liveReasoning}
@@ -161,7 +164,7 @@ function MascotMessage({ m, onEdit, onDelete, onRegenerate }: MascotMessageProps
           }}
         >
           <summary style={{ cursor: "pointer", color: "var(--on-surface-muted)", fontSize: 9, letterSpacing: 0.5, textTransform: "uppercase" }}>
-            Thinking ({m.reasoning.length} chars)
+            Réflexion ({m.reasoning.length} caractères)
           </summary>
           <div style={{ marginTop: 4, fontStyle: "italic", color: "var(--on-surface-muted)", whiteSpace: "pre-wrap" }}>
             {m.reasoning}
@@ -199,21 +202,21 @@ function MascotMessage({ m, onEdit, onDelete, onRegenerate }: MascotMessageProps
               onClick={commitEdit}
               style={{ fontSize: 9, padding: "2px 8px", borderRadius: 4, background: "rgba(124,58,237,0.22)", color: "var(--primary, #7c3aed)", border: "1px solid rgba(124,58,237,0.4)", cursor: "pointer" }}
             >
-              Save
+              Enregistrer
             </button>
             <button
               type="button"
               onClick={cancelEdit}
               style={{ fontSize: 9, padding: "2px 8px", borderRadius: 4, background: "transparent", color: "var(--on-surface-muted)", border: "1px solid rgba(255,255,255,0.1)", cursor: "pointer" }}
             >
-              Cancel
+              Annuler
             </button>
           </div>
         </div>
       ) : imageDataUrl ? (
         <img
           src={imageDataUrl}
-          alt="attached"
+          alt="Image jointe"
           style={{ maxWidth: "100%", maxHeight: 160, borderRadius: 4, display: "block", marginTop: 2 }}
         />
       ) : (
@@ -245,6 +248,7 @@ function MascotMessage({ m, onEdit, onDelete, onRegenerate }: MascotMessageProps
           <button
             type="button"
             title="Modifier"
+            aria-label="Modifier le message"
             onClick={() => setEditDraft(String(m.text ?? m.body ?? ""))}
             style={{ background: "none", border: "none", cursor: "pointer", padding: "1px 3px", color: "var(--on-surface-muted)", lineHeight: 1 }}
           >
@@ -257,6 +261,7 @@ function MascotMessage({ m, onEdit, onDelete, onRegenerate }: MascotMessageProps
           <button
             type="button"
             title="Supprimer"
+            aria-label="Supprimer le message"
             onClick={() => onDelete(String(m.id))}
             style={{ background: "none", border: "none", cursor: "pointer", padding: "1px 3px", color: "var(--on-surface-muted)", lineHeight: 1 }}
           >
@@ -270,7 +275,8 @@ function MascotMessage({ m, onEdit, onDelete, onRegenerate }: MascotMessageProps
           {m.role === "ai" && (
             <button
               type="button"
-              title="Regénérer depuis ici"
+              title="Régénérer depuis ici"
+              aria-label="Régénérer la réponse depuis ce message"
               onClick={() => onRegenerate(String(m.id))}
               style={{ background: "none", border: "none", cursor: "pointer", padding: "1px 3px", color: "var(--on-surface-muted)", lineHeight: 1 }}
             >
@@ -301,6 +307,7 @@ export interface ChatPanelProps {
 
 export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
   const { mode, setMode, edge } = useFloatShell();
+  const { confirm, dialog: confirmDialog } = useConfirm();
   const { data: discoveredModels } = useDiscoveredModels();
   const hasKey = discoveredModels.length > 0;
   const [model] = useActiveModel();
@@ -443,7 +450,13 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
 
   const [historyConvs, setHistoryConvs] = useState<{ id: string; title: string; ts: number }[]>([]);
   const [histRefresh, setHistRefresh] = useState(0);
-  const historyRef = useRef<HTMLDivElement | null>(null);
+  // Auto-scroll respectueux du feed mascotte : même hook partagé que le chat
+  // cockpit (le bug de scroll volé existait des deux côtés — fix mutualisé).
+  const feedStick = useStickToBottom([msgs, chatStream.streaming, chatStream.partial, chatStream.partialReasoning]);
+  // Fenêtrage des longues conversations (mêmes hooks partagés que le cockpit).
+  const feedWindow = useMessageWindow(msgs, { resetKey: activeConv, scrollRef: feedStick.ref });
+  // Historique : mêmes paliers, 20 par défaut (liste courte, pas d'ancrage scroll).
+  const histWindow = useMessageWindow(historyConvs, { resetKey: "history", initial: 20 });
 
   // Track new AI replies arriving while the panel is closed or tucked, so
   // the chibi can pop the peek_open expression. Cleared when the user
@@ -494,7 +507,7 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
           .filter((r: any) => r.id !== activeConv && !r.archived)
           .map((r: any) => ({
             id: r.id as string,
-            title: (r.title as string) || "Untitled",
+            title: (r.title as string) || "Sans titre",
             ts: (r.updated_at as number) ?? Date.now(),
           }));
         setHistoryConvs(mapped);
@@ -505,11 +518,12 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
     return () => { cancelled = true; };
   }, [mode, tab, activeConv, histRefresh]);
 
+  // Au passage en mode plein, recolle le feed en bas (nouvelle ouverture du
+  // panneau) — ensuite useStickToBottom gère l'auto-scroll respectueux.
   useEffect(() => {
-    if (mode === "full" && historyRef.current) {
-      historyRef.current.scrollTop = historyRef.current.scrollHeight;
-    }
-  }, [msgs, mode]);
+    if (mode === "full") feedStick.scrollToBottom();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
 
   // Réconcilie les placeholders "Orchestrateur au travail…" laissés
   // orphelins par un freeze/crash précédent (l'agent a fini côté Rust
@@ -542,8 +556,20 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
     bumpInteract();
   };
 
-  const deleteConvo = async (id: string, e: React.MouseEvent) => {
+  const deleteConvo = async (id: string, title: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    const ok = await confirm({
+      title: "Supprimer la conversation",
+      body: (
+        <>
+          La conversation <strong>« {title} »</strong> et tous ses messages
+          seront supprimés définitivement.
+        </>
+      ),
+      tone: "danger",
+      confirmLabel: "Supprimer",
+    });
+    if (!ok) return;
     try { await db.conversations.remove(id); } catch { /* no-op */ }
     setHistoryConvs(h => h.filter(c => c.id !== id));
     setHistRefresh(n => n + 1);
@@ -623,6 +649,7 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
                     <button
                       className="ctx-inpanel-btn"
                       title={"Plein écran — ouvrir « " + ctxMeta.label + " » dans la fenêtre principale"}
+                      aria-label={"Ouvrir « " + ctxMeta.label + " » en plein écran dans la fenêtre principale"}
                       onClick={() => mascotFullscreen(ctxMeta.id)}
                     >
                       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -640,13 +667,18 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
           ) : tab === "hub" ? (
             <CardsHub counts={ctxCounts} onOpen={setTab} />
           ) : tab === "feed" ? (
-            <div className="float-history" ref={historyRef}>
+            <div className="float-history" ref={feedStick.ref} onScroll={feedStick.onScroll}>
               {msgs.length === 0 && (
                 <div style={{color:"var(--on-surface-muted)", fontSize:12, padding:"24px 8px", textAlign:"center", fontFamily:"var(--font-mono)"}}>
-                  No conversation yet — say something.
+                  Pas encore de conversation — dis quelque chose !
                 </div>
               )}
-              {msgs.map((m) => (
+              {feedWindow.hiddenCount > 0 && (
+                <button type="button" className="fm-show-more" onClick={feedWindow.showMore}>
+                  ↑ Afficher les {Math.min(40, feedWindow.hiddenCount)} précédents ({feedWindow.hiddenCount} masqués)
+                </button>
+              )}
+              {feedWindow.windowed.map((m) => (
                 <MascotMessage
                   key={String(m.id)}
                   m={m}
@@ -675,7 +707,7 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
                       }}
                     >
                       <summary style={{ cursor: "pointer", color: "var(--on-surface-muted)", fontSize: 9, letterSpacing: 0.5, textTransform: "uppercase" }}>
-                        Thinking…
+                        Réflexion…
                       </summary>
                       <div style={{ marginTop: 4, fontStyle: "italic", color: "var(--on-surface-muted)", whiteSpace: "pre-wrap" }}>
                         {chatStream.partialReasoning}
@@ -699,7 +731,12 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
                       <span className="t">{h.title}</span>
                       <span className="m">{fmtAgo(h.ts)}</span>
                     </div>
-                    <button className="fhl-del" onClick={(e) => deleteConvo(h.id, e)} title="Supprimer">
+                    <button
+                      className="fhl-del"
+                      onClick={(e) => { void deleteConvo(h.id, h.title, e); }}
+                      title="Supprimer"
+                      aria-label={"Supprimer la conversation « " + h.title + " »"}
+                    >
                       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                         <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/>
                       </svg>
@@ -755,12 +792,13 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
             <div style={{ padding: "2px 6px 0", display: "flex", alignItems: "center", gap: 4 }}>
               <img
                 src={pendingImage}
-                alt="pending"
+                alt="Image en attente d'envoi"
                 style={{ height: 28, borderRadius: 3, objectFit: "cover", border: "1px solid rgba(255,255,255,0.1)" }}
               />
               <button
                 onClick={() => setPendingImage(null)}
-                title="Remove"
+                title="Retirer l'image"
+                aria-label="Retirer l'image en attente"
                 style={{ background: "none", border: "none", cursor: "pointer", color: "var(--on-surface-muted)", fontSize: 12, lineHeight: 1 }}
               >
                 ×
@@ -803,7 +841,7 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
                   }
                 }}
               >
-                Set API key
+                Configurer une clé API
               </button>
             )}
           </div>
@@ -828,7 +866,8 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
             {busy ? (
               <button
                 className="float-icon-btn"
-                title="Stop generation"
+                title="Arrêter la génération"
+                aria-label="Arrêter la génération"
                 onClick={() => {
                   chatStream.abort();
                   setChatBusy(false);
@@ -840,13 +879,20 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
                 </svg>
               </button>
             ) : (
-              <span className={"float-kbd-hint" + (input.trim() && hasKey ? " ready" : "")} onClick={send} title="Send (Enter)">
+              <span
+                className={"float-kbd-hint" + (input.trim() && hasKey ? " ready" : "")}
+                onClick={send}
+                role="button"
+                title="Envoyer (Entrée)"
+                aria-label="Envoyer le message"
+              >
                 <span className="k">↵</span>
               </span>
             )}
             <button
               className="float-icon-btn attach"
-              title="Attach an image"
+              title="Joindre une image"
+              aria-label="Joindre une image"
               onClick={() => fileInputRef.current?.click()}
             >
               <Icon name="attach" size={13}/>
@@ -878,6 +924,7 @@ export function ChatPanel({ pinnedAnno, clearPinned }: ChatPanelProps) {
         </div>
       </div>
 
+      {confirmDialog}
     </>
   );
 }

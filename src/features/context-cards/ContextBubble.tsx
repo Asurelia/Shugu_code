@@ -33,7 +33,9 @@ export function ContextBubble({ convId }: { convId: string }) {
       className="tb-action ctx-tb-btn"
       onClick={() => setOpen((o) => !o)}
       title="Contexte"
-      aria-pressed={open}
+      aria-label="Contexte — ouvrir le menu des panneaux (Plan, Agents, Git, Sources…)"
+      aria-haspopup="menu"
+      aria-expanded={open}
     >
       <Icon name="sparkle" size={15} />
       {totalBadge > 0 && <span className="ctx-pill-count">{totalBadge}</span>}
@@ -49,7 +51,7 @@ export function ContextBubble({ convId }: { convId: string }) {
             <span className="ctx-bubble-title">
               <Icon name="sparkle" size={13} /> Contexte
             </span>
-            <button className="ctx-bubble-close" onClick={() => setOpen(false)} title="Fermer le menu">
+            <button className="ctx-bubble-close" onClick={() => setOpen(false)} title="Fermer le menu" aria-label="Fermer le menu Contexte">
               <Icon name="x" size={13} />
             </button>
           </div>

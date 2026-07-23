@@ -15,6 +15,8 @@ import { queryClient } from "@/lib/queryClient";
 import { invoke } from "@/lib/tauri";
 import { loadProviderConfig } from "@/lib/credentials";
 import { db } from "@/lib/db";
+import { pushToast } from "@/components/toast";
+import { sayMascot } from "./speechStore";
 
 const TTS_SETTING_KEY = "voice.tts";
 const TTS_VOICE_KEY = "voice.ttsVoice";
@@ -30,6 +32,20 @@ let pendingCount = 0;
 /** Dédoublonnage : même texte demandé deux fois en < 4 s = un seul énoncé. */
 let lastText = "";
 let lastAt = 0;
+/** Erreur TTS notifiée UNE seule fois par activation du réglage. Garde-fou
+ * anti-boucle : la bulle d'erreur (sayMascot) repasse elle-même par ttsSpeak
+ * via SpeechBubble — sans ce flag, erreur → bulle → TTS de la bulle → erreur…
+ * Réarmé quand l'utilisateur repasse le toggle voix à ON. */
+let ttsErrorNotified = false;
+
+function notifyTtsErrorOnce(msg: string): void {
+  if (ttsErrorNotified) return;
+  ttsErrorNotified = true;
+  // Double canal (même logique que CaptureButton) : bulle côté fenêtre
+  // mascotte, toast côté fenêtre principale — chacun ne rend que chez lui.
+  sayMascot(msg, { tone: "error", ttlMs: 8000 });
+  pushToast(msg, "error", 8000);
+}
 
 export async function isTtsEnabled(): Promise<boolean> {
   try {
@@ -68,7 +84,10 @@ async function speakNow(clean: string): Promise<void> {
   if (!(await isTtsEnabled())) return;
   try {
     const cfg = await loadProviderConfig("minimax");
-    if (!cfg.apiKey) return;
+    if (!cfg.apiKey) {
+      notifyTtsErrorOnce("Voix activée mais clé MiniMax manquante — ajoute-la dans Réglages → Connexions.");
+      return;
+    }
     const voiceId = (await db.settings.get(TTS_VOICE_KEY).catch(() => null)) || undefined;
     const dataUrl = await invoke<string>("voice_tts", {
       text: clean.slice(0, 400),
@@ -85,6 +104,7 @@ async function speakNow(clean: string): Promise<void> {
     });
   } catch (err) {
     console.warn("[tts] speak failed:", err);
+    notifyTtsErrorOnce("Erreur de synthèse vocale : " + String(err));
   }
 }
 
@@ -103,7 +123,8 @@ export function useTtsEnabled() {
     },
     onSuccess: (next) => {
       queryClient.setQueryData(TTS_QUERY_KEY, next);
-      if (!next) currentAudio?.pause();
+      if (next) ttsErrorNotified = false; // réarme la notification d'erreur
+      else currentAudio?.pause();
     },
   });
   return { enabled, toggle: () => toggle.mutate() };

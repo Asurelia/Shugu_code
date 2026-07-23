@@ -103,7 +103,12 @@ function Tile({
           <span className="ctx-tile-title">
             <Icon name={meta.icon} size={12} /> {meta.label}
           </span>
-          <button className="ctx-tile-close" onClick={() => closeTile(id)} title="Fermer la tuile">
+          <button
+            className="ctx-tile-close"
+            onClick={() => closeTile(id)}
+            title="Fermer la tuile"
+            aria-label={"Fermer la tuile " + meta.label}
+          >
             <Icon name="x" size={12} />
           </button>
         </div>

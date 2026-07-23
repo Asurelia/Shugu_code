@@ -131,11 +131,19 @@ export function MascotMemoryPanel() {
               </div>
               <div style={{ display: "flex", gap: 6 }}>
                 {!f.validated && (
-                  <button className="lgb lgb-sm" onClick={() => validate.mutate(f.id)}>
+                  <button
+                    className="lgb lgb-sm"
+                    aria-label={"Valider le fait « " + f.key + " »"}
+                    onClick={() => validate.mutate(f.id)}
+                  >
                     Valider
                   </button>
                 )}
-                <button className="lgb lgb-sm" onClick={() => del.mutate(f.id)}>
+                <button
+                  className="lgb lgb-sm"
+                  aria-label={"Supprimer le fait « " + f.key + " »"}
+                  onClick={() => del.mutate(f.id)}
+                >
                   Supprimer
                 </button>
               </div>
