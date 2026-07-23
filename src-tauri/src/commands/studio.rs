@@ -280,7 +280,11 @@ pub fn studio_project_load(
 
 /// Rename a project.
 #[tauri::command]
-pub fn studio_project_rename(app: tauri::AppHandle, id: String, name: String) -> Result<(), String> {
+pub fn studio_project_rename(
+    app: tauri::AppHandle,
+    id: String,
+    name: String,
+) -> Result<(), String> {
     let conn_mutex = crate::commands::agents::get_conn(&app)?;
     let conn = conn_mutex.lock().map_err(|e| format!("db lock: {e}"))?;
     conn.execute(

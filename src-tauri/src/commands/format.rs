@@ -49,10 +49,7 @@ use tokio::process::Command;
 /// Returns None if no CLI formatter is registered for this language.
 fn formatter_for_lang(lang: &str, file_path: Option<&str>) -> Option<(String, Vec<String>)> {
     match lang {
-        "rust" => Some((
-            "rustfmt".into(),
-            vec!["--edition".into(), "2021".into()],
-        )),
+        "rust" => Some(("rustfmt".into(), vec!["--edition".into(), "2021".into()])),
         "go" => Some(("gofmt".into(), vec![])),
         "python" => {
             let fp = file_path.unwrap_or("file.py");
@@ -169,10 +166,8 @@ pub async fn format_code(
     };
 
     // Find formatter for this language
-    let (binary, args) =
-        formatter_for_lang(&lang, file_path.as_deref()).ok_or_else(|| {
-            format!("no formatter for lang: {lang}")
-        })?;
+    let (binary, args) = formatter_for_lang(&lang, file_path.as_deref())
+        .ok_or_else(|| format!("no formatter for lang: {lang}"))?;
 
     // Resolve binary path. Prefer local `node_modules/.bin/<binary>` over
     // PATH lookup: Node-based formatters (prettier, etc.) are usually project-
@@ -185,13 +180,15 @@ pub async fn format_code(
         } else {
             binary.clone()
         };
-        workspace_root.join("node_modules").join(".bin").join(basename)
+        workspace_root
+            .join("node_modules")
+            .join(".bin")
+            .join(basename)
     };
     let binary_path: PathBuf = if local_bin.exists() {
         local_bin
     } else {
-        which::which(&binary)
-            .map_err(|_| format!("formatter not found: {binary}"))?
+        which::which(&binary).map_err(|_| format!("formatter not found: {binary}"))?
     };
 
     // Spawn the formatter child process
@@ -237,8 +234,7 @@ pub async fn format_code(
         return Err(format!("format error: {first_lines}"));
     }
 
-    let formatted =
-        String::from_utf8(output.stdout).map_err(|e| format!("output utf8: {e}"))?;
+    let formatted = String::from_utf8(output.stdout).map_err(|e| format!("output utf8: {e}"))?;
 
     Ok(formatted)
 }

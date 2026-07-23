@@ -84,9 +84,6 @@ export interface CommandContext {
   // Annotations
   onAnnotate: (payload: { kind: string; payload: any; target: any }) => void;
 
-  // Model selection
-  setActiveModel?: (id: string) => void;
-
   // Editor (CodeMirror) — optional; only present when /code view is active.
   editorViewRef?: React.RefObject<CodeMirrorEditorHandle>;
 
@@ -551,32 +548,6 @@ export const COMMANDS: Command[] = [
     category: "View",
     when: (ctx) => ctx.currentView === "code",
     run: (ctx) => ctx.setEditorPref("minimap", !ctx.editorPrefs.minimap),
-  },
-
-  // ── Models (palette-only, no keybinding) ──────────────────
-  {
-    id: "set-model",
-    title: "Switch Model · shugu-sonnet-5",
-    category: "Workbench",
-    icon: "sparkle",
-    description: "balanced · 200k ctx",
-    run: (ctx) => ctx.setActiveModel?.("shugu-sonnet-5"),
-  },
-  {
-    id: "set-model-h",
-    title: "Switch Model · shugu-haiku-4-5",
-    category: "Workbench",
-    icon: "sparkle",
-    description: "fast · default",
-    run: (ctx) => ctx.setActiveModel?.("shugu-haiku-4-5"),
-  },
-  {
-    id: "set-model-l",
-    title: "Switch Model · local qwen-32b",
-    category: "Workbench",
-    icon: "sparkle",
-    description: "ollama",
-    run: (ctx) => ctx.setActiveModel?.("qwen-32b"),
   },
 
   // ── Edit ─────────────────────────────────────────────────

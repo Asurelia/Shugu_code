@@ -404,7 +404,11 @@ pub async fn shugu_storage_cleanup(app: AppHandle, zone: String) -> Result<Clean
                 .path()
                 .app_data_dir()
                 .map_err(|e| format!("app_data_dir indisponible : {e}"))?;
-            let sub = if zone == "captures" { "captures" } else { "browser-tests" };
+            let sub = if zone == "captures" {
+                "captures"
+            } else {
+                "browser-tests"
+            };
             Ok(clear_dir_contents(&data.join(sub)))
         }
         "logs" => {
@@ -622,12 +626,7 @@ mod tests {
         let real = dir.join("real");
         std::fs::create_dir_all(&real).unwrap();
         std::fs::write(real.join("f"), b"xyz").unwrap();
-        let item = measure_first_present(
-            "k",
-            "L",
-            "h",
-            vec![missing.clone(), real.clone()],
-        );
+        let item = measure_first_present("k", "L", "h", vec![missing.clone(), real.clone()]);
         assert!(item.present);
         assert_eq!(item.bytes, 3);
         assert!(item.path.ends_with("/real"));

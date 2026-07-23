@@ -86,7 +86,9 @@ impl AppServer {
         w.write_all(line.as_bytes())
             .await
             .map_err(|e| format!("codex app-server write: {e}"))?;
-        w.flush().await.map_err(|e| format!("codex app-server flush: {e}"))
+        w.flush()
+            .await
+            .map_err(|e| format!("codex app-server flush: {e}"))
     }
 
     /// Register a per-thread notification subscriber; returns the receiver. The
@@ -158,7 +160,9 @@ pub async fn ensure(app: &AppHandle) -> Result<Arc<AppServer>, String> {
     crate::commands::codex::apply_no_window_pub(&mut cmd);
     apply_codex_home(app, &mut cmd);
 
-    let mut child = cmd.spawn().map_err(|e| format!("spawn codex app-server: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn codex app-server: {e}"))?;
     let stdin = child.stdin.take().ok_or("codex app-server: no stdin")?;
     let stdout = child.stdout.take().ok_or("codex app-server: no stdout")?;
     let stderr = child.stderr.take().ok_or("codex app-server: no stderr")?;
@@ -183,7 +187,9 @@ pub async fn ensure(app: &AppHandle) -> Result<Arc<AppServer>, String> {
                 if !line.starts_with('{') {
                     continue;
                 }
-                let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+                let Ok(v) = serde_json::from_str::<Value>(line) else {
+                    continue;
+                };
                 // Response (has an id matching a pending request).
                 if let Some(id) = v.get("id").and_then(|x| x.as_i64()) {
                     let waiter = server2.pending.lock().ok().and_then(|mut p| p.remove(&id));

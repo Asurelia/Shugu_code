@@ -13,11 +13,9 @@
 //!   * **Reads: OPEN.** The confined child can read anywhere — system dirs, the
 //!     user profile, every toolchain (node / pnpm / cargo / git) — so the tools
 //!     keep working.
-//!   * **Writes: CONFINED** to an allowlist = { workspace root, OS temp dir,
-//!     package caches (`~\.cargo` / `CARGO_HOME`, `~\.rustup` / `RUSTUP_HOME`,
-//!     `~\.npm` / `npm_config_cache`, `~\.pnpm`, npm-cache, …) }. A write to ANY
-//!     path outside the allowlist fails — not because we listed it, but because
-//!     it isn't on the allow side.
+//!   * **Writes: CONFINED** to the workspace plus dedicated runtime/cache
+//!     directories under `<workspace>/.shugu/agent-runtime`. User-wide package
+//!     caches are never relabeled. A write elsewhere remains blocked by MIC.
 //!   * **Network: ACTIVE.** Untouched — cutting it would break `pnpm install` /
 //!     `git fetch`.
 //!
@@ -85,9 +83,8 @@
 //! ## Fail-safe
 //!
 //! Setting up the token, labeling a dir, or the confined spawn can each fail for
-//! environmental reasons. ANY failure logs a one-line warning and falls back to
-//! the existing **direct** spawn — the agent loop is never blocked or bricked by
-//! the sandbox. Confinement is best-effort hardening, never a precondition.
+//! environmental reasons. The public API reports that failure explicitly. Auto
+//! mode must fail closed; only an explicit Full Access policy may run directly.
 //!
 //! ## Non-Windows
 //!
@@ -111,7 +108,10 @@ pub const DISABLE_ENV: &str = "SHUGU_SANDBOX_DISABLE";
 /// truthy value — the default (unset / anything else) keeps the sandbox ON.
 pub fn should_disable() -> bool {
     match std::env::var(DISABLE_ENV) {
-        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"),
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        ),
         Err(_) => false,
     }
 }
@@ -131,62 +131,20 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
-/// The write-allowlist: directories the confined command may write. Everything
-/// NOT under one of these stays read-only to the LOW child (no-write-up).
-///
-/// `ws` is the agent workspace root (always writable — the whole point). The OS
-/// temp dir and the package caches are included so `pnpm install` / `cargo
-/// build` keep working. Caches honor the conventional env overrides
-/// (`CARGO_HOME`, `RUSTUP_HOME`, `npm_config_cache`) before the home-relative
-/// default.
-///
-/// Pure function of `ws` + `home` + the cache env vars → trivially testable.
-/// Paths that don't exist on a given machine are harmless: labeling is skipped
-/// for a missing dir (the caller creates the ones it can, e.g. the workspace).
-pub(crate) fn write_allowlist(ws: &Path, home: Option<&Path>) -> Vec<PathBuf> {
-    let mut allow: Vec<PathBuf> = vec![ws.to_path_buf()];
-
-    // System temp — many toolchains write scratch files here.
-    allow.push(std::env::temp_dir());
-
-    // Package caches — env override first, then the conventional home-relative
-    // location. Without these `pnpm install` / `cargo fetch` would fail because
-    // their cache writes land outside the workspace.
-    let cache_env_or_home = |env_key: &str, rel: &str| -> Option<PathBuf> {
-        if let Some(v) = std::env::var_os(env_key) {
-            let p = PathBuf::from(v);
-            if !p.as_os_str().is_empty() {
-                return Some(p);
-            }
-        }
-        home.map(|h| h.join(rel))
-    };
-
-    let mut push_opt = |p: Option<PathBuf>| {
-        if let Some(p) = p {
-            allow.push(p);
-        }
-    };
-
-    push_opt(cache_env_or_home("CARGO_HOME", ".cargo"));
-    push_opt(cache_env_or_home("RUSTUP_HOME", ".rustup"));
-    push_opt(cache_env_or_home("npm_config_cache", ".npm"));
-    if let Some(h) = home {
-        allow.push(h.join(".pnpm"));
-        allow.push(h.join(".pnpm-store"));
-        // pnpm's content-addressable store on Windows often lives under
-        // LocalAppData too; covered below.
-        allow.push(h.join(".cache"));
-    }
-    // npm's / pnpm's default Windows caches live under LocalAppData.
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        let local = PathBuf::from(local);
-        if !local.as_os_str().is_empty() {
-            allow.push(local.join("npm-cache"));
-            allow.push(local.join("pnpm"));
-            allow.push(local.join(r"pnpm-cache"));
-        }
-    }
+/// The write-allowlist: workspace plus dedicated per-workspace runtime roots.
+/// Global temp/package caches stay MEDIUM and are never weakened.
+pub(crate) fn write_allowlist(ws: &Path, _home: Option<&Path>) -> Vec<PathBuf> {
+    let runtime = ws.join(".shugu").join("agent-runtime");
+    let mut allow: Vec<PathBuf> = vec![
+        ws.to_path_buf(),
+        runtime.join("temp"),
+        runtime.join("cargo-home"),
+        runtime.join("cargo-target"),
+        runtime.join("npm-cache"),
+        runtime.join("pnpm-store"),
+        runtime.join("xdg-cache"),
+        runtime.join("pip-cache"),
+    ];
 
     // De-dup (env overrides can collide with the home-relative defaults).
     allow.sort();
@@ -208,6 +166,13 @@ pub struct ConfinedOutcome {
     pub timed_out: bool,
 }
 
+/// Proof of whether the command actually ran inside the sandbox. Callers must
+/// never infer confinement from a best-effort attempt.
+pub enum ConfinedRun {
+    Executed(ConfinedOutcome),
+    Unavailable { reason: &'static str },
+}
+
 /// Attempt to run `command` (via `cmd /d /s /c`) under the process sandbox, with
 /// cwd = `ws`, a wall-clock `timeout_secs`, and stdout/stderr each capped at
 /// `output_cap` bytes. BLOCKS (call under `spawn_blocking`).
@@ -221,31 +186,77 @@ pub struct ConfinedOutcome {
 /// Never panics: every fallible FFI step degrades to `None` so the dev loop is
 /// never blocked.
 #[cfg(windows)]
-pub fn run_confined(
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn run_confined(ws: &Path, command: &str, timeout_secs: u64, output_cap: usize) -> ConfinedRun {
+    run_confined_cancellable(ws, command, timeout_secs, output_cap, None)
+}
+
+#[cfg(windows)]
+pub fn run_confined_cancellable(
     ws: &Path,
     command: &str,
     timeout_secs: u64,
     output_cap: usize,
-) -> Option<ConfinedOutcome> {
-    if should_disable() {
-        eprintln!(
-            "[agent:sandbox] {DISABLE_ENV} set — confinement OFF, running command directly."
-        );
-        return None;
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> ConfinedRun {
+    // MIC labels are process-global filesystem state. Serialize confined runs so
+    // one command cannot restore a transient workspace label while another
+    // command is still executing under LOW integrity.
+    static RUN_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    let _run_guard = match RUN_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return ConfinedRun::Unavailable {
+                reason: "sandboxLockPoisoned",
+            }
+        }
+    };
+    if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+        return ConfinedRun::Executed(ConfinedOutcome {
+            exit_code: 130,
+            stdout: String::new(),
+            stderr: "commande annulée avant démarrage".to_string(),
+            timed_out: false,
+        });
     }
-    windows_impl::run_confined(ws, command, timeout_secs, output_cap)
+    if should_disable() {
+        eprintln!("[agent:sandbox] {DISABLE_ENV} set — confinement unavailable.");
+        return ConfinedRun::Unavailable {
+            reason: "disabledByEnvironment",
+        };
+    }
+    match windows_impl::run_confined(ws, command, timeout_secs, output_cap, cancelled) {
+        Some(outcome) => ConfinedRun::Executed(outcome),
+        None => ConfinedRun::Unavailable {
+            reason: "sandboxSetupFailed",
+        },
+    }
 }
 
 /// Non-Windows: no confined spawn lane. Always `None` → caller uses its direct
 /// `std::process::Command` path. (A POSIX confinement lane is out of scope.)
 #[cfg(not(windows))]
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn run_confined(
     _ws: &Path,
     _command: &str,
     _timeout_secs: u64,
     _output_cap: usize,
-) -> Option<ConfinedOutcome> {
-    None
+) -> ConfinedRun {
+    run_confined_cancellable(_ws, _command, _timeout_secs, _output_cap, None)
+}
+
+#[cfg(not(windows))]
+pub fn run_confined_cancellable(
+    _ws: &Path,
+    _command: &str,
+    _timeout_secs: u64,
+    _output_cap: usize,
+    _cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> ConfinedRun {
+    ConfinedRun::Unavailable {
+        reason: "unsupportedPlatform",
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -268,23 +279,23 @@ mod windows_impl {
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
     use windows_sys::Win32::Security::{
-        CreateWellKnownSid, DuplicateTokenEx, GetFileSecurityW, GetLengthSid, SecurityImpersonation,
-        SetFileSecurityW, SetTokenInformation, TokenIntegrityLevel, TokenPrimary, WinLowLabelSid,
-        ACL, LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
-        SID_AND_ATTRIBUTES, TOKEN_ALL_ACCESS, TOKEN_MANDATORY_LABEL,
+        CreateWellKnownSid, DuplicateTokenEx, GetFileSecurityW, GetLengthSid,
+        SecurityImpersonation, SetFileSecurityW, SetTokenInformation, TokenIntegrityLevel,
+        TokenPrimary, WinLowLabelSid, ACL, LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+        SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, TOKEN_ALL_ACCESS, TOKEN_MANDATORY_LABEL,
+    };
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::{
-        CreateProcessAsUserW, DeleteProcThreadAttributeList, GetCurrentProcess,
-        GetExitCodeProcess, InitializeProcThreadAttributeList, OpenProcessToken, TerminateProcess,
+        CreateProcessAsUserW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess,
+        InitializeProcThreadAttributeList, OpenProcessToken, TerminateProcess,
         UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW,
         EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
         PROC_THREAD_ATTRIBUTE_JOB_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    };
-    use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-        JobObjectExtendedLimitInformation, TerminateJobObject,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
 
     use windows_sys::Win32::Security::{
@@ -298,7 +309,10 @@ mod windows_impl {
 
     /// Convert a path to a NUL-terminated UTF-16 buffer for the *W APIs.
     fn wide(p: &Path) -> Vec<u16> {
-        p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     }
 
     /// A NUL-terminated wide string from a &str (for SDDL / command line).
@@ -343,43 +357,230 @@ mod windows_impl {
     struct LabelRestore {
         path_w: Vec<u16>,
     }
+    fn clear_integrity_label(path_w: &[u16], warn: bool) {
+        let empty = wide_str("S:");
+        let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        let parsed = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                empty.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                ptr::null_mut(),
+            )
+        };
+        if parsed != 0 && !sd.is_null() {
+            let ok = unsafe { SetFileSecurityW(path_w.as_ptr(), LABEL_SECURITY_INFORMATION, sd) };
+            if warn && ok == 0 {
+                eprintln!(
+                    "[agent:sandbox] WARN failed to restore integrity label (err {})",
+                    std::io::Error::last_os_error()
+                );
+            }
+            unsafe {
+                LocalFree(sd as *mut _);
+            }
+        }
+    }
     impl Drop for LabelRestore {
         fn drop(&mut self) {
-            // Remove our LOW label by writing an EMPTY SACL under
-            // LABEL_SECURITY_INFORMATION on the object only. We build a minimal SD
-            // with a present-but-empty SACL (`S:`) so the mandatory label reverts
-            // to the inherited default (MEDIUM). Object-only — no child walk.
-            let empty = wide_str("S:");
-            let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
-            // SAFETY: `S:` is a valid SDDL (empty SACL); out-param gets a LocalAlloc'd SD.
-            let parsed = unsafe {
-                ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                    empty.as_ptr(),
-                    SDDL_REVISION_1,
-                    &mut sd,
-                    ptr::null_mut(),
-                )
-            };
-            if parsed != 0 && !sd.is_null() {
-                // SAFETY: path_w NUL-terminated; sd is a valid SD. SetFileSecurityW
-                // writes ONLY this object's SD (no propagation to children).
-                let ok = unsafe {
-                    SetFileSecurityW(self.path_w.as_ptr(), LABEL_SECURITY_INFORMATION, sd)
-                };
-                if ok == 0 {
-                    eprintln!(
-                        "[agent:sandbox] WARN failed to remove the LOW label from the workspace \
-                         (err {}) — harmless (LOW only GRANTS low-IL write); recover with \
-                         `icacls <dir> /setintegritylevel Medium` if needed.",
-                        std::io::Error::last_os_error()
-                    );
+            clear_integrity_label(&self.path_w, true);
+        }
+    }
+
+    /// Transient recursive MIC grant for pre-existing workspace files. Merely
+    /// labeling the root does not retrofit inherited labels onto existing
+    /// children, so a LOW process otherwise cannot edit a real project. Paths
+    /// that were already LOW are preserved; labels introduced by the command on
+    /// newly-created files are cleaned up in the final walk.
+    struct WorkspaceTreeLabels {
+        root: PathBuf,
+        preserve_low: std::collections::HashSet<PathBuf>,
+        restores: Vec<LabelRestore>,
+        include_node_modules: bool,
+    }
+
+    impl Drop for WorkspaceTreeLabels {
+        fn drop(&mut self) {
+            if let Ok(mut paths) = workspace_label_paths(&self.root, self.include_node_modules) {
+                paths.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+                for path in paths {
+                    if self.preserve_low.contains(&path) {
+                        continue;
+                    }
+                    let path_w = wide(&path);
+                    if dir_is_low_labeled(&path_w) {
+                        clear_integrity_label(&path_w, false);
+                    }
                 }
-                // SAFETY: sd was LocalAlloc'd by the parser; freed once.
-                unsafe {
-                    LocalFree(sd as *mut _);
+            }
+            // The explicit guards are retained as a crash-safe fallback during
+            // the run. After the full cleanup walk, dropping them is idempotent.
+            self.restores.clear();
+        }
+    }
+
+    fn workspace_label_paths(
+        root: &Path,
+        include_node_modules: bool,
+    ) -> Result<Vec<PathBuf>, String> {
+        let mut out = vec![root.to_path_buf()];
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .map_err(|e| format!("sandbox read_dir {}: {e}", dir.display()))?;
+            for entry in entries {
+                let entry = entry.map_err(|e| format!("sandbox directory entry: {e}"))?;
+                let path = entry.path();
+                let ty = entry
+                    .file_type()
+                    .map_err(|e| format!("sandbox file_type {}: {e}", path.display()))?;
+                if ty.is_symlink() {
+                    continue;
+                }
+                if ty.is_dir() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name == ".git"
+                        || name == ".shugu"
+                        || (!include_node_modules && name == "node_modules")
+                    {
+                        continue;
+                    }
+                    stack.push(path.clone());
+                }
+                out.push(path);
+                if out.len() > 150_000 {
+                    return Err("workspace trop volumineux pour armer le sandbox Auto".into());
                 }
             }
         }
+        Ok(out)
+    }
+
+    fn command_needs_dependency_writes(command: &str) -> bool {
+        let lower = command.to_ascii_lowercase();
+        [
+            "pnpm add",
+            "pnpm install",
+            "pnpm update",
+            "pnpm remove",
+            "npm install",
+            "npm update",
+            "npm uninstall",
+            "yarn add",
+            "yarn install",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    }
+
+    fn label_workspace_tree(ws: &Path, command: &str) -> Option<WorkspaceTreeLabels> {
+        let include_node_modules = command_needs_dependency_writes(command);
+        let paths = match workspace_label_paths(ws, include_node_modules) {
+            Ok(paths) => paths,
+            Err(e) => {
+                eprintln!("[agent:sandbox] WARN {e}");
+                return None;
+            }
+        };
+        let mut preserve_low = std::collections::HashSet::new();
+        let mut restores = Vec::with_capacity(paths.len());
+        for path in paths {
+            let path_w = wide(&path);
+            if let Some(rid) = integrity_rid(&path_w) {
+                if rid == 0x0000_1000 {
+                    preserve_low.insert(path);
+                    continue;
+                }
+                if rid > 0x0000_2000 {
+                    eprintln!(
+                        "[agent:sandbox] WARN refusing to lower protected integrity label on {}",
+                        path.display()
+                    );
+                    return None;
+                }
+            }
+            match ensure_label_low(&path, true) {
+                LabelOutcome::Transient(restore) => restores.push(restore),
+                LabelOutcome::Provisioned => {
+                    preserve_low.insert(path);
+                }
+                LabelOutcome::Failed => {
+                    eprintln!(
+                        "[agent:sandbox] WARN could not label workspace entry {}",
+                        path.display()
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(WorkspaceTreeLabels {
+            root: ws.to_path_buf(),
+            preserve_low,
+            restores,
+            include_node_modules,
+        })
+    }
+
+    fn prepare_runtime_dirs(ws: &Path) -> Option<Vec<PathBuf>> {
+        let allow = write_allowlist(ws, home_dir().as_deref());
+        for dir in allow.iter().filter(|dir| dir.as_path() != ws) {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                eprintln!(
+                    "[agent:sandbox] WARN create runtime dir {} failed: {e}",
+                    dir.display()
+                );
+                return None;
+            }
+        }
+        // Preserve Cargo registry/auth configuration without ever relabeling the
+        // user's real ~/.cargo tree. Downloads and indexes go to the dedicated
+        // CARGO_HOME after this one-time small-file seed.
+        if let Some(home) = home_dir() {
+            let source = home.join(".cargo");
+            let dest = ws.join(".shugu").join("agent-runtime").join("cargo-home");
+            for name in ["config", "config.toml", "credentials", "credentials.toml"] {
+                let from = source.join(name);
+                let to = dest.join(name);
+                if from.is_file() && !to.exists() {
+                    let _ = std::fs::copy(from, to);
+                }
+            }
+        }
+        Some(allow)
+    }
+
+    fn environment_block(ws: &Path) -> Vec<u16> {
+        let runtime = ws.join(".shugu").join("agent-runtime");
+        let mut vars: std::collections::BTreeMap<String, (String, String)> =
+            std::collections::BTreeMap::new();
+        for (key, value) in std::env::vars_os() {
+            let key = key.to_string_lossy().into_owned();
+            let value = value.to_string_lossy().into_owned();
+            vars.insert(key.to_ascii_uppercase(), (key, value));
+        }
+        for (key, value) in [
+            ("TEMP", runtime.join("temp")),
+            ("TMP", runtime.join("temp")),
+            ("CARGO_HOME", runtime.join("cargo-home")),
+            ("CARGO_TARGET_DIR", runtime.join("cargo-target")),
+            ("npm_config_cache", runtime.join("npm-cache")),
+            ("npm_config_store_dir", runtime.join("pnpm-store")),
+            ("XDG_CACHE_HOME", runtime.join("xdg-cache")),
+            ("PIP_CACHE_DIR", runtime.join("pip-cache")),
+        ] {
+            vars.insert(
+                key.to_ascii_uppercase(),
+                (key.to_string(), value.to_string_lossy().into_owned()),
+            );
+        }
+        let mut block = Vec::new();
+        for (_, (key, value)) in vars {
+            block.extend(format!("{key}={value}").encode_utf16());
+            block.push(0);
+        }
+        block.push(0);
+        block
     }
 
     // ── Step 1: a LOW-integrity primary token duplicated from ours ──────
@@ -427,7 +628,12 @@ mod windows_impl {
             // 1c. Build the LOW integrity SID (S-1-16-4096) via CreateWellKnownSid.
             let mut sid_len: u32 = 0;
             // First call sizes the buffer (returns 0 / ERROR_INSUFFICIENT_BUFFER).
-            CreateWellKnownSid(WinLowLabelSid, ptr::null_mut(), ptr::null_mut(), &mut sid_len);
+            CreateWellKnownSid(
+                WinLowLabelSid,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut sid_len,
+            );
             if sid_len == 0 {
                 eprintln!("[agent:sandbox] WARN CreateWellKnownSid sizing failed — unconfined.");
                 return None;
@@ -547,9 +753,8 @@ mod windows_impl {
 
         // 2c. Apply to the OBJECT ONLY (no child walk).
         // SAFETY: path_w NUL-terminated; new_sd is a valid SD from the parser.
-        let applied = unsafe {
-            SetFileSecurityW(path_w.as_ptr(), LABEL_SECURITY_INFORMATION, new_sd)
-        };
+        let applied =
+            unsafe { SetFileSecurityW(path_w.as_ptr(), LABEL_SECURITY_INFORMATION, new_sd) };
         // SAFETY: new_sd was LocalAlloc'd by the parser; freed once here (the
         // apply copied what it needs).
         unsafe {
@@ -576,7 +781,7 @@ mod windows_impl {
     /// object's own label SACL via the object-only `GetFileSecurityW` and checks
     /// the first mandatory-label ACE's SID for the LOW RID (4096). On any read
     /// failure → `false` (we'll just (re)apply — correctness over a micro-opt).
-    fn dir_is_low_labeled(path_w: &[u16]) -> bool {
+    fn integrity_rid(path_w: &[u16]) -> Option<u32> {
         unsafe {
             // Size the buffer.
             let mut needed: u32 = 0;
@@ -588,7 +793,7 @@ mod windows_impl {
                 &mut needed,
             );
             if needed == 0 {
-                return false;
+                return None;
             }
             let mut buf = vec![0u8; needed as usize];
             if GetFileSecurityW(
@@ -599,7 +804,7 @@ mod windows_impl {
                 &mut needed,
             ) == 0
             {
-                return false;
+                return None;
             }
             // Pull the SACL out of the (self-relative) SD.
             let mut present: i32 = 0;
@@ -614,7 +819,7 @@ mod windows_impl {
                 || present == 0
                 || sacl.is_null()
             {
-                return false;
+                return None;
             }
             // The mandatory-label ACE is the first (only) ACE; its SID's last
             // sub-authority is the integrity RID. LOW = 0x1000 (4096). We read
@@ -625,7 +830,7 @@ mod windows_impl {
             // 8-byte revision/identifier-authority preamble.
             let acl = &*(sacl as *const ACL);
             if acl.AceCount == 0 {
-                return false;
+                return None;
             }
             // First ACE sits immediately after the ACL header.
             let ace_ptr = (sacl as *const u8).add(std::mem::size_of::<ACL>());
@@ -636,13 +841,16 @@ mod windows_impl {
             // SubAuthority[count] (4 bytes each). Integrity RID is the last sub.
             let sub_count = *sid_ptr.add(1);
             if sub_count == 0 {
-                return false;
+                return None;
             }
             let last_sub_off = 8 + (sub_count as usize - 1) * 4;
             let rid = (sid_ptr.add(last_sub_off) as *const u32).read_unaligned();
-            // SECURITY_MANDATORY_LOW_RID = 0x1000.
-            rid == 0x0000_1000
+            Some(rid)
         }
+    }
+
+    fn dir_is_low_labeled(path_w: &[u16]) -> bool {
+        integrity_rid(path_w) == Some(0x0000_1000)
     }
 
     // ── Job object (tree-kill on timeout / drop), mirrors exec.rs ───────
@@ -677,6 +885,7 @@ mod windows_impl {
         command: &str,
         timeout_secs: u64,
         output_cap: usize,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
     ) -> Option<ConfinedOutcome> {
         // 3a. Build the LOW token. If this fails, bail to the direct path.
         let token = make_low_token()?;
@@ -686,27 +895,21 @@ mod windows_impl {
         // be writable, so if labeling the workspace itself fails we bail (the
         // command would fail spuriously otherwise — a worse outcome than the
         // unconfined direct path).
-        let home = home_dir();
-        let allow = write_allowlist(ws, home.as_deref());
+        let allow = prepare_runtime_dirs(ws)?;
         let mut restores: Vec<LabelRestore> = Vec::new();
-        let mut workspace_labeled = false;
+        let workspace_labels = label_workspace_tree(ws, command)?;
+        let workspace_labeled = true;
         for dir in &allow {
+            if dir == ws {
+                continue;
+            }
             // The workspace label is TRANSIENT (removed on Drop — it's the user's
             // live project). Cache/temp roots are PROVISIONED (labeled once, left
             // in place; re-labeling is skipped on later commands → fast loop).
             let transient = dir == ws;
             match ensure_label_low(dir, transient) {
-                LabelOutcome::Transient(r) => {
-                    if dir == ws {
-                        workspace_labeled = true;
-                    }
-                    restores.push(r);
-                }
-                LabelOutcome::Provisioned => {
-                    if dir == ws {
-                        workspace_labeled = true;
-                    }
-                }
+                LabelOutcome::Transient(r) => restores.push(r),
+                LabelOutcome::Provisioned => {}
                 LabelOutcome::Failed => {}
             }
         }
@@ -767,9 +970,9 @@ mod windows_impl {
         let cmdline = format!("cmd /d /s /c {command}");
         let mut cmdline_w = wide_str(&cmdline);
         let cwd_w = wide(ws);
+        let mut env_block = environment_block(ws);
 
-        let creation_flags = CREATE_NO_WINDOW
-            | EXTENDED_STARTUPINFO_PRESENT;
+        let creation_flags = CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | 0x0000_0400; // CREATE_UNICODE_ENVIRONMENT
 
         let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
@@ -786,7 +989,7 @@ mod windows_impl {
                 ptr::null(),
                 1, // bInheritHandles
                 creation_flags,
-                ptr::null(),
+                env_block.as_mut_ptr() as *mut core::ffi::c_void,
                 cwd_w.as_ptr(),
                 &si.StartupInfo,
                 &mut pi,
@@ -797,9 +1000,7 @@ mod windows_impl {
         if have_attr_list {
             // SAFETY: attr_buf was initialized by InitializeProcThreadAttributeList.
             unsafe {
-                DeleteProcThreadAttributeList(
-                    attr_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST,
-                );
+                DeleteProcThreadAttributeList(attr_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST);
             }
         }
 
@@ -861,6 +1062,17 @@ mod windows_impl {
                 }
                 break code as i32;
             }
+            if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+                if let Some(ref j) = job {
+                    unsafe {
+                        TerminateJobObject(j.raw(), 1);
+                    }
+                }
+                unsafe {
+                    TerminateProcess(p.raw(), 1);
+                }
+                break 130;
+            }
             if Instant::now() >= deadline {
                 timed_out = true;
                 if let Some(ref j) = job {
@@ -888,6 +1100,7 @@ mod windows_impl {
         drop(thread);
         drop(proc);
         drop(job);
+        drop(workspace_labels);
         // restores + token dropped at scope end.
         let _ = restores;
         let _ = token;
@@ -1011,7 +1224,10 @@ mod tests {
         std::env::set_var(DISABLE_ENV, "0");
         assert!(!should_disable(), "0 → stays ON");
         std::env::set_var(DISABLE_ENV, "banana");
-        assert!(!should_disable(), "unknown → stays ON (never accidentally OFF)");
+        assert!(
+            !should_disable(),
+            "unknown → stays ON (never accidentally OFF)"
+        );
 
         // restore
         match prev {
@@ -1028,12 +1244,15 @@ mod tests {
         let home = Path::new("C:\\Users\\tester");
         let allow = write_allowlist(ws, Some(home));
         assert!(allow.iter().any(|p| p == ws), "workspace must be writable");
-        assert!(allow.contains(&std::env::temp_dir()), "temp must be writable");
-        let has_cargo = allow.iter().any(|p| p.ends_with(".cargo"))
-            || std::env::var_os("CARGO_HOME").is_some();
-        assert!(has_cargo, "cargo cache must be in the allowlist");
-        let has_pnpm = allow.iter().any(|p| p.ends_with(".pnpm"));
-        assert!(has_pnpm, "pnpm cache must be in the allowlist");
+        assert!(allow.iter().any(|p| p.ends_with("agent-runtime\\temp")));
+        assert!(allow
+            .iter()
+            .any(|p| p.ends_with("agent-runtime\\cargo-home")));
+        assert!(allow
+            .iter()
+            .any(|p| p.ends_with("agent-runtime\\pnpm-store")));
+        assert!(!allow.contains(&home.join(".cargo")));
+        assert!(!allow.contains(&std::env::temp_dir()));
     }
 
     #[test]
@@ -1041,7 +1260,7 @@ mod tests {
         let ws = Path::new("C:\\proj\\app");
         let allow = write_allowlist(ws, None);
         assert!(allow.iter().any(|p| p == ws));
-        assert!(allow.contains(&std::env::temp_dir()));
+        assert!(allow.iter().all(|p| p.starts_with(ws)));
     }
 
     #[test]
@@ -1073,20 +1292,24 @@ mod tests {
         let prev_disable = std::env::var(DISABLE_ENV).ok();
         std::env::remove_var(DISABLE_ENV);
 
-        // Unique workspace under temp (temp itself is allowlisted, but we label
-        // the WORKSPACE specifically and write into it).
+        // Unique medium-integrity parent under the user profile. Creating the
+        // existing file BEFORE sandbox setup proves Auto can modify real project
+        // files, not merely create new files in an already-low temp tree.
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let ws = std::env::temp_dir().join(format!("shugu-sbx-it-{stamp}"));
+        let home = home_dir().expect("home dir for the test");
+        let test_root = home.join(format!("shugu-sbx-it-{stamp}"));
+        let ws = test_root.join("workspace");
         fs::create_dir_all(&ws).expect("create test workspace");
+        let existing = ws.join("existing.txt");
+        fs::write(&existing, "before").expect("seed existing medium file");
 
         // An OUT-OF-ALLOWLIST target: a sibling dir NOT under temp/workspace/
         // caches. Use the user profile root with a unique name. We must NOT be
         // able to write here from the confined child.
-        let home = home_dir().expect("home dir for the test");
-        let outside_file = home.join(format!("shugu-sbx-should-fail-{stamp}.txt"));
+        let outside_file = test_root.join("outside.txt");
         // Make sure it doesn't pre-exist.
         let _ = fs::remove_file(&outside_file);
 
@@ -1105,8 +1328,12 @@ mod tests {
         // ── (b) write INSIDE the workspace → must SUCCEED ──────────────
         let in_ws_name = "in_ws.txt";
         let cmd_b = format!("echo hello-ws> {in_ws_name}");
-        let res_b = run_confined(&ws, &cmd_b, 30, 8 * 1024)
-            .expect("sandbox should have run the in-workspace write (got None = fell back)");
+        let res_b = match run_confined(&ws, &cmd_b, 30, 8 * 1024) {
+            ConfinedRun::Executed(outcome) => outcome,
+            ConfinedRun::Unavailable { reason } => {
+                panic!("sandbox should have run the in-workspace write: {reason}")
+            }
+        };
         let in_ws_path = ws.join(in_ws_name);
         assert!(
             in_ws_path.exists(),
@@ -1115,13 +1342,33 @@ mod tests {
             res_b.stderr
         );
 
+        // ── (b2) modify a PRE-EXISTING workspace file → must SUCCEED ──
+        let cmd_b2 = "echo after> existing.txt";
+        let res_b2 = match run_confined(&ws, cmd_b2, 30, 8 * 1024) {
+            ConfinedRun::Executed(outcome) => outcome,
+            ConfinedRun::Unavailable { reason } => {
+                panic!("sandbox should edit an existing workspace file: {reason}")
+            }
+        };
+        let existing_after = fs::read_to_string(&existing).unwrap_or_default();
+        assert!(
+            res_b2.exit_code == 0 && existing_after.contains("after"),
+            "(b2) existing workspace files must be writable; exit={}, stderr={}, content={existing_after:?}",
+            res_b2.exit_code,
+            res_b2.stderr
+        );
+
         // ── (a) write OUTSIDE the allowlist → must FAIL ────────────────
         // Redirect into the profile root. Under MIC-low this dir is MEDIUM, the
         // child is LOW → no-write-up → the create fails (non-zero exit and/or no
         // file).
         let cmd_a = format!("echo boom> \"{}\"", outside_file.display());
-        let res_a = run_confined(&ws, &cmd_a, 30, 8 * 1024)
-            .expect("sandbox should have run the out-of-allowlist write attempt");
+        let res_a = match run_confined(&ws, &cmd_a, 30, 8 * 1024) {
+            ConfinedRun::Executed(outcome) => outcome,
+            ConfinedRun::Unavailable { reason } => {
+                panic!("sandbox should have run the out-of-allowlist write attempt: {reason}")
+            }
+        };
         let created_outside = outside_file.exists();
         // Clean up immediately if (against the contract) it got created, so a
         // failing assertion doesn't litter the profile.
@@ -1136,10 +1383,15 @@ mod tests {
 
         // ── (c) READ a file outside the workspace → must SUCCEED ───────
         let cmd_c = format!("type \"{}\"", readable.display());
-        let res_c = run_confined(&ws, &cmd_c, 30, 8 * 1024)
-            .expect("sandbox should have run the outside-read");
+        let res_c = match run_confined(&ws, &cmd_c, 30, 8 * 1024) {
+            ConfinedRun::Executed(outcome) => outcome,
+            ConfinedRun::Unavailable { reason } => {
+                panic!("sandbox should have run the outside-read: {reason}")
+            }
+        };
         assert_eq!(
-            res_c.exit_code, 0,
+            res_c.exit_code,
+            0,
             "(c) reading {} outside the workspace must succeed (reads are open); stderr={}",
             readable.display(),
             res_c.stderr
@@ -1151,7 +1403,7 @@ mod tests {
         );
 
         // ── cleanup: remove the workspace (label restored on Drop already) ──
-        let _ = fs::remove_dir_all(&ws);
+        let _ = fs::remove_dir_all(&test_root);
 
         // restore disable env
         match prev_disable {

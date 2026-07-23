@@ -6,6 +6,13 @@ export function imageDisplaySrc(url: string | null | undefined): string | null {
   return convertFileSrc(url);
 }
 
+export function generationDisplaySrc(
+  generation: { resultUrl?: string | null; status?: string | null } | null | undefined,
+): string | null {
+  if (!generation || generation.status === "missing") return null;
+  return imageDisplaySrc(generation.resultUrl);
+}
+
 export function ratioToCss(ratio: string | null | undefined): string {
   switch (ratio) {
     case "16:9": return "16 / 9";

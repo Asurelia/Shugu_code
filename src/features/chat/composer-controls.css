@@ -1,0 +1,90 @@
+/* Mode + provider/modèle forment un seul contrat d'exécution. */
+.cx-under-row > .cx-exec-block {
+  min-width: 0;
+  height: 32px;
+  margin-right: 5px;
+  display: inline-flex;
+  align-items: stretch;
+  flex: 0 1 auto;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  background: rgba(20, 17, 34, 0.78);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+}
+
+.cx-exec-block > span:first-child {
+  height: 100%;
+  flex: 0 0 auto;
+}
+
+.cx-exec-block .cx-chip.mode {
+  height: 100%;
+  margin: 0;
+  border: 0;
+  border-radius: 9px 0 0 9px;
+  background: transparent;
+}
+
+.cx-exec-block > .model-picker-anchor {
+  min-width: 112px;
+  height: 100%;
+  flex: 0 1 190px;
+  border-left: 1px solid rgba(255, 255, 255, 0.075);
+}
+
+.cx-exec-block .model-picker-trigger {
+  height: 100%;
+  max-width: 190px;
+  border: 0 !important;
+  border-radius: 0 9px 9px 0 !important;
+  background: transparent !important;
+}
+
+.cx-under-row .cx-quiet {
+  max-width: 112px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 1100px) {
+  .cx-under-row .cx-quiet,
+  .cx-under-row .cx-quiet-sep {
+    display: none;
+  }
+}
+
+@media (max-width: 980px) {
+  .cx-under-row {
+    gap: 2px;
+  }
+
+  .cx-exec-block .model-picker-trigger {
+    max-width: 165px;
+  }
+
+  .cx-under-row .trust-perm-badge {
+    width: 28px;
+    height: 28px;
+    padding: 0 !important;
+    justify-content: center;
+    border-radius: 9px !important;
+  }
+
+  .cx-under-row .trust-perm-badge > span:last-child {
+    display: none;
+  }
+}
+
+@media (max-width: 590px) {
+  .cx-exec-block > .model-picker-anchor {
+    min-width: 88px;
+  }
+
+  .cx-under-row .cx-tool:nth-of-type(n + 4) {
+    display: none;
+  }
+
+  .cx-exec-block .model-picker-trigger {
+    max-width: 140px;
+  }
+}

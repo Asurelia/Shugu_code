@@ -89,7 +89,7 @@ export function Markdown({ text }: { text: string }): React.ReactElement {
     buf.length = 0;
   };
 
-  let para: string[] = [];
+  const para: string[] = [];
 
   while (i < lines.length) {
     const line = lines[i];

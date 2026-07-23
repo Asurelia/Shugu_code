@@ -69,7 +69,11 @@ mod tests {
 
     #[test]
     fn strip_prefix_noop_on_non_extended() {
-        let p = PathBuf::from(if cfg!(windows) { r"C:\foo\bar" } else { "/foo/bar" });
+        let p = PathBuf::from(if cfg!(windows) {
+            r"C:\foo\bar"
+        } else {
+            "/foo/bar"
+        });
         let stripped = strip_extended_prefix(p.clone());
         assert_eq!(stripped, p);
     }
@@ -112,7 +116,10 @@ mod tests {
     #[test]
     fn strip_prefix_str_variant_matches() {
         assert_eq!(strip_extended_prefix_str(r"\\?\C:\foo\bar"), r"C:\foo\bar");
-        assert_eq!(strip_extended_prefix_str("plain/relative"), "plain/relative");
+        assert_eq!(
+            strip_extended_prefix_str("plain/relative"),
+            "plain/relative"
+        );
     }
 
     /// La forme IPC/affichage ne doit JAMAIS fuir le préfixe verbatim, sous
@@ -135,10 +142,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn norm_display_cleans_real_canonicalized_path() {
-        let dir = std::env::temp_dir().join(format!(
-            "shugu_pathutil_test_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("shugu_pathutil_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let canon = std::fs::canonicalize(&dir).expect("canonicalize");
         let out = norm_display(&canon);

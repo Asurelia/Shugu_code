@@ -40,12 +40,12 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use futures_util::StreamExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tauri::{Emitter, Manager};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
-use futures_util::StreamExt;
 
 // ---------------------------------------------------------------------------
 // Catalog
@@ -97,31 +97,29 @@ pub struct ModelBundleEntry {
 /// choice (the default). Additional models can be exposed through a
 /// future "Advanced" Settings page that calls the same `model_bundle_*`
 /// commands.
-pub const CATALOG: &[ModelBundleEntry] = &[
-    ModelBundleEntry {
-        id: "qwen3.5-2b-q4_k_m",
-        display_name: "Qwen 3.5 2B",
-        tagline: "Persona + router unifie, multilingue, 262K context, Apache 2.0",
-        // unsloth republishes the official Qwen weights in GGUF format
-        // (Apache 2.0 preserved). Their repo is the most reliably reachable
-        // source for the Q4_K_M quant at this scale; Qwen's own GGUF repo
-        // for the 2B variant returns 401 as of May 2026.
-        // `resolve/main/` is the raw-file download endpoint (vs `/blob/main/`
-        // which serves the HTML viewer).
-        url: "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_K_M.gguf",
-        // SHA256 deliberately left empty for first-run discovery. The first
-        // successful download will print the computed hash; the dev pins it
-        // here in a follow-up commit, and from then on every install
-        // validates strictly against this value.
-        sha256: "",
-        // 1.28 GiB per the upstream HF model card. Used as the progress bar
-        // denominator if the server doesn't send Content-Length (rare on HF
-        // but possible behind a caching proxy).
-        size_bytes: 1_280_000_000,
-        license: "Apache-2.0",
-        quant: "Q4_K_M",
-    },
-];
+pub const CATALOG: &[ModelBundleEntry] = &[ModelBundleEntry {
+    id: "qwen3.5-2b-q4_k_m",
+    display_name: "Qwen 3.5 2B",
+    tagline: "Persona + router unifie, multilingue, 262K context, Apache 2.0",
+    // unsloth republishes the official Qwen weights in GGUF format
+    // (Apache 2.0 preserved). Their repo is the most reliably reachable
+    // source for the Q4_K_M quant at this scale; Qwen's own GGUF repo
+    // for the 2B variant returns 401 as of May 2026.
+    // `resolve/main/` is the raw-file download endpoint (vs `/blob/main/`
+    // which serves the HTML viewer).
+    url: "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_K_M.gguf",
+    // SHA256 deliberately left empty for first-run discovery. The first
+    // successful download will print the computed hash; the dev pins it
+    // here in a follow-up commit, and from then on every install
+    // validates strictly against this value.
+    sha256: "",
+    // 1.28 GiB per the upstream HF model card. Used as the progress bar
+    // denominator if the server doesn't send Content-Length (rare on HF
+    // but possible behind a caching proxy).
+    size_bytes: 1_280_000_000,
+    license: "Apache-2.0",
+    quant: "Q4_K_M",
+}];
 
 // ---------------------------------------------------------------------------
 // URL allowlist
@@ -250,14 +248,14 @@ pub fn model_bundle_status(app: tauri::AppHandle) -> Result<Vec<ModelBundleStatu
                 });
             }
 
-            let metadata = std::fs::metadata(&path)
-                .map_err(|e| format!("stat {}: {e}", path.display()))?;
+            let metadata =
+                std::fs::metadata(&path).map_err(|e| format!("stat {}: {e}", path.display()))?;
             let bytes_on_disk = metadata.len();
 
             // Compute the on-disk hash. Stream the file in 1 MB chunks so we
             // don't load a multi-GB file into RAM at once.
-            let mut file = std::fs::File::open(&path)
-                .map_err(|e| format!("open {}: {e}", path.display()))?;
+            let mut file =
+                std::fs::File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
             let mut hasher = Sha256::new();
             let mut buf = vec![0u8; 1024 * 1024];
             loop {
@@ -353,9 +351,7 @@ pub async fn model_bundle_download(
 
     // Determine resume offset by looking at any existing .partial.
     let resume_from: u64 = if tmp_path.exists() {
-        std::fs::metadata(&tmp_path)
-            .map(|m| m.len())
-            .unwrap_or(0)
+        std::fs::metadata(&tmp_path).map(|m| m.len()).unwrap_or(0)
     } else {
         0
     };
@@ -379,14 +375,17 @@ pub async fn model_bundle_download(
     let response = match req.send().await {
         Ok(r) => r,
         Err(e) => {
-            emit(&app, BundleProgress {
-                id: entry.id.to_string(),
-                phase: "error",
-                bytes_done: resume_from,
-                bytes_total: entry.size_bytes,
-                sha256_actual: None,
-                error: Some(format!("HTTP send failed: {e}")),
-            });
+            emit(
+                &app,
+                BundleProgress {
+                    id: entry.id.to_string(),
+                    phase: "error",
+                    bytes_done: resume_from,
+                    bytes_total: entry.size_bytes,
+                    sha256_actual: None,
+                    error: Some(format!("HTTP send failed: {e}")),
+                },
+            );
             return Err(format!("HTTP send failed: {e}"));
         }
     };
@@ -394,14 +393,17 @@ pub async fn model_bundle_download(
     let status = response.status();
     if !status.is_success() {
         let msg = format!("HTTP {} from {}", status, entry.url);
-        emit(&app, BundleProgress {
-            id: entry.id.to_string(),
-            phase: "error",
-            bytes_done: resume_from,
-            bytes_total: entry.size_bytes,
-            sha256_actual: None,
-            error: Some(msg.clone()),
-        });
+        emit(
+            &app,
+            BundleProgress {
+                id: entry.id.to_string(),
+                phase: "error",
+                bytes_done: resume_from,
+                bytes_total: entry.size_bytes,
+                sha256_actual: None,
+                error: Some(msg.clone()),
+            },
+        );
         return Err(msg);
     }
 
@@ -412,15 +414,13 @@ pub async fn model_bundle_download(
 
     // Content-Length, when present, gives us the REMAINING bytes after
     // resume_from. We use this to recompute the total target size.
-    let content_length = response
-        .content_length()
-        .or_else(|| {
-            response
-                .headers()
-                .get("content-length")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-        });
+    let content_length = response.content_length().or_else(|| {
+        response
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+    });
 
     let bytes_total: u64 = match content_length {
         Some(len) => effective_resume + len,
@@ -466,26 +466,32 @@ pub async fn model_bundle_download(
     let mut last_emit = std::time::Instant::now();
 
     // Initial progress beacon so the UI shows the bar immediately.
-    emit(&app, BundleProgress {
-        id: entry.id.to_string(),
-        phase: "downloading",
-        bytes_done,
-        bytes_total,
-        sha256_actual: None,
-        error: None,
-    });
+    emit(
+        &app,
+        BundleProgress {
+            id: entry.id.to_string(),
+            phase: "downloading",
+            bytes_done,
+            bytes_total,
+            sha256_actual: None,
+            error: None,
+        },
+    );
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| {
             let msg = format!("stream chunk: {e}");
-            emit(&app, BundleProgress {
-                id: entry.id.to_string(),
-                phase: "error",
-                bytes_done,
-                bytes_total,
-                sha256_actual: None,
-                error: Some(msg.clone()),
-            });
+            emit(
+                &app,
+                BundleProgress {
+                    id: entry.id.to_string(),
+                    phase: "error",
+                    bytes_done,
+                    bytes_total,
+                    sha256_actual: None,
+                    error: Some(msg.clone()),
+                },
+            );
             msg
         })?;
 
@@ -493,14 +499,17 @@ pub async fn model_bundle_download(
         file.write_all(&chunk).await.map_err(|e| {
             let msg = format!("write {}: {e}", tmp_path.display());
             // Emit synchronously - we are at the await frontier already.
-            let _ = app.emit("bundle-download://progress", BundleProgress {
-                id: entry.id.to_string(),
-                phase: "error",
-                bytes_done,
-                bytes_total,
-                sha256_actual: None,
-                error: Some(msg.clone()),
-            });
+            let _ = app.emit(
+                "bundle-download://progress",
+                BundleProgress {
+                    id: entry.id.to_string(),
+                    phase: "error",
+                    bytes_done,
+                    bytes_total,
+                    sha256_actual: None,
+                    error: Some(msg.clone()),
+                },
+            );
             msg
         })?;
 
@@ -509,14 +518,17 @@ pub async fn model_bundle_download(
         // Throttle progress events to ~10 per second to avoid drowning the
         // webview event loop on fast downloads.
         if last_emit.elapsed() >= std::time::Duration::from_millis(100) {
-            emit(&app, BundleProgress {
-                id: entry.id.to_string(),
-                phase: "downloading",
-                bytes_done,
-                bytes_total,
-                sha256_actual: None,
-                error: None,
-            });
+            emit(
+                &app,
+                BundleProgress {
+                    id: entry.id.to_string(),
+                    phase: "downloading",
+                    bytes_done,
+                    bytes_total,
+                    sha256_actual: None,
+                    error: None,
+                },
+            );
             last_emit = std::time::Instant::now();
         }
     }
@@ -528,14 +540,17 @@ pub async fn model_bundle_download(
     drop(file);
 
     // ---- Verify SHA256 ----
-    emit(&app, BundleProgress {
-        id: entry.id.to_string(),
-        phase: "verifying",
-        bytes_done,
-        bytes_total,
-        sha256_actual: None,
-        error: None,
-    });
+    emit(
+        &app,
+        BundleProgress {
+            id: entry.id.to_string(),
+            phase: "verifying",
+            bytes_done,
+            bytes_total,
+            sha256_actual: None,
+            error: None,
+        },
+    );
 
     let actual_hash = format!("{:x}", hasher.finalize());
 
@@ -547,29 +562,40 @@ pub async fn model_bundle_download(
             "SHA256 mismatch for {}: expected {}, got {}",
             entry.id, entry.sha256, actual_hash
         );
-        emit(&app, BundleProgress {
-            id: entry.id.to_string(),
-            phase: "error",
-            bytes_done,
-            bytes_total,
-            sha256_actual: Some(actual_hash),
-            error: Some(msg.clone()),
-        });
+        emit(
+            &app,
+            BundleProgress {
+                id: entry.id.to_string(),
+                phase: "error",
+                bytes_done,
+                bytes_total,
+                sha256_actual: Some(actual_hash),
+                error: Some(msg.clone()),
+            },
+        );
         return Err(msg);
     }
 
     // Rename .partial -> final. Atomic on the same filesystem.
-    std::fs::rename(&tmp_path, &final_path)
-        .map_err(|e| format!("rename {} -> {}: {e}", tmp_path.display(), final_path.display()))?;
+    std::fs::rename(&tmp_path, &final_path).map_err(|e| {
+        format!(
+            "rename {} -> {}: {e}",
+            tmp_path.display(),
+            final_path.display()
+        )
+    })?;
 
-    emit(&app, BundleProgress {
-        id: entry.id.to_string(),
-        phase: "done",
-        bytes_done,
-        bytes_total,
-        sha256_actual: Some(actual_hash),
-        error: None,
-    });
+    emit(
+        &app,
+        BundleProgress {
+            id: entry.id.to_string(),
+            phase: "done",
+            bytes_done,
+            bytes_total,
+            sha256_actual: Some(actual_hash),
+            error: None,
+        },
+    );
 
     Ok(final_path.to_string_lossy().into_owned())
 }
@@ -663,7 +689,9 @@ mod tests {
     #[test]
     fn allows_huggingface_https() {
         assert!(is_url_allowed("https://huggingface.co/foo/bar"));
-        assert!(is_url_allowed("https://huggingface.co/Qwen/Qwen3.5-2B-Instruct-GGUF/resolve/main/x.gguf"));
+        assert!(is_url_allowed(
+            "https://huggingface.co/Qwen/Qwen3.5-2B-Instruct-GGUF/resolve/main/x.gguf"
+        ));
     }
 
     #[test]
@@ -674,7 +702,9 @@ mod tests {
     #[test]
     fn rejects_off_allowlist_host() {
         assert!(!is_url_allowed("https://evil.example/x.gguf"));
-        assert!(!is_url_allowed("https://huggingface.co.evil.example/x.gguf"));
+        assert!(!is_url_allowed(
+            "https://huggingface.co.evil.example/x.gguf"
+        ));
     }
 
     #[test]

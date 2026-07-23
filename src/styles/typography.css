@@ -23,7 +23,7 @@
   /* Contraste : textes secondaires légèrement relevés — le violet-gris
      d'origine passait sous les seuils de confort sur fond sombre. */
   --on-surface-variant: #b0abc9;
-  --on-surface-muted: #7f7a9c;
+  --on-surface-muted: #9b95b6;
 }
 
 /* ── Vraies surfaces de code : ré-épinglées sur la monospace ────────────── */

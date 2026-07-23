@@ -5,11 +5,12 @@
 // with no confirm — re-adding is trivial (no data loss from removing a
 // remote pointer).
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Icon } from "@/components/components";
 import { useGitRemotes } from "@/features/git/queries";
 import { useAddRemote, useRemoveRemote } from "@/features/git/mutations";
+import { useModalFocusTrap } from "@/lib/modalFocus";
 
 function AddRemoteModal({
   onClose,
@@ -19,6 +20,14 @@ function AddRemoteModal({
   const [name, setName] = useState("origin");
   const [url, setUrl] = useState("");
   const add = useAddRemote();
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const nameRef = useRef<HTMLInputElement | null>(null);
+  useModalFocusTrap({
+    open: true,
+    containerRef: dialogRef,
+    initialFocusRef: nameRef,
+    onEscape: add.isPending ? undefined : onClose,
+  });
 
   const submit = () => {
     if (!name.trim() || !url.trim()) return;
@@ -45,6 +54,11 @@ function AddRemoteModal({
       }}
     >
       <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Add Git remote"
+        tabIndex={-1}
         style={{
           width: "min(440px, 92vw)",
           background:
@@ -64,7 +78,10 @@ function AddRemoteModal({
         <label style={{ fontSize: 11, color: "var(--on-surface-variant)" }}>
           Name
           <input
+            ref={nameRef}
             type="text"
+            name="remote-name"
+            autoComplete="off"
             value={name}
             onChange={(e) => setName(e.target.value)}
             style={{
@@ -84,7 +101,10 @@ function AddRemoteModal({
         <label style={{ fontSize: 11, color: "var(--on-surface-variant)" }}>
           URL
           <input
-            type="text"
+            type="url"
+            inputMode="url"
+            name="remote-url"
+            autoComplete="url"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
             placeholder="git@github.com:user/repo.git"
@@ -105,6 +125,7 @@ function AddRemoteModal({
         </label>
         {add.isError && (
           <div
+            role="alert"
             style={{
               fontSize: 11,
               color: "var(--danger)",

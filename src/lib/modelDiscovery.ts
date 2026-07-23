@@ -219,6 +219,7 @@ const PROVIDER_LABELS: Record<string, string> = {
 // protocol, this URL, this key" into one IPC call.
 
 async function probeProviderModels(
+  providerId: string,
   protocol: Protocol,
   baseUrl: string,
   apiKey: string | null,
@@ -230,6 +231,7 @@ async function probeProviderModels(
     protocol,
     baseUrl,
     apiKey: apiKey ?? null,
+    allowPrivateLocal: providerId === "llamacpp",
   });
 }
 
@@ -453,7 +455,12 @@ export async function discoverAllModels(): Promise<DiscoveryResult> {
         result.unconfigured.push(id);
         return;
       }
-      const ids = await probeProviderModels(cfg.protocol, baseForProbe, cfg.apiKey);
+      const ids = await probeProviderModels(
+        cfg.providerId,
+        cfg.protocol,
+        baseForProbe,
+        cfg.apiKey,
+      );
 
       if (ids.length === 0 && defaultModel) {
         // Endpoint joignable mais ne liste rien (ou n'implémente pas le listing)

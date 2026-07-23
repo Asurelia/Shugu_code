@@ -21,6 +21,7 @@ import { diag } from "@/lib/diag";
 // ────────────────────────────────────────────────────────────────────
 
 export type AgentStatus = "pending" | "running" | "complete" | "error" | "killed";
+export type ExecutionProfile = "chat" | "plan" | "auto" | "fullAccess";
 export type AgentRole =
   | "mascot"
   | "orchestrator"
@@ -32,6 +33,7 @@ export type AgentRole =
 export type AgentEventKind =
   | "spawn"
   | "message"
+  | "promptComposed"
   | "toolCall"
   | "toolResult"
   | "delta"
@@ -65,6 +67,19 @@ export interface AgentRow {
   finishedAt: number | null;
   output: string | null;
   error: string | null;
+  executionProfile: ExecutionProfile;
+  isolate: boolean;
+  /** False for runs created before the enforced profile contract existed. */
+  profileVerified: boolean;
+  isolationStatus:
+    | "none"
+    | "pending"
+    | "active"
+    | "failed"
+    | "review"
+    | "finalized"
+    | "discarded"
+    | "unknown";
 }
 
 export interface AgentEventRow {
@@ -98,12 +113,27 @@ export type AgentEvent =
       task: string;
       model: string;
       conversationId: string | null;
+      /** Optional for transcripts created before schema V20. */
+      executionProfile?: ExecutionProfile;
+      isolate?: boolean;
     }
   | {
       kind: "message";
       agentId: string;
       role: "system" | "user" | "assistant";
       content: string;
+    }
+  | {
+      kind: "promptComposed";
+      agentId: string;
+      version: string;
+      fingerprint: string;
+      executionProfile: ExecutionProfile;
+      protocol: string;
+      toolNames: string[];
+      ruleSources: string[];
+      packageManager: string | null;
+      contextTruncated: boolean;
     }
   | {
       kind: "toolCall";
@@ -227,9 +257,8 @@ export type AgentEvent =
     }
   | {
       // Phase 7 #4 — l'isolation a été DEMANDÉE mais n'a pas pu démarrer (pas de
-      // dépôt git, pas de workspace, ou échec `git worktree add`). Le run continue
-      // IN-PLACE sur le checkout — l'UI affiche un badge « exec sur checkout » pour
-      // ne jamais laisser croire à une protection inexistante. `reason` explique.
+      // dépôt git, pas de workspace, ou échec `git worktree add`). Le run est
+      // arrêté avant mutation : aucune retombée silencieuse sur le checkout.
       kind: "worktreeSkipped";
       agentId: string;
       /** Pourquoi l'isolation n'a pas pu démarrer (affiché tel quel à l'user). */
@@ -295,7 +324,8 @@ export interface SpawnArgs {
    *  (le runner retire fs_write_file/fs_edit/run_command du manifest et refuse
    *  toute mutation). `"agent"` (ou absent) ⇒ exécution directe complète.
    *  Sérialise vers le champ Rust `mode` (SpawnArgs). */
-  mode?: "plan" | "agent" | (string & {});
+  mode?: "chat" | "plan" | "agent" | (string & {});
+  executionProfile?: ExecutionProfile;
   /** Modèle CONSEILLER distinct pour l'outil `advisor` in-loop (v2). Résolu
    *  côté appelant depuis `routing.advisorModel` (provider compris). Quand
    *  fourni, le runner consulte CE modèle au lieu de l'exécuteur (sinon
@@ -335,7 +365,9 @@ export interface ContinueArgs {
    *  plan approuvé » avec le plan réinjecté). Devient la `task` du nouveau run. */
   answer: string;
   /** "plan" (relance après ask_user) ou "agent" (approbation → exécution). */
-  mode?: "plan" | "agent";
+  mode?: "chat" | "plan" | "agent";
+  executionProfile?: ExecutionProfile;
+  isolate?: boolean;
   /** tool_call_id de l'interaction consommée — clé d'idempotence de la relance. */
   interactionId?: string;
   kind?: "ask_user" | "submit_plan";

@@ -31,6 +31,17 @@ pub enum Toolset {
     Reduced,
 }
 
+/// Depth of Shugu's adapter for this provider/model pair. `Compatible` means
+/// the OpenAI-compatible tool dialect is available but the specific endpoint
+/// remains user-configured; `ChatOnly` must never enter the mutating agent loop.
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentLoopSupport {
+    Native,
+    Compatible,
+    ChatOnly,
+}
+
 /// Instantané des capacités d'un modèle. Tous les champs ont une valeur sûre par
 /// défaut (jamais d'option « en cours de chargement » à gérer côté consommateur).
 #[derive(Serialize, Clone, Debug)]
@@ -41,7 +52,12 @@ pub struct ModelCapabilities {
     /// protocole). `false` uniquement pour les modèles vraiment minuscules,
     /// incapables de tool-calling fiable → on retombe sur le single-call.
     pub supports_tools: bool,
+    pub supports_streaming: bool,
     pub supports_vision: bool,
+    pub supports_reasoning: bool,
+    pub supports_mcp: bool,
+    pub supports_effort: bool,
+    pub agent_loop: AgentLoopSupport,
     pub context_window: u32,
     pub recommended_toolset: Toolset,
 }
@@ -91,13 +107,8 @@ fn name_is_small(m: &str) -> bool {
 /// évite que « 13b » ⊃ « 3b » ou « 21b » ⊃ « 1b » ne fasse passer un 13B/21B
 /// pour un modèle minuscule.
 fn bounded_size(m: &str, tag: &str) -> bool {
-    m.match_indices(tag).any(|(i, _)| {
-        i == 0
-            || !matches!(
-                m.as_bytes().get(i - 1).copied(),
-                Some(b'0'..=b'9')
-            )
-    })
+    m.match_indices(tag)
+        .any(|(i, _)| i == 0 || !matches!(m.as_bytes().get(i - 1).copied(), Some(b'0'..=b'9')))
 }
 
 /// « Tiny » = trop faible pour tout tool-calling fiable → single-call. Délimité
@@ -119,6 +130,40 @@ fn name_has_vision(m: &str) -> bool {
         || m.contains("gpt-5")
         || m.contains("-vl")
         || m.contains("vision")
+}
+
+fn name_has_reasoning(m: &str) -> bool {
+    m.contains("opus")
+        || m.contains("sonnet")
+        || m.contains("gpt-5")
+        || m.contains("o3")
+        || m.contains("o4")
+        || m.contains("reason")
+        || m.contains("deepseek-r1")
+        || m.contains("minimax-m")
+}
+
+/// Conservative allow-list for Ollama model families whose chat templates are
+/// known to support the native `/api/chat` tools contract. The Ollama server
+/// supports tool calling, but not every installed model does; unknown families
+/// stay Chat-only instead of failing after an agent has started.
+fn ollama_model_supports_tools(model: &str) -> bool {
+    [
+        "qwen2.5",
+        "qwen3",
+        "llama3.1",
+        "llama3.2",
+        "llama3.3",
+        "mistral-nemo",
+        "mistral-small",
+        "command-r",
+        "hermes",
+        "firefunction",
+        "granite3",
+        "gpt-oss",
+    ]
+    .iter()
+    .any(|marker| model.contains(marker))
 }
 
 /// Fenêtre de contexte (tokens). Défaut côté FORT = large (pas de régression de
@@ -207,10 +252,32 @@ pub fn capabilities(protocol: &str, model: &str) -> ModelCapabilities {
         Toolset::Full
     };
 
+    let dialect_supports_tools = matches!(protocol, "anthropic" | "openai" | "custom")
+        || (protocol == "ollama" && ollama_model_supports_tools(&m));
+    let supports_tools = dialect_supports_tools && !tiny;
+    let agent_loop = if !supports_tools {
+        AgentLoopSupport::ChatOnly
+    } else if protocol == "custom" {
+        AgentLoopSupport::Compatible
+    } else {
+        AgentLoopSupport::Native
+    };
+
     ModelCapabilities {
         tier,
-        supports_tools: !tiny,
+        supports_tools,
+        supports_streaming: matches!(
+            protocol,
+            "anthropic" | "openai" | "custom" | "ollama" | "codex"
+        ),
         supports_vision: name_has_vision(&m),
+        supports_reasoning: name_has_reasoning(&m) || protocol == "codex",
+        supports_mcp: supports_tools,
+        supports_effort: protocol == "codex"
+            || m.contains("gpt-5")
+            || m.contains("o3")
+            || m.contains("o4"),
+        agent_loop,
         context_window: context_window_for(protocol, &m, tier),
         recommended_toolset,
     }
@@ -252,15 +319,17 @@ pub fn model_supports_delegation(protocol: &str, model: &str) -> bool {
 }
 
 /// Outils « core » conservés pour les petits modèles (toolset réduit). Exclut
-/// web_*, code_search, advisor, skill_save, todo_write, capture_screen et les
-/// outils MCP namespacés (`mcp__…`) — un petit modèle se noie dans un gros set.
+/// web_*, code_search, advisor, skill_save, capture_screen et les outils MCP
+/// namespacés (`mcp__…`) — un petit modèle se noie dans un gros set. `todo_write`
+/// reste obligatoire : le contrôleur plan-first refuse toute mutation tant
+/// qu'un plan n'a pas été enregistré, quel que soit le palier du modèle.
 pub fn is_core_small_tool(name: &str) -> bool {
     matches!(
         name,
         "fs_read_file" | "fs_list_dir" | "fs_search" | "fs_write_file" | "fs_edit" | "run_command"
             // Human-in-the-loop : dispo même en toolset réduit (surtout en Plan, où
             // `submit_plan` est le SEUL moyen de finir proprement). Ne mutent rien.
-            | "ask_user" | "submit_plan"
+            | "todo_write" | "ask_user" | "submit_plan"
     )
 }
 
@@ -285,7 +354,7 @@ pub fn tier_prompt(tier: Tier, has_tools: bool) -> Option<&'static str> {
 /// reflètent exactement la whitelist `is_core_small_tool`.
 const SMALL_TIER_PROMPT_TOOLS: &str = "You are running as a smaller model. Work in small, verifiable steps:\n\
 - Call ONE tool at a time, then read its result before deciding the next step.\n\
-- Only the core tools exist (fs_read_file, fs_list_dir, fs_search, fs_write_file, fs_edit, run_command; plus ask_user and submit_plan in Plan mode). Do not assume others.\n\
+- Only the core tools exist (todo_write, fs_read_file, fs_list_dir, fs_search, fs_write_file, fs_edit, run_command; plus ask_user and submit_plan in Plan mode). Do not assume others.\n\
 - Keep each action tightly scoped; prefer the smallest change that makes progress.\n\
 - After each tool result, restate in one line what you learned and what you'll do next.\n\
 - If the task is too large to do reliably in one pass, ask for a smaller, more specific instruction instead of guessing.\n\
@@ -293,7 +362,8 @@ const SMALL_TIER_PROMPT_TOOLS: &str = "You are running as a smaller model. Work 
 
 /// Consignes pour un petit modèle SANS outils (chat single-call). Ne mentionne
 /// aucun outil.
-const SMALL_TIER_PROMPT_PLAIN: &str = "You are running as a smaller model. Keep your answer focused and concrete:\n\
+const SMALL_TIER_PROMPT_PLAIN: &str =
+    "You are running as a smaller model. Keep your answer focused and concrete:\n\
 - Address only what was asked; do not pad with unrelated detail.\n\
 - Prefer short, direct steps over long reasoning chains.\n\
 - If the request is ambiguous or too broad, ask one clarifying question instead of guessing.\n\
@@ -333,7 +403,10 @@ mod tests {
         let c = capabilities("openai", "gpt-4o-mini");
         assert_eq!(c.tier, Tier::Small);
         assert_eq!(c.recommended_toolset, Toolset::Reduced);
-        assert!(c.supports_tools, "mini can still tool-call, just reduced set");
+        assert!(
+            c.supports_tools,
+            "mini can still tool-call, just reduced set"
+        );
     }
 
     #[test]
@@ -366,7 +439,10 @@ mod tests {
     fn tiny_models_drop_tool_support() {
         let c = capabilities("ollama", "gemma:2b");
         assert_eq!(c.tier, Tier::Small);
-        assert!(!c.supports_tools, "2b is too tiny for reliable tool-calling");
+        assert!(
+            !c.supports_tools,
+            "2b is too tiny for reliable tool-calling"
+        );
     }
 
     #[test]
@@ -387,7 +463,42 @@ mod tests {
         assert_eq!(c.tier, Tier::Strong, "unknown → safe default Strong");
         assert_eq!(c.recommended_toolset, Toolset::Full);
         assert!(c.supports_tools);
-        assert!(c.context_window > 65_536, "unknown strong keeps a large context window");
+        assert!(
+            c.context_window > 65_536,
+            "unknown strong keeps a large context window"
+        );
+        assert_eq!(c.agent_loop, AgentLoopSupport::Compatible);
+    }
+
+    #[test]
+    fn agent_loop_matrix_never_claims_unimplemented_adapters() {
+        let anthropic = capabilities("anthropic", "claude-sonnet-4-6");
+        assert_eq!(anthropic.agent_loop, AgentLoopSupport::Native);
+        assert!(anthropic.supports_tools && anthropic.supports_mcp);
+
+        let openai_compat = capabilities("custom", "my-tool-model");
+        assert_eq!(openai_compat.agent_loop, AgentLoopSupport::Compatible);
+
+        let ollama = capabilities("ollama", "qwen2.5:32b");
+        assert_eq!(ollama.agent_loop, AgentLoopSupport::Native);
+        assert!(ollama.supports_tools);
+
+        for (protocol, model) in [
+            ("ollama", "gemma2:9b"),
+            ("codex", "gpt-5-codex"),
+            ("unknown", "model"),
+        ] {
+            let c = capabilities(protocol, model);
+            assert_eq!(
+                c.agent_loop,
+                AgentLoopSupport::ChatOnly,
+                "{protocol}/{model}"
+            );
+            assert!(
+                !c.supports_tools,
+                "{protocol}/{model} has no Shugu tool adapter"
+            );
+        }
     }
 
     #[test]
@@ -429,6 +540,7 @@ mod tests {
     fn core_small_tools_whitelist() {
         assert!(is_core_small_tool("fs_read_file"));
         assert!(is_core_small_tool("run_command"));
+        assert!(is_core_small_tool("todo_write"));
         assert!(!is_core_small_tool("code_search"));
         assert!(!is_core_small_tool("advisor"));
         assert!(!is_core_small_tool("web_search"));
@@ -447,7 +559,10 @@ mod tests {
     fn small_tier_with_tools_names_the_core_tools() {
         let frag = tier_prompt(Tier::Small, true).expect("small+tools → fragment");
         // Mentionne au moins un outil core et cadre l'usage outil à la fois.
-        assert!(frag.contains("fs_read_file"), "tools fragment should name core tools");
+        assert!(
+            frag.contains("fs_read_file"),
+            "tools fragment should name core tools"
+        );
         assert!(frag.contains("ONE tool at a time"));
     }
 

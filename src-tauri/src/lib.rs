@@ -504,6 +504,54 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_root       ON projects(root_path)
 CREATE INDEX        IF NOT EXISTS idx_conversations_project ON conversations(project_id, updated_at);
 ";
 
+// V20 — contrat d'exécution durable par run. Le profil effectif et la demande
+// d'isolation doivent survivre au reload et aux reprises HITL ; sinon l'UI ne
+// peut pas expliquer honnêtement sous quelle frontière un agent a travaillé.
+const MIGRATION_V20: &str = "
+ALTER TABLE agents ADD COLUMN execution_profile TEXT NOT NULL DEFAULT 'auto'
+  CHECK (execution_profile IN ('chat', 'plan', 'auto', 'fullAccess'));
+ALTER TABLE agents ADD COLUMN isolate INTEGER NOT NULL DEFAULT 0
+  CHECK (isolate IN (0, 1));
+";
+
+// V21 — reprise HITL durable et atomique. Le contexte de sécurité vient du run
+// source enregistré au moment où la carte est créée, jamais des champs IPC de
+// la fenêtre. `claim_token` évite le double-spawn sans consommer définitivement
+// la carte si la création du run échoue.
+const MIGRATION_V21: &str = "
+ALTER TABLE agent_interactions ADD COLUMN source_agent_id TEXT;
+ALTER TABLE agent_interactions ADD COLUMN source_execution_profile TEXT
+  CHECK (source_execution_profile IS NULL OR source_execution_profile IN ('chat', 'plan', 'auto', 'fullAccess'));
+ALTER TABLE agent_interactions ADD COLUMN source_isolate INTEGER
+  CHECK (source_isolate IS NULL OR source_isolate IN (0, 1));
+ALTER TABLE agent_interactions ADD COLUMN claim_token TEXT;
+ALTER TABLE agent_interactions ADD COLUMN continuation_agent_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_agent_interactions_source ON agent_interactions(source_agent_id);
+";
+
+// V22 — vérité d'affichage des runs historiques et de l'isolation. Les lignes
+// antérieures n'avaient pas de preuve fiable du profil effectif : elles sont
+// donc explicitement marquées non vérifiées. Pour les nouveaux runs,
+// `isolation_status` distingue une simple demande d'un worktree réellement
+// créé, échoué, conservé pour revue ou finalisé.
+const MIGRATION_V22: &str = "
+ALTER TABLE agents ADD COLUMN profile_verified INTEGER NOT NULL DEFAULT 0
+  CHECK (profile_verified IN (0, 1));
+ALTER TABLE agents ADD COLUMN isolation_status TEXT NOT NULL DEFAULT 'none'
+  CHECK (isolation_status IN ('none', 'pending', 'active', 'failed', 'review', 'finalized', 'discarded', 'unknown'));
+UPDATE agents
+   SET isolation_status = CASE WHEN isolate = 1 THEN 'unknown' ELSE 'none' END;
+";
+
+// V23 — médiathèque unifiée. Les anciennes lignes sont des images ; vidéo et
+// musique utilisent désormais la même persistance locale au lieu de disparaître
+// au changement d'onglet ou au redémarrage.
+const MIGRATION_V23: &str = "
+ALTER TABLE generations ADD COLUMN kind TEXT NOT NULL DEFAULT 'image'
+  CHECK (kind IN ('image', 'video', 'music'));
+CREATE INDEX IF NOT EXISTS idx_generations_kind_ts ON generations(kind, ts DESC);
+";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = vec![
@@ -621,6 +669,30 @@ pub fn run() {
             sql: MIGRATION_V19,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 20,
+            description: "agent_execution_profile",
+            sql: MIGRATION_V20,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 21,
+            description: "agent_interaction_resume_context",
+            sql: MIGRATION_V21,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 22,
+            description: "agent_isolation_truth",
+            sql: MIGRATION_V22,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 23,
+            description: "unified_media_generations",
+            sql: MIGRATION_V23,
+            kind: MigrationKind::Up,
+        },
     ];
 
     // Garde anti-dérive : le backup pré-migration (backup.rs) décide « une
@@ -655,9 +727,11 @@ pub fn run() {
         .manage(commands::terminal::PtyRegistry::default())
         .manage(commands::llama::LlamaServerState::default())
         .manage(commands::agents::AgentManagerState::default())
+        .manage(commands::agents::FullAccessGrant::default())
         // Lot C — registre des connexions MCP vives (un RunningService par serveur).
         .manage(commands::mcp::McpManager::default())
         .manage(commands::chat::ChatAbortRegistry::default())
+        .manage(commands::media::MediaJobRegistry::default())
         // Phase 3 — merge-back lock. Isolated agents (worktree-per-agent) acquire
         // this around `merge_back` so up to MAX_CONCURRENT_AGENTS concurrent runs
         // serialize their merges into the user's tree (no two `git merge` at once).
@@ -674,6 +748,11 @@ pub fn run() {
             // à la cible et, si une migration est en attente, on dépose un
             // snapshot atomique horodaté AVANT que le front ne déclenche la
             // migration. Best-effort : une erreur ici n'empêche jamais le boot.
+            match commands::backup::apply_pending_restore(app.handle()) {
+                Ok(true) => eprintln!("[backup] pending restore applied before SQLite open"),
+                Ok(false) => {}
+                Err(error) => eprintln!("[backup] pending restore kept for recovery: {error}"),
+            }
             let _ = commands::backup::auto_backup_before_migration(app.handle());
 
             // Régime de la base — purge des chunks d'index ignorés (venv,
@@ -734,8 +813,7 @@ pub fn run() {
             let _ = (|| -> Result<(), ()> {
                 let restored = commands::fs::restore_workspace_root(app.handle());
                 if let Some(canonical) = restored {
-                    let state = app
-                        .state::<Mutex<Option<std::path::PathBuf>>>();
+                    let state = app.state::<Mutex<Option<std::path::PathBuf>>>();
                     let mut guard = state.lock().map_err(|_| ())?;
                     *guard = Some(canonical.clone());
                     // Seed both watchers with the restored root so file-change
@@ -766,17 +844,12 @@ pub fn run() {
             // its own visibility state (tucked / un-tucked / click-through)
             // and the user typically wants it to keep floating even when
             // the main IDE is hidden.
-            let show_item = MenuItem::with_id(
-                app, "tray-show", "Show Shugu Forge", true, None::<&str>,
-            )?;
+            let show_item =
+                MenuItem::with_id(app, "tray-show", "Show Shugu Forge", true, None::<&str>)?;
             let separator = PredefinedMenuItem::separator(app)?;
-            let quit_item = MenuItem::with_id(
-                app, "tray-quit", "Fermer Shugu Forge", true, None::<&str>,
-            )?;
-            let tray_menu = Menu::with_items(
-                app,
-                &[&show_item, &separator, &quit_item],
-            )?;
+            let quit_item =
+                MenuItem::with_id(app, "tray-quit", "Fermer Shugu Forge", true, None::<&str>)?;
+            let tray_menu = Menu::with_items(app, &[&show_item, &separator, &quit_item])?;
 
             // llama autostart at boot was REMOVED — Option A of the
             // "llama bundling" decision (2026-05-19). Local AI is now strictly
@@ -882,6 +955,11 @@ pub fn run() {
             commands::image::image_generate,
             commands::video::video_generate,
             commands::music::music_generate,
+            commands::media::media_job_cancel,
+            commands::media::media_jobs_recover,
+            commands::media::media_assets_reconcile,
+            commands::media::media_asset_reveal,
+            commands::media::media_asset_delete,
             commands::capture::capture_screen,
             commands::capture::capture_list_monitors,
             commands::voice::voice_tts,
@@ -896,6 +974,7 @@ pub fn run() {
             commands::vector::memory_search,
             // Phase 5 — incremental single-file (re)index + standalone semantic search.
             commands::vector::vec_index_file,
+            commands::vector::vec_index_files,
             commands::vector::semantic_search,
             commands::vector::vec_remove_file,
             // Boot-time diff — reconcile the existing index instead of re-embedding
@@ -912,6 +991,9 @@ pub fn run() {
             commands::model_bundle::model_bundle_installed_ids,
             commands::agents::agent_spawn,
             commands::agents::agent_continue,
+            commands::agents::agent_enable_full_access,
+            commands::agents::agent_disable_full_access,
+            commands::agents::agent_full_access_status,
             commands::agents::agent_kill,
             commands::agents::agent_list_active,
             commands::agents::agent_get_transcript,

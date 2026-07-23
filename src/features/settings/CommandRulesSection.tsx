@@ -110,8 +110,9 @@ export function CommandRulesSection() {
             (« autorisé »), ou signale un motif que le classifieur rate
             (« refusé »). Un motif est un glob de tokens, optionnellement terminé
             par <code>*</code> (ex. <code>git push *</code>, <code>pnpm run build</code>).
-            Le filet reste git + le kill d'arbre de processus : une règle ne
-            bloque jamais, elle change seulement l'affichage du risque.
+            Une règle « refusé » bloque réellement la commande avant le démarrage.
+            Une règle « autorisé » retire uniquement le badge d'un motif simple ;
+            les chaînes/redirections dangereuses restent détectées.
           </p>
 
           {/* ── Ajout d'une règle ─────────────────────────────── */}

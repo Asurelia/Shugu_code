@@ -8,7 +8,7 @@
 // Composition : un seul fichier, sous-composants internes (AgentCard,
 // EmptyState, AgentFormDrawer) pour rester sous le plafond CLAUDE.md.
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { ModelPicker } from "@/features/panels/panels";
 import { ConfirmDialog } from "@/components/trust";
 import {
@@ -25,6 +25,7 @@ import { readAgentDefRaw, writeAgentDefRaw } from "@/lib/agentDefs";
 import { CodeMirrorEditor } from "@/features/code/CodeMirrorEditor";
 import { useActiveAgents } from "./queries";
 import { TranscriptDrawer } from "./AgentsPanel";
+import { useModalFocusTrap } from "@/lib/modalFocus";
 
 // ─────────────────────────────────────────────────────────────────────
 // Constantes d'affichage
@@ -47,7 +48,7 @@ const ORIGIN_BADGE: Record<
   model: { label: "Créé par Shugu", bg: "rgba(224,142,254,0.20)", fg: "#e08efe" },
 };
 
-const DEFAULT_TOOLS = ["read", "write", "edit", "bash"];
+const DEFAULT_TOOLS = ["read", "write", "edit", "bash", "web", "browser"];
 const BASE_ROLES = ["coder", "researcher", "tester", "orchestrator", "mascot"];
 
 // ─────────────────────────────────────────────────────────────────────
@@ -181,7 +182,7 @@ function AgentCard({
             background: def.color || "linear-gradient(135deg,#e08efe,#7c3aed)",
           }}
         >
-          {initial}
+          <span style={styles.avatarInitial}>{initial}</span>
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={styles.cardName}>{def.name}</div>
@@ -245,6 +246,8 @@ function AgentFormDrawer({
   onDelete?: () => void | Promise<void>;
 }) {
   const [def, setDef] = useState<EditingState>(initial);
+  const drawerRef = useRef<HTMLDivElement | null>(null);
+  useModalFocusTrap({ open: true, containerRef: drawerRef, onEscape: onClose });
   const set = <K extends keyof EditingState>(k: K, v: EditingState[K]) =>
     setDef((d) => ({ ...d, [k]: v }));
   const canSave = def.name.trim().length > 0 && def.body.trim().length > 0;
@@ -306,7 +309,14 @@ function AgentFormDrawer({
   return (
     <>
       <div style={styles.scrim} onClick={onClose} />
-      <div style={{ ...styles.drawer, width: drawerWidth }}>
+      <div
+        ref={drawerRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label={initial.isNew ? "Create agent" : `Edit agent ${initial.name}`}
+        tabIndex={-1}
+        style={{ ...styles.drawer, width: drawerWidth }}
+      >
         <div
           style={styles.resizeHandle}
           onMouseDown={onResizeStart}
@@ -316,7 +326,7 @@ function AgentFormDrawer({
           <h3 style={styles.drawerTitle}>
             {initial.isNew ? "Nouvel agent" : `Éditer · ${initial.name}`}
           </h3>
-          <button style={styles.btnGhost} onClick={onClose}>
+          <button style={styles.btnGhost} onClick={onClose} aria-label="Close agent editor">
             ✕
           </button>
         </div>
@@ -498,7 +508,7 @@ function ScopeRadio({
 
 // Tools "connus" gérés par les toggles ci-dessous. Tout autre tool (MCP, custom)
 // passe par le champ "Outils avancés" et est préservé tel quel.
-const KNOWN_TOOLS = new Set(["read", "write", "edit", "bash"]);
+const KNOWN_TOOLS = new Set(["read", "write", "edit", "bash", "web", "browser"]);
 
 function ToolsField({
   tools,
@@ -541,7 +551,7 @@ function ToolsField({
         <ToolToggle
           icon="💻"
           label="Peut lancer des commandes système"
-          desc="Tools : bash — ⚠️ exécution directe sur ta machine (le filet de sécurité est git)"
+          desc="Tool : bash — soumis au profil Chat / Plan / Auto / Full Access choisi pour le run"
           danger
           on={has("bash")}
           onChange={(on) => setTool("bash", on)}
@@ -549,10 +559,16 @@ function ToolsField({
         <ToolToggle
           icon="🌐"
           label="Peut chercher sur le web"
-          desc="(à venir — via serveurs MCP)"
-          disabled
-          on={false}
-          onChange={() => {}}
+          desc="Tools : web_search, web_fetch"
+          on={has("web")}
+          onChange={(on) => setTool("web", on)}
+        />
+        <ToolToggle
+          icon="🧭"
+          label="Peut piloter le navigateur"
+          desc="Tools : browser_test, capture_screen"
+          on={has("browser")}
+          onChange={(on) => setTool("browser", on)}
         />
       </div>
       <details style={styles.advancedTools}>
@@ -931,8 +947,19 @@ const styles: Record<string, React.CSSProperties> = {
     justifyContent: "center",
     fontFamily: "var(--font-display)",
     fontWeight: 700,
-    color: "#fff",
     flexShrink: 0,
+  },
+  avatarInitial: {
+    minWidth: 22,
+    height: 22,
+    padding: "0 5px",
+    borderRadius: 6,
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    color: "#fff",
+    background: "#11111e",
+    border: "1px solid rgba(255,255,255,0.18)",
   },
   cardName: {
     fontFamily: "var(--font-display)",
@@ -1016,8 +1043,8 @@ const styles: Record<string, React.CSSProperties> = {
     padding: "8px 14px",
     borderRadius: 8,
     border: 0,
-    background: "linear-gradient(135deg, #e08efe, #7c3aed)",
-    color: "#fff",
+    background: "linear-gradient(135deg, var(--primary), var(--primary-container))",
+    color: "#24172a",
     fontWeight: 600,
     fontSize: 13,
     cursor: "pointer",

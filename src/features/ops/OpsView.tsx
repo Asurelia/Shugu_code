@@ -294,7 +294,7 @@ function BackupCenter() {
         setLastImport(res);
         setMsg({
           kind: "ok",
-          text: `Restauré depuis ${res.bundleDir}. Copie de sécurité : ${res.safetyBackup}. Redémarre Shugu pour finaliser.`,
+          text: `Restauration préparée depuis ${res.bundleDir}. Copie de sécurité : ${res.safetyBackup}. La base sera remplacée avant l'ouverture de SQLite au prochain démarrage.`,
         });
       }
     } catch (e) {
@@ -384,7 +384,7 @@ function BackupCenter() {
       )}
       {lastImport?.restartRequired && (
         <div className="chip warn" style={{ marginTop: 8 }}>
-          Redémarrage requis pour appliquer la restauration
+          Restauration validée et préparée · redémarrage requis pour l'appliquer
         </div>
       )}
     </div>

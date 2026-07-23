@@ -3,7 +3,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { Icon } from "@/components/components";
 import { pushToast } from "@/components/toast";
 import { useActiveDesignSystem, setActiveDesignSystem } from "@/features/design/activeDesignSystem";
-import { fallbackGradient, formatGenerationTime, imageDisplaySrc, copyText } from "@/features/image/imageAssets";
+import { fallbackGradient, formatGenerationTime, generationDisplaySrc, copyText } from "@/features/image/imageAssets";
 import { useShell } from "@/routes/shell-context";
 import { setStudioDraft } from "./studioDraft";
 import { setStudioBrandBoard, togglePinnedAsset, useStudioBrandBoard } from "./brandBoard";
@@ -60,12 +60,12 @@ export function StudioBrandView() {
 
   const tokens = useMemo(() => parseTokens(active?.tokensCss ?? ""), [active?.tokensCss]);
   const imageAssets = useMemo(
-    () => generations.filter((g: any) => g.resultUrl).slice(0, 18),
+    () => generations.filter((g: any) => (g.kind ?? "image") === "image" && g.resultUrl).slice(0, 18),
     [generations],
   );
   const pinned = useMemo(
     () => board.pinnedAssetIds
-      .map((id) => generations.find((g: any) => assetId(g) === id))
+      .map((id) => generations.find((g: any) => (g.kind ?? "image") === "image" && assetId(g) === id))
       .filter(Boolean),
     [board.pinnedAssetIds, generations],
   );
@@ -188,7 +188,7 @@ export function StudioBrandView() {
             <div className="studio-brand-asset-grid">
               {imageAssets.map((g: any) => {
                 const id = assetId(g);
-                const src = imageDisplaySrc(g.resultUrl);
+                const src = generationDisplaySrc(g);
                 const isPinned = board.pinnedAssetIds.includes(id);
                 return (
                   <button

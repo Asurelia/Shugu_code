@@ -1,0 +1,5 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Shugu Forge Native Smoke",
+  "identifier": "dev.shugu.forge.native-smoke"
+}

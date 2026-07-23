@@ -100,7 +100,12 @@ mod tests {
         );
         // Third chunk arrives past the interval → whole accumulation emitted.
         assert_eq!(
-            push_at("t-agent-1", "content", " world", t0 + Duration::from_millis(80)),
+            push_at(
+                "t-agent-1",
+                "content",
+                " world",
+                t0 + Duration::from_millis(80)
+            ),
             Some("Hello world".to_string())
         );
         // Buffer was consumed — nothing left to drain.

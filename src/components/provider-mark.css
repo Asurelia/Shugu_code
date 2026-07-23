@@ -1,0 +1,63 @@
+.provider-mark {
+  --provider-color: #8b7aa8;
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  overflow: hidden;
+  color: var(--provider-icon-color, color-mix(in srgb, var(--provider-color) 78%, white));
+  background:
+    radial-gradient(circle at 28% 20%, color-mix(in srgb, var(--provider-color) 26%, transparent), transparent 55%),
+    color-mix(in srgb, var(--provider-color) 10%, rgba(13, 11, 24, 0.94));
+  border: 1px solid color-mix(in srgb, var(--provider-color) 38%, rgba(255, 255, 255, 0.08));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 8px 22px -14px color-mix(in srgb, var(--provider-color) 70%, transparent);
+}
+
+.provider-mark-sm {
+  width: 24px;
+  height: 24px;
+  border-radius: 8px;
+}
+
+.provider-mark-md {
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+}
+
+.provider-mark-lg {
+  width: 46px;
+  height: 46px;
+  border-radius: 13px;
+}
+
+.provider-mark svg {
+  width: 54%;
+  height: 54%;
+}
+
+.provider-mark-glyph {
+  font-family: var(--font-display, var(--font-body));
+  font-size: 15px;
+  font-weight: 780;
+  line-height: 1;
+}
+
+.provider-mark-sm .provider-mark-glyph {
+  font-size: 11px;
+}
+
+.provider-mark-word {
+  max-width: 90%;
+  font-family: var(--font-body);
+  font-size: 7px;
+  font-weight: 760;
+  letter-spacing: -0.055em;
+  line-height: 1;
+}
+
+.provider-mark-sm .provider-mark-word {
+  font-size: 5px;
+}

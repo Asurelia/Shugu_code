@@ -26,10 +26,11 @@ timestamped, crash-traceable run, use **`tauri-dev-log.cmd`** — it tees stdout
 `dev-logs/run-<timestamp>.log`, so a native crash (e.g. `STATUS_ILLEGAL_INSTRUCTION`) is captured
 to disk instead of scrolling past in a closed terminal.
 
-**Rust / `cargo` on Windows:** a plain shell fails with `cl.exe`/`kernel32.lib` not found — Git's `link.exe` shadows MSVC's on PATH. Run cargo through the VS Developer environment:
+**Rust / `cargo` on Windows:** a plain shell fails with `cl.exe`/`kernel32.lib` not found — Git's `link.exe` shadows MSVC's on PATH. Use the repository wrapper, which loads `vcvars64.bat` before Cargo:
 
 ```
-cmd /c "\"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat\" >nul 2>&1 && cd /d F:\Dev\shugu_code\src-tauri && cargo check"
+cmd.exe /d /c F:\Dev\shugu_code\cargo-msvc.cmd check
+cmd.exe /d /c F:\Dev\shugu_code\cargo-msvc.cmd test --no-fail-fast
 ```
 
 `.cargo/config.toml` exists locally as a partial linker fix but is **gitignored** (hardcoded machine-specific MSVC path) — don't rely on it cross-machine.
@@ -39,7 +40,7 @@ cmd /c "\"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\B
 - **Vitest** is the unit test runner: `pnpm test` (one-shot) / `pnpm test:watch`. Tests live next to
   code as `*.test.ts` (chat context, mentions, git status map, minimap, folding, autocomplete,
   chunker, markdown, …). Add a `*.test.ts` for pure logic you change.
-- **Rust** unit tests run via `cargo test` (through the VS Developer env on Windows — see above).
+- **Rust** unit tests run through `cargo-msvc.cmd test` on Windows (see above).
 - Verification gates before merge: `pnpm typecheck` + `pnpm test` + `cargo check`/`cargo test`.
 
 ## Vérification visuelle sans Tauri — `pnpm ui:tour`

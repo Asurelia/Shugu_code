@@ -91,6 +91,10 @@ export function useAgentEvents(): void {
                     finishedAt: null,
                     output: null,
                     error: null,
+                    executionProfile: event.executionProfile ?? "auto",
+                    isolate: event.isolate ?? false,
+                    profileVerified: true,
+                    isolationStatus: event.isolate ? "pending" : "none",
                   };
                   return { agent: agentRow, events: [event] };
                 }
@@ -106,6 +110,10 @@ export function useAgentEvents(): void {
                   finishedAt: null,
                   output: null,
                   error: null,
+                  executionProfile: "auto",
+                  isolate: false,
+                  profileVerified: false,
+                  isolationStatus: "unknown",
                 };
                 return { agent: minimalAgent, events: [event] };
               }
@@ -140,6 +148,19 @@ export function useAgentEvents(): void {
                   error: event.error,
                   finishedAt: Date.now(),
                 };
+              } else if (event.kind === "worktreeStarted") {
+                nextRow = { ...nextRow, isolationStatus: "active" };
+              } else if (event.kind === "worktreeSkipped") {
+                nextRow = { ...nextRow, isolationStatus: "failed" };
+              } else if (event.kind === "worktreeFinalized") {
+                nextRow = {
+                  ...nextRow,
+                  isolationStatus: event.outcome === "diff"
+                    ? "review"
+                    : event.outcome === "discarded"
+                      ? "discarded"
+                      : "finalized",
+                };
               }
               return { agent: nextRow, events: [...prev.events, event] };
             },
@@ -148,6 +169,14 @@ export function useAgentEvents(): void {
           // Invalide juste les LISTES (active, byConv) sur transitions
           // de status. Le détail (transcript) ne s'invalide PAS — il vit
           // en mémoire avec les deltas, et un refetch wiperait le stream.
+          if (
+            event.kind === "worktreeStarted"
+            || event.kind === "worktreeSkipped"
+            || event.kind === "worktreeFinalized"
+          ) {
+            void qc.invalidateQueries({ queryKey: agentKeys.lists() });
+          }
+
           if (event.kind === "spawn" || event.kind === "complete" || event.kind === "error") {
             void qc.invalidateQueries({ queryKey: agentKeys.lists() });
             // Lot 6 + mascotte-avatar (2026-06-10) — la mascotte INCARNE le
@@ -191,19 +220,16 @@ export function useAgentEvents(): void {
               { tone: "proud", ttlMs: 4000, agentId: event.agentId },
             );
           } else if (event.kind === "worktreeSkipped") {
-            // Phase 7 #4 — l'isolation worktree a été DEMANDÉE mais n'a pas pu
-            // démarrer (pas de dépôt git / échec `git worktree add`). Le run
-            // continue IN-PLACE sur le checkout. On le signale honnêtement mais
-            // SANS alarmer : l'agent travaille quand même, c'est une info d'état
-            // (pas une erreur), et la mascotte ne panique pas pour ça.
+            // L'isolation est un contrat : si elle ne démarre pas, le backend
+            // arrête le run avant toute mutation du checkout réel.
             pushToast(
-              `L'agent travaille directement dans tes fichiers (pas d'espace isolé : ${event.reason}).`,
-              "info",
+              `Run arrêté : espace isolé indisponible (${event.reason}).`,
+              "error",
               6000,
             );
             sayMascot(
-              `Je travaille directement dans tes fichiers (${truncateSpeech(event.reason, 50)}).`,
-              { tone: "info", ttlMs: 6000, agentId: event.agentId },
+              `Je me suis arrêté avant de modifier tes fichiers (${truncateSpeech(event.reason, 50)}).`,
+              { tone: "error", ttlMs: 6000, agentId: event.agentId },
             );
           }
         });

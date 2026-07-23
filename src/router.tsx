@@ -172,7 +172,6 @@ const routeTree = rootRoute.addChildren([
 // ─── Router (memory history — avoids file:// issues in Tauri) ─
 // Cast to any to bypass createRouter's strictNullChecks compile-time guard.
 // The underlying runtime behaviour is identical; only the TS gate is bypassed.
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const router = createRouter({
   routeTree,
   history: createMemoryHistory({ initialEntries: ["/chat"] }),

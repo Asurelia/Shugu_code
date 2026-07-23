@@ -14,7 +14,7 @@
 // (aucun renderer markdown dans le repo — cohérent avec le chat). Le streaming
 // et la review branche-vs-main sont des stretch hors-MVP.
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 import { Icon } from "@/components/components";
 import { pushToast } from "@/components/toast";
@@ -25,6 +25,7 @@ import {
   type ReviewSource,
 } from "../reviewDialogStore";
 import { useAICodeReview } from "../useAICodeReview";
+import { useModalFocusTrap } from "@/lib/modalFocus";
 
 const SOURCES: { value: ReviewSource; label: string }[] = [
   { value: "index", label: "Staged" },
@@ -34,6 +35,8 @@ const SOURCES: { value: ReviewSource; label: string }[] = [
 export function ReviewDialog(): JSX.Element | null {
   const { open, source } = useReviewDialog();
   const { review, isLoading, error, generate } = useAICodeReview();
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  useModalFocusTrap({ open, containerRef: dialogRef, onEscape: closeReviewDialog });
 
   // Auto-génère à l'ouverture et au changement de source. On exclut
   // volontairement `generate` des deps : son identité change quand le git
@@ -43,16 +46,6 @@ export function ReviewDialog(): JSX.Element | null {
     if (open) void generate(source);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, source]);
-
-  // Escape ferme (autorisé même pendant le chargement — l'appel one-shot n'a
-  // pas de conversationId donc pas d'abort ; il se résout en arrière-plan).
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") closeReviewDialog();
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, []);
 
   if (!open) return null;
 
@@ -83,6 +76,11 @@ export function ReviewDialog(): JSX.Element | null {
       }}
     >
       <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label="AI code review"
+        tabIndex={-1}
         style={{
           width: "min(760px, 92vw)",
           maxHeight: "85vh",
@@ -134,6 +132,7 @@ export function ReviewDialog(): JSX.Element | null {
             onClick={closeReviewDialog}
             className="lgb lgb-sm"
             title="Close"
+            aria-label="Close code review"
             style={{ padding: "4px 8px" }}
           >
             <Icon name="x" size={11} />

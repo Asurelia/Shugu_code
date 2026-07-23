@@ -12,6 +12,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { fsListFiles } from "@/lib/fs";
 import { Icon } from "@/components/components";
+import { useModalFocusTrap } from "@/lib/modalFocus";
 
 const MAX_FILES = 20_000;
 const MAX_SHOWN = 50;
@@ -57,6 +58,8 @@ export function QuickOpenPalette({
   const [paths, setPaths] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  useModalFocusTrap({ open, containerRef: dialogRef, initialFocusRef: inputRef, onEscape: onClose });
 
   // (Re)charge la liste plate à chaque ouverture — fraîcheur > micro-latence
   // (le walk Rust d'un projet moyen prend quelques dizaines de ms).
@@ -77,7 +80,6 @@ export function QuickOpenPalette({
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
-    requestAnimationFrame(() => inputRef.current?.focus());
     return () => {
       cancelled = true;
     };
@@ -134,11 +136,14 @@ export function QuickOpenPalette({
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="palette">
+      <div ref={dialogRef} className="palette" role="dialog" aria-modal="true" aria-label="Open a workspace file" tabIndex={-1}>
         <div className="palette-search">
           <Icon name="search" size={16} />
           <input
             ref={inputRef}
+            name="quick-open-query"
+            autoComplete="off"
+            aria-label="Search workspace files"
             value={q}
             onChange={(e) => setQ(e.target.value)}
             onKeyDown={onKey}
@@ -166,9 +171,11 @@ export function QuickOpenPalette({
               const dir = slash >= 0 ? p.slice(0, slash) : "";
               const base = slash >= 0 ? p.slice(slash + 1) : p;
               return (
-                <div
+                <button
+                  type="button"
                   key={p}
                   className={"palette-item" + (me === idx ? " active" : "")}
+                  style={{ width: "100%", border: 0, font: "inherit", textAlign: "left" }}
                   onMouseEnter={() => setIdx(me)}
                   onClick={() => pick(p)}
                 >
@@ -179,7 +186,7 @@ export function QuickOpenPalette({
                     <div className="name">{base}</div>
                     {dir && <div className="hint">{dir}</div>}
                   </div>
-                </div>
+                </button>
               );
             })}
           {!loading && filtered.length === 0 && (

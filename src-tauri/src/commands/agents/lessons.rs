@@ -88,8 +88,11 @@ pub(super) fn lessons_prompt_block(
         acc
     };
     candidates.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    let lessons: Vec<(String, String)> =
-        candidates.into_iter().take(3).map(|(_, _, v, b)| (v, b)).collect();
+    let lessons: Vec<(String, String)> = candidates
+        .into_iter()
+        .take(3)
+        .map(|(_, _, v, b)| (v, b))
+        .collect();
 
     if lessons.is_empty() {
         return (String::new(), 0);

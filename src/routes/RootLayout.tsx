@@ -42,10 +42,9 @@ import {
 } from "@/features/tweaks/tweaks-panel";
 import { shiftHsl } from "@/lib/colors";
 
-import { seedGalleryFolders } from "@/mocks/seedGalleryFolders";
-import type { DockState, FileNode, Generation } from "@/lib/types";
-import { db, seedIfEmpty, toGenerationRow } from "@/lib/db";
-import { useActiveConv, createConversation, sendChatMessage } from "@/features/chat/chat-sync";
+import type { DockState, Generation } from "@/lib/types";
+import { db, ensureInitialConversation, toGenerationRow } from "@/lib/db";
+import { useActiveConv, createConversation, sendChatMessage, getActiveModel } from "@/features/chat/chat-sync";
 import { loadOpenFiles, saveOpenFiles } from "@/lib/ide-state";
 import { fsReadFile, fsReadFiles, fsWriteFile, fsCreateDir, fsCreateFile, langToExt, fsSetWorkspaceRoot, fsGetWorkspaceRoot } from "@/lib/fs";
 import { RecentWorkspacesPalette } from "@/features/fs/RecentWorkspacesPalette";
@@ -96,6 +95,8 @@ import { setLspBridge } from "@/features/code/lsp/lspBridge";
 import { loadJSON, saveJSON } from "@/features/settings/settings-extras";
 import { useProfileFields, initialsOf } from "@/features/profile/profileQueries";
 import { formatCurrentDocumentCli, formatCodeDirect } from "@/features/code/format";
+import { invoke } from "@/lib/tauri";
+import { useModalFocusTrap } from "@/lib/modalFocus";
 
 // ─── Path → view string (derived navigation) ─────────────────
 
@@ -156,6 +157,8 @@ function CommandPalette({ open, onClose, ctx }: { open: boolean; onClose: () => 
   const [q, setQ] = useState("");
   const [idx, setIdx] = useState(0);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  useModalFocusTrap({ open, containerRef: dialogRef, initialFocusRef: inputRef, onEscape: onClose });
 
   // Build the active command list from COMMANDS, filtered by when() and search query.
   // Commands with when()===false are hidden (Pass 1 behaviour: filter rather than grey-out).
@@ -177,10 +180,6 @@ function CommandPalette({ open, onClose, ctx }: { open: boolean; onClose: () => 
   }, [q, activeCmds]);
 
   useEffect(() => { setIdx(0); }, [q]);
-  useEffect(() => {
-    if (open) requestAnimationFrame(() => inputRef.current?.focus());
-  }, [open]);
-
   // Group by category (replaces old group field).
   const grouped = useMemo(() => {
     const m = new Map<string, typeof filtered>();
@@ -207,10 +206,10 @@ function CommandPalette({ open, onClose, ctx }: { open: boolean; onClose: () => 
   let cursor = 0;
   return (
     <div className="palette-scrim" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <div className="palette">
+      <div ref={dialogRef} className="palette" role="dialog" aria-modal="true" aria-label="Command palette" tabIndex={-1}>
         <div className="palette-search">
           <Icon name="search" size={16}/>
-          <input ref={inputRef} value={q} onChange={e => setQ(e.target.value)} onKeyDown={onKey} placeholder="Type a command, file, or jump to a view…"/>
+          <input ref={inputRef} name="command-query" autoComplete="off" aria-label="Search commands" value={q} onChange={e => setQ(e.target.value)} onKeyDown={onKey} placeholder="Type a command, file, or jump to a view…"/>
           <span className="kbd">esc</span>
         </div>
         <div className="palette-list scroll">
@@ -221,9 +220,11 @@ function CommandPalette({ open, onClose, ctx }: { open: boolean; onClose: () => 
                 const me = cursor++;
                 const kbd = fmtKbd(c.keybinding);
                 return (
-                  <div
+                  <button
+                    type="button"
                     key={c.id}
                     className={"palette-item" + (me === idx ? " active" : "")}
+                    style={{ width: "100%", border: 0, font: "inherit", textAlign: "left" }}
                     onMouseEnter={() => setIdx(me)}
                     onClick={() => { void c.run(ctx); onClose(); }}
                   >
@@ -233,7 +234,7 @@ function CommandPalette({ open, onClose, ctx }: { open: boolean; onClose: () => 
                       {c.description && <div className="hint">{c.description}</div>}
                     </div>
                     {kbd && <span className="kbd">{kbd}</span>}
-                  </div>
+                  </button>
                 );
               })}
             </div>
@@ -470,8 +471,11 @@ export function RootLayout() {
     []
   );
 
-  const [galleryFolders] = useState(seedGalleryFolders);
-  const [activeFolder, setActiveFolder] = useState("g1");
+  const galleryFolders = useMemo(
+    () => [{ id: "all", name: "Toutes les créations", count: generations.length }],
+    [generations.length],
+  );
+  const [activeFolder, setActiveFolder] = useState("all");
 
   // Agents — REAL active agents (was: useState(seedAgents) mock). Feeds the
   // left-rail "Workers" list + the header subtitle. The /agents page renders
@@ -541,23 +545,38 @@ export function RootLayout() {
   // Context menu + annotations + account
   const [ctx, setCtx] = useState<any>({ open: false, x: 0, y: 0, target: null });
   const [annotations, setAnnotations] = useState<any[]>([]);
-  const [pinnedAnno, setPinnedAnno] = useState<any>(null);
+  const [_pinnedAnno, setPinnedAnno] = useState<any>(null);
   const [accountOpen, setAccountOpen] = useState(false);
   // Centre de notifications (cloche titlebar) — journal persistant des toasts.
   const [notifOpen, setNotifOpen] = useState(false);
   const unreadNotifications = useUnreadNotificationCount();
 
-  // Hydrate generations from SQLite on mount (Tauri mode only).
-  // seedIfEmpty() ensures a fresh DB has prototype data on first run.
+  // Hydrate real generations from SQLite on mount. A fresh database gets one
+  // empty conversation, but no synthetic gallery content.
   // Write-through is handled by setGenerationsPersisted passed into ShellContext.
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      await seedIfEmpty();
+      await ensureInitialConversation();
+      const recovered = await invoke<number>("media_jobs_recover").catch((error) => {
+        console.warn("[media-jobs] recovery failed:", error);
+        return 0;
+      });
+      if (!cancelled && recovered > 0) {
+        pushToast(
+          `${recovered} génération${recovered > 1 ? "s" : ""} interrompue${recovered > 1 ? "s" : ""} à relancer`,
+          "info",
+          5000,
+        );
+      }
+      await invoke("media_assets_reconcile").catch((error) => {
+        console.warn("[media-assets] reconciliation failed:", error);
+      });
       const rows = await db.generations.list();
       if (!cancelled && rows.length > 0) {
         setGenerations(rows.map((r) => ({
           id: r.id,
+          kind: r.kind,
           prompt: r.prompt,
           ratio: r.ratio ?? "1:1",
           hue: r.hue ?? 0,
@@ -631,7 +650,7 @@ export function RootLayout() {
         void removeRecentWorkspace(path);
       }
     })();
-  }, [invalidateFileTree, setOpenFiles, setActiveFile, setFileContents]);
+  }, [setOpenFiles, setActiveFile, setFileContents]);
 
   // Garde-fou anti-Codex : si shugu.db dépasse le seuil Rust (300 Mo), un
   // toast long au boot pointe vers Réglages → Stockage. Un seul check, deux
@@ -861,7 +880,7 @@ export function RootLayout() {
         rewrite: `Rewrite this for clarity:\n\n${fullText}`,
       };
       const prompt = prompts[kind];
-      void sendChatMessage(activeConvo, prompt, "shugu-haiku-4-5");
+      void sendChatMessage(activeConvo, prompt, getActiveModel());
       return;
     }
     if (kind === "comment") {

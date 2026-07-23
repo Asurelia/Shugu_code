@@ -102,6 +102,15 @@ export async function vecIndexFile(path: string): Promise<number> {
 }
 
 /**
+ * Batch variant used by the workspace reconciler. The Rust side reads and
+ * chunks every file, embeds all chunks in one FastEmbed call, then atomically
+ * replaces the batch. The backend rejects batches above 64 files.
+ */
+export async function vecIndexFiles(paths: string[]): Promise<number> {
+  return invoke<number>("vec_index_files", { paths });
+}
+
+/**
  * Remove a single workspace-relative file's chunks from the `code` collection
  * (and its `vec_code_files` tracking row). A file that was never indexed is a
  * clean no-op.

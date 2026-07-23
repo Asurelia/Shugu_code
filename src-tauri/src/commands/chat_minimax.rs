@@ -149,7 +149,11 @@ fn partition(raw: &str) -> Partition {
             }
         }
     }
-    Partition { visible, reasoning, tool_blocks }
+    Partition {
+        visible,
+        reasoning,
+        tool_blocks,
+    }
 }
 
 /// Plus grand indice ≤ `target` qui est une frontière de caractère UTF-8.
@@ -180,7 +184,11 @@ impl MinimaxContentFilter {
     }
 
     fn recompute(&mut self, flush: bool) -> FilterEmit {
-        let Partition { visible, reasoning, tool_blocks } = partition(&self.raw);
+        let Partition {
+            visible,
+            reasoning,
+            tool_blocks,
+        } = partition(&self.raw);
         self.tool_blocks = tool_blocks;
 
         let vis_end = if flush {
@@ -255,7 +263,11 @@ pub(crate) fn extract_invokes(blocks: &[String]) -> Vec<ParsedInvoke> {
             let name = open_tag
                 .find("name=\"")
                 .map(|np| np + "name=\"".len())
-                .and_then(|s| open_tag[s..].find('"').map(|e| open_tag[s..s + e].to_string()));
+                .and_then(|s| {
+                    open_tag[s..]
+                        .find('"')
+                        .map(|e| open_tag[s..s + e].to_string())
+                });
             let Some(name) = name else {
                 rest = &rest[advance..];
                 continue;
@@ -266,7 +278,10 @@ pub(crate) fn extract_invokes(blocks: &[String]) -> Vec<ParsedInvoke> {
                 None => rest.len(),
             };
             let body = &rest[body_start..body_end];
-            out.push(ParsedInvoke { name, params: extract_params(body) });
+            out.push(ParsedInvoke {
+                name,
+                params: extract_params(body),
+            });
             // Avance après ce </invoke> (ou la fin).
             rest = if body_end + "</invoke>".len() <= rest.len() {
                 &rest[body_end + "</invoke>".len()..]
@@ -340,7 +355,10 @@ fn next_short_tag(s: &str) -> Option<(String, String, usize)> {
         }
         // Doit être <name> (pas d'attributs pour la forme courte) puis </name>.
         let rest_after_name = &after[name_len..];
-        let Some(gt) = rest_after_name.find('>') else { i = abs + 1; continue };
+        let Some(gt) = rest_after_name.find('>') else {
+            i = abs + 1;
+            continue;
+        };
         let val_start = abs + 1 + name_len + gt + 1;
         let close = format!("</{name}>");
         if let Some(ce) = s[val_start..].find(&close) {
@@ -385,9 +403,7 @@ pub(crate) fn parse_tool_blocks(
 /// Note de repli quand le modèle a voulu des outils mais qu'ils ne sont PAS
 /// exécutés — typiquement le toggle « Accès complet » coupé (chemin sans boucle
 /// d'outils). Construite à partir des `ToolCall` déjà parsés (nom + 1er arg).
-pub(crate) fn summarize_tool_calls(
-    calls: &[crate::commands::agents::ToolCall],
-) -> String {
+pub(crate) fn summarize_tool_calls(calls: &[crate::commands::agents::ToolCall]) -> String {
     if calls.is_empty() {
         return String::new();
     }
@@ -551,17 +567,18 @@ mod tests {
     #[test]
     fn extract_invokes_short_form() {
         // Forme courte <path>v</path> (capture d'écran M3).
-        let blocks = vec![
-            "<invoke name=\"fs_list_dir\"><path>js</path></invoke>\
+        let blocks = vec!["<invoke name=\"fs_list_dir\"><path>js</path></invoke>\
              <invoke name=\"fs_read_file\"><path>formicium.html</path></invoke>"
-                .to_string(),
-        ];
+            .to_string()];
         let inv = extract_invokes(&blocks);
         assert_eq!(inv.len(), 2);
         assert_eq!(inv[0].name, "fs_list_dir");
         assert_eq!(inv[0].params, vec![("path".to_string(), "js".to_string())]);
         assert_eq!(inv[1].name, "fs_read_file");
-        assert_eq!(inv[1].params, vec![("path".to_string(), "formicium.html".to_string())]);
+        assert_eq!(
+            inv[1].params,
+            vec![("path".to_string(), "formicium.html".to_string())]
+        );
     }
 
     #[test]
@@ -573,22 +590,26 @@ mod tests {
         let inv = extract_invokes(&blocks);
         assert_eq!(inv.len(), 1);
         assert_eq!(inv[0].name, "search_web");
-        assert_eq!(inv[0].params, vec![("query".to_string(), "rust async".to_string())]);
+        assert_eq!(
+            inv[0].params,
+            vec![("query".to_string(), "rust async".to_string())]
+        );
     }
 
     #[test]
     fn malformed_invoke_without_name_is_skipped_not_abandoned() {
         // Un <invoke> sans name= ne doit pas faire perdre l'invoke valide
         // qui suit (ni boucler). Robustesse de revue.
-        let blocks = vec![
-            "<invoke><path>x</path></invoke>\
+        let blocks = vec!["<invoke><path>x</path></invoke>\
              <invoke name=\"fs_read_file\"><path>ok.ts</path></invoke>"
-                .to_string(),
-        ];
+            .to_string()];
         let inv = extract_invokes(&blocks);
         assert_eq!(inv.len(), 1);
         assert_eq!(inv[0].name, "fs_read_file");
-        assert_eq!(inv[0].params, vec![("path".to_string(), "ok.ts".to_string())]);
+        assert_eq!(
+            inv[0].params,
+            vec![("path".to_string(), "ok.ts".to_string())]
+        );
     }
 
     #[test]
@@ -600,7 +621,10 @@ mod tests {
         assert_eq!(inv.len(), 1);
         assert_eq!(
             inv[0].params,
-            vec![("a".to_string(), "1".to_string()), ("b".to_string(), "2".to_string())]
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string())
+            ]
         );
     }
 
@@ -625,11 +649,9 @@ mod tests {
 
     #[test]
     fn summarize_reads_names_and_first_arg() {
-        let blocks = vec![
-            "<invoke name=\"fs_list_dir\"><path>js</path></invoke>\
+        let blocks = vec!["<invoke name=\"fs_list_dir\"><path>js</path></invoke>\
              <invoke name=\"fs_read_file\"><path>formicium.html</path></invoke>"
-                .to_string(),
-        ];
+            .to_string()];
         let s = summarize_tool_calls(&parse_tool_blocks(&blocks, 0));
         assert!(s.contains("`fs_list_dir(js)`"), "{s}");
         assert!(s.contains("`fs_read_file(formicium.html)`"), "{s}");

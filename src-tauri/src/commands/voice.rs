@@ -27,7 +27,15 @@ const MAX_TTS_CHARS: usize = 600;
 /// src/features/mascot/affect.ts (côté TS). Toute divergence = une émotion
 /// choisie côté TS mais droppée ici en silence.
 const VALID_EMOTIONS: [&str; 9] = [
-    "happy", "sad", "angry", "fearful", "disgusted", "surprised", "calm", "fluent", "whisper",
+    "happy",
+    "sad",
+    "angry",
+    "fearful",
+    "disgusted",
+    "surprised",
+    "calm",
+    "fluent",
+    "whisper",
 ];
 
 fn is_valid_emotion(e: &str) -> bool {
@@ -109,7 +117,11 @@ pub async fn voice_tts(
     let text: String = text.chars().take(MAX_TTS_CHARS).collect();
 
     let base = base_url.trim().trim_end_matches('/');
-    let base = if base.is_empty() { "https://api.minimax.io" } else { base };
+    let base = if base.is_empty() {
+        "https://api.minimax.io"
+    } else {
+        base
+    };
     let url = if base.ends_with("/v1") {
         format!("{base}/t2a_v2")
     } else {
@@ -125,7 +137,11 @@ pub async fn voice_tts(
         "vol": clamp_vol(vol),
         "pitch": clamp_pitch(pitch),
     });
-    if let Some(e) = emotion.as_deref().map(str::trim).filter(|e| is_valid_emotion(e)) {
+    if let Some(e) = emotion
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| is_valid_emotion(e))
+    {
         voice_setting["emotion"] = serde_json::Value::String(e.to_string());
     }
 
@@ -142,7 +158,11 @@ pub async fn voice_tts(
     });
     // language_boost optionnel (ex. "French") : améliore la prononciation d'une
     // langue cible. Absent → l'API reste en détection automatique.
-    if let Some(lb) = language_boost.as_deref().map(str::trim).filter(|lb| !lb.is_empty()) {
+    if let Some(lb) = language_boost
+        .as_deref()
+        .map(str::trim)
+        .filter(|lb| !lb.is_empty())
+    {
         body["language_boost"] = serde_json::Value::String(lb.to_string());
     }
 

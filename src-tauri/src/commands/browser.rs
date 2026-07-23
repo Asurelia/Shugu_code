@@ -8,7 +8,7 @@
 //! ## Backends (abstraction [`BrowserBackend`])
 //! * **Playwright-shell** (ICI) — pilote un petit script Node (`playwright`).
 //!   Éprouvé, **aucune dépendance Rust lourde** ; exige que `playwright` soit
-//!   installé côté projet (`npm i -D playwright && npx playwright install chromium`).
+//!   installé côté projet (`pnpm add -D playwright && pnpm exec playwright install chromium`).
 //! * **chromiumoxide** (Phase 1b) — CDP 100 % Rust ; exige un Chrome/Chromium.
 //!   Ajouté dans un commit suivant ; l'`enum` `engine` du schéma d'outil sera
 //!   alors étendu à `"chromiumoxide"`.
@@ -89,6 +89,9 @@ struct AssertionResult {
 pub struct BrowserOutcome {
     pub summary: String,
     pub is_error: bool,
+    /// Structured assertion verdict. `None` means infrastructure/input failure;
+    /// callers must never infer a green verification from formatted prose.
+    pub passed: Option<bool>,
     pub screenshots: Vec<(String, String)>,
 }
 
@@ -190,8 +193,8 @@ impl KillJob {
         use std::ptr;
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-            JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         };
         use windows_sys::Win32::System::Threading::{
@@ -254,8 +257,9 @@ struct PlaywrightShellBackend {
 
 impl BrowserBackend for PlaywrightShellBackend {
     async fn run(&self, spec: &Value, artifact_png: &Path) -> Result<DriverResult, String> {
-        let node = which::which("node")
-            .map_err(|_| "node introuvable sur le PATH — installe Node.js pour utiliser browser_test".to_string())?;
+        let node = which::which("node").map_err(|_| {
+            "node introuvable sur le PATH — installe Node.js pour utiliser browser_test".to_string()
+        })?;
 
         // Dossier de travail jetable du driver (script + spec + result), hors
         // dépôt utilisateur. On y écrit le driver CJS et le spec normalisé.
@@ -264,7 +268,8 @@ impl BrowserBackend for PlaywrightShellBackend {
         let driver_path = work.join("driver.cjs");
         let spec_path = work.join("spec.json");
         let result_path = work.join("result.json");
-        std::fs::write(&driver_path, PLAYWRIGHT_DRIVER_CJS).map_err(|e| format!("write driver: {e}"))?;
+        std::fs::write(&driver_path, PLAYWRIGHT_DRIVER_CJS)
+            .map_err(|e| format!("write driver: {e}"))?;
         std::fs::write(
             &spec_path,
             serde_json::to_vec(spec).map_err(|e| format!("serialize spec: {e}"))?,
@@ -319,7 +324,14 @@ impl BrowserBackend for PlaywrightShellBackend {
                 .map_err(|e| format!("parse result.json: {e}")),
             Err(_) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                let tail: String = stderr.chars().rev().take(800).collect::<String>().chars().rev().collect();
+                let tail: String = stderr
+                    .chars()
+                    .rev()
+                    .take(800)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
                 Err(format!(
                     "browser_test: le driver n'a produit aucun résultat (node exit {}). stderr:\n{}",
                     out.status.code().unwrap_or(-1),
@@ -379,9 +391,9 @@ impl BrowserBackend for ChromiumoxideBackend {
             .user_data_dir(&profile)
             .build()
             .map_err(|e| format!("LAUNCH_FAILED: config navigateur: {e}"))?;
-        let (mut browser, mut handler) = Browser::launch(config)
-            .await
-            .map_err(|e| format!("LAUNCH_FAILED: lancement de Chrome impossible (installé ?) : {e}"))?;
+        let (mut browser, mut handler) = Browser::launch(config).await.map_err(|e| {
+            format!("LAUNCH_FAILED: lancement de Chrome impossible (installé ?) : {e}")
+        })?;
         // Le Handler doit être pompé en continu, sinon le CDP se fige.
         let handler_task = tokio::spawn(async move {
             while let Some(h) = handler.next().await {
@@ -439,12 +451,17 @@ async fn cdp_inner(
         .map_err(|_| format!("goto {url}: délai dépassé ({timeout_ms}ms)"))?
         .map_err(|e| format!("goto {url}: {e}"))?;
     // `goto` se résout déjà au load ; ce wait est best-effort et JAMAIS bloquant.
-    let _ = tokio::time::timeout(Duration::from_millis(timeout_ms), page.wait_for_navigation()).await;
+    let _ = tokio::time::timeout(
+        Duration::from_millis(timeout_ms),
+        page.wait_for_navigation(),
+    )
+    .await;
 
     if let Some(sel) = spec["waitSelector"].as_str() {
         // Tolère un selector jamais présent (timeout) sans tuer le test —
         // l'assertion correspondante tranchera ensuite.
-        let _ = tokio::time::timeout(Duration::from_millis(timeout_ms), page.find_element(sel)).await;
+        let _ =
+            tokio::time::timeout(Duration::from_millis(timeout_ms), page.find_element(sel)).await;
     }
     if let Some(ms) = spec["waitMs"].as_u64() {
         tokio::time::sleep(Duration::from_millis(ms.min(10_000))).await;
@@ -560,7 +577,11 @@ use super::pathutil::strip_extended_prefix_str as strip_extended_prefix;
 /// l'event `Screenshot` de la timeline (même pipeline que capture.rs).
 fn thumb_from_png(png_path: &Path) -> Option<String> {
     let img = image::open(png_path).ok()?;
-    let thumb = img.resize(THUMB_EDGE, THUMB_EDGE, image::imageops::FilterType::Triangle);
+    let thumb = img.resize(
+        THUMB_EDGE,
+        THUMB_EDGE,
+        image::imageops::FilterType::Triangle,
+    );
     let rgb = image::DynamicImage::ImageRgb8(thumb.to_rgb8());
     let mut buf = Vec::new();
     rgb.write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
@@ -587,7 +608,10 @@ fn build_spec(args: &Value, screenshot_path: &Path) -> Result<Value, String> {
             "browser_test: url doit être http(s) absolu (ex. http://localhost:5173) — reçu: {url:?}"
         ));
     }
-    let timeout_ms = args["timeoutMs"].as_u64().unwrap_or(30_000).clamp(1_000, 60_000);
+    let timeout_ms = args["timeoutMs"]
+        .as_u64()
+        .unwrap_or(30_000)
+        .clamp(1_000, 60_000);
     let require_no_errors = args["requireNoErrors"].as_bool().unwrap_or(true);
     let want_shot = args["screenshot"].as_bool().unwrap_or(true);
 
@@ -637,13 +661,25 @@ pub async fn browser_test_run(
             dir.join(format!("{safe}-{}.png", uuid::Uuid::new_v4()))
         }
         Err(e) => {
-            return BrowserOutcome { summary: e, is_error: true, screenshots: vec![] };
+            return BrowserOutcome {
+                summary: e,
+                is_error: true,
+                passed: None,
+                screenshots: vec![],
+            };
         }
     };
 
     let spec = match build_spec(args, &png_path) {
         Ok(s) => s,
-        Err(e) => return BrowserOutcome { summary: e, is_error: true, screenshots: vec![] },
+        Err(e) => {
+            return BrowserOutcome {
+                summary: e,
+                is_error: true,
+                passed: None,
+                screenshots: vec![],
+            }
+        }
     };
 
     // Sélection backend :
@@ -671,6 +707,7 @@ pub async fn browser_test_run(
                     "browser_test: engine inconnu {other:?} — disponibles: \"auto\", \"chromiumoxide\", \"playwright\""
                 ),
                 is_error: true,
+                passed: None,
                 screenshots: vec![],
             }
         }
@@ -678,7 +715,12 @@ pub async fn browser_test_run(
 
     match result {
         Ok(res) => render_outcome(res, &png_path),
-        Err(e) => BrowserOutcome { summary: e, is_error: true, screenshots: vec![] },
+        Err(e) => BrowserOutcome {
+            summary: e,
+            is_error: true,
+            passed: None,
+            screenshots: vec![],
+        },
     }
 }
 
@@ -687,8 +729,9 @@ fn render_outcome(res: DriverResult, png_path: &Path) -> BrowserOutcome {
     // Panne d'infra distincte (playwright/navigateur absent) → message actionnable.
     if let Some(kind) = &res.infra_error {
         let hint = if kind == "playwright-missing" {
-            "Playwright n'est pas installé dans ce projet. Lance : \
-             `npm i -D playwright && npx playwright install chromium`."
+            "Playwright n'est pas installé dans ce projet. Lance le gestionnaire \
+             déclaré par package.json (par exemple `pnpm add -D playwright && \
+             pnpm exec playwright install chromium`)."
         } else {
             "Le driver navigateur n'a pas pu démarrer."
         };
@@ -696,6 +739,7 @@ fn render_outcome(res: DriverResult, png_path: &Path) -> BrowserOutcome {
         return BrowserOutcome {
             summary: format!("browser_test indisponible ({kind}). {hint}\n{msg}"),
             is_error: true,
+            passed: None,
             screenshots: vec![],
         };
     }
@@ -703,7 +747,11 @@ fn render_outcome(res: DriverResult, png_path: &Path) -> BrowserOutcome {
     let mut lines = Vec::new();
     lines.push(format!(
         "browser_test: {}",
-        if res.passed { "PASSED ✅" } else { "FAILED ❌" }
+        if res.passed {
+            "PASSED ✅"
+        } else {
+            "FAILED ❌"
+        }
     ));
     if let Some(u) = &res.final_url {
         lines.push(format!("URL finale : {u}"));
@@ -751,6 +799,7 @@ fn render_outcome(res: DriverResult, png_path: &Path) -> BrowserOutcome {
     BrowserOutcome {
         summary: lines.join("\n"),
         is_error: false,
+        passed: Some(res.passed),
         screenshots,
     }
 }
@@ -798,7 +847,7 @@ mod tests {
         };
         let out = render_outcome(res, std::path::Path::new("/tmp/none.png"));
         assert!(out.is_error);
-        assert!(out.summary.contains("npx playwright install"));
+        assert!(out.summary.contains("pnpm exec playwright install"));
     }
 
     #[test]
@@ -814,7 +863,10 @@ mod tests {
             ..Default::default()
         };
         let out = render_outcome(res, std::path::Path::new("/tmp/none.png"));
-        assert!(!out.is_error, "un échec d'assertion est une DONNÉE, pas une erreur d'outil");
+        assert!(
+            !out.is_error,
+            "un échec d'assertion est une DONNÉE, pas une erreur d'outil"
+        );
         assert!(out.summary.contains("FAILED"));
         assert!(out.summary.contains("✗ text Hello"));
     }

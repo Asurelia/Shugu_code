@@ -18,10 +18,26 @@ pub struct Provider {
 #[tauri::command]
 pub fn models_list() -> Vec<Provider> {
     vec![
-        Provider { id: "anthropic/claude-haiku-4-5".into(), label: "claude-haiku-4-5".into(), protocol: "anthropic".into() },
-        Provider { id: "anthropic/claude-sonnet-5".into(),  label: "claude-sonnet-5".into(),  protocol: "anthropic".into() },
-        Provider { id: "openai/gpt-4o-mini".into(),         label: "gpt-4o-mini".into(),      protocol: "openai".into() },
-        Provider { id: "ollama/qwen2.5:32b".into(),         label: "qwen2.5:32b".into(),      protocol: "ollama".into() },
+        Provider {
+            id: "anthropic/claude-haiku-4-5".into(),
+            label: "claude-haiku-4-5".into(),
+            protocol: "anthropic".into(),
+        },
+        Provider {
+            id: "anthropic/claude-sonnet-5".into(),
+            label: "claude-sonnet-5".into(),
+            protocol: "anthropic".into(),
+        },
+        Provider {
+            id: "openai/gpt-4o-mini".into(),
+            label: "gpt-4o-mini".into(),
+            protocol: "openai".into(),
+        },
+        Provider {
+            id: "ollama/qwen2.5:32b".into(),
+            label: "qwen2.5:32b".into(),
+            protocol: "ollama".into(),
+        },
     ]
 }
 
@@ -69,6 +85,7 @@ pub async fn models_discover_external(
     protocol: String,
     base_url: String,
     api_key: Option<String>,
+    allow_private_local: Option<bool>,
 ) -> Result<Vec<String>, String> {
     // SSRF guard — `models_discover_external` takes a user-supplied `base_url`
     // and issues an outbound backend GET, exactly the same pivot surface as
@@ -97,7 +114,20 @@ pub async fn models_discover_external(
     // design, and guarding it would break the default local-Ollama discovery
     // flow. The guard runs FIRST — before the client is built and before the
     // anthropic key check — so a blocked target never opens a socket.
-    if matches!(protocol.as_str(), "anthropic" | "openai" | "custom") {
+    // The built-in llama.cpp card is the one deliberately trusted local
+    // exception. The flag alone is insufficient: the target must still parse
+    // as localhost or a loopback IP, so it cannot become a generic SSRF bypass.
+    let trusted_loopback = allow_private_local.unwrap_or(false)
+        && reqwest::Url::parse(&base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .is_some_and(|host| {
+                host.eq_ignore_ascii_case("localhost")
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            });
+    if matches!(protocol.as_str(), "anthropic" | "openai" | "custom") && !trusted_loopback {
         crate::commands::chat::validate_custom_base_url(&base_url)?;
     }
 
@@ -170,10 +200,7 @@ async fn parse_data_id_array(resp: reqwest::Response) -> Result<Vec<String>, Str
         let excerpt: String = body.chars().take(300).collect();
         return Err(format!("HTTP {status}: {excerpt}"));
     }
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse json: {e}"))?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| format!("parse json: {e}"))?;
     let arr = json
         .get("data")
         .and_then(|v| v.as_array())
@@ -192,10 +219,7 @@ async fn parse_ollama_tags(resp: reqwest::Response) -> Result<Vec<String>, Strin
         let excerpt: String = body.chars().take(300).collect();
         return Err(format!("HTTP {status}: {excerpt}"));
     }
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse json: {e}"))?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| format!("parse json: {e}"))?;
     let arr = json
         .get("models")
         .and_then(|v| v.as_array())
@@ -228,7 +252,7 @@ mod ssrf_discovery_tests {
     /// guard (validation error, no network hop). `None` api_key also proves the
     /// guard fires ahead of the anthropic key-presence check.
     async fn block(protocol: &str, url: &str) {
-        let res = models_discover_external(protocol.to_string(), url.to_string(), None).await;
+        let res = models_discover_external(protocol.to_string(), url.to_string(), None, None).await;
         assert!(
             res.is_err(),
             "{protocol} discovery to {url} should be blocked by the SSRF guard"
@@ -273,6 +297,45 @@ mod ssrf_discovery_tests {
     }
 
     #[tokio::test]
+    async fn trusted_local_flag_only_exempts_loopback() {
+        use tokio::time::{timeout, Duration};
+
+        let private = models_discover_external(
+            "openai".to_string(),
+            "http://10.1.2.3/v1".to_string(),
+            None,
+            Some(true),
+        )
+        .await
+        .expect_err("the built-in-local flag must not exempt a private LAN target");
+        assert!(
+            private.contains("SSRF"),
+            "unexpected validation error: {private}"
+        );
+
+        match timeout(
+            Duration::from_secs(5),
+            models_discover_external(
+                "openai".to_string(),
+                "http://127.0.0.1:1/v1".to_string(),
+                None,
+                Some(true),
+            ),
+        )
+        .await
+        {
+            Ok(res) => {
+                let msg = res.expect_err("no OpenAI-compatible server on 127.0.0.1:1");
+                assert!(
+                    !msg.contains("SSRF"),
+                    "trusted built-in loopback discovery must reach the transport layer: {msg}"
+                );
+            }
+            Err(_elapsed) => {}
+        }
+    }
+
+    #[tokio::test]
     async fn ollama_discovery_is_exempt_from_guard() {
         use tokio::time::{timeout, Duration};
         // ollama targets localhost by design — the guard must NOT fire for it,
@@ -289,7 +352,12 @@ mod ssrf_discovery_tests {
         //     reqwest timeout.
         match timeout(
             Duration::from_secs(5),
-            models_discover_external("ollama".to_string(), "http://127.0.0.1:1".to_string(), None),
+            models_discover_external(
+                "ollama".to_string(),
+                "http://127.0.0.1:1".to_string(),
+                None,
+                None,
+            ),
         )
         .await
         {

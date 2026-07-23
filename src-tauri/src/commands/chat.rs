@@ -1,11 +1,13 @@
 use futures_util::StreamExt;
 use serde::Deserialize;
-use tauri::{Emitter, Manager};
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use tauri::{Emitter, Manager};
 
-use crate::commands::agents::{tools_json_anthropic, tools_json_openai, ToolCall, ToolCallAccumulator};
+use crate::commands::agents::{
+    tools_json_anthropic, tools_json_openai, ToolCall, ToolCallAccumulator,
+};
 
 // ---------------------------------------------------------------------------
 // Abort registry — tracks in-flight chat streams so the frontend can cancel.
@@ -59,7 +61,11 @@ fn build_codex_prompt(messages: &[ChatMessage]) -> String {
         if m.role == "system" {
             continue;
         }
-        let who = if m.role == "assistant" { "Assistant" } else { "User" };
+        let who = if m.role == "assistant" {
+            "Assistant"
+        } else {
+            "User"
+        };
         out.push_str(who);
         out.push_str(": ");
         out.push_str(&m.content);
@@ -183,7 +189,11 @@ impl ChatDeltaCoalescer {
         if !chunk.is_empty() && (kind == "content" || kind == "reasoning") {
             self.emitted = true;
         }
-        let delta_kind: &'static str = if kind == "reasoning" { "reasoning" } else { "content" };
+        let delta_kind: &'static str = if kind == "reasoning" {
+            "reasoning"
+        } else {
+            "content"
+        };
         if self.kind != delta_kind {
             self.flush();
             self.kind = delta_kind;
@@ -687,8 +697,12 @@ pub(crate) async fn call_anthropic_structured(
     let mut text_acc = String::new();
 
     collect_lines(response, abort, |line| {
-        let Some(payload) = line.strip_prefix("data: ") else { return };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else { return };
+        let Some(payload) = line.strip_prefix("data: ") else {
+            return;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
+            return;
+        };
 
         match v["type"].as_str() {
             Some("content_block_start") => {
@@ -818,8 +832,18 @@ pub(crate) async fn call_openai_compat(
         })
         .collect();
     call_openai_compat_structured(
-        client, base_url, model, messages_json, api_key, protocol, chat_template_kwargs,
-        with_tools, /* tools */ None, abort, on_chunk,
+        client,
+        base_url,
+        model,
+        messages_json,
+        api_key,
+        protocol,
+        chat_template_kwargs,
+        with_tools,
+        /* tools */ None,
+        /* forced tool */ None,
+        abort,
+        on_chunk,
     )
     .await
 }
@@ -847,6 +871,7 @@ pub(crate) async fn call_openai_compat_structured(
     chat_template_kwargs: &Option<serde_json::Value>,
     with_tools: bool,
     tools: Option<serde_json::Value>,
+    forced_tool: Option<&str>,
     abort: Option<Arc<AtomicBool>>,
     on_chunk: &mut (dyn FnMut(&str, &str) + Send),
 ) -> Result<AssistantTurn, String> {
@@ -869,13 +894,29 @@ pub(crate) async fn call_openai_compat_structured(
     if with_tools {
         // OpenAI tool-use wire format. `tool_choice: "auto"` lets the
         // model decide whether to call a tool or answer directly —
-        // alternatives are "none" (text-only) or `{type:"function",
-        // function:{name:"X"}}` (force a specific tool). Auto matches
-        // the agent runtime contract where the orchestrator decides.
+        // alternatives are "none" (text-only) or "required". For a recovery
+        // turn that must use one specific tool, send ONLY that tool and mark
+        // the choice required. This is semantically identical to OpenAI's
+        // named-function object while also working with llama.cpp/LM Studio
+        // versions that accept the object but silently ignore its name.
         // Custom tools (the chat read/write subset) override the default agent
         // tool set when provided; otherwise fall back to the full agent tools.
-        body["tools"] = tools.unwrap_or_else(tools_json_openai);
-        body["tool_choice"] = serde_json::json!("auto");
+        let mut manifest = tools.unwrap_or_else(tools_json_openai);
+        if let Some(name) = forced_tool {
+            let Some(entries) = manifest.as_array_mut() else {
+                return Err("OpenAI tools manifest is not an array".to_string());
+            };
+            entries.retain(|tool| tool["function"]["name"].as_str() == Some(name));
+            if entries.is_empty() {
+                return Err(format!(
+                    "forced OpenAI tool `{name}` is absent from the effective manifest"
+                ));
+            }
+            body["tool_choice"] = serde_json::json!("required");
+        } else {
+            body["tool_choice"] = serde_json::json!("auto");
+        }
+        body["tools"] = manifest;
     }
     // Recherche NATIVE OpenAI : les modèles `*-search-preview` cherchent le web
     // quand `web_search_options` est présent (résultats fondus dans le texte
@@ -918,10 +959,16 @@ pub(crate) async fn call_openai_compat_structured(
     eprintln!("[chat:{protocol}] streaming model={model} url={url} with_tools={with_tools}");
 
     collect_lines(response, abort, |line| {
-        let Some(payload) = line.strip_prefix("data: ") else { return };
+        let Some(payload) = line.strip_prefix("data: ") else {
+            return;
+        };
         // Terminal sentinel — not JSON; just stop accumulating.
-        if payload.trim() == "[DONE]" { return }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else { return };
+        if payload.trim() == "[DONE]" {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
+            return;
+        };
         // Visible answer chunk (the standard OpenAI field). Routé via le filtre
         // MiniMax : le `<think>` part en reasoning, les blocs d'outils XML sont
         // mis de côté, et SEULE la prose visible nettoyée nourrit `acc` +
@@ -966,7 +1013,8 @@ pub(crate) async fn call_openai_compat_structured(
             // emitted post-execution as the authoritative entry).
             on_chunk("tool_call_delta", "");
         }
-    }).await?;
+    })
+    .await?;
 
     // Vide la marge retenue du filtre (dernier fragment de prose/raisonnement).
     let tail = mm.finish();
@@ -1001,7 +1049,10 @@ pub(crate) async fn call_openai_compat_structured(
         tool_calls.len(),
     );
 
-    Ok(AssistantTurn { content: acc, tool_calls })
+    Ok(AssistantTurn {
+        content: acc,
+        tool_calls,
+    })
 }
 
 /// Ollama newline-delimited JSON streaming (`/api/chat` with `"stream": true`).
@@ -1019,16 +1070,192 @@ pub(crate) async fn call_ollama(
     abort: Option<Arc<AtomicBool>>,
     on_chunk: &mut (dyn FnMut(&str, &str) + Send),
 ) -> Result<AssistantTurn, String> {
-    let url = format!("{}/api/chat", base_url.trim_end_matches('/'));
     let messages_json: Vec<_> = messages
         .iter()
         .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
         .collect();
-    let body = serde_json::json!({
+    call_ollama_structured(
+        client,
+        base_url,
+        model,
+        messages_json,
+        None,
+        abort,
+        on_chunk,
+    )
+    .await
+}
+
+fn ollama_tool_calls_from_chunk(value: &serde_json::Value, calls: &mut Vec<ToolCall>) {
+    let Some(items) = value
+        .get("message")
+        .and_then(|m| m.get("tool_calls"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    for item in items {
+        let Some(function) = item.get("function") else {
+            continue;
+        };
+        let Some(name) = function.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let arguments = match function.get("arguments") {
+            Some(serde_json::Value::String(raw)) => raw.clone(),
+            Some(value) => value.to_string(),
+            None => "{}".to_string(),
+        };
+        // Some Ollama versions repeat a complete tool call in the terminal
+        // chunk. Avoid executing that duplicate while preserving real repeated
+        // calls that differ in arguments.
+        if calls
+            .last()
+            .is_some_and(|last| last.name == name && last.arguments == arguments)
+        {
+            continue;
+        }
+        calls.push(ToolCall {
+            // Ollama does not return a tool-call id. A per-response index would
+            // collide on every turn of a multi-turn run (`ollama-tool-0`), which
+            // makes durable lifecycle events and HITL interaction ids ambiguous.
+            // Give every synthesized id process-wide uniqueness instead.
+            id: format!(
+                "ollama-tool-{}",
+                OLLAMA_TOOL_CALL_SEQ.fetch_add(1, Ordering::Relaxed)
+            ),
+            name: name.to_string(),
+            arguments,
+        });
+    }
+}
+
+static OLLAMA_TOOL_CALL_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+mod ollama_tool_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn parses_native_tool_calls_and_deduplicates_terminal_repeat() {
+        let chunk = serde_json::json!({
+            "message": {
+                "tool_calls": [{
+                    "function": {
+                        "name": "fs_read_file",
+                        "arguments": {"path": "src/main.rs"}
+                    }
+                }]
+            }
+        });
+        let mut calls = Vec::new();
+        ollama_tool_calls_from_chunk(&chunk, &mut calls);
+        ollama_tool_calls_from_chunk(&chunk, &mut calls);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "fs_read_file");
+        assert_eq!(calls[0].arguments, r#"{"path":"src/main.rs"}"#);
+    }
+
+    #[tokio::test]
+    async fn structured_ollama_round_trip_sends_tools_and_parses_stream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (body_tx, body_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            let header_end = loop {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().ok())
+                        .flatten()
+                })
+                .unwrap();
+            while request.len() < header_end + content_length {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body: serde_json::Value =
+                serde_json::from_slice(&request[header_end..header_end + content_length]).unwrap();
+            body_tx.send(body).unwrap();
+
+            let payload = concat!(
+                "{\"message\":{\"role\":\"assistant\",\"content\":\"\",\"thinking\":\"inspect\",\"tool_calls\":[{\"function\":{\"name\":\"fs_read_file\",\"arguments\":{\"path\":\"Cargo.toml\"}}}]},\"done\":false}\n",
+                "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true}\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                payload.len(),
+                payload
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut streamed = Vec::new();
+        let turn = call_ollama_structured(
+            &reqwest::Client::new(),
+            &format!("http://{addr}"),
+            "qwen2.5:7b",
+            vec![serde_json::json!({"role":"user","content":"inspect"})],
+            Some(serde_json::json!([{
+                "type":"function",
+                "function":{"name":"fs_read_file","parameters":{"type":"object"}}
+            }])),
+            None,
+            &mut |kind, chunk| streamed.push((kind.to_string(), chunk.to_string())),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+        let request_body = body_rx.await.unwrap();
+        assert_eq!(request_body["tools"][0]["function"]["name"], "fs_read_file");
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "fs_read_file");
+        assert_eq!(
+            streamed,
+            vec![("reasoning".to_string(), "inspect".to_string())]
+        );
+    }
+}
+
+/// Ollama's native `/api/chat` tool dialect. The official API accepts the
+/// OpenAI-shaped function manifest, emits `message.tool_calls`, and expects
+/// assistant tool calls plus `{role:"tool", tool_name, content}` in history.
+pub(crate) async fn call_ollama_structured(
+    client: &reqwest::Client,
+    base_url: &str,
+    model: &str,
+    messages: Vec<serde_json::Value>,
+    tools: Option<serde_json::Value>,
+    abort: Option<Arc<AtomicBool>>,
+    on_chunk: &mut (dyn FnMut(&str, &str) + Send),
+) -> Result<AssistantTurn, String> {
+    let url = format!("{}/api/chat", base_url.trim_end_matches('/'));
+    let mut body = serde_json::json!({
         "model": model,
-        "messages": messages_json,
+        "messages": messages,
         "stream": true,
     });
+    if tools
+        .as_ref()
+        .is_some_and(|value| value.as_array().is_some_and(|items| !items.is_empty()))
+    {
+        body["tools"] = tools.unwrap_or_default();
+    }
 
     let response = client
         .post(&url)
@@ -1045,23 +1272,34 @@ pub(crate) async fn call_ollama(
     }
 
     let mut acc = String::new();
+    let mut tool_calls = Vec::new();
 
     collect_lines(response, abort, |line| {
-        if line.is_empty() { return }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
-        let Some(text) = v["message"]["content"].as_str() else { return };
-        if !text.is_empty() {
-            acc.push_str(text);
-            on_chunk("content", text);
+        if line.is_empty() {
+            return;
         }
-    }).await?;
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return;
+        };
+        if let Some(text) = v["message"]["content"].as_str() {
+            if !text.is_empty() {
+                acc.push_str(text);
+                on_chunk("content", text);
+            }
+        }
+        if let Some(thinking) = v["message"]["thinking"].as_str() {
+            if !thinking.is_empty() {
+                on_chunk("reasoning", thinking);
+            }
+        }
+        ollama_tool_calls_from_chunk(&v, &mut tool_calls);
+    })
+    .await?;
 
-    // Phase 2: Ollama tool_use is model-specific and not handled here.
-    // We return an empty tool_calls vec so the runner gracefully treats
-    // Ollama agents as "text-only" — they can still answer but won't
-    // exercise the fs tools. Phase 3 can route specific Ollama models
-    // (mistral-nemo, llama3.1) through the OpenAI-compat tool path.
-    Ok(AssistantTurn { content: acc, tool_calls: Vec::new() })
+    Ok(AssistantTurn {
+        content: acc,
+        tool_calls,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1121,12 +1359,10 @@ fn chat_tool_label(name: &str, args: &serde_json::Value) -> String {
             format!("🧭 recherche sémantique « {q} »")
         }
         // BLOCKER 1 — libellé propre pour un outil MCP : `🔌 server__tool`.
-        name if name.starts_with("mcp__") => {
-            match crate::commands::mcp::split_namespaced(name) {
-                Some((server, tool)) => format!("🔌 {server}__{tool}"),
-                None => format!("🔌 {}", name.strip_prefix("mcp__").unwrap_or(name)),
-            }
-        }
+        name if name.starts_with("mcp__") => match crate::commands::mcp::split_namespaced(name) {
+            Some((server, tool)) => format!("🔌 {server}__{tool}"),
+            None => format!("🔌 {}", name.strip_prefix("mcp__").unwrap_or(name)),
+        },
         other => format!("⚙️ {other}"),
     }
 }
@@ -1251,8 +1487,7 @@ async fn run_chat_tool_loop(
                 _ => chat_tools_json_openai(write_enabled),
             };
             let mgr = app.state::<crate::commands::mcp::McpManager>();
-            let mcp_tools =
-                crate::commands::mcp::enabled_tools_json(app, &mgr, protocol).await;
+            let mcp_tools = crate::commands::mcp::enabled_tools_json(app, &mgr, protocol).await;
             if let Some(a) = arr.as_array_mut() {
                 a.extend(mcp_tools);
             }
@@ -1278,7 +1513,9 @@ async fn run_chat_tool_loop(
             {
                 if let Some(a) = arr.as_array_mut() {
                     a.retain(|t| {
-                        let name = t["name"].as_str().or_else(|| t["function"]["name"].as_str());
+                        let name = t["name"]
+                            .as_str()
+                            .or_else(|| t["function"]["name"].as_str());
                         name.is_some_and(crate::commands::model_capabilities::is_core_small_tool)
                     });
                 }
@@ -1296,7 +1533,14 @@ async fn run_chat_tool_loop(
         let turn: AssistantTurn = match protocol {
             "anthropic" => {
                 call_anthropic_structured(
-                    client, base_url, model, msgs, system, api_key, with_tools, tools_json,
+                    client,
+                    base_url,
+                    model,
+                    msgs,
+                    system,
+                    api_key,
+                    with_tools,
+                    tools_json,
                     abort.clone(),
                     &mut |kind: &str, chunk: &str| coalescer.push(kind, chunk),
                 )
@@ -1304,8 +1548,17 @@ async fn run_chat_tool_loop(
             }
             "openai" | "custom" => {
                 call_openai_compat_structured(
-                    client, base_url, model, msgs, api_key, protocol, chat_template_kwargs,
-                    with_tools, tools_json, abort.clone(),
+                    client,
+                    base_url,
+                    model,
+                    msgs,
+                    api_key,
+                    protocol,
+                    chat_template_kwargs,
+                    with_tools,
+                    tools_json,
+                    None,
+                    abort.clone(),
                     &mut |kind: &str, chunk: &str| coalescer.push(kind, chunk),
                 )
                 .await?
@@ -1394,15 +1647,20 @@ async fn run_chat_tool_loop(
                 let query = args["query"].as_str().unwrap_or("").trim();
                 let max = args["max_results"].as_u64().unwrap_or(5).clamp(1, 10) as usize;
                 if query.is_empty() {
-                    ("web_search: champ requis manquant : query".to_string(), true)
+                    (
+                        "web_search: champ requis manquant : query".to_string(),
+                        true,
+                    )
                 } else {
                     crate::commands::search::web_search(client, query, max).await
                 }
             } else if tc.name == "web_fetch" {
                 // Lecture d'une page (lecture seule) — async.
                 let url = args["url"].as_str().unwrap_or("").trim();
-                let max_chars =
-                    args["max_chars"].as_u64().unwrap_or(48_000).clamp(500, 200_000) as usize;
+                let max_chars = args["max_chars"]
+                    .as_u64()
+                    .unwrap_or(48_000)
+                    .clamp(500, 200_000) as usize;
                 if url.is_empty() {
                     ("web_fetch: champ requis manquant : url".to_string(), true)
                 } else {
@@ -1413,7 +1671,10 @@ async fn run_chat_tool_loop(
                 let query = args["query"].as_str().unwrap_or("").trim();
                 let k = args["k"].as_u64().unwrap_or(8).clamp(1, 20) as u32;
                 if query.is_empty() {
-                    ("code_search: champ requis manquant : query".to_string(), true)
+                    (
+                        "code_search: champ requis manquant : query".to_string(),
+                        true,
+                    )
                 } else {
                     match crate::commands::vector::vec_search_internal(app, "code", query, k) {
                         Ok(hits) if hits.is_empty() => (
@@ -1508,16 +1769,32 @@ async fn dispatch_single_call(
         "anthropic" => {
             let key = resolve_key(target.protocol, &api_key_owned)?;
             call_anthropic(
-                client, target.base_url, target.model, messages, &key,
-                /* with_tools */ false, img_ref, abort_flag, on_chunk,
+                client,
+                target.base_url,
+                target.model,
+                messages,
+                &key,
+                /* with_tools */ false,
+                img_ref,
+                abort_flag,
+                on_chunk,
             )
             .await
         }
         "openai" | "custom" => {
             let key = resolve_key(target.protocol, &api_key_owned)?;
             call_openai_compat(
-                client, target.base_url, target.model, messages, &key, target.protocol,
-                chat_template_kwargs, /* with_tools */ false, img_ref, abort_flag, on_chunk,
+                client,
+                target.base_url,
+                target.model,
+                messages,
+                &key,
+                target.protocol,
+                chat_template_kwargs,
+                /* with_tools */ false,
+                img_ref,
+                abort_flag,
+                on_chunk,
             )
             .await
             .map(|mut turn| {
@@ -1529,15 +1806,30 @@ async fn dispatch_single_call(
             })
         }
         "ollama" => {
-            call_ollama(client, target.base_url, target.model, messages, abort_flag, on_chunk).await
+            call_ollama(
+                client,
+                target.base_url,
+                target.model,
+                messages,
+                abort_flag,
+                on_chunk,
+            )
+            .await
         }
         "codex" => {
             let prompt = build_codex_prompt(messages);
             crate::commands::codex::codex_chat_turn(
-                app, &prompt, Some(target.model), reasoning_effort, on_chunk,
+                app,
+                &prompt,
+                Some(target.model),
+                reasoning_effort,
+                on_chunk,
             )
             .await
-            .map(|content| AssistantTurn { content, tool_calls: Vec::new() })
+            .map(|content| AssistantTurn {
+                content,
+                tool_calls: Vec::new(),
+            })
         }
         other => Err(format!("unsupported protocol: {}", other)),
     };
@@ -1978,10 +2270,7 @@ pub async fn chat_send(
 /// `collect_lines` exits on the next chunk boundary.  If no stream is active
 /// for `conversation_id` (e.g. the stream already finished), this is a no-op.
 #[tauri::command]
-pub fn chat_abort(
-    conversation_id: String,
-    abort_registry: tauri::State<'_, ChatAbortRegistry>,
-) {
+pub fn chat_abort(conversation_id: String, abort_registry: tauri::State<'_, ChatAbortRegistry>) {
     if let Ok(reg) = abort_registry.0.lock() {
         if let Some(flag) = reg.get(&conversation_id) {
             flag.store(true, Ordering::Relaxed);
@@ -2449,16 +2738,17 @@ async fn fim_stream_inner(
 
 #[cfg(test)]
 mod failover_tests {
-    use super::{
-        contains_status_class, error_is_retryable, failover_is_eligible,
-    };
+    use super::{contains_status_class, error_is_retryable, failover_is_eligible};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     #[test]
     fn status_class_detects_4xx_and_5xx_only_as_standalone_status() {
         // 4xx / 5xx present as a standalone 3-digit token.
-        assert!(contains_status_class("anthropic api error 401: bad key", '4'));
+        assert!(contains_status_class(
+            "anthropic api error 401: bad key",
+            '4'
+        ));
         assert!(contains_status_class("http 503: upstream down", '5'));
         assert!(contains_status_class("openai api error 429: rate", '4'));
         // Not the queried class.
@@ -2554,7 +2844,13 @@ mod ssrf_tests {
 
     #[test]
     fn classifies_public_v4_as_external() {
-        for s in ["8.8.8.8", "1.1.1.1", "52.10.20.30", "172.32.0.1", "100.128.0.1"] {
+        for s in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "52.10.20.30",
+            "172.32.0.1",
+            "100.128.0.1",
+        ] {
             assert!(!is_internal_ip(ip(s)), "{s} should be external");
         }
     }
@@ -2562,13 +2858,13 @@ mod ssrf_tests {
     #[test]
     fn classifies_v6_internal_including_mapped() {
         for s in [
-            "::1",                 // loopback
-            "::",                  // unspecified
-            "fe80::1",             // link-local
-            "fc00::1",             // unique-local
-            "fdff::1",             // unique-local
-            "::ffff:127.0.0.1",    // v4-mapped loopback
-            "::ffff:192.168.0.1",  // v4-mapped private
+            "::1",                // loopback
+            "::",                 // unspecified
+            "fe80::1",            // link-local
+            "fc00::1",            // unique-local
+            "fdff::1",            // unique-local
+            "::ffff:127.0.0.1",   // v4-mapped loopback
+            "::ffff:192.168.0.1", // v4-mapped private
             "::ffff:169.254.169.254",
         ] {
             assert!(is_internal_ip(ip(s)), "{s} should be internal");
@@ -2577,7 +2873,11 @@ mod ssrf_tests {
 
     #[test]
     fn classifies_public_v6_as_external() {
-        for s in ["2606:4700:4700::1111", "2001:4860:4860::8888", "::ffff:8.8.8.8"] {
+        for s in [
+            "2606:4700:4700::1111",
+            "2001:4860:4860::8888",
+            "::ffff:8.8.8.8",
+        ] {
             assert!(!is_internal_ip(ip(s)), "{s} should be external");
         }
     }
@@ -2594,7 +2894,10 @@ mod ssrf_tests {
             "http://api.localhost:1234",
             "http://ip6-localhost",
         ] {
-            assert!(validate_custom_base_url(u).is_err(), "{u} should be blocked");
+            assert!(
+                validate_custom_base_url(u).is_err(),
+                "{u} should be blocked"
+            );
         }
     }
 
@@ -2608,7 +2911,10 @@ mod ssrf_tests {
             "http://[::1]:8080/v1",
             "http://[::ffff:127.0.0.1]:9000",
         ] {
-            assert!(validate_custom_base_url(u).is_err(), "{u} should be blocked");
+            assert!(
+                validate_custom_base_url(u).is_err(),
+                "{u} should be blocked"
+            );
         }
     }
 
@@ -2627,7 +2933,10 @@ mod ssrf_tests {
     #[test]
     fn rejects_non_http_schemes_and_empty() {
         for u in ["", "ftp://example.com", "file:///etc/passwd", "not a url"] {
-            assert!(validate_custom_base_url(u).is_err(), "{u:?} should be rejected");
+            assert!(
+                validate_custom_base_url(u).is_err(),
+                "{u:?} should be rejected"
+            );
         }
     }
 

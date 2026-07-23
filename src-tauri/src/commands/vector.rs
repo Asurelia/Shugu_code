@@ -69,8 +69,7 @@ const BUSY_TIMEOUT_MS: u32 = 5_000;
 /// each turn so past knowledge resurfaces instead of evaporating at the 30-msg
 /// drop. The vector row is keyed by a UUID; the human-readable text + metadata
 /// live in the `agent_memory` side table (vec0 stores only the embedding).
-const ALLOWED_COLLECTIONS: &[&str] =
-    &["messages", "docs", "errors", "patterns", "code", "memory"];
+const ALLOWED_COLLECTIONS: &[&str] = &["messages", "docs", "errors", "patterns", "code", "memory"];
 
 // ---------------------------------------------------------------------------
 // sqlite-vec auto-extension registration (once per process)
@@ -170,8 +169,7 @@ fn get_conn(app: &tauri::AppHandle) -> Result<&'static Mutex<Connection>, String
     // Ensure the parent directory exists (mirrors what tauri-plugin-sql does
     // via create_dir_all before its own Connection::open).
     if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create app config dir: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create app config dir: {e}"))?;
     }
 
     // Extension must be registered before any Connection::open.
@@ -271,6 +269,14 @@ fn serialize_f32_vec(v: &[f32]) -> Vec<u8> {
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 static EMBED_MODEL: OnceLock<Result<TextEmbedding, String>> = OnceLock::new();
+/// Bound the ONNX tensor working set independently from the SQLite file batch.
+///
+/// A 32-file transaction can contain ~160 chunks. Letting FastEmbed infer that
+/// whole slice in one tensor pushed the native working set above 1 GiB on the
+/// performance fixture. Four texts keeps inference vectorised while bounding
+/// transient/retained ONNX allocations and was selected by the native harness
+/// as the desktop memory/throughput compromise.
+const FASTEMBED_INFERENCE_BATCH: usize = 4;
 
 /// Lazily initialise the fastembed model.
 ///
@@ -288,14 +294,44 @@ fn get_model() -> Result<&'static TextEmbedding, String> {
 
 /// Embed a single string into an `EMBED_DIM`-dimensional f32 vector.
 fn embed(text: &str) -> Result<Vec<f32>, String> {
-    let model = get_model()?;
-    let mut batch = model
-        .embed(vec![text.to_string()], None)
-        .map_err(|e| format!("embed error: {e}"))?;
-    batch
+    embed_many(&[text.to_string()])?
         .pop()
-        .filter(|v| v.len() == EMBED_DIM)
         .ok_or_else(|| format!("expected {EMBED_DIM}-dim vector, got unexpected output"))
+}
+
+/// Embed several chunks in ONE ONNX invocation.
+///
+/// Calling `TextEmbedding::embed` once per chunk dominated full-workspace
+/// indexing: a 1 200-file fixture producing 6 000 chunks paid 6 000 session
+/// dispatches. FastEmbed is designed for batches; validating cardinality and
+/// dimensions here lets file and workspace indexing share the efficient path
+/// without weakening the single-text API used by search/memory.
+fn embed_many(texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let model = get_model()?;
+    let batch = model
+        .embed(texts.to_vec(), Some(FASTEMBED_INFERENCE_BATCH))
+        .map_err(|e| format!("embed batch error: {e}"))?;
+    if batch.len() != texts.len() {
+        return Err(format!(
+            "embedding batch cardinality mismatch: expected {}, got {}",
+            texts.len(),
+            batch.len()
+        ));
+    }
+    if let Some((index, vector)) = batch
+        .iter()
+        .enumerate()
+        .find(|(_, vector)| vector.len() != EMBED_DIM)
+    {
+        return Err(format!(
+            "embedding {index}: expected {EMBED_DIM}-dim vector, got {}",
+            vector.len()
+        ));
+    }
+    Ok(batch)
 }
 
 // ---------------------------------------------------------------------------
@@ -451,8 +487,15 @@ fn decl_after_export(line: &str) -> bool {
 /// matches at ANY split point, the whole tail matches.
 fn decl_after_pub(line: &str) -> bool {
     const MODIFIERS: &[&str] = &[
-        "public", "private", "protected", "internal", "static", "async",
-        "abstract", "final", "unsafe",
+        "public",
+        "private",
+        "protected",
+        "internal",
+        "static",
+        "async",
+        "abstract",
+        "final",
+        "unsafe",
     ];
     let mut rest = line;
     loop {
@@ -479,9 +522,27 @@ fn decl_after_pub(line: &str) -> bool {
 /// `#[` are sigil prefixes.
 fn matches_decl_keyword(rest: &str) -> bool {
     const KEYWORDS: &[&str] = &[
-        "function", "class", "interface", "type", "enum", "struct", "impl",
-        "trait", "fn", "def", "func", "module", "namespace", "component",
-        "const", "let", "var", "val", "public", "private", "protected",
+        "function",
+        "class",
+        "interface",
+        "type",
+        "enum",
+        "struct",
+        "impl",
+        "trait",
+        "fn",
+        "def",
+        "func",
+        "module",
+        "namespace",
+        "component",
+        "const",
+        "let",
+        "var",
+        "val",
+        "public",
+        "private",
+        "protected",
     ];
     for kw in KEYWORDS {
         if rest.starts_with(kw) {
@@ -544,17 +605,18 @@ fn chunk_source(text: &str) -> Vec<(String, usize, usize)> {
     let mut start: usize = 0; // 0-indexed start of the current chunk
 
     // flush(endExclusive): emit [start, endExclusive) if non-blank, advance start.
-    let flush = |chunks: &mut Vec<(String, usize, usize)>, start: &mut usize, end_exclusive: usize| {
-        if end_exclusive <= *start {
-            return;
-        }
-        let body = lines[*start..end_exclusive].join("\n");
-        if !body.trim().is_empty() {
-            // startLine = start + 1, endLine = end_exclusive (1-indexed inclusive).
-            chunks.push((body, *start + 1, end_exclusive));
-        }
-        *start = end_exclusive;
-    };
+    let flush =
+        |chunks: &mut Vec<(String, usize, usize)>, start: &mut usize, end_exclusive: usize| {
+            if end_exclusive <= *start {
+                return;
+            }
+            let body = lines[*start..end_exclusive].join("\n");
+            if !body.trim().is_empty() {
+                // startLine = start + 1, endLine = end_exclusive (1-indexed inclusive).
+                chunks.push((body, *start + 1, end_exclusive));
+            }
+            *start = end_exclusive;
+        };
 
     // Index loop (not an iterator): the body needs `i` for BOTH the running
     // chunk size `i - start` AND `flush(.., i)`. A `.enumerate()` form would still
@@ -588,19 +650,71 @@ fn chunk_id(path: &str, start: usize, end: usize) -> String {
 /// TS list's intent and `fs_list_files`'s `rsplit_once('.')` behaviour.
 const EXCLUDE_EXTS: &[&str] = &[
     // images / media
-    "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp", "tiff", "avif",
-    "mp3", "mp4", "wav", "ogg", "flac", "webm", "mov", "avi", "mkv",
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "webp",
+    "svg",
+    "ico",
+    "bmp",
+    "tiff",
+    "avif",
+    "mp3",
+    "mp4",
+    "wav",
+    "ogg",
+    "flac",
+    "webm",
+    "mov",
+    "avi",
+    "mkv",
     // archives
-    "pdf", "zip", "tar", "gz", "br", "7z", "rar", "xz", "zst",
+    "pdf",
+    "zip",
+    "tar",
+    "gz",
+    "br",
+    "7z",
+    "rar",
+    "xz",
+    "zst",
     // compiled / native
-    "wasm", "bin", "dll", "so", "dylib", "exe", "o", "a", "lib", "pdb",
+    "wasm",
+    "bin",
+    "dll",
+    "so",
+    "dylib",
+    "exe",
+    "o",
+    "a",
+    "lib",
+    "pdb",
     // fonts
-    "ttf", "otf", "woff", "woff2", "eot",
+    "ttf",
+    "otf",
+    "woff",
+    "woff2",
+    "eot",
     // ML models / weights / datasets
-    "safetensors", "ckpt", "pt", "pth", "onnx", "gguf", "ggml",
-    "npy", "npz", "h5", "hdf5", "pkl", "pickle", "parquet", "arrow",
+    "safetensors",
+    "ckpt",
+    "pt",
+    "pth",
+    "onnx",
+    "gguf",
+    "ggml",
+    "npy",
+    "npz",
+    "h5",
+    "hdf5",
+    "pkl",
+    "pickle",
+    "parquet",
+    "arrow",
     // huge / non-useful text
-    "lock", "map",
+    "lock",
+    "map",
 ];
 
 /// Max file size eligible for indexing (mirror of workspaceIndexer's
@@ -670,48 +784,23 @@ pub(crate) fn index_file_internal(
     root: &Path,
     rel: &str,
 ) -> Result<usize, String> {
-    // Read via the same guarded reader the editor/agent use (size + binary +
-    // containment guards). A missing/binary/too-large file is a NO-OP (Ok(0)),
-    // not an error: on a Remove or a binary save we simply have nothing to index.
-    let text = match crate::commands::fs::read_file_inner(root, rel, None) {
-        Ok(t) => t,
-        Err(_) => return Ok(0),
-    };
+    index_files_internal(app, root, &[rel.to_string()])
+}
 
-    // A file that READS fine but is (or became) ineligible — emptied, grew past
-    // MAX_FILE_BYTES, blank — flows through with ZERO chunks instead of
-    // early-returning: the transaction below then purges its prior chunks and
-    // records an EMPTY tracking row with a fresh `indexed_at`. Early-returning
-    // here (the old behaviour) left a shrunk/emptied file's stale chunks
-    // searchable forever AND its `indexed_at` frozen, so the boot diff
-    // re-listed it stale at every start. Only a failed READ keeps the prior
-    // index untouched (could be a transient lock; Remove events go through
-    // `delete_file_index_internal`).
-    let chunks = if is_code_eligible(rel, &text) {
-        chunk_source(&text)
-    } else {
-        Vec::new()
-    };
+/// Maximum number of files accepted by one native embedding/transaction batch.
+///
+/// The frontend currently sends 32. The larger hard boundary protects the IPC
+/// surface from unbounded model/transaction memory while keeping enough room
+/// for future tuning.
+const INDEX_FILE_BATCH_MAX: usize = 64;
 
-    // Embed every chunk OUTSIDE the conn lock. A single embed failure (model not
-    // ready) aborts the whole file with Err so the caller can log-once-and-skip;
-    // we never index a file partially.
-    let mut prepared: Vec<(String, Vec<u8>)> = Vec::with_capacity(chunks.len());
-    for (body, start, end) in &chunks {
-        let id = chunk_id(rel, *start, *end);
-        let blob = serialize_f32_vec(&embed(body)?);
-        prepared.push((id, blob));
-    }
-    let new_ids: Vec<String> = prepared.iter().map(|(id, _)| id.clone()).collect();
-    let new_ids_json =
-        serde_json::to_string(&new_ids).map_err(|e| format!("serialize chunk ids: {e}"))?;
-
-    let mut guard = get_conn(app)?.lock().map_err(|e| format!("lock: {e}"))?;
-    let tx = guard
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| format!("index_file begin: {e}"))?;
-
-    // 1. Read the file's PRIOR chunk ids (if any) and delete each by exact id.
+/// Replace one file's prior chunks inside an already-open batch transaction.
+fn replace_prepared_file(
+    tx: &rusqlite::Transaction<'_>,
+    rel: &str,
+    prepared: &[(String, Vec<u8>)],
+    indexed_at: i64,
+) -> Result<(), String> {
     let prior_json: Option<String> = tx
         .query_row(
             "SELECT chunk_ids FROM vec_code_files WHERE path = ?1",
@@ -728,8 +817,7 @@ pub(crate) fn index_file_internal(
         }
     }
 
-    // 2. Insert the new chunks.
-    for (id, blob) in &prepared {
+    for (id, blob) in prepared {
         tx.execute(
             "INSERT OR REPLACE INTO vec_code(id, embedding) VALUES (?1, ?2)",
             params![id, blob],
@@ -737,24 +825,102 @@ pub(crate) fn index_file_internal(
         .map_err(|e| format!("index_file insert chunk: {e}"))?;
     }
 
-    // 3. Upsert the side-table row with the new id list + timestamp.
+    let new_ids: Vec<&str> = prepared.iter().map(|(id, _)| id.as_str()).collect();
+    let new_ids_json =
+        serde_json::to_string(&new_ids).map_err(|e| format!("serialize chunk ids: {e}"))?;
     tx.execute(
         "INSERT OR REPLACE INTO vec_code_files(path, chunk_ids, indexed_at) VALUES (?1, ?2, ?3)",
-        params![rel, new_ids_json, now_ms()],
+        params![rel, new_ids_json, indexed_at],
     )
     .map_err(|e| format!("index_file upsert side table: {e}"))?;
+    Ok(())
+}
 
-    tx.commit().map_err(|e| format!("index_file commit: {e}"))?;
-    Ok(prepared.len())
+/// Batch variant of [`index_file_internal`].
+///
+/// All reads/chunking and the ONE FastEmbed call happen outside the SQLite
+/// lock. The resulting files are replaced in one short IMMEDIATE transaction,
+/// so search sees either the complete old batch or the complete new batch.
+/// Unreadable files remain no-ops (their prior index is preserved), while
+/// readable-but-ineligible files participate with zero chunks and therefore
+/// purge stale hits exactly like the single-file contract.
+pub(crate) fn index_files_internal(
+    app: &tauri::AppHandle,
+    root: &Path,
+    rels: &[String],
+) -> Result<usize, String> {
+    if rels.len() > INDEX_FILE_BATCH_MAX {
+        return Err(format!(
+            "index batch too large: {} files (max {INDEX_FILE_BATCH_MAX})",
+            rels.len()
+        ));
+    }
+    if rels.is_empty() {
+        return Ok(0);
+    }
+
+    let mut seen = std::collections::HashSet::with_capacity(rels.len());
+    let mut sources: Vec<(String, Vec<(String, usize, usize)>)> = Vec::with_capacity(rels.len());
+    for rel in rels {
+        if !seen.insert(rel.clone()) {
+            continue;
+        }
+        let text = match crate::commands::fs::read_file_inner(root, rel, None) {
+            Ok(text) => text,
+            Err(_) => continue,
+        };
+        let chunks = if is_code_eligible(rel, &text) {
+            chunk_source(&text)
+        } else {
+            Vec::new()
+        };
+        sources.push((rel.clone(), chunks));
+    }
+    if sources.is_empty() {
+        return Ok(0);
+    }
+
+    let bodies: Vec<String> = sources
+        .iter()
+        .flat_map(|(_, chunks)| chunks.iter().map(|(body, _, _)| body.clone()))
+        .collect();
+    let mut embeddings = embed_many(&bodies)?.into_iter();
+    let mut prepared_files: Vec<(String, Vec<(String, Vec<u8>)>)> =
+        Vec::with_capacity(sources.len());
+    let mut total = 0usize;
+    for (rel, chunks) in sources {
+        let mut prepared = Vec::with_capacity(chunks.len());
+        for (_, start, end) in chunks {
+            let vector = embeddings
+                .next()
+                .ok_or_else(|| "embedding batch ended before chunk metadata".to_string())?;
+            prepared.push((chunk_id(&rel, start, end), serialize_f32_vec(&vector)));
+        }
+        total += prepared.len();
+        prepared_files.push((rel, prepared));
+    }
+    if embeddings.next().is_some() {
+        return Err("embedding batch returned more vectors than chunk metadata".to_string());
+    }
+
+    let mut guard = get_conn(app)?.lock().map_err(|e| format!("lock: {e}"))?;
+    let tx = guard
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("index batch begin: {e}"))?;
+    let indexed_at = now_ms();
+    for (rel, prepared) in &prepared_files {
+        replace_prepared_file(&tx, rel, prepared, indexed_at)?;
+    }
+
+    tx.commit()
+        .map_err(|e| format!("index batch commit: {e}"))?;
+    Ok(total)
 }
 
 /// Remove a file's index entirely: delete its tracked chunk ids from `vec_code`
 /// and drop its `vec_code_files` row, in one IMMEDIATE transaction. Used for
 /// filesystem Remove events. A file with no tracked row is a clean no-op (Ok).
-pub(crate) fn delete_file_index_internal(
-    app: &tauri::AppHandle,
-    rel: &str,
-) -> Result<(), String> {
+pub(crate) fn delete_file_index_internal(app: &tauri::AppHandle, rel: &str) -> Result<(), String> {
     let mut guard = get_conn(app)?.lock().map_err(|e| format!("lock: {e}"))?;
     let tx = guard
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -778,7 +944,8 @@ pub(crate) fn delete_file_index_internal(
     tx.execute("DELETE FROM vec_code_files WHERE path = ?1", params![rel])
         .map_err(|e| format!("delete_file drop side row: {e}"))?;
 
-    tx.commit().map_err(|e| format!("delete_file commit: {e}"))?;
+    tx.commit()
+        .map_err(|e| format!("delete_file commit: {e}"))?;
     Ok(())
 }
 
@@ -812,9 +979,7 @@ pub fn vec_index(
     validate_collection(&collection)?;
     let blob = serialize_f32_vec(&embed(&text)?);
     let guard = get_conn(&app)?.lock().map_err(|e| format!("lock: {e}"))?;
-    let sql = format!(
-        "INSERT OR REPLACE INTO vec_{collection}(id, embedding) VALUES (?1, ?2)"
-    );
+    let sql = format!("INSERT OR REPLACE INTO vec_{collection}(id, embedding) VALUES (?1, ?2)");
     guard
         .execute(&sql, params![id, blob])
         .map_err(|e| format!("vec_index: {e}"))?;
@@ -870,11 +1035,7 @@ pub fn vec_search(
 
 /// Delete the entry identified by `id` from `vec_<collection>`.
 #[tauri::command(async)]
-pub fn vec_delete(
-    app: tauri::AppHandle,
-    collection: String,
-    id: String,
-) -> Result<(), String> {
+pub fn vec_delete(app: tauri::AppHandle, collection: String, id: String) -> Result<(), String> {
     validate_collection(&collection)?;
     let mut guard = get_conn(&app)?.lock().map_err(|e| format!("lock: {e}"))?;
     let sql = format!("DELETE FROM vec_{collection} WHERE id = ?1");
@@ -1076,9 +1237,7 @@ fn lock_workspace_root(
     let guard = root_state
         .lock()
         .map_err(|e| format!("workspace state lock: {e}"))?;
-    guard
-        .clone()
-        .ok_or_else(|| "no workspace open".to_string())
+    guard.clone().ok_or_else(|| "no workspace open".to_string())
 }
 
 /// (Re)index a single workspace-relative file into the `code` collection.
@@ -1095,6 +1254,24 @@ pub fn vec_index_file(
 ) -> Result<usize, String> {
     let root = lock_workspace_root(&root_state)?;
     index_file_internal(&app, &root, &path)
+}
+
+/// Batch workspace index entry used by the full/diff indexer. See
+/// [`INDEX_FILE_BATCH_MAX`] for the hard IPC boundary.
+#[tauri::command(async)]
+pub fn vec_index_files(
+    app: tauri::AppHandle,
+    root_state: tauri::State<'_, Mutex<Option<std::path::PathBuf>>>,
+    paths: Vec<String>,
+) -> Result<usize, String> {
+    if paths.len() > INDEX_FILE_BATCH_MAX {
+        return Err(format!(
+            "index batch too large: {} files (max {INDEX_FILE_BATCH_MAX})",
+            paths.len()
+        ));
+    }
+    let root = lock_workspace_root(&root_state)?;
+    index_files_internal(&app, &root, &paths)
 }
 
 /// Remove a single workspace-relative file's chunks from the `code` collection
@@ -1187,7 +1364,11 @@ fn partition_stale(
             .cloned()
             .collect()
     };
-    StaleReport { stale, deleted, fresh }
+    StaleReport {
+        stale,
+        deleted,
+        fresh,
+    }
 }
 
 /// mtime of `root/rel` in ms since epoch, or `None` when unreadable.
@@ -1284,7 +1465,8 @@ pub(crate) fn gc_untracked_chunks(conn: &mut Connection) -> Result<usize, String
             purged += 1;
         }
     }
-    tx.commit().map_err(|e| format!("vec_code_gc commit: {e}"))?;
+    tx.commit()
+        .map_err(|e| format!("vec_code_gc commit: {e}"))?;
     Ok(purged)
 }
 
@@ -1384,7 +1566,8 @@ pub(crate) fn purge_ignored_chunks(conn: &mut Connection) -> Result<usize, Strin
             tx.execute("DELETE FROM vec_code WHERE id = ?1", params![id])
                 .map_err(|e| format!("purge_ignored delete chunk: {e}"))?;
         }
-        tx.commit().map_err(|e| format!("purge_ignored commit: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("purge_ignored commit: {e}"))?;
     }
     for batch in doomed_paths.chunks(PURGE_BATCH) {
         let tx = conn
@@ -1564,7 +1747,9 @@ pub(crate) fn boot_maintenance(app: &tauri::AppHandle) -> Result<(), String> {
             crate::commands::backup::schema_version_of(&db),
             Some(v) if v < crate::commands::backup::TARGET_SCHEMA_VERSION
         ) {
-            eprintln!("[vector] maintenance sautée : migration de schéma en attente (priorité au front)");
+            eprintln!(
+                "[vector] maintenance sautée : migration de schéma en attente (priorité au front)"
+            );
             return Ok(());
         }
     }
@@ -1876,7 +2061,10 @@ mod tests {
             .unwrap();
         assert_eq!(vec_n, expected, "all vec rows committed");
         assert_eq!(pay_n, expected, "all payload rows committed");
-        assert_eq!(orphans, 0, "no vec row left without its payload (atomic pairs)");
+        assert_eq!(
+            orphans, 0,
+            "no vec row left without its payload (atomic pairs)"
+        );
 
         let _ = std::fs::remove_dir_all(db.parent().unwrap());
     }
@@ -1898,19 +2086,34 @@ mod tests {
         assert!(id_is_ignored("venv/lib/site.py#L1-10"));
         assert!(id_is_ignored(".claude/plans/plan.md"));
         assert!(id_is_ignored("sub/node_modules/x/i.js#L3-9"));
-        assert!(id_is_ignored("venv\\lib\\win.py#L1-2"), "séparateur Windows");
+        assert!(
+            id_is_ignored("venv\\lib\\win.py#L1-2"),
+            "séparateur Windows"
+        );
         assert!(id_is_ignored(".shugu-snippets/snippet-1.ts#L1-4"));
         // Le code légitime ne matche jamais.
         assert!(!id_is_ignored("src/main.rs#L1-40"));
         assert!(!id_is_ignored("public/index.html"));
-        assert!(!id_is_ignored("packages/env/index.ts#L1-3"), "`env` n'est pas bloqué en dur");
+        assert!(
+            !id_is_ignored("packages/env/index.ts#L1-3"),
+            "`env` n'est pas bloqué en dur"
+        );
         // `#` est LÉGAL dans un nom de fichier : seul un suffixe terminal
         // `#L<d>-<d>` est retiré. Couper au premier `#` tronquerait
         // `src/dist#v2/x.ts#L1-10` en `src/dist` → purge/ré-index en boucle
         // à chaque boot (revue fa27ff6, low confirmé).
-        assert!(!id_is_ignored("src/dist#v2/x.ts#L1-10"), "dist#v2 est un vrai dossier");
-        assert!(!id_is_ignored("notes/build#2.md"), "id legacy avec # légitime");
-        assert!(!id_is_ignored("venv#py311/lib/x.py#L1-2"), "venv#py311 ≠ venv");
+        assert!(
+            !id_is_ignored("src/dist#v2/x.ts#L1-10"),
+            "dist#v2 est un vrai dossier"
+        );
+        assert!(
+            !id_is_ignored("notes/build#2.md"),
+            "id legacy avec # légitime"
+        );
+        assert!(
+            !id_is_ignored("venv#py311/lib/x.py#L1-2"),
+            "venv#py311 ≠ venv"
+        );
         assert!(is_chunk_line_suffix("L1-40"));
         assert!(!is_chunk_line_suffix("v2"));
         assert!(!is_chunk_line_suffix("L1"));
@@ -2003,7 +2206,10 @@ mod tests {
         conn.execute("DELETE FROM vec_code", []).unwrap();
 
         let outcome = maybe_vacuum(&conn).unwrap();
-        assert!(outcome.ran, "40 Mo de freelist doivent déclencher le VACUUM");
+        assert!(
+            outcome.ran,
+            "40 Mo de freelist doivent déclencher le VACUUM"
+        );
         assert!(
             outcome.after_bytes < outcome.before_bytes / 4,
             "le fichier doit rétrécir massivement ({} → {})",
@@ -2073,7 +2279,10 @@ mod tests {
         }
         // chunk_id formatting.
         let (_, s, e) = &chunks[0];
-        assert_eq!(chunk_id("src/foo.ts", *s, *e), format!("src/foo.ts#L{s}-{e}"));
+        assert_eq!(
+            chunk_id("src/foo.ts", *s, *e),
+            format!("src/foo.ts#L{s}-{e}")
+        );
     }
 
     #[test]
@@ -2141,8 +2350,15 @@ mod tests {
     fn chunker_parity_contiguous_covering_all_lines() {
         // chunker.test.ts: contiguous, non-overlapping, covers lines 1..9
         let src = [
-            "function a() {", "  x", "}", "f", "f", "f",
-            "function b() {", "  y", "}",
+            "function a() {",
+            "  x",
+            "}",
+            "f",
+            "f",
+            "f",
+            "function b() {",
+            "  y",
+            "}",
         ]
         .join("\n");
         let r = chunk_source(&src);
@@ -2165,9 +2381,15 @@ mod tests {
     #[test]
     fn chunker_parity_python_and_rust_boundaries() {
         // chunker.test.ts: Python `def` and Rust `fn` boundaries each split into 2
-        let py = ["def a():", "  pass", "  pass", "  pass", "  pass", "  pass", "def b():", "  pass"].join("\n");
+        let py = [
+            "def a():", "  pass", "  pass", "  pass", "  pass", "  pass", "def b():", "  pass",
+        ]
+        .join("\n");
         assert_eq!(chunk_source(&py).len(), 2);
-        let rs = ["fn a() {", "  1", "  1", "  1", "  1", "  1", "fn b() {", "  2", "}"].join("\n");
+        let rs = [
+            "fn a() {", "  1", "  1", "  1", "  1", "  1", "fn b() {", "  2", "}",
+        ]
+        .join("\n");
         assert_eq!(chunk_source(&rs).len(), 2);
     }
 
@@ -2205,21 +2427,36 @@ mod tests {
         // → orphan/duplicate ids on incremental reindex. See decl_re().
         assert!(is_boundary("export default OpsView;"));
         assert!(is_boundary("export default Foo"));
-        assert!(is_boundary("export default deffo"), "abandon `default`, `def` matches `default`");
-        assert!(is_boundary("export deffo"), "`def` prefix matches on bare ident after export");
-        assert!(is_boundary("export funcky()"), "`func` prefix matches after export");
+        assert!(
+            is_boundary("export default deffo"),
+            "abandon `default`, `def` matches `default`"
+        );
+        assert!(
+            is_boundary("export deffo"),
+            "`def` prefix matches on bare ident after export"
+        );
+        assert!(
+            is_boundary("export funcky()"),
+            "`func` prefix matches after export"
+        );
         assert!(is_boundary("export const x = 1"));
         // Negative cases.
         assert!(!is_boundary("  function indented() {"), "col-0 required");
         assert!(!is_boundary(""), "empty line is not a boundary");
         assert!(!is_boundary("foobar()"), "not a declaration keyword");
-        assert!(!is_boundary("####### too many hashes"), ">6 hashes is not MD");
+        assert!(
+            !is_boundary("####### too many hashes"),
+            ">6 hashes is not MD"
+        );
         assert!(!is_boundary("#noheaderspace"), "MD header needs a space");
         assert!(!is_boundary("return 1;"), "plain statement");
         // C1 negatives: `export <bare non-keyword identifier>` is NOT a boundary
         // (no keyword prefix matches after abandoning the optional groups).
         assert!(!is_boundary("export Foo"), "bare ident, no keyword prefix");
-        assert!(!is_boundary("export Widget"), "bare ident, no keyword prefix");
+        assert!(
+            !is_boundary("export Widget"),
+            "bare ident, no keyword prefix"
+        );
     }
 
     #[test]
@@ -2235,12 +2472,16 @@ mod tests {
             "// context line",          // 4
             "// context line",          // 5
             "const view = makeView();", // 6
-            "export default OpsView;",   // 7 ← boundary (chunk so far = 6 >= MIN)
+            "export default OpsView;",  // 7 ← boundary (chunk so far = 6 >= MIN)
             "// trailing",              // 8
         ]
         .join("\n");
         let r = chunk_source(&src);
-        assert_eq!(r.len(), 2, "export default <Identifier> must start a new chunk");
+        assert_eq!(
+            r.len(),
+            2,
+            "export default <Identifier> must start a new chunk"
+        );
         assert_eq!((r[0].1, r[0].2), (1, 6));
         assert_eq!((r[1].1, r[1].2), (7, 8));
         assert!(r[1].0.contains("export default OpsView;"));
@@ -2284,7 +2525,10 @@ mod tests {
             multibyte_at_cap.chars().map(char::len_utf16).sum::<usize>(),
             MAX_FILE_BYTES
         );
-        assert!(multibyte_at_cap.len() > MAX_FILE_BYTES, "byte len exceeds cap");
+        assert!(
+            multibyte_at_cap.len() > MAX_FILE_BYTES,
+            "byte len exceeds cap"
+        );
         assert!(
             is_code_eligible("src/accents.ts", &multibyte_at_cap),
             "UTF-16-unit count at the cap must be eligible (parity with TS .length)"
@@ -2449,7 +2693,11 @@ mod tests {
 
         // A reindex whose 2nd insert fails must roll back ENTIRELY: neither the
         // prior-id deletes nor the partial inserts persist; the side row is intact.
-        let v2 = vec![chunk_id(rel, 1, 4), chunk_id(rel, 5, 10), chunk_id(rel, 11, 18)];
+        let v2 = vec![
+            chunk_id(rel, 1, 4),
+            chunk_id(rel, 5, 10),
+            chunk_id(rel, 11, 18),
+        ];
         let r = reindex_pair(&mut conn, rel, &v2, true);
         assert!(r.is_err(), "forced 2nd-statement failure must error");
 
@@ -2498,16 +2746,22 @@ mod tests {
             if let Some(json) = prior_json {
                 let prior: Vec<String> = serde_json::from_str(&json).unwrap();
                 for id in &prior {
-                    tx.execute("DELETE FROM vec_code WHERE id = ?1", params![id]).unwrap();
+                    tx.execute("DELETE FROM vec_code WHERE id = ?1", params![id])
+                        .unwrap();
                 }
             }
-            tx.execute("DELETE FROM vec_code_files WHERE path = ?1", params![rel]).unwrap();
+            tx.execute("DELETE FROM vec_code_files WHERE path = ?1", params![rel])
+                .unwrap();
             tx.commit().unwrap();
         }
 
         assert!(code_ids(&conn).is_empty(), "all tracked chunks deleted");
         let side_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM vec_code_files WHERE path = ?1", params![rel], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM vec_code_files WHERE path = ?1",
+                params![rel],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(side_count, 0, "side-table row dropped");
 
@@ -2534,7 +2788,7 @@ mod tests {
             "src/modified.ts".into(),    // mtime > indexed_at → stale
             "src/unstattable.ts".into(), // no mtime → stale (errs towards freshness)
             "src/new.ts".into(),         // untracked → stale
-            // "src/gone.ts" absent → deleted
+                                         // "src/gone.ts" absent → deleted
         ];
         let mtimes = |rel: &str| -> Option<i64> {
             match rel {
@@ -2578,12 +2832,16 @@ mod tests {
     #[test]
     fn partition_stale_truncated_listing_never_deletes() {
         use std::collections::HashMap;
-        let tracked: HashMap<String, i64> =
-            [("src/kept-by-cap-cut.ts".to_string(), 1_000i64)].into_iter().collect();
+        let tracked: HashMap<String, i64> = [("src/kept-by-cap-cut.ts".to_string(), 1_000i64)]
+            .into_iter()
+            .collect();
         // The tracked file is missing from the candidates because the listing
         // was CAPPED — with truncated=true it must NOT be reported as deleted.
         let r = partition_stale(&["src/other.ts".to_string()], &tracked, |_| Some(1), true);
-        assert!(r.deleted.is_empty(), "truncated listing proves nothing about absence");
+        assert!(
+            r.deleted.is_empty(),
+            "truncated listing proves nothing about absence"
+        );
         let r2 = partition_stale(&["src/other.ts".to_string()], &tracked, |_| Some(1), false);
         assert_eq!(r2.deleted, vec!["src/kept-by-cap-cut.ts".to_string()]);
     }
@@ -2601,7 +2859,10 @@ mod tests {
         reindex_pair(&mut conn, "src/b.ts", &b, false).unwrap();
         // …plus two ORPHAN chunks straight into vec_code (the pre-diff-era TS
         // full-walk shape: upserted without any side-table row).
-        for orphan in [chunk_id("src/a.ts", 1, 40), chunk_id("src/deleted.ts", 1, 8)] {
+        for orphan in [
+            chunk_id("src/a.ts", 1, 40),
+            chunk_id("src/deleted.ts", 1, 8),
+        ] {
             conn.execute(
                 "INSERT OR REPLACE INTO vec_code(id, embedding) VALUES (?1, ?2)",
                 params![orphan, vec![0u8, 1, 2, 3]],

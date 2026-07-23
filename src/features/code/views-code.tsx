@@ -2,6 +2,8 @@
 // Ported from views-code.jsx. CodeMirror moved to CodeMirrorEditor.tsx (ESM npm).
 
 import { useState, useEffect, useRef, useCallback } from "react";
+import { useNavigate } from "@tanstack/react-router";
+import { confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
 import { Icon } from "@/components/components";
 import { CodeMirrorEditor } from "./CodeMirrorEditor";
 import { Breadcrumbs } from "./Breadcrumbs";
@@ -10,15 +12,20 @@ import { LspStatusIndicator } from "./LspStatusIndicator";
 // Items d'activité partagés avec la statusbar globale (agents actifs,
 // génération chat, indexation) — même information dans l'éditeur qu'ailleurs.
 import { ShellStatusExtras } from "@/components/StatusBar";
-import { ConfirmDialog } from "@/components/trust";
 import { ShortcutsSettings, InterfaceSettings } from "@/features/settings/settings-extras";
 import { ShuguProfileView } from "@/features/settings/ShuguProfileView";
 import { CommandRulesSection } from "@/features/settings/CommandRulesSection";
+import {
+  AboutSettings,
+  GeneralSettings,
+  ImageSettings,
+  ModelSettings,
+  PrivacySettings,
+} from "@/features/settings/ProductSettings";
 import { ConnectionsView, ProfileView } from "@/features/panels/panels";
 // Lane OPÉRABILITÉ — Storage / Backup / Diagnostics centers (section « ops »).
 import { OpsView } from "@/features/ops/OpsView";
 import { db } from "@/lib/db";
-import { queryClient } from "@/lib/queryClient";
 import { reindexWorkspace } from "@/features/fs/workspaceIndexer";
 import { pushToast } from "@/components/toast";
 import { useShell } from "@/routes/shell-context";
@@ -31,8 +38,10 @@ import { GitDiffStats } from "@/features/git/components/GitDiffStats";
 import { DiffView as CompareDiffView } from "./DiffView";
 import { InlineEditWidget } from "./ai-edit/InlineEditWidget";
 import { useApplyRunner } from "./ai-edit/applyController";
-import { fallbackGradient, formatGenerationTime, imageDisplaySrc, copyText as copyImageText } from "@/features/image/imageAssets";
+import { fallbackGradient, formatGenerationTime, generationDisplaySrc, copyText as copyImageText } from "@/features/image/imageAssets";
 import { togglePinnedAsset, useStudioBrandBoard } from "@/features/studio/brandBoard";
+import { invoke } from "@/lib/tauri";
+import { queueMediaRetry } from "@/features/image/mediaRetry";
 
 // ─── Code view (editor + tabs + statusbar) ──────────────────
 export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, fileContents, setFileContents, editorViewRef, embedded }: any) {
@@ -241,7 +250,6 @@ export function CodeView({ activeFile, openFiles, setOpenFiles, setActiveFile, f
     </div>
   );
 }
-
 export function fileIcon(p: string) {
   if (p.endsWith(".ts") || p.endsWith(".tsx")) return "🔷";
   if (p.endsWith(".rs")) return "🦀";
@@ -341,47 +349,98 @@ export function DiffView({ original, modified }: { original: string; modified: s
 }
 
 // ─── Gallery view ───────────────────────────────────────────
-export function GalleryView({ generations }: any) {
+export function GalleryView({ generations, setGenerations }: any) {
   const brandBoard = useStudioBrandBoard();
+  const navigate = useNavigate();
+  const [busyAsset, setBusyAsset] = useState<string | null>(null);
   const copyPrompt = (prompt: string) => {
     copyImageText(prompt);
-    pushToast("Prompt image copie", "success", 2200);
+    pushToast("Prompt copié", "success", 2200);
   };
   const copyPath = (path?: string | null) => {
     copyImageText(path ?? "");
-    pushToast(path ? "Chemin image copie" : "Aucun fichier image", path ? "success" : "info", 2200);
+    pushToast(path ? "Chemin copié" : "Aucun fichier local", path ? "success" : "info", 2200);
+  };
+  const revealAsset = async (id: string) => {
+    setBusyAsset(id);
+    try {
+      await invoke("media_asset_reveal", { id });
+    } catch (error) {
+      pushToast(`Impossible de révéler le fichier : ${String(error)}`, "error", 5000);
+    } finally {
+      setBusyAsset(null);
+    }
+  };
+  const removeAsset = async (generation: any, pinned: boolean) => {
+    const id = String(generation.id);
+    const confirmed = await confirmDialog(
+      generation.resultUrl
+        ? "Supprimer cette création de la médiathèque et effacer son fichier local ?"
+        : "Supprimer cette création de la médiathèque ?",
+      { title: "Supprimer la création", kind: "warning" },
+    );
+    if (!confirmed) return;
+    setBusyAsset(id);
+    try {
+      await invoke("media_asset_delete", { id, deleteFile: true });
+      if (pinned) togglePinnedAsset(id);
+      setGenerations((items: any[]) => items.filter((item) => String(item.id) !== id));
+      pushToast("Création supprimée", "success", 2400);
+    } catch (error) {
+      pushToast(`Suppression impossible : ${String(error)}`, "error", 5000);
+    } finally {
+      setBusyAsset(null);
+    }
+  };
+  const retryAsset = (generation: any) => {
+    queueMediaRetry(generation);
+    void navigate({ to: "/image" });
   };
 
   return (
     <div className="gallery-shell scroll">
       <div className="gallery-head">
         <div>
-          <div style={{fontFamily:"var(--font-display)", fontSize:14, fontWeight:700}}>Image assets · {generations.length} generations</div>
-          <div style={{fontSize:12, color:"var(--on-surface-variant)", marginTop:4}}>Fichiers locaux, prompts, seeds et providers — la galerie devient la memoire creative.</div>
+          <div style={{fontFamily:"var(--font-display)", fontSize:14, fontWeight:700}}>Médiathèque · {generations.length} créations</div>
+          <div style={{fontSize:12, color:"var(--on-surface-variant)", marginTop:4}}>Images, vidéos et musiques réellement générées, persistées dans SQLite avec leur fichier local.</div>
         </div>
         <div style={{display:"flex", gap:6}}>
           <span className="chip">grid</span>
-          <span className="chip tertiary">{generations.filter((g: any) => g.resultUrl).length} files</span>
+          <span className="chip tertiary">{generations.filter((g: any) => g.resultUrl && g.status !== "missing").length} files</span>
         </div>
       </div>
       {generations.length === 0 ? (
         <div className="gallery-empty">
           <Icon name="gallery" size={30} />
-          <div>Aucune generation image pour le moment.</div>
-          <span>Les images produites dans l'atelier Image apparaitront ici avec leur prompt et leur fichier local.</span>
+          <div>Aucune création pour le moment.</div>
+          <span>Les médias produits dans le Studio apparaîtront ici avec leur prompt et leur fichier local.</span>
         </div>
       ) : (
         <div className="gallery-grid">
           {generations.map((g: any) => {
-            const src = imageDisplaySrc(g.resultUrl);
             const id = String(g.id);
+            const kind = g.kind ?? "image";
             const pinned = brandBoard.pinnedAssetIds.includes(id);
+            const missing = g.status === "missing";
+            const src = generationDisplaySrc(g);
+            const localPath = typeof g.resultUrl === "string" && (
+              /^[A-Za-z]:[\\/]/.test(g.resultUrl) || g.resultUrl.startsWith("/") || g.resultUrl.startsWith("\\\\")
+            );
             return (
               <div key={g.id} className="gallery-card" style={{ background: src ? undefined : fallbackGradient(g.hue ?? 250) }}>
-                {src ? <img className="img-real" src={src} alt={g.prompt} /> : <div className="img"></div>}
+                {kind === "image" && (src ? <img className="img-real" src={src} alt={g.prompt} /> : <div className="img"></div>)}
+                {kind === "video" && (src
+                  ? <video className="img-real" src={src} controls preload="metadata" style={{objectFit:"contain", background:"#050507"}} />
+                  : <div className="img-fallback-note">Fichier vidéo absent</div>)}
+                {kind === "music" && (
+                  <div style={{height:"100%", minHeight:190, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:14, padding:18}}>
+                    <Icon name="sparkle" size={30}/>
+                    {src ? <audio src={src} controls preload="metadata" style={{width:"100%"}}/> : <div className="img-fallback-note">Fichier audio absent</div>}
+                  </div>
+                )}
                 <div className="gallery-card-top">
                   <span>{g.model ?? "unknown"}</span>
-                  <span>{pinned ? "brand ref" : (g.status ?? (src ? "done" : "no file"))}</span>
+                  <span>{kind === "image" && pinned ? "brand ref" : `${kind} · ${missing ? "fichier manquant" : (g.status ?? (src ? "done" : "no file"))}`}</span>
                 </div>
                 <div className="meta">
                   <span style={{flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>{g.prompt}</span>
@@ -389,18 +448,33 @@ export function GalleryView({ generations }: any) {
                 </div>
                 <div className="gallery-actions">
                   <button className="lgb lgb-sm" onClick={() => copyPrompt(g.prompt)}><Icon name="copy" size={11}/> Prompt</button>
+                  <button className="lgb lgb-sm" onClick={() => retryAsset(g)}><Icon name="sparkle" size={11}/> Relancer</button>
                   <button className="lgb lgb-sm" onClick={() => copyPath(g.resultUrl)}><Icon name="download" size={11}/> Path</button>
                   <button
                     className="lgb lgb-sm"
-                    disabled={!g.resultUrl}
-                    onClick={() => {
-                      togglePinnedAsset(id);
-                      pushToast(pinned ? "Reference marque retiree" : "Reference marque ajoutee", "success", 2200);
-                    }}
-                  ><Icon name="image" size={11}/> {pinned ? "Unpin" : "Brand"}</button>
+                    disabled={!localPath || missing || busyAsset === id}
+                    onClick={() => void revealAsset(id)}
+                    title={missing ? "Le fichier local est manquant" : "Afficher dans l’explorateur"}
+                  ><Icon name="search" size={11}/> Révéler</button>
+                  <button
+                    className="lgb lgb-sm"
+                    disabled={busyAsset === id}
+                    onClick={() => void removeAsset(g, pinned)}
+                    style={{ color: "var(--danger)" }}
+                  ><Icon name="trash" size={11}/> Supprimer</button>
+                  {kind === "image" && (
+                    <button
+                      className="lgb lgb-sm"
+                      disabled={!g.resultUrl}
+                      onClick={() => {
+                        togglePinnedAsset(id);
+                        pushToast(pinned ? "Référence marque retirée" : "Référence marque ajoutée", "success", 2200);
+                      }}
+                    ><Icon name="image" size={11}/> {pinned ? "Unpin" : "Brand"}</button>
+                  )}
                 </div>
                 <div className="gallery-card-foot">
-                  <span>seed {g.seed ?? "auto"}</span>
+                  <span>{kind === "image" ? `seed ${g.seed ?? "auto"}` : (g.style ?? kind)}</span>
                   <span>{formatGenerationTime(g.ts)}</span>
                 </div>
               </div>
@@ -414,22 +488,22 @@ export function GalleryView({ generations }: any) {
 
 // ─── Settings view dispatcher ───────────────────────────────
 export function SettingsView({ section }: { section: string }) {
-  if (section === 'models') return <SettingsModels/>;
-  if (section === 'image') return <SettingsImage/>;
+  if (section === 'models') return <ModelSettings/>;
+  if (section === 'image') return <ImageSettings/>;
   if (section === 'editor') return <SettingsEditor/>;
   if (section === 'shortcuts') return <ShortcutsSettings/>;
   if (section === 'interface') return <InterfaceSettings/>;
   if (section === 'mascot') return <ShuguProfileView/>;
-  if (section === 'privacy') return <SettingsPrivacy/>;
+  if (section === 'privacy') return <PrivacySettings/>;
   if (section === 'command-rules') return <CommandRulesSection/>;
   if (section === 'ops') return <OpsView/>;
-  if (section === 'about') return <SettingsAbout/>;
+  if (section === 'about') return <AboutSettings/>;
   // Connections + Profile previously fell through to <SettingsGeneral/> here,
   // which is why the sidebar would highlight the entry but the panel showed
   // unrelated content. Each section now resolves to its actual component.
   if (section === 'connections') return <ConnectionsView/>;
   if (section === 'profile') return <ProfileView/>;
-  return <SettingsGeneral/>;
+  return <GeneralSettings/>;
 }
 
 export function SettingRow({ label, desc, children }: any) {
@@ -445,89 +519,15 @@ export function SettingRow({ label, desc, children }: any) {
 }
 
 export function Switch({ on, onChange }: { on: boolean; onChange: (v: boolean) => void }) {
-  return <div className="switch" data-on={on ? "true" : "false"} onClick={() => onChange(!on)}></div>;
-}
-
-export function SettingsGeneral() {
-  const [vals, setVals] = useState({ vsync: true, autosave: true, notifs: false, sounds: true });
-  const set = (k: string) => (v: boolean) => setVals((s: any) => ({ ...s, [k]: v }));
   return (
-    <div className="settings-shell scroll">
-      <div className="settings-inner">
-        <div className="setting-section">
-          <h3>General</h3>
-          <p className="sub">Comportement par défaut de l'application.</p>
-          <SettingRow label="Autosave" desc="Sauvegarde toutes les 30 secondes."><Switch on={vals.autosave} onChange={set("autosave")}/></SettingRow>
-          <SettingRow label="Vsync rendering" desc="Synchronise le rendu avec le refresh moniteur."><Switch on={vals.vsync} onChange={set("vsync")}/></SettingRow>
-          <SettingRow label="Notifications système" desc="Bannières OS pour les générations et erreurs."><Switch on={vals.notifs} onChange={set("notifs")}/></SettingRow>
-          <SettingRow label="Sons d'interface" desc="Pop discret sur réponse / fin de génération."><Switch on={vals.sounds} onChange={set("sounds")}/></SettingRow>
-        </div>
-        <div className="setting-section">
-          <h3>Apparence</h3>
-          <p className="sub">L'apparence vit dans le panneau Tweaks (en bas à droite).</p>
-          <SettingRow label="Thème" desc="Celestial Veil · dark uniquement.">
-            <span className="chip primary">veil-dark</span>
-          </SettingRow>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-export function SettingsModels() {
-  const [pick, setPick] = useState("shugu-haiku-4-5");
-  const models = [
-    { id: "shugu-haiku-4-5", name: "shugu-haiku-4-5", meta: "fast · 8k ctx · default" },
-    { id: "shugu-sonnet-5", name: "shugu-sonnet-5", meta: "balanced · 200k ctx" },
-    { id: "shugu-opus", name: "shugu-opus", meta: "deep · 200k ctx · slow" },
-    { id: "local-qwen", name: "local-qwen-32b", meta: "ollama · 32B · MIT" },
-  ];
-  return (
-    <div className="settings-shell scroll">
-      <div className="settings-inner">
-        <div className="setting-section">
-          <h3>Modèles · langage</h3>
-          <p className="sub">Choisis le modèle utilisé pour le chat et les agents.</p>
-          <div style={{display:"flex", flexDirection:"column", gap:8, marginTop:8}}>
-            {models.map(m => (
-              <div key={m.id} className={"model-card" + (m.id === pick ? " on" : "")} onClick={() => setPick(m.id)}>
-                <div className="mark">{m.id[0].toUpperCase()}</div>
-                <div style={{flex:1, minWidth:0}}>
-                  <div className="name">{m.name}</div>
-                  <div className="meta">{m.meta}</div>
-                </div>
-                <div className="check">✓</div>
-              </div>
-            ))}
-          </div>
-        </div>
-        <div className="setting-section">
-          <h3>Clés API</h3>
-          <p className="sub">Stockées chiffrées dans le keychain OS via Tauri.</p>
-          <SettingRow label="Anthropic API Key" desc="Pour les modèles shugu-*"><span className="chip success">connected</span></SettingRow>
-          <SettingRow label="Replicate" desc="Pour flux.1 et sdxl"><span className="chip success">connected</span></SettingRow>
-          <SettingRow label="Local Ollama" desc="http://localhost:11434"><span className="chip warn">offline</span></SettingRow>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-export function SettingsImage() {
-  const [vals, setVals] = useState({ nsfw: false, watermark: true, upscale: true });
-  const set = (k: string) => (v: boolean) => setVals((s: any) => ({ ...s, [k]: v }));
-  return (
-    <div className="settings-shell scroll">
-      <div className="settings-inner">
-        <div className="setting-section">
-          <h3>Image Generation</h3>
-          <p className="sub">Defaults pour les nouvelles générations.</p>
-          <SettingRow label="Auto-upscale × 2" desc="Lance un pass d'upscale après chaque génération."><Switch on={vals.upscale} onChange={set("upscale")}/></SettingRow>
-          <SettingRow label="Watermark caché" desc="Tag invisible C2PA dans le PNG (non-destructif)."><Switch on={vals.watermark} onChange={set("watermark")}/></SettingRow>
-          <SettingRow label="Filtres NSFW" desc="Désactiver = travail adulte. Reste local."><Switch on={vals.nsfw} onChange={set("nsfw")}/></SettingRow>
-        </div>
-      </div>
-    </div>
+    <button
+      type="button"
+      className="switch"
+      role="switch"
+      aria-checked={on}
+      data-on={on ? "true" : "false"}
+      onClick={() => onChange(!on)}
+    />
   );
 }
 
@@ -603,9 +603,6 @@ export function SettingsEditor() {
         <div className="setting-section">
           <h3>Editor</h3>
           <p className="sub">Comportement de l'éditeur de code. Les changements sont immédiats sans rechargement.</p>
-          <SettingRow label="Tab size" desc="Espaces ou tab — par fichier (à venir).">
-            <span className="chip">2 spaces</span>
-          </SettingRow>
           <SettingRow label="Word wrap" desc="Retour à la ligne automatique (Alt+Z). Désactive la minimap.">
             <Switch on={editorPrefs.wordWrap} onChange={(v) => setEditorPref("wordWrap", v)}/>
           </SettingRow>
@@ -639,73 +636,6 @@ export function SettingsEditor() {
           <AutoRagToggle/>
           {/* Suite Lot 4 — réindexation manuelle */}
           <ReindexCodeRow/>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-export function SettingsPrivacy() {
-  const [clearing, setClearing] = useState(false);
-  // Confirmation via ConfirmDialog (trust) — window.confirm remplacé : l'action
-  // la plus destructive de l'app mérite le modal danger uniforme.
-  const [confirmClear, setConfirmClear] = useState(false);
-
-  const handleClearAll = async () => {
-    setConfirmClear(false);
-    setClearing(true);
-    try {
-      await db.clearAll();
-      // Invalidate all TanStack queries so the UI reflects the empty state.
-      await queryClient.invalidateQueries();
-    } finally {
-      setClearing(false);
-    }
-  };
-
-  return (
-    <div className="settings-shell scroll">
-      <div className="settings-inner">
-        <div className="setting-section">
-          <h3>Privacy</h3>
-          <p className="sub">Shugu Forge ne transmet rien à un serveur tiers en dehors des appels API explicites.</p>
-          <SettingRow label="Telemetry" desc="Crash reports anonymes."><Switch on={false} onChange={() => {}}/></SettingRow>
-          <SettingRow label="Conversation history" desc="Stockée localement, chiffrée au repos."><span className="chip success">local · AES-256</span></SettingRow>
-          <SettingRow label="Effacer toutes les données" desc="Conversations, générations, projets, caches.">
-            <button
-              className="lgb"
-              style={{color:"var(--danger)", borderColor:"rgba(255,106,138,0.4)"}}
-              disabled={clearing}
-              onClick={() => setConfirmClear(true)}
-            >
-              {clearing ? "Effacement…" : "Effacer"}
-            </button>
-          </SettingRow>
-        </div>
-      </div>
-      <ConfirmDialog
-        open={confirmClear}
-        title="Effacer TOUTES les données ?"
-        body={<>Conversations, messages, projets, générations, jobs, logs et agents seront supprimés <b>définitivement</b>. Vos paramètres (clés API, préférences) seront conservés.</>}
-        confirmLabel="Tout effacer"
-        tone="danger"
-        onCancel={() => setConfirmClear(false)}
-        onConfirm={() => void handleClearAll()}
-      />
-    </div>
-  );
-}
-
-export function SettingsAbout() {
-  return (
-    <div className="settings-shell scroll">
-      <div className="settings-inner">
-        <div className="setting-section">
-          <h3>About</h3>
-          <p className="sub">Shugu Forge · build de référence.</p>
-          <SettingRow label="Version" desc="Tauri 2.1.1 · React 18.3 · CodeMirror 6.26"><span className="chip primary">0.4.0 · veil</span></SettingRow>
-          <SettingRow label="Plateforme" desc="macOS 14 · arm64"><span className="chip">darwin-arm64</span></SettingRow>
-          <SettingRow label="Repo" desc="Asurelia/Shugu_stream"><span className="kbd">github →</span></SettingRow>
         </div>
       </div>
     </div>

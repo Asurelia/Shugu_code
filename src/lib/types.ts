@@ -65,6 +65,7 @@ export interface Conversation {
 
 export interface Generation {
   id: number | string;
+  kind?: "image" | "video" | "music";
   prompt: string;
   negative?: string | null;
   ratio: string;

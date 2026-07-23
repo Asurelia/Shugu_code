@@ -67,7 +67,6 @@ export function parseVerdict(text: string): Verdict {
   // Normalise: lower-case, strip accents (NFD decomposition).
   const norm = text
     .normalize("NFD")
-    // eslint-disable-next-line no-control-regex
     .replace(/[̀-ͯ]/g, "")
     .toLowerCase();
 

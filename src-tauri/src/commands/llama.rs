@@ -99,7 +99,10 @@ fn vulkan_available() -> bool {
         // initialization state for the whole process.
         use std::ffi::OsStr;
         use std::os::windows::ffi::OsStrExt;
-        let wide: Vec<u16> = OsStr::new("vulkan-1.dll").encode_wide().chain(std::iter::once(0)).collect();
+        let wide: Vec<u16> = OsStr::new("vulkan-1.dll")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
         unsafe {
             #[link(name = "kernel32")]
             extern "system" {
@@ -125,11 +128,49 @@ fn vulkan_available() -> bool {
 
 fn pick_backend(user_override: Option<&str>) -> Backend {
     match user_override {
-        Some("cpu")     => Backend::Cpu,
-        Some("vulkan")  => Backend::Vulkan,
+        Some("cpu") => Backend::Cpu,
+        Some("vulkan") => Backend::Vulkan,
         Some("auto") | None | Some(_) => {
-            if vulkan_available() { Backend::Vulkan } else { Backend::Cpu }
+            if vulkan_available() {
+                Backend::Vulkan
+            } else {
+                Backend::Cpu
+            }
         }
+    }
+}
+
+/// llama.cpp only accepts built-in template names here. Keeping a closed list
+/// avoids accidentally treating an arbitrary user string as Jinja source while
+/// still covering the families exposed by Shugu's model picker. `None` means
+/// "trust the template embedded in the GGUF".
+fn validate_chat_template(value: Option<&str>) -> Result<Option<String>, String> {
+    const BUILT_INS: &[&str] = &[
+        "chatml",
+        "command-r",
+        "deepseek",
+        "gemma",
+        "gpt-oss",
+        "granite",
+        "llama3",
+        "mistral-v1",
+        "mistral-v3",
+        "mistral-v3-tekken",
+        "mistral-v7",
+        "mistral-v7-tekken",
+        "phi3",
+        "phi4",
+    ];
+    let Some(trimmed) = value.map(str::trim).filter(|item| !item.is_empty()) else {
+        return Ok(None);
+    };
+    if BUILT_INS.contains(&trimmed) {
+        Ok(Some(trimmed.to_string()))
+    } else {
+        Err(format!(
+            "unsupported llama.cpp chat template `{trimmed}`; allowed built-ins: {}",
+            BUILT_INS.join(", ")
+        ))
     }
 }
 
@@ -255,7 +296,12 @@ fn ensure_sidecar_dlls(sidecar: &std::path::Path, app: &tauri::AppHandle, backen
     //      fetch script) still boots.
     let mut sources: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(res) = app.path().resource_dir() {
-        sources.push(res.join("_up_").join("binaries").join(variant).join("runtime"));
+        sources.push(
+            res.join("_up_")
+                .join("binaries")
+                .join(variant)
+                .join("runtime"),
+        );
         sources.push(res.join("binaries").join(variant).join("runtime"));
         // Legacy
         sources.push(res.join("_up_").join("binaries").join("runtime"));
@@ -279,9 +325,7 @@ fn ensure_sidecar_dlls(sidecar: &std::path::Path, app: &tauri::AppHandle, backen
     let runtime_dir = match sources.into_iter().find(|p| p.is_dir()) {
         Some(d) => d,
         None => {
-            eprintln!(
-                "[sidecar] no runtime DLL source dir found; sidecar may fail to start"
-            );
+            eprintln!("[sidecar] no runtime DLL source dir found; sidecar may fail to start");
             return;
         }
     };
@@ -406,6 +450,7 @@ async fn do_start(
     port: Option<u16>,
     backend_override: Option<String>,
     n_gpu_layers: Option<i32>,
+    chat_template: Option<String>,
 ) -> Result<LlamaStatus, String> {
     // Drop any existing child first. We do this BEFORE resolving the new
     // binary so a bad new path doesn't leave us with a dangling running
@@ -447,11 +492,12 @@ async fn do_start(
     // On the CPU path it stays at 0 — the flag is still passed because that
     // makes the picture deterministic across both binaries.
     let ngl = match (backend, n_gpu_layers) {
-        (Backend::Vulkan, None)        => 99,
-        (Backend::Cpu, None)           => 0,
-        (_, Some(n)) if n < 0          => 0,
-        (_, Some(n))                   => n,
+        (Backend::Vulkan, None) => 99,
+        (Backend::Cpu, None) => 0,
+        (_, Some(n)) if n < 0 => 0,
+        (_, Some(n)) => n,
     };
+    let chat_template = validate_chat_template(chat_template.as_deref())?;
 
     // Resolve which model the user wants. Local path wins over hf_model
     // when both are provided — the local file is already on disk, so
@@ -469,9 +515,7 @@ async fn do_start(
         (Some(p), _) => ("-m", p),
         (None, Some(h)) => ("-hf", h),
         (None, None) => {
-            return Err(
-                "either modelPath or hfModel must be provided (got neither)".into(),
-            )
+            return Err("either modelPath or hfModel must be provided (got neither)".into())
         }
     };
 
@@ -525,6 +569,12 @@ async fn do_start(
     //   We deliberately do NOT pass `--chat-template <preset>` — it
     //      breaks any GGUF that embeds its own template (Gemma 4 was the
     //      regression that proved this). Always trust the file's template.
+    //
+    //   `--jinja` — enables llama.cpp's tool-aware chat parser. Recent builds
+    //      currently report Jinja as enabled by default, but upstream's
+    //      function-calling contract still requires this flag and older/bundled
+    //      builds do not all share that default. Passing it explicitly is
+    //      harmless for plain chat and prevents tools from degrading into prose.
     // `--reasoning-format deepseek` is explicit even though `auto` (default)
     // detects it correctly for Qwen 3.5 / DeepSeek-R1 / Llama-3.3-Reasoning.
     // Being explicit means the OpenAI-compat stream's `delta.reasoning_content`
@@ -533,30 +583,37 @@ async fn do_start(
     // it on `auto` and a future template variant slipped through with the
     // legacy in-content format, the UI would silently fall back to the old
     // "pavé" behaviour where reasoning isn't visually separated.
+    let mut args = vec![
+        model_flag.to_string(),
+        model_value,
+        "-c".to_string(),
+        ctx_str,
+        "-ngl".to_string(),
+        ngl_str,
+        "-fit".to_string(),
+        "off".to_string(),
+        "--parallel".to_string(),
+        "1".to_string(),
+        "--cache-ram".to_string(),
+        "0".to_string(),
+        "--mlock".to_string(),
+        "--jinja".to_string(),
+        "--reasoning-format".to_string(),
+        "deepseek".to_string(),
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
+        port_str,
+    ];
+    if let Some(template) = chat_template {
+        args.push("--chat-template".to_string());
+        args.push(template);
+    }
+
     let (mut rx, child) = app
         .shell()
         .command(&bin_display)
-        .args([
-            model_flag,
-            &model_value,
-            "-c",
-            &ctx_str,
-            "-ngl",
-            &ngl_str,
-            "-fit",
-            "off",
-            "--parallel",
-            "1",
-            "--cache-ram",
-            "0",
-            "--mlock",
-            "--reasoning-format",
-            "deepseek",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port_str,
-        ])
+        .args(args)
         .spawn()
         .map_err(|e| format!("failed to spawn llama-server: {e}"))?;
 
@@ -639,6 +696,7 @@ pub async fn llama_start(
     port: Option<u16>,
     backend: Option<String>,
     n_gpu_layers: Option<i32>,
+    chat_template: Option<String>,
 ) -> Result<LlamaStatus, String> {
     // State<'_> is kept in the signature purely so the frontend's existing
     // invoke shape stays compatible (Tauri's command resolver doesn't mind
@@ -647,7 +705,18 @@ pub async fn llama_start(
     //
     // `backend` accepts "auto" (default — Vulkan when available, else CPU),
     // "cpu", or "vulkan". Anything else is treated as "auto".
-    do_start(app, binary, hf_model, model_path, ctx, port, backend, n_gpu_layers).await
+    do_start(
+        app,
+        binary,
+        hf_model,
+        model_path,
+        ctx,
+        port,
+        backend,
+        n_gpu_layers,
+        chat_template,
+    )
+    .await
 }
 
 /// Boot-time helper: if the default bundle model is installed on disk,
@@ -678,18 +747,26 @@ pub async fn llama_autostart(app: tauri::AppHandle) -> Result<LlamaStatus, Strin
     // Nothing owned — does an external server hold the port? If yes, leave
     // it alone (the user may have started one manually).
     if probe_llama_endpoint().await {
-        return Ok(LlamaStatus { running: true, pid: None, binary: None });
+        return Ok(LlamaStatus {
+            running: true,
+            pid: None,
+            binary: None,
+        });
     }
 
     // No server anywhere AND the default bundle is installed → fire it up.
     if !crate::commands::model_bundle::default_model_installed(&app) {
-        return Ok(LlamaStatus { running: false, pid: None, binary: None });
+        return Ok(LlamaStatus {
+            running: false,
+            pid: None,
+            binary: None,
+        });
     }
     let path = crate::commands::model_bundle::default_model_path(&app)
         .map(|p| p.to_string_lossy().into_owned())
         .ok_or_else(|| "no default bundle model path".to_string())?;
 
-    do_start(app, None, None, Some(path), None, None, None, None).await
+    do_start(app, None, None, Some(path), None, None, None, None, None).await
 }
 
 /// Cheap "what would `llama_start` pick on this box?" probe — returns the
@@ -719,7 +796,11 @@ pub fn llama_stop(state: State<'_, LlamaServerState>) -> Result<LlamaStatus, Str
     if let Some(child) = guard.take() {
         let _ = child.kill();
     }
-    Ok(LlamaStatus { running: false, pid: None, binary: None })
+    Ok(LlamaStatus {
+        running: false,
+        pid: None,
+        binary: None,
+    })
 }
 
 /// Hard-kill ALL `llama-server.exe` processes on the system (Windows-only).
@@ -764,7 +845,11 @@ pub async fn llama_force_stop_external(app: tauri::AppHandle) -> Result<LlamaSta
     // reflects reality immediately instead of waiting for the next 2s poll.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let still_running = probe_llama_endpoint().await;
-    Ok(LlamaStatus { running: still_running, pid: None, binary: None })
+    Ok(LlamaStatus {
+        running: still_running,
+        pid: None,
+        binary: None,
+    })
 }
 
 /// Snapshot current llama-server status. Two-tier detection:
@@ -798,11 +883,19 @@ pub async fn llama_status(state: State<'_, LlamaServerState>) -> Result<LlamaSta
     };
 
     if let Some(pid) = owned_pid {
-        return Ok(LlamaStatus { running: true, pid: Some(pid), binary: None });
+        return Ok(LlamaStatus {
+            running: true,
+            pid: Some(pid),
+            binary: None,
+        });
     }
 
     let detached_running = probe_llama_endpoint().await;
-    Ok(LlamaStatus { running: detached_running, pid: None, binary: None })
+    Ok(LlamaStatus {
+        running: detached_running,
+        pid: None,
+        binary: None,
+    })
 }
 
 /// Best-effort GET against the standard llama-server endpoint. Returns true
@@ -828,5 +921,22 @@ async fn probe_llama_endpoint_on_port(port: u16) -> bool {
     match client.get(&url).send().await {
         Ok(r) => r.status().is_success(),
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_chat_template;
+
+    #[test]
+    fn chat_template_override_is_closed_and_optional() {
+        assert_eq!(validate_chat_template(None).unwrap(), None);
+        assert_eq!(validate_chat_template(Some("   ")).unwrap(), None);
+        assert_eq!(
+            validate_chat_template(Some(" mistral-v3-tekken ")).unwrap(),
+            Some("mistral-v3-tekken".to_string())
+        );
+        assert!(validate_chat_template(Some("../../template.jinja")).is_err());
+        assert!(validate_chat_template(Some("{{ arbitrary_jinja }}")).is_err());
     }
 }

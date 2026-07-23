@@ -57,6 +57,23 @@ interface ResolvedProvider {
   model: string;
 }
 
+function profileSummary(row: AgentRow): string {
+  return row.profileVerified ? row.executionProfile : "profil historique non vérifié";
+}
+
+function isolationSummary(row: AgentRow): string {
+  switch (row.isolationStatus) {
+    case "pending": return "isolation demandée";
+    case "active": return "worktree actif";
+    case "failed": return "isolation échouée";
+    case "review": return "worktree à relire";
+    case "finalized": return "isolation finalisée";
+    case "discarded": return "worktree jeté";
+    case "unknown": return "isolation historique inconnue";
+    default: return "checkout courant";
+  }
+}
+
 // Throws Error("Aucun provider…") when no provider is enabled — both launchers
 // already have a try/catch that surfaces err.message, so the error path stays
 // uniform without a discriminated-union return (which `strict:false` narrows
@@ -209,6 +226,12 @@ function AgentRowItem({
       <StatusBadge status={row.status} />
       <span style={{ fontSize: 11, fontWeight: 600 }}>{row.role}</span>
       <span
+        title={`${profileSummary(row)} · ${isolationSummary(row)}`}
+        style={{ fontSize: 9, color: "var(--on-surface-muted)", fontFamily: "var(--font-mono)" }}
+      >
+        {profileSummary(row)}{row.isolate ? ` · ${isolationSummary(row)}` : ""}
+      </span>
+      <span
         style={{
           flex: 1,
           fontSize: 11,
@@ -354,6 +377,18 @@ export function TranscriptDrawer({
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <StatusBadge status={row.status} />
         <span style={{ fontSize: 12, fontWeight: 600 }}>{row.role}</span>
+        <span
+          style={{
+            fontSize: 9,
+            padding: "2px 6px",
+            borderRadius: 999,
+            fontFamily: "var(--font-mono)",
+            color: row.profileVerified && row.executionProfile === "fullAccess" ? "var(--danger, #ff6a8a)" : "var(--tertiary, #81ecff)",
+            border: "1px solid currentColor",
+          }}
+        >
+          {profileSummary(row)} · {isolationSummary(row)}
+        </span>
         <span
           style={{
             flex: 1,
@@ -664,15 +699,13 @@ export function TranscriptDrawer({
         </div>
       )}
 
-      {/* Grounded — exec directe sur le vrai projet : les modifications sont
-          visibles et annulables dans l'onglet Git (le watcher le rafraîchit
-          en live), plus de diff/patch dédié ici. */}
+      {/* Grounded — la frontière affichée vient de la row persistée V20. */}
       {row.role === "grounded" && hasExecRuns && (
         <div style={sectionStyle}>
           <div style={{ fontSize: 10.5, color: "var(--on-surface-muted)", lineHeight: 1.5 }}>
-            🌱 Cet agent travaille directement sur ton projet — suis ses modifications
-            dans l'onglet <b>Git</b>, où tu peux les examiner et les annuler fichier
-            par fichier.
+            {row.isolate
+              ? "🌱 Cet agent travaille dans un worktree Git isolé. Examine puis merge ou jette ses changements ci-dessous."
+              : "🌱 Cet agent travaille sur le checkout courant. Suis et annule ses modifications dans l’onglet Git."}
           </div>
         </div>
       )}
@@ -683,8 +716,8 @@ export function TranscriptDrawer({
 // ────────────────────────────────────────────────────────────────────
 // Isolation worktree (Phase 7 #4) — statut du run isolé + actions.
 //
-// L'isolation devient le défaut en mode Agent : le run tourne dans un worktree
-// git sur sa propre branche, et le merge n'est PLUS automatique. Cette section
+// Quand l'isolation est demandée, le run tourne dans un worktree git sur sa
+// propre branche et le merge n'est pas automatique. Cette section
 // est l'endroit où l'utilisateur RELIT le diff puis décide :
 //   • « Merger » → worktree_merge_back(branch) ;
 //   • « Jeter »  → worktree_discard(branch) (derrière une confirmation, c'est
@@ -715,8 +748,7 @@ function WorktreeIsolationSection({
   // Rien d'isolé pour ce run (cas in-place classique) → on ne rend rien.
   if (!started && !finalized && !skipped) return null;
 
-  // Pas d'espace isolé pour ce run → info d'état honnête (l'agent travaille
-  // quand même, directement sur les fichiers) : habillage neutre, pas une alerte.
+  // Une isolation demandée qui échoue arrête désormais le run (fail-closed).
   if (skipped) {
     return (
       <div
@@ -734,7 +766,7 @@ function WorktreeIsolationSection({
             color: "var(--info, #60a5fa)",
           }}
         >
-          ℹ L'agent travaille directement dans tes fichiers — pas de copie isolée pour ce run ({skipped.reason})
+          ⛔ Run arrêté avant toute mutation : l’isolation demandée n’a pas pu être créée ({skipped.reason})
         </div>
       </div>
     );

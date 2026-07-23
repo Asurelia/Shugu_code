@@ -79,7 +79,9 @@ impl TaskGraph {
                 continue;
             }
             let status = TaskStatus::parse(
-                item.get("status").and_then(Value::as_str).unwrap_or("pending"),
+                item.get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("pending"),
             );
             let id = item
                 .get("id")

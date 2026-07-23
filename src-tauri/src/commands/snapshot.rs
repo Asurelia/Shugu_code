@@ -83,13 +83,11 @@ fn validate_turn_id(id: &str) -> Result<(), String> {
     if id.len() > 200 {
         return Err("turn id too long".to_string());
     }
-    let ok = id.chars().all(|c| {
-        c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
-    });
+    let ok = id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
     if !ok {
-        return Err(
-            "turn id must be alphanumeric with '-', '_' or '.' only".to_string(),
-        );
+        return Err("turn id must be alphanumeric with '-', '_' or '.' only".to_string());
     }
     if id.starts_with('.') || id.ends_with('.') || id.contains("..") {
         return Err("turn id has invalid dot placement".to_string());
@@ -106,11 +104,7 @@ fn ref_for(id: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Run `git <args>` in `cwd` with optional extra env, returning trimmed stdout.
-async fn run_git_env(
-    cwd: &Path,
-    args: &[&str],
-    env: &[(&str, &str)],
-) -> Result<String, String> {
+async fn run_git_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String, String> {
     let mut cmd = TokioCommand::new("git");
     cmd.args(args)
         .current_dir(cwd)
@@ -244,11 +238,7 @@ async fn list_inner(root: &Path) -> Result<Vec<Snapshot>, String> {
     // `for-each-ref` prints one line per matching ref. %(refname) %(objectname)
     // and the commit's tree/parent via dereference.
     let fmt = "%(refname)\t%(objectname)\t%(creatordate:unix)";
-    let out = run_git(
-        root,
-        &["for-each-ref", "--format", fmt, "refs/shugu/turn/"],
-    )
-    .await?;
+    let out = run_git(root, &["for-each-ref", "--format", fmt, "refs/shugu/turn/"]).await?;
 
     let mut snaps = Vec::new();
     for line in out.lines() {
@@ -296,9 +286,12 @@ async fn revert_inner(root: &Path, turn_id: &str) -> Result<Snapshot, String> {
     let ref_name = ref_for(turn_id);
 
     // Resolve the snapshot — error clearly if it does not exist.
-    let oid = run_git(root, &["rev-parse", "--verify", &format!("{ref_name}^{{commit}}")])
-        .await
-        .map_err(|_| format!("snapshot not found: {turn_id}"))?;
+    let oid = run_git(
+        root,
+        &["rev-parse", "--verify", &format!("{ref_name}^{{commit}}")],
+    )
+    .await
+    .map_err(|_| format!("snapshot not found: {turn_id}"))?;
     let tree = run_git(root, &["rev-parse", &format!("{oid}^{{tree}}")]).await?;
     let parent = run_git(root, &["rev-parse", "--verify", &format!("{oid}^")])
         .await
@@ -332,11 +325,7 @@ async fn revert_inner(root: &Path, turn_id: &str) -> Result<Snapshot, String> {
     // tracked-or-untracked file under the repo root that is NOT in it. We use
     // `git ls-files --others --exclude-standard` to find untracked leftovers
     // (files created since the checkpoint that the snapshot never had).
-    let leftovers = run_git(
-        root,
-        &["ls-files", "--others", "--exclude-standard"],
-    )
-    .await?;
+    let leftovers = run_git(root, &["ls-files", "--others", "--exclude-standard"]).await?;
     for rel in leftovers.lines() {
         let rel = rel.trim();
         if rel.is_empty() {
@@ -346,14 +335,11 @@ async fn revert_inner(root: &Path, turn_id: &str) -> Result<Snapshot, String> {
         let _ = std::fs::remove_file(&p);
     }
 
-    let created_at = run_git(
-        root,
-        &["log", "-1", "--format=%ct", &oid],
-    )
-    .await
-    .ok()
-    .and_then(|s| s.trim().parse::<i64>().ok())
-    .unwrap_or_else(now_unix);
+    let created_at = run_git(root, &["log", "-1", "--format=%ct", &oid])
+        .await
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or_else(now_unix);
 
     Ok(Snapshot {
         turn_id: turn_id.to_string(),
@@ -395,10 +381,7 @@ pub async fn shugu_snapshot_checkpoint(
 
 /// Restore the working tree to the checkpoint stored for `turnId`.
 #[command(rename_all = "camelCase")]
-pub async fn shugu_snapshot_revert(
-    app: AppHandle,
-    turn_id: String,
-) -> Result<Snapshot, String> {
+pub async fn shugu_snapshot_revert(app: AppHandle, turn_id: String) -> Result<Snapshot, String> {
     let root = workspace_root_required(&app)?;
     revert_inner(&root, &turn_id).await
 }
@@ -427,10 +410,8 @@ mod tests {
     use std::process::Command as StdCommand;
 
     fn make_temp_dir(suffix: &str) -> PathBuf {
-        let base = std::env::temp_dir().join(format!(
-            "shugu_snap_test_{suffix}_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("shugu_snap_test_{suffix}_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).expect("create temp dir");
         let canon = std::fs::canonicalize(&base).expect("canonicalize temp dir");
         strip_extended_prefix(canon)

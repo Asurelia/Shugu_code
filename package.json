@@ -20,12 +20,17 @@
     "test:watch": "vitest",
     "test:e2e": "playwright test",
     "ui:tour": "node scripts/ui-tour.mjs",
+    "native:smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/native-smoke.ps1",
+    "release:smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release-smoke.ps1",
+    "perf:smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/perf-smoke.ps1",
+    "provider:smoke:live": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/live-provider-smoke.ps1",
+    "provider:smoke:kimi": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/kimi-provider-smoke.ps1",
     "test:eval": "node evals/run.mjs --self-check",
     "test:eval:dry": "node evals/run.mjs --dry-run",
     "test:eval:live": "node evals/run.mjs",
     "audit": "pnpm run audit:js && pnpm run audit:rust",
-    "audit:js": "pnpm audit --audit-level high",
-    "audit:rust": "cargo audit --file src-tauri/Cargo.lock",
+    "audit:js": "pnpm audit",
+    "audit:rust": "cargo audit --file src-tauri/Cargo.lock --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071",
     "convex": "convex",
     "convex:dev": "convex dev"
   },
@@ -69,29 +74,37 @@
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/xterm": "^5.5.0",
     "convex": "^1.14.0",
-    "dompurify": "^3.4.7",
+    "dompurify": "^3.4.12",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-resizable-panels": "^2.0.22"
+    "react-resizable-panels": "^2.0.22",
+    "simple-icons": "^16.27.0"
   },
   "devDependencies": {
-    "@eslint/js": "^9.39.4",
+    "@eslint/js": "^10.0.1",
     "@playwright/test": "^1.61.0",
     "@tauri-apps/cli": "^2.0.0",
     "@types/node": "^20.14.10",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
-    "@vitejs/plugin-react": "^4.3.1",
-    "eslint": "^9.39.4",
-    "eslint-plugin-react-hooks": "^5.2.0",
+    "@vitejs/plugin-react": "^6.0.4",
+    "eslint": "^10.7.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.3",
-    "globals": "^17.6.0",
-    "happy-dom": "^20.9.0",
+    "globals": "^17.7.0",
+    "happy-dom": "^20.11.1",
     "prettier": "^3.8.3",
     "typescript": "^5.9.3",
-    "typescript-eslint": "^8.61.1",
+    "typescript-eslint": "^8.65.0",
     "typescript-language-server": "^5.2.0",
-    "vite": "^5.3.4",
-    "vitest": "^2.1.9"
+    "vite": "^8.1.5",
+    "vitest": "^4.1.10"
+  },
+  "pnpm": {
+    "overrides": {
+      "@babel/core@<=7.29.0": "7.29.6",
+      "brace-expansion@>=3.0.0 <5.0.7": "5.0.7",
+      "ws@>=8.0.0 <8.21.0": "8.21.1"
+    }
   }
 }

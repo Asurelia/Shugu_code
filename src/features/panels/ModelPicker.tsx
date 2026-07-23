@@ -1,29 +1,29 @@
-// Shugu Forge — ModelPicker popover.
+// Shugu Forge — compact provider-aware model selector.
 //
-// Used by both:
-//   - the mascot's FloatChat footer (className="float-foot-model")
-//   - the main IDE composer in ChatView   (className="composer-model")
-// Pass `className` so the trigger button inherits the right look-and-feel
-// from each context's stylesheet. Default keeps the original FloatChat skin.
+// The picker is shared by the main composer, the mascot and product settings.
+// It deliberately exposes product language (provider, friendly model name,
+// capabilities) rather than storage ids or backend diagnostics.
 
-import { useState, useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "@tanstack/react-router";
 import { Icon } from "@/components/components";
+import { ProviderMark } from "@/components/ProviderMark";
 import { useDiscoveredModels } from "@/lib/modelDiscovery";
 import { useActiveCodexEffort } from "@/features/chat/chat-sync";
 import { codexModels, type CodexModel } from "@/lib/codex";
 import { useModelCapabilities } from "@/lib/modelCapabilities";
+import "./model-picker.css";
 
-// Mirrors the labels used in ConnectionsView's card catalog. Local copy here
-// so ModelPicker can label provider groups even when discovery reports only
-// an error (no model row available to read the label from).
 const PROVIDER_LABELS_DISPLAY: Record<string, string> = {
   anthropic: "Anthropic",
-  openai:    "OpenAI",
-  ollama:    "Ollama",
-  llamacpp:  "llama.cpp",
-  mistral:   "Mistral",
-  groq:      "Groq",
-  minimax:   "MiniMax",
+  openai: "OpenAI",
+  ollama: "Ollama",
+  llamacpp: "llama.cpp",
+  mistral: "Mistral",
+  groq: "Groq",
+  minimax: "MiniMax",
+  codex: "OpenAI Codex",
+  kimi: "Kimi",
 };
 
 export interface ModelPickerProps {
@@ -32,36 +32,77 @@ export interface ModelPickerProps {
   className?: string;
 }
 
-// Petit badge de capacité affiché sur les modèles « Small » (toolset réduit /
-// sans outils). Source de vérité = commande Rust `model_capabilities` (via le
-// hook). Silencieux pour les modèles forts et hors-Tauri (mock web/dev).
-function CapBadge({ modelId }: { modelId: string }) {
-  const caps = useModelCapabilities(modelId);
-  if (!caps || caps.tier !== "small") return null;
-  const ctxK = Math.max(1, Math.round(caps.contextWindow / 1000));
-  return (
-    <span
-      className="meta"
-      title={`Petit modèle — ${caps.supportsTools ? "toolset réduit" : "outils désactivés"}, contexte ~${ctxK}k`}
-      style={{ color: "var(--tertiary, #b48ead)", fontSize: 9 }}
-    >
-      {caps.supportsTools ? "petit · outils réduits" : "petit · sans outils"}
-    </span>
-  );
+function friendlyModelName(value: string): string {
+  const raw = value.split("/").pop()?.trim() || value.trim();
+  if (!raw) return "Choisir un modèle";
+  if (raw.toLowerCase() === "k3") return "K3";
+  return raw
+    .replace(/^kimi-for-coding[-_]?/i, "Kimi Coding ")
+    .replace(/[-_]+/g, " ")
+    .replace(/\b(highspeed|turbo)\b/gi, (match) => `· ${match}`)
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-export function ModelPicker({ model, onChange, className = "float-foot-model" }: ModelPickerProps) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLSpanElement | null>(null);
-  // Real, live model discovery. No more hardcoded fake lists. Models appear
-  // ONLY for providers the user has actually configured AND that respond to
-  // their list-models endpoint. Errors per provider surface as a small line
-  // under the group header so the user can debug (wrong key, server down, etc.).
-  const { data: discovered, errors, unconfigured, isLoading, refresh } = useDiscoveredModels();
+function friendlyProviderName(providerId: string, discoveredLabel?: string): string {
+  if (discoveredLabel && !discoveredLabel.startsWith("custom-")) return discoveredLabel;
+  return PROVIDER_LABELS_DISPLAY[providerId] ?? "Provider personnalisé";
+}
 
-  // Codex reasoning-effort selector — only shown when a `codex/*` model is the
-  // active one. The supported efforts come from the same `model/list` the picker
-  // already surfaces (loaded lazily when the popover opens on a codex model).
+function diagnosticLabel(message: string): string {
+  const normalized = message.toLowerCase();
+  if (
+    normalized.includes("private") ||
+    normalized.includes("loopback") ||
+    normalized.includes("localhost") ||
+    normalized.includes("connection refused") ||
+    normalized.includes("connect")
+  ) {
+    return "Serveur local indisponible ou non autorisé";
+  }
+  if (normalized.includes("401") || normalized.includes("403") || normalized.includes("auth")) {
+    return "Authentification à vérifier";
+  }
+  if (normalized.includes("timeout") || normalized.includes("timed out")) {
+    return "Le provider met trop de temps à répondre";
+  }
+  return "Connexion à vérifier";
+}
+
+function CapBadge({ modelId }: { modelId: string }) {
+  const caps = useModelCapabilities(modelId);
+  if (!caps) return null;
+  if (caps.agentLoop === "chatOnly") {
+    return (
+      <span className="model-cap model-cap-chat" title="Ce modèle ne pilote pas les outils Shugu">
+        Chat
+      </span>
+    );
+  }
+  if (caps.tier === "small") {
+    return (
+      <span
+        className="model-cap model-cap-small"
+        title={caps.supportsTools ? "Petit modèle, outils réduits" : "Petit modèle sans outils"}
+      >
+        Léger
+      </span>
+    );
+  }
+  return <span className="model-cap model-cap-agent">Agent</span>;
+}
+
+export function ModelPicker({
+  model,
+  onChange,
+  className = "float-foot-model",
+}: ModelPickerProps) {
+  const navigate = useNavigate();
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const ref = useRef<HTMLSpanElement | null>(null);
+  const { data: discovered, errors, isLoading, refresh } = useDiscoveredModels();
+
   const isCodex = model.startsWith("codex/");
   const [effort, setEffort] = useActiveCodexEffort();
   const [codexList, setCodexList] = useState<CodexModel[]>([]);
@@ -69,121 +110,245 @@ export function ModelPicker({ model, onChange, className = "float-foot-model" }:
     if (!open || !isCodex) return;
     let cancelled = false;
     void codexModels()
-      .then((ms) => { if (!cancelled) setCodexList(ms); })
-      .catch(() => { /* app-server briefly unreachable — keep the fallback efforts */ });
-    return () => { cancelled = true; };
+      .then((models) => {
+        if (!cancelled) setCodexList(models);
+      })
+      .catch(() => {
+        // The picker remains usable with its conservative fallback efforts.
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [open, isCodex]);
+
   const activeCodexModel = isCodex ? model.slice("codex/".length) : "";
   const supportedEfforts =
-    codexList.find((m) => m.model === activeCodexModel)?.supportedEfforts ??
+    codexList.find((entry) => entry.model === activeCodexModel)?.supportedEfforts ??
     ["low", "medium", "high", "xhigh"];
 
-  // Re-discovery is handled by the shared store: the 60s TTL kicks in on
-  // next consume, and ConnCard / AddProviderModal explicitly invalidate
-  // after a save. The picker only needs to react to clicks outside.
   useEffect(() => {
     if (!open) return;
-    const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
-    document.addEventListener("mousedown", onDoc);
-    return () => document.removeEventListener("mousedown", onDoc);
+    const onPointerDown = (event: MouseEvent) => {
+      if (ref.current && !ref.current.contains(event.target as Node)) setOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
   }, [open]);
 
-  // The composer button shows the active model id by default. BUT a value
-  // saved in localStorage from a previous session (e.g. "llamacpp/foo") can
-  // outlive its provider being disconnected — the picker would correctly
-  // show "Aucun provider configuré", but the button would still display the
-  // stale id, contradicting the truth one popover above. We detect that
-  // mismatch and display a neutral "Choisir un modèle" until either the
-  // user picks something new or re-saves the provider in Settings.
-  const isActiveModelAvailable = isLoading || discovered.some((m) => m.id === model);
-  const displayName: string = isActiveModelAvailable
-    ? (model || "Choisir un modèle")
-    : (isLoading ? "…" : "Choisir un modèle");
+  useEffect(() => {
+    if (!open) setSearch("");
+  }, [open]);
 
-  // Group discovered models by providerId for display. We preserve the order
-  // in which providers appeared in the discovery result (which respects the
-  // PROVIDER_REGISTRY key order then custom providers).
-  const groups = (() => {
-    const byProvider = new Map<string, { label: string; items: typeof discovered }>();
-    for (const m of discovered) {
-      const g = byProvider.get(m.providerId);
-      if (g) g.items.push(m);
-      else byProvider.set(m.providerId, { label: m.providerLabel, items: [m] });
+  const active = discovered.find((entry) => entry.id === model);
+  const activeProviderId = active?.providerId ?? model.split("/")[0] ?? "";
+  const activeProvider = friendlyProviderName(activeProviderId, active?.providerLabel);
+  const activeModel = active ? friendlyModelName(active.label) : "Choisir un modèle";
+  const isActiveModelAvailable = isLoading || Boolean(active);
+
+  const groups = useMemo(() => {
+    const query = search.trim().toLocaleLowerCase();
+    const byProvider = new Map<
+      string,
+      { label: string; items: typeof discovered }
+    >();
+    for (const entry of discovered) {
+      const haystack = `${entry.providerLabel} ${entry.label}`.toLocaleLowerCase();
+      if (query && !haystack.includes(query)) continue;
+      const current = byProvider.get(entry.providerId);
+      if (current) current.items.push(entry);
+      else {
+        byProvider.set(entry.providerId, {
+          label: friendlyProviderName(entry.providerId, entry.providerLabel),
+          items: [entry],
+        });
+      }
     }
-    return Array.from(byProvider.entries()).map(([providerId, { label, items }]) => ({ providerId, label, items }));
-  })();
+    return Array.from(byProvider.entries()).map(([providerId, group]) => ({
+      providerId,
+      ...group,
+    }));
+  }, [discovered, search]);
+
+  const diagnostics = Object.entries(errors);
+  const readyProviderCount = new Set(discovered.map((item) => item.providerId)).size;
+
+  const openConnections = () => {
+    setOpen(false);
+    void navigate({ to: "/connections" });
+  };
 
   return (
-    <span ref={ref} style={{position:"relative", minWidth:0}}>
-      <button className={className} title="Switch model" onClick={() => setOpen(o => !o)}>
-        <span className="live"></span>
-        <span className="name">{displayName}</span>
-        <Icon name="down" size={10}/>
+    <span ref={ref} className="model-picker-anchor">
+      <button
+        type="button"
+        className={`${className} model-picker-trigger`}
+        title="Changer de provider ou de modèle"
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <ProviderMark
+          id={isActiveModelAvailable ? activeProviderId : ""}
+          name={isActiveModelAvailable ? activeProvider : "Modèles"}
+          fallback="M"
+          size="sm"
+        />
+        <span className="model-picker-trigger-copy">
+          <span className="model-picker-provider">
+            {isActiveModelAvailable ? activeProvider : "Modèle"}
+          </span>
+          <span className="model-picker-model">
+            {isLoading && !active ? "Découverte…" : activeModel}
+          </span>
+        </span>
+        <Icon name="down" size={11} />
       </button>
+
       {open && (
-        <div className="model-pop">
-          {isLoading && (
-            <div className="model-pop-group" style={{ opacity: 0.6 }}>Découverte des modèles…</div>
-          )}
-          {!isLoading && groups.length === 0 && (
-            <div style={{ padding: "12px 14px", fontSize: 12, color: "var(--on-surface-variant)" }}>
-              Aucun provider configuré. Va dans <b>Settings → Connections</b> pour brancher Anthropic, OpenAI, Ollama, llama.cpp, etc.
-            </div>
-          )}
-          {groups.map(g => (
-            <div key={g.providerId}>
-              <div className="model-pop-group">{g.label}</div>
-              {g.items.map(m => (
-                <button key={m.id} className={"model-pop-item" + (m.id === model ? " on" : "")} onClick={() => { onChange(m.id); setOpen(false); }}>
-                  <span className="name">{m.label}</span>
-                  <span className="meta">{m.providerId}</span>
-                  <CapBadge modelId={m.id} />
-                  {m.id === model && <span className="check">✓</span>}
-                </button>
-              ))}
-              {errors[g.providerId] && (
-                <div style={{ padding: "2px 14px 6px", fontSize: 10, color: "var(--error, #ff6b6b)" }} title={errors[g.providerId]}>
-                  ⚠ {errors[g.providerId]}
-                </div>
-              )}
-            </div>
-          ))}
-          {Object.entries(errors).filter(([k]) => !groups.find(g => g.providerId === k)).map(([providerId, msg]) => (
-            <div key={providerId}>
-              <div className="model-pop-group" style={{ opacity: 0.5 }}>{PROVIDER_LABELS_DISPLAY[providerId] ?? providerId}</div>
-              <div style={{ padding: "2px 14px 6px", fontSize: 10, color: "var(--error, #ff6b6b)" }} title={msg}>
-                ⚠ {msg}
-              </div>
-            </div>
-          ))}
-          {!isLoading && unconfigured.length > 0 && (
-            <div style={{ padding: "6px 14px 8px", fontSize: 10, color: "var(--on-surface-muted)" }}>
-              Non configurés : {unconfigured.map(id => PROVIDER_LABELS_DISPLAY[id] ?? id).join(", ")}
-            </div>
-          )}
-          {isCodex && (
+        <div className="model-picker-pop" role="dialog" aria-label="Choisir un modèle">
+          <div className="model-picker-head">
             <div>
-              <div className="model-pop-group">Raisonnement (Codex)</div>
-              <div style={{ display: "flex", gap: 4, flexWrap: "wrap", padding: "2px 14px 8px" }}>
-                {supportedEfforts.map((e) => (
+              <strong>Modèles disponibles</strong>
+              <span>{discovered.length} détecté{discovered.length > 1 ? "s" : ""}</span>
+            </div>
+            <button
+              type="button"
+              className="model-picker-icon-btn"
+              onClick={() => void refresh()}
+              aria-label="Actualiser les modèles"
+              title="Actualiser les modèles"
+            >
+              <Icon name="history" size={13} />
+            </button>
+          </div>
+
+          {discovered.length > 5 && (
+            <label className="model-picker-search">
+              <Icon name="search" size={13} />
+              <input
+                autoFocus
+                value={search}
+                onChange={(event) => setSearch(event.currentTarget.value)}
+                placeholder="Rechercher un modèle…"
+                aria-label="Rechercher un modèle"
+              />
+            </label>
+          )}
+
+          <div className="model-picker-scroll">
+            {isLoading && (
+              <div className="model-picker-empty">Interrogation des providers…</div>
+            )}
+
+            {!isLoading && groups.length === 0 && (
+              <div className="model-picker-empty">
+                <strong>{search ? "Aucun résultat" : "Aucun modèle prêt"}</strong>
+                <span>
+                  {search
+                    ? "Essaie un autre nom."
+                    : "Configure ou reconnecte un provider pour commencer."}
+                </span>
+                {!search && (
+                  <button type="button" className="lgb lgb-sm" onClick={openConnections}>
+                    Ouvrir Connexions
+                  </button>
+                )}
+              </div>
+            )}
+
+            {groups.map((group) => (
+              <section className="model-picker-group" key={group.providerId}>
+                <header>
+                  <ProviderMark
+                    id={group.providerId}
+                    name={group.label}
+                    fallback={group.label.charAt(0)}
+                    size="sm"
+                  />
+                  <span>{group.label}</span>
+                  <span className="model-picker-count">{group.items.length}</span>
+                  <span className="model-picker-online">Prêt</span>
+                </header>
+                {group.items.map((entry) => (
                   <button
-                    key={e}
-                    className={"lgb lgb-sm" + (e === effort ? " lgb-primary" : "")}
-                    onClick={() => setEffort(e)}
-                    title={`Niveau de raisonnement : ${e}`}
+                    type="button"
+                    key={entry.id}
+                    className={`model-pop-item model-picker-item${entry.id === model ? " on" : ""}`}
+                    onClick={() => {
+                      onChange(entry.id);
+                      setOpen(false);
+                    }}
+                    aria-pressed={entry.id === model}
                   >
-                    {e}
+                    <span className="model-picker-item-copy">
+                      <span className="name">{friendlyModelName(entry.label)}</span>
+                      <span className="model-picker-item-desc">
+                        {entry.id === model ? "Sélectionné pour cette conversation" : "Utiliser ce modèle"}
+                      </span>
+                    </span>
+                    <CapBadge modelId={entry.id} />
+                    {entry.id === model && <span className="check">✓</span>}
                   </button>
                 ))}
-              </div>
-            </div>
-          )}
-          <div className="model-pop-foot">
-            <button className="lgb lgb-sm" onClick={refresh} title="Re-fetch the model lists">
-              <Icon name="sparkle" size={11}/> Refresh
+              </section>
+            ))}
+
+            {isCodex && (
+              <section className="model-picker-group model-picker-effort">
+                <header>
+                  <span>Effort de raisonnement</span>
+                </header>
+                <div>
+                  {supportedEfforts.map((entry) => (
+                    <button
+                      type="button"
+                      key={entry}
+                      className={entry === effort ? "on" : ""}
+                      onClick={() => setEffort(entry)}
+                    >
+                      {entry}
+                    </button>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {diagnostics.length > 0 && (
+              <details className="model-picker-diagnostics">
+                <summary>
+                  {diagnostics.length} provider{diagnostics.length > 1 ? "s" : ""} à vérifier
+                </summary>
+                {diagnostics.map(([providerId, message]) => (
+                  <div key={providerId}>
+                    <span>
+                      {friendlyProviderName(
+                        providerId,
+                        discovered.find((entry) => entry.providerId === providerId)?.providerLabel,
+                      )}
+                    </span>
+                    <small>{diagnosticLabel(message)}</small>
+                  </div>
+                ))}
+              </details>
+            )}
+          </div>
+
+          <div className="model-picker-foot">
+            <span>
+              {discovered.length} modèle{discovered.length > 1 ? "s" : ""} ·{" "}
+              {readyProviderCount} provider{readyProviderCount > 1 ? "s" : ""} prêt
+              {readyProviderCount > 1 ? "s" : ""}
+            </span>
+            <button type="button" onClick={openConnections}>
+              Gérer les providers <Icon name="chevron-right" size={11} />
             </button>
-            <span style={{flex:1}}></span>
-            <button className="lgb lgb-sm" onClick={() => setOpen(false)}>Close</button>
           </div>
         </div>
       )}

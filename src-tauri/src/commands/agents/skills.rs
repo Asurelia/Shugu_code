@@ -161,7 +161,14 @@ pub async fn skill_save_advisor(
     let name_capped: String = name.trim().chars().take(120).collect();
     let when_capped: String = when_to_use.trim().chars().take(300).collect();
     let body_capped: String = body.trim().chars().take(2000).collect();
-    save_skill(&app, &role, &name_capped, &when_capped, &body_capped, "advisor")?;
+    save_skill(
+        &app,
+        &role,
+        &name_capped,
+        &when_capped,
+        &body_capped,
+        "advisor",
+    )?;
     let _ = super::persist_and_emit(
         &app,
         &super::AgentEvent::SkillLearned {

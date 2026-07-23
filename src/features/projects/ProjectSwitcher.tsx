@@ -149,7 +149,7 @@ function chipStyle(active: boolean): React.CSSProperties {
     fontSize: 11,
     cursor: "pointer",
     background: active ? "var(--primary, #7f77dd)" : "transparent",
-    color: active ? "#fff" : MUTED,
+    color: active ? "#24172a" : MUTED,
     font: "inherit",
     lineHeight: 1.6,
   };

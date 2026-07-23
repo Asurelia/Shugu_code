@@ -3,6 +3,6 @@ import { useShell } from "@/routes/shell-context";
 import { GalleryView } from "@/features/code/views-code";
 
 export default function GalleryRouteComponent() {
-  const { generations } = useShell();
-  return <GalleryView generations={generations} />;
+  const { generations, setGenerations } = useShell();
+  return <GalleryView generations={generations} setGenerations={setGenerations} />;
 }

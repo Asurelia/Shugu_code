@@ -53,6 +53,25 @@ pub(super) struct ExecResult {
     /// the result so the dispatcher can surface it to the model + the UI without
     /// re-classifying. `Safe` for the overwhelming majority of commands.
     pub(super) risk: CommandRisk,
+    pub(super) provenance: ExecutionProvenance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum ExecutionProvenance {
+    Sandboxed,
+    FullAccessDirect,
+    Blocked,
+}
+
+impl ExecutionProvenance {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Sandboxed => "sandboxed",
+            Self::FullAccessDirect => "fullAccessDirect",
+            Self::Blocked => "blocked",
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -82,7 +101,7 @@ impl ProcessTree {
     fn create() -> Option<Self> {
         use std::ptr;
         use windows_sys::Win32::System::JobObjects::{
-            CreateJobObjectW, SetInformationJobObject, JobObjectExtendedLimitInformation,
+            CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         };
 
@@ -178,6 +197,7 @@ use crate::commands::pathutil::strip_extended_prefix;
 /// the result so the dispatcher can flag it to the model + UI. Classification
 /// is ADVISORY — a `Danger` verdict is logged and surfaced, never a refusal
 /// (the loop stays fluid; the safety net is git + the process-tree kill).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn run_command_direct(
     ws: &Path,
     command: &str,
@@ -185,29 +205,91 @@ pub(super) fn run_command_direct(
     policy: ExecutionPolicy,
     rules: &[CommandRule],
 ) -> ExecResult {
+    run_command_governed(ws, command, timeout_secs, policy, rules, None)
+}
+
+/// Cancellable command lane used by live agents. Unit tests and diagnostic
+/// callers use [`run_command_direct`], which delegates here without a token.
+pub(super) fn run_command_governed(
+    ws: &Path,
+    command: &str,
+    timeout_secs: u64,
+    policy: ExecutionPolicy,
+    rules: &[CommandRule],
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> ExecResult {
     let cwd = strip_extended_prefix(ws.to_path_buf());
     // Phase 2 — les règles apprises de l'utilisateur OVERRIDENT le classifieur
     // statique (allow → Safe, deny → Danger) ; sinon on retombe sur les
     // détecteurs. `rules` est vide quand aucune règle / DB indisponible.
     let risk = classify_with_rules(command, policy, rules);
 
-    // Real process sandbox (ALWAYS ON — Claude-Code model). The command runs in
-    // a write-confined / reads-open low-integrity child: it can read anywhere
-    // (so node/pnpm/cargo/git work) but can only WRITE the workspace + temp +
-    // package caches. Network stays active. The ONLY opt-out is the emergency
-    // env `SHUGU_SANDBOX_DISABLE=1`. `run_confined` returns `Some(outcome)` when
-    // it actually ran the command confined; it returns `None` when the sandbox
-    // declined or could not arm (disabled, non-Windows, or any FFI failure) — in
-    // which case we fall through to the proven direct spawn below so the dev loop
-    // is never blocked. See sandbox.rs for the mechanism + honest limits.
-    if let Some(out) = super::sandbox::run_confined(&cwd, command, timeout_secs, OUTPUT_CAP) {
-        log_exec(command, &cwd, policy, &risk, out.exit_code, out.timed_out);
-        return ExecResult {
-            exit_code: out.exit_code,
-            stdout: out.stdout,
-            stderr: out.stderr,
-            timed_out: out.timed_out,
+    if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+        return blocked_result(
+            command,
+            &cwd,
+            policy,
             risk,
+            "commande annulée avant démarrage".to_string(),
+        );
+    }
+
+    if !policy.allows_exec() {
+        return blocked_result(
+            command,
+            &cwd,
+            policy,
+            risk,
+            "profil en lecture seule : l'exécution de commandes est interdite".to_string(),
+        );
+    }
+    if risk.blocked {
+        let detail = risk
+            .detail
+            .clone()
+            .unwrap_or_else(|| "commande refusée par une règle utilisateur".to_string());
+        return blocked_result(command, &cwd, policy, risk, detail);
+    }
+
+    // Auto/WorkspaceWrite is fail-closed: direct execution is forbidden unless
+    // the user selected Full Access explicitly. This removes the former silent
+    // sandbox → direct fallback.
+    if matches!(policy, ExecutionPolicy::WorkspaceWrite) {
+        return match super::sandbox::run_confined_cancellable(
+            &cwd,
+            command,
+            timeout_secs,
+            OUTPUT_CAP,
+            cancelled,
+        ) {
+            super::sandbox::ConfinedRun::Executed(out) => {
+                log_exec(
+                    command,
+                    &cwd,
+                    policy,
+                    &risk,
+                    ExecutionProvenance::Sandboxed,
+                    out.exit_code,
+                    out.timed_out,
+                );
+                ExecResult {
+                    exit_code: out.exit_code,
+                    stdout: out.stdout,
+                    stderr: out.stderr,
+                    timed_out: out.timed_out,
+                    risk,
+                    provenance: ExecutionProvenance::Sandboxed,
+                }
+            }
+            super::sandbox::ConfinedRun::Unavailable { reason } => blocked_result(
+                command,
+                &cwd,
+                policy,
+                risk,
+                format!(
+                    "sandbox Auto indisponible ({reason}) : commande non exécutée. Active Full Access explicitement pour une exécution directe"
+                ),
+            ),
         };
     }
 
@@ -243,13 +325,22 @@ pub(super) fn run_command_direct(
     let mut child = match child {
         Ok(c) => c,
         Err(e) => {
-            log_exec(command, &cwd, policy, &risk, -1, false);
+            log_exec(
+                command,
+                &cwd,
+                policy,
+                &risk,
+                ExecutionProvenance::FullAccessDirect,
+                -1,
+                false,
+            );
             return ExecResult {
                 exit_code: -1,
                 stdout: String::new(),
                 stderr: format!("exécution impossible : {e}"),
                 timed_out: false,
                 risk,
+                provenance: ExecutionProvenance::FullAccessDirect,
             };
         }
     };
@@ -271,6 +362,14 @@ pub(super) fn run_command_direct(
         match child.try_wait() {
             Ok(Some(status)) => break status.code().unwrap_or(-1),
             Ok(None) => {
+                if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+                    kill_tree(&mut child);
+                    #[cfg(windows)]
+                    if let Some(ref tree) = process_tree {
+                        tree.terminate();
+                    }
+                    break 130;
+                }
                 if Instant::now() >= deadline {
                     timed_out = true;
                     kill_tree(&mut child);
@@ -291,19 +390,36 @@ pub(super) fn run_command_direct(
                 if let Some(ref tree) = process_tree {
                     tree.terminate();
                 }
-                log_exec(command, &cwd, policy, &risk, -1, false);
+                log_exec(
+                    command,
+                    &cwd,
+                    policy,
+                    &risk,
+                    ExecutionProvenance::FullAccessDirect,
+                    -1,
+                    false,
+                );
                 return ExecResult {
                     exit_code: -1,
                     stdout: join_reader(stdout_handle),
                     stderr: format!("wait failed: {e}"),
                     timed_out: false,
                     risk,
+                    provenance: ExecutionProvenance::FullAccessDirect,
                 };
             }
         }
     };
 
-    log_exec(command, &cwd, policy, &risk, exit_code, timed_out);
+    log_exec(
+        command,
+        &cwd,
+        policy,
+        &risk,
+        ExecutionProvenance::FullAccessDirect,
+        exit_code,
+        timed_out,
+    );
 
     ExecResult {
         exit_code,
@@ -311,6 +427,33 @@ pub(super) fn run_command_direct(
         stderr: join_reader(stderr_handle),
         timed_out,
         risk,
+        provenance: ExecutionProvenance::FullAccessDirect,
+    }
+}
+
+fn blocked_result(
+    command: &str,
+    cwd: &Path,
+    policy: ExecutionPolicy,
+    risk: CommandRisk,
+    stderr: String,
+) -> ExecResult {
+    log_exec(
+        command,
+        cwd,
+        policy,
+        &risk,
+        ExecutionProvenance::Blocked,
+        -1,
+        false,
+    );
+    ExecResult {
+        exit_code: -1,
+        stdout: String::new(),
+        stderr,
+        timed_out: false,
+        risk,
+        provenance: ExecutionProvenance::Blocked,
     }
 }
 
@@ -332,6 +475,7 @@ fn log_exec(
     cwd: &Path,
     policy: ExecutionPolicy,
     risk: &CommandRisk,
+    provenance: ExecutionProvenance,
     exit_code: i32,
     timed_out: bool,
 ) {
@@ -345,6 +489,8 @@ fn log_exec(
         "policy": policy.as_str(),
         "risk": risk.level.as_str(),
         "riskReason": risk.reason,
+        "blocked": risk.blocked,
+        "provenance": provenance.as_str(),
         "exit": exit_code,
         "timedOut": timed_out,
     });
@@ -467,6 +613,19 @@ pub(super) fn check_git_safety(root: Option<std::path::PathBuf>) -> ExecCapabili
 mod tests {
     use super::*;
 
+    fn isolated_workspace(test_name: &str) -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!(
+            "shugu-exec-{test_name}-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create isolated command workspace");
+        path
+    }
+
     #[test]
     fn truncate_caps_long_output() {
         let s = "x".repeat(OUTPUT_CAP + 100);
@@ -482,7 +641,7 @@ mod tests {
 
     #[test]
     fn run_echo_captures_stdout() {
-        let tmp = std::env::temp_dir();
+        let tmp = isolated_workspace("echo");
         let res = run_command_direct(
             &tmp,
             "echo hello-exec",
@@ -493,23 +652,26 @@ mod tests {
         assert_eq!(res.exit_code, 0, "stderr: {}", res.stderr);
         assert!(res.stdout.contains("hello-exec"));
         assert!(!res.timed_out);
+        assert_eq!(res.provenance, ExecutionProvenance::Sandboxed);
         // A plain echo must classify as safe.
         assert!(!res.risk.is_danger());
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]
     fn run_nonzero_exit_reported() {
-        let tmp = std::env::temp_dir();
+        let tmp = isolated_workspace("nonzero");
         let res = run_command_direct(&tmp, "exit 3", 30, ExecutionPolicy::WorkspaceWrite, &[]);
         assert_eq!(res.exit_code, 3);
         assert!(!res.timed_out);
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]
     fn run_carries_risk_verdict() {
         // run_command_direct RUNS the command regardless of risk (non-blocking)
         // but the verdict must ride back on the result for the UI/log.
-        let tmp = std::env::temp_dir();
+        let tmp = isolated_workspace("risk");
         let res = run_command_direct(
             &tmp,
             "git push --force",
@@ -520,13 +682,49 @@ mod tests {
         // (git may or may not be a repo here — we only assert the classifier ran.)
         assert!(res.risk.is_danger());
         assert_eq!(res.risk.reason, Some("forcePush"));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn read_only_and_user_deny_never_start_a_process() {
+        let tmp = std::env::temp_dir();
+        let marker = tmp.join(format!("shugu-exec-blocked-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let command = format!("echo forbidden> \"{}\"", marker.display());
+
+        let read_only = run_command_direct(&tmp, &command, 30, ExecutionPolicy::ReadOnly, &[]);
+        assert_eq!(read_only.provenance, ExecutionProvenance::Blocked);
+        assert!(!marker.exists());
+
+        let deny = [CommandRule {
+            pattern: "echo *".to_string(),
+            allow: false,
+            detail: Some("test deny".to_string()),
+        }];
+        let denied = run_command_direct(&tmp, &command, 30, ExecutionPolicy::FullLocal, &deny);
+        assert_eq!(denied.provenance, ExecutionProvenance::Blocked);
+        assert!(denied.risk.blocked);
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn full_access_is_explicit_direct_provenance() {
+        let res = run_command_direct(
+            &std::env::temp_dir(),
+            "echo full-access",
+            30,
+            ExecutionPolicy::FullLocal,
+            &[],
+        );
+        assert_eq!(res.exit_code, 0, "stderr: {}", res.stderr);
+        assert_eq!(res.provenance, ExecutionProvenance::FullAccessDirect);
     }
 
     #[test]
     fn run_timeout_kills_within_grace() {
         // A command that sleeps far past the 1s timeout must come back as
         // timed_out=124 promptly (the Job-Object/kill path), not hang the test.
-        let tmp = std::env::temp_dir();
+        let tmp = isolated_workspace("timeout");
         #[cfg(windows)]
         // `ping -n 10 127.0.0.1` runs ~9s; with a 1s timeout it must be killed.
         let cmd = "ping -n 10 127.0.0.1";
@@ -535,13 +733,18 @@ mod tests {
         let start = Instant::now();
         let res = run_command_direct(&tmp, cmd, 1, ExecutionPolicy::WorkspaceWrite, &[]);
         let elapsed = start.elapsed();
-        assert!(res.timed_out, "expected timeout, got exit {}", res.exit_code);
+        assert!(
+            res.timed_out,
+            "expected timeout, got exit {}",
+            res.exit_code
+        );
         assert_eq!(res.exit_code, 124);
         // Generous upper bound: 1s timeout + polling slack + kill, well under 8s.
         assert!(
             elapsed < Duration::from_secs(8),
             "timeout kill took too long: {elapsed:?}"
         );
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     #[test]

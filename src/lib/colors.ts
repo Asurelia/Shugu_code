@@ -40,3 +40,34 @@ export function shiftHsl(hex: string, dl: number) {
   const { h, s, l } = hexToHsl(hex);
   return hslToHex(h, s, Math.max(0, Math.min(100, l + dl)));
 }
+
+function parseHexColor(hex: string): [number, number, number] | null {
+  const normalized = hex.trim().replace(/^#/, "");
+  const expanded = normalized.length === 3
+    ? normalized.split("").map((part) => part + part).join("")
+    : normalized;
+  if (!/^[0-9a-f]{6}$/i.test(expanded)) return null;
+  return [
+    Number.parseInt(expanded.slice(0, 2), 16),
+    Number.parseInt(expanded.slice(2, 4), 16),
+    Number.parseInt(expanded.slice(4, 6), 16),
+  ];
+}
+
+function relativeLuminance([r, g, b]: [number, number, number]): number {
+  const linear = (channel: number) => {
+    const value = channel / 255;
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
+}
+
+/** Chooses the WCAG-higher-contrast neutral foreground for a solid hex color. */
+export function getContrastingTextColor(background: string): "#000" | "#fff" {
+  const rgb = parseHexColor(background);
+  if (!rgb) return "#fff";
+  const luminance = relativeLuminance(rgb);
+  const contrastWithBlack = (luminance + 0.05) / 0.05;
+  const contrastWithWhite = 1.05 / (luminance + 0.05);
+  return contrastWithBlack >= contrastWithWhite ? "#000" : "#fff";
+}

@@ -16,7 +16,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Icon } from "@/components/components";
 import { invoke } from "@/lib/tauri";
 import { useChatStream } from "./useChatStream";
-import { useMessages, sendChatMessage, useActiveModel, useChatMode } from "./chat-sync";
+import { useAgentAccessProfile, useMessages, sendChatMessage, useActiveModel, useChatMode } from "./chat-sync";
 import { useEditorSelection } from "./editorSelectionStore";
 import { PermissionBadge, ModeBadge } from "@/components/trust";
 import { useChatToolActivity } from "./chatToolActivityStore";
@@ -33,6 +33,7 @@ import { useAgentTranscript } from "@/features/agents/queries";
 import { BrowserTestResultViewer } from "./BrowserTestResultViewer";
 import { CommandRiskCard } from "./CommandRiskCard";
 import { QuestionCard } from "./QuestionCard";
+import { useModalFocusTrap } from "@/lib/modalFocus";
 import { PlanApprovalCard } from "./PlanApprovalCard";
 import { AgentPlan } from "./AgentPlan";
 import { QuickOpenPalette } from "@/features/code/QuickOpenPalette";
@@ -49,7 +50,8 @@ import { fsGetWorkspaceRoot } from "@/lib/fs";
 import { fsKeys } from "@/features/fs/keys";
 import { CommentTray } from "@/features/cockpit/CommentTray";
 import { getComments, clearComments } from "@/features/cockpit/commentStore";
-import type { Message, MessageAction } from "@/lib/types";
+import "./composer-controls.css";
+import type { Generation, Message, MessageAction } from "@/lib/types";
 import { IMAGE_MODEL_PRESETS, resolveImageProvider } from "@/lib/imageProviders";
 import {
   VIDEO_MODEL_PRESETS,
@@ -58,12 +60,15 @@ import {
   VIDEO_DURATIONS,
   MINIMAX_DEFAULT_BASE_URL,
 } from "@/lib/mediaGenProviders";
-import { fallbackGradient, formatGenerationTime, imageDisplaySrc, ratioToCss, copyText as copyImageText } from "@/features/image/imageAssets";
+import { fallbackGradient, formatGenerationTime, generationDisplaySrc, imageDisplaySrc, ratioToCss, copyText as copyImageText } from "@/features/image/imageAssets";
 import { pushToast } from "@/components/toast";
 import { togglePinnedAsset, useStudioBrandBoard } from "@/features/studio/brandBoard";
+import { isMediaCancellation, useMediaJob } from "./useMediaJob";
+import { clearMediaRetry, peekMediaRetry } from "@/features/image/mediaRetry";
 
 type ImageResult = {
   id: number | string;
+  kind?: "image";
   prompt: string;
   ratio: string;
   model: string;
@@ -121,13 +126,14 @@ export function ChatView({
   // Agent mode gets a "guarded" (git safety net) fact instead of the old
   // ambiguous "local" chip.
   const [chatMode] = useChatMode();
+  const [agentAccess] = useAgentAccessProfile();
   // Lot A — Task 12 : libellés des tool-calls du tour en cours (« 🔍 a lu … »,
   // « ✏️ a écrit … »), accumulés par le listener root et rendus dans le bloc de
   // streaming ci-dessous. Vidé à la fin du tour (done delta).
   const toolActivity = useChatToolActivity(activeConv);
 
   const navigate = useNavigate();
-  const { activeFile, openFiles, openFile, fileContents, setFileContents, editorPrefs, compareFile, setCompareFile, applyCodeToFile, openRecentPicker } = useShell();
+  const { activeFile, openFile, fileContents, setFileContents, editorPrefs, compareFile, setCompareFile, applyCodeToFile, openRecentPicker } = useShell();
 
   // Phase 2 — Chat→Editor handoff. When a file is opened from an action card,
   // we reveal an in-chat split (chat left, CodeMirror right) instead of
@@ -537,7 +543,10 @@ export function ChatView({
           pièces jointes | contexte (fichier, projet·branche, permission),
           modèle, envoi. */}
       <div className="cx-under-row">
-        <ModeSelector />
+        <div className="cx-exec-block" aria-label="Mode et modèle d’exécution">
+          <ModeSelector />
+          <ModelPicker model={model} onChange={setModel} className="composer-model" />
+        </div>
         <button
           className="cx-tool"
           title="Ajouter un fichier comme source (@fichier) — son contenu sera joint au message"
@@ -601,21 +610,25 @@ export function ChatView({
           </span>
         )}
         {/* Trust-UX — fait de permission précis, dépendant du mode. */}
-        {chatMode === "agent" ? (
+        {chatMode === "agent" && agentAccess === "auto" ? (
           <PermissionBadge
-            kind="guarded"
-            label="Filet git"
-            title="Mode Agent — l'agent peut écrire et exécuter sur ton projet. Chaque modification reste réversible dans Source Control (le filet de sécurité). Cliquer pour voir le diff."
-            onClick={() => navigate({ to: "/git" })}
+            kind="scoped"
+            label="Auto sandboxé"
+            title="Mode Agent Auto — écrit dans le workspace et n'exécute une commande que si le sandbox Windows a réellement démarré. Aucun fallback direct."
+          />
+        ) : chatMode === "agent" ? (
+          <PermissionBadge
+            kind="direct"
+            label="Full Access direct"
+            title="Mode Full Access — exécution directe sur la machine, sans confirmation par commande. Ce choix expire à la fermeture de l'application."
           />
         ) : (
           <PermissionBadge
-            kind="private"
-            label="Privé"
-            title="Mode lecture seule — l'inférence et tes données restent locales ; aucun fichier n'est modifié ni aucune commande exécutée ce tour-ci."
+            kind="readonly"
+            label="Lecture seule"
+            title="Ce mode ne permet aucune écriture ni commande. Le provider sélectionné peut toutefois être local ou cloud."
           />
         )}
-        <ModelPicker model={model} onChange={setModel} className="composer-model" />
         {typing ? (
           <button
             className="cx-send stop"
@@ -1437,6 +1450,13 @@ export function CodeBlock({
   onApply?: (code: string, lang: string, target: string) => void;
 }) {
   const [preview, setPreview] = useState(false);
+  const previewDialogRef = useRef<HTMLDivElement | null>(null);
+  const isHtml = lang === "html" || lang === "htm";
+  useModalFocusTrap({
+    open: preview && isHtml,
+    containerRef: previewDialogRef,
+    onEscape: () => setPreview(false),
+  });
   // Lot A (Task 8) — résolution de la cible d'apply. On regarde d'abord un
   // chemin déclaré DANS le bloc (commentaire de 1ʳᵉ ligne `// src/x.ts` — le
   // seul indice qui survit à la persistance SQLite, l'info-string `lang path`
@@ -1450,8 +1470,6 @@ export function CodeBlock({
   // same-origin) inside a portal overlay so it escapes the chat feed's
   // overflow clipping. NOT the chat-split-right editor pane — that's for
   // files on disk; this is an ephemeral render of inline output.
-  const isHtml = lang === "html" || lang === "htm";
-
   return (
     <div className="cx-code-block">
       <div className="cx-code-block-head">
@@ -1503,11 +1521,11 @@ export function CodeBlock({
           className="cx-preview-scrim"
           onClick={(e) => { if (e.target === e.currentTarget) setPreview(false); }}
         >
-          <div className="cx-preview-modal">
+          <div ref={previewDialogRef} className="cx-preview-modal" role="dialog" aria-modal="true" aria-label="HTML preview" tabIndex={-1}>
             <div className="cx-preview-head">
               <span className="cx-preview-title"><Icon name="image" size={13} /> Aperçu</span>
               <span style={{ flex: 1 }} />
-              <button className="cx-tool" title="Fermer" onClick={() => setPreview(false)}><Icon name="x" size={13} /></button>
+              <button className="cx-tool" title="Fermer" aria-label="Fermer l’aperçu HTML" onClick={() => setPreview(false)}><Icon name="x" size={13} /></button>
             </div>
             <iframe className="cx-preview-frame" title="Aperçu HTML" srcDoc={text} sandbox="allow-scripts" />
           </div>
@@ -1519,19 +1537,30 @@ export function CodeBlock({
 }
 
 // ─── Image panel — onglet « Image » du Studio média (logique inchangée) ─────
-function ImagePanel({ generations, setGenerations }: any) {
-  const [prompt, setPrompt] = useState("interface companion mascot in a quiet desktop IDE, luminous glass, precise product illustration");
-  const [negative, setNegative] = useState("");
-  const [ratio, setRatio] = useState("1:1");
-  const [seed, setSeed] = useState(8204);
-  const [steps, setSteps] = useState(28);
-  const [guidance, setGuidance] = useState(7.5);
-  const [model, setModel] = useState(IMAGE_MODEL_PRESETS[0]?.id ?? "comfyui/v1-5-pruned-emaonly.safetensors");
-  const [styleKey, setStyleKey] = useState("painterly");
+function ImagePanel({ generations, setGenerations, retryDraft }: any) {
+  const [prompt, setPrompt] = useState(retryDraft?.prompt ?? "interface companion mascot in a quiet desktop IDE, luminous glass, precise product illustration");
+  const [negative, setNegative] = useState(retryDraft?.negative ?? "");
+  const [ratio, setRatio] = useState(retryDraft?.ratio ?? "1:1");
+  const [seed, setSeed] = useState(typeof retryDraft?.seed === "number" ? retryDraft.seed : 8204);
+  const [steps, setSteps] = useState(typeof retryDraft?.steps === "number" ? retryDraft.steps : 28);
+  const [guidance, setGuidance] = useState(typeof retryDraft?.guidance === "number" ? retryDraft.guidance : 7.5);
+  const [model, setModel] = useState(retryDraft?.model ?? IMAGE_MODEL_PRESETS[0]?.id ?? "comfyui/v1-5-pruned-emaonly.safetensors");
+  const [styleKey, setStyleKey] = useState(retryDraft?.style ?? "painterly");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [current, setCurrent] = useState<any>(null);
   const brandBoard = useStudioBrandBoard();
+  const mediaJob = useMediaJob();
+  const retryStarted = useRef(false);
+
+  useEffect(() => {
+    let alive = true;
+    if (retryDraft) return () => { alive = false; };
+    void db.settings.get("image.defaultModel").then((savedModel) => {
+      if (alive && savedModel?.trim()) setModel(savedModel.trim());
+    });
+    return () => { alive = false; };
+  }, [retryDraft]);
 
   const ratios = ["1:1", "4:3", "3:4", "16:9", "9:16"];
   const styles = ["product", "cinematic", "vector", "anime", "photo", "3d"];
@@ -1544,6 +1573,7 @@ function ImagePanel({ generations, setGenerations }: any) {
     setBusy(true);
     setCurrent(null);
     setError(null);
+    const requestId = mediaJob.begin("image");
     try {
       const resolved = resolveImageProvider(model);
       const config = await loadProviderConfig(resolved.providerId).catch(() => null);
@@ -1551,6 +1581,7 @@ function ImagePanel({ generations, setGenerations }: any) {
       const apiKey = config?.apiKey?.trim() || undefined;
       const raw = await invoke<any>("image_generate", {
         args: {
+          requestId,
           prompt: nextPrompt,
           negative,
           ratio,
@@ -1564,6 +1595,7 @@ function ImagePanel({ generations, setGenerations }: any) {
       const derivedHue = [...nextPrompt].reduce((a, c) => a + c.charCodeAt(0), 0) % 360;
       const normalized: ImageResult = {
         id:        raw.id       ?? Date.now(),
+        kind:      "image",
         prompt:    nextPrompt,
         negative,
         ratio,
@@ -1584,8 +1616,12 @@ function ImagePanel({ generations, setGenerations }: any) {
       }
       setBusy(false);
     } catch (err) {
-      setError(String(err));
-      pushToast("Generation image echouee", "error", 5000);
+      if (isMediaCancellation(err)) {
+        pushToast("Génération image annulée", "info", 2500);
+      } else {
+        setError(String(err));
+        pushToast("Generation image echouee", "error", 5000);
+      }
       setBusy(false);
     }
   };
@@ -1595,6 +1631,15 @@ function ImagePanel({ generations, setGenerations }: any) {
     setSeed(nextSeed);
     void generate({ seed: nextSeed });
   };
+
+  useEffect(() => {
+    if (!retryDraft || retryStarted.current) return;
+    retryStarted.current = true;
+    void generate();
+    // `generate` intentionally captures the retry form's initial state. Making
+    // it a dependency would resubscribe on every render and risks duplicate jobs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [retryDraft]);
 
   // Lot stubs-palette (2026-06-10) — les commandes palette (Cmd+Enter /
   // Cmd+Shift+V / Cmd+S sur /image) pilotent les fonctions internes de cette
@@ -1634,7 +1679,10 @@ function ImagePanel({ generations, setGenerations }: any) {
             <div className="loading">
               <div className="ring"></div>
               <div style={{fontFamily:"var(--font-mono)",fontSize:"12px",color:"var(--on-surface-variant)"}}>
-                Generating <span style={{color:"var(--primary)"}}>{steps}</span> steps · seed {seed}
+                {mediaJob.progress?.message ?? "Génération de l’image"} · {mediaJob.progress?.progress ?? 0}%
+                <div style={{ marginTop: 7, width: 180, height: 3, borderRadius: 2, background: "var(--outline-variant)" }}>
+                  <div style={{ width: `${mediaJob.progress?.progress ?? 0}%`, height: "100%", borderRadius: 2, background: "var(--primary)", transition: "width 180ms ease" }} />
+                </div>
               </div>
             </div>
           )}
@@ -1694,8 +1742,8 @@ function ImagePanel({ generations, setGenerations }: any) {
           <div className="label-row"><span className="l">Negative</span></div>
           <textarea value={negative} onChange={e => setNegative(e.target.value)} placeholder="blurry, watermark…" style={{minHeight:54}}/>
           {error && <div className="image-error">{error}</div>}
-          <button className="lgb lgb-primary lgb-lg" style={{width:"100%", marginTop:14}} onClick={() => void generate()} disabled={busy || !prompt.trim()}>
-            <Icon name="sparkle" size={14}/> {busy ? "Generating…" : "Generate"}
+          <button className="lgb lgb-primary lgb-lg" style={{width:"100%", marginTop:14}} onClick={() => busy ? void mediaJob.cancel() : void generate()} disabled={!busy && !prompt.trim()}>
+            <Icon name={busy ? "x" : "sparkle"} size={14}/> {busy ? (mediaJob.progress?.status === "cancel_requested" ? "Annulation…" : "Annuler") : "Generate"}
           </button>
         </div>
 
@@ -1740,12 +1788,12 @@ function ImagePanel({ generations, setGenerations }: any) {
           <input type="range" min={0} max={99999} value={seed} onChange={e => setSeed(+e.target.value)} className="slider"/>
         </div>
 
-        {generations.length > 0 && (
+        {generations.some((g: Generation) => (g.kind ?? "image") === "image") && (
           <div className="panel">
             <div className="panel-title">Recent</div>
             <div className="image-recent-list">
-              {generations.slice(0, 5).map((g: any) => {
-                const src = imageDisplaySrc(g.resultUrl);
+              {generations.filter((g: Generation) => (g.kind ?? "image") === "image").slice(0, 5).map((g: any) => {
+                const src = generationDisplaySrc(g);
                 return (
                   <button key={g.id} className="image-recent-item" onClick={() => setCurrent(g)}>
                     <span className="image-recent-thumb" style={{ background: src ? undefined : fallbackGradient(g.hue ?? 250) }}>
@@ -1777,17 +1825,19 @@ async function resolveMinimaxAuth(): Promise<{ baseUrl: string; apiKey: string }
 }
 
 // ─── Vidéo (Hailuo) — onglet « Vidéo » du Studio média ──────────────────────
-function VideoPanel() {
+function VideoPanel({ setGenerations, retryDraft }: { setGenerations: React.Dispatch<React.SetStateAction<Generation[]>>; retryDraft?: Generation | null }) {
   const [prompt, setPrompt] = useState(
-    "a cozy desktop mascot waving hello, soft volumetric light, smooth camera [Push in]",
+    retryDraft?.prompt ?? "a cozy desktop mascot waving hello, soft volumetric light, smooth camera [Push in]",
   );
-  const [model, setModel] = useState(VIDEO_MODEL_PRESETS[0]?.id ?? "MiniMax-Hailuo-02");
-  const [resolution, setResolution] = useState<string>("1080P");
-  const [duration, setDuration] = useState<number>(6);
+  const [model, setModel] = useState((retryDraft?.model ?? "").replace(/^minimax\//, "") || VIDEO_MODEL_PRESETS[0]?.id || "MiniMax-Hailuo-02");
+  const [resolution, setResolution] = useState<string>(retryDraft?.style ?? "1080P");
+  const [duration, setDuration] = useState<number>(retryDraft?.steps ?? 6);
   const [firstFrame, setFirstFrame] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [current, setCurrent] = useState<{ id: string; resultUrl: string | null } | null>(null);
+  const mediaJob = useMediaJob();
+  const retryStarted = useRef(false);
 
   const currentSrc = imageDisplaySrc(current?.resultUrl);
 
@@ -1795,6 +1845,7 @@ function VideoPanel() {
     setBusy(true);
     setError(null);
     setCurrent(null);
+    const requestId = mediaJob.begin("video");
     try {
       const { baseUrl, apiKey } = await resolveMinimaxAuth();
       if (!apiKey) {
@@ -1804,6 +1855,7 @@ function VideoPanel() {
       }
       const raw = await invoke<any>("video_generate", {
         args: {
+          requestId,
           prompt,
           model,
           firstFrameImage: firstFrame.trim() || undefined,
@@ -1813,16 +1865,42 @@ function VideoPanel() {
           apiKey,
         },
       });
-      setCurrent({ id: String(raw?.id ?? Date.now()), resultUrl: raw?.resultUrl ?? null });
+      const normalized: Generation = {
+        id: String(raw?.id ?? Date.now()),
+        kind: "video",
+        prompt,
+        ratio: "16:9",
+        hue: 260,
+        ts: Date.now(),
+        model: `minimax/${model}`,
+        steps: duration,
+        style: resolution,
+        status: raw?.status ?? "done",
+        resultUrl: raw?.resultUrl ?? null,
+      };
+      setCurrent({ id: String(normalized.id), resultUrl: normalized.resultUrl ?? null });
+      setGenerations((items) => [normalized, ...items]);
       if (!raw?.resultUrl) pushToast("Vidéo : aucun fichier reçu", "info", 4500);
       else pushToast("Vidéo générée", "success", 3000);
     } catch (err) {
-      setError(String(err));
-      pushToast("Génération vidéo échouée", "error", 6000);
+      if (isMediaCancellation(err)) {
+        pushToast("Génération vidéo annulée", "info", 2500);
+      } else {
+        setError(String(err));
+        pushToast("Génération vidéo échouée", "error", 6000);
+      }
     } finally {
       setBusy(false);
     }
   };
+
+  useEffect(() => {
+    if (!retryDraft || retryStarted.current) return;
+    retryStarted.current = true;
+    void generate();
+    // One immutable retry handoff per mount; see the image panel above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [retryDraft]);
 
   return (
     <div className="image-shell">
@@ -1832,9 +1910,12 @@ function VideoPanel() {
             <div className="loading">
               <div className="ring"></div>
               <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--on-surface-variant)" }}>
-                Génération vidéo… <span style={{ color: "var(--primary)" }}>{resolution}</span> · {duration}s
+                {mediaJob.progress?.message ?? "Génération vidéo"} · {mediaJob.progress?.progress ?? 0}%
                 <div style={{ marginTop: 6, color: "var(--on-surface-muted)" }}>
-                  ça peut prendre 1 à 5 minutes
+                  {mediaJob.progress?.phase ?? "starting"} · {resolution} · {duration}s
+                </div>
+                <div style={{ marginTop: 7, width: 180, height: 3, borderRadius: 2, background: "var(--outline-variant)" }}>
+                  <div style={{ width: `${mediaJob.progress?.progress ?? 0}%`, height: "100%", borderRadius: 2, background: "var(--primary)", transition: "width 180ms ease" }} />
                 </div>
               </div>
             </div>
@@ -1863,7 +1944,7 @@ function VideoPanel() {
             <div className="empty">
               <Icon name="sparkle" size={28} />
               <div style={{ marginTop: 10 }}>VIDÉO — DÉCRIS TA SCÈNE</div>
-              <div style={{ marginTop: 6, fontSize: 11, color: "var(--on-surface-muted)" }}>3 clips/jour inclus dans ton plan Max</div>
+              <div style={{ marginTop: 6, fontSize: 11, color: "var(--on-surface-muted)" }}>Génération via ta connexion MiniMax configurée localement</div>
             </div>
           )}
         </div>
@@ -1880,8 +1961,8 @@ function VideoPanel() {
           <div className="panel-title">Prompt</div>
           <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="Décris la scène… ajoute [Pan left] / [Zoom in] pour la caméra" />
           {error && <div className="image-error">{error}</div>}
-          <button className="lgb lgb-primary lgb-lg" style={{ width: "100%", marginTop: 14 }} onClick={() => void generate()} disabled={busy || !prompt.trim()}>
-            <Icon name="sparkle" size={14} /> {busy ? "Génération…" : "Générer la vidéo"}
+          <button className="lgb lgb-primary lgb-lg" style={{ width: "100%", marginTop: 14 }} onClick={() => busy ? void mediaJob.cancel() : void generate()} disabled={!busy && !prompt.trim()}>
+            <Icon name={busy ? "x" : "sparkle"} size={14} /> {busy ? (mediaJob.progress?.status === "cancel_requested" ? "Annulation…" : "Annuler") : "Générer la vidéo"}
           </button>
         </div>
 
@@ -1921,14 +2002,16 @@ function VideoPanel() {
 }
 
 // ─── Musique — onglet « Musique » du Studio média ───────────────────────────
-function MusicPanel() {
-  const [prompt, setPrompt] = useState("upbeat lo-fi hip-hop, warm vinyl, mellow piano, relaxed tempo");
-  const [lyrics, setLyrics] = useState("");
-  const [instrumental, setInstrumental] = useState(true);
-  const [model, setModel] = useState(MUSIC_MODEL_PRESETS[0]?.id ?? "music-2.6");
+function MusicPanel({ setGenerations, retryDraft }: { setGenerations: React.Dispatch<React.SetStateAction<Generation[]>>; retryDraft?: Generation | null }) {
+  const [prompt, setPrompt] = useState(retryDraft?.prompt ?? "upbeat lo-fi hip-hop, warm vinyl, mellow piano, relaxed tempo");
+  const [lyrics, setLyrics] = useState(retryDraft?.negative ?? "");
+  const [instrumental, setInstrumental] = useState(retryDraft ? retryDraft.style !== "chanté" : true);
+  const [model, setModel] = useState((retryDraft?.model ?? "").replace(/^minimax\//, "") || MUSIC_MODEL_PRESETS[0]?.id || "music-2.6");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [current, setCurrent] = useState<{ id: string; resultUrl: string | null } | null>(null);
+  const mediaJob = useMediaJob();
+  const retryStarted = useRef(false);
 
   const currentSrc = imageDisplaySrc(current?.resultUrl);
 
@@ -1936,6 +2019,7 @@ function MusicPanel() {
     setBusy(true);
     setError(null);
     setCurrent(null);
+    const requestId = mediaJob.begin("music");
     try {
       const { baseUrl, apiKey } = await resolveMinimaxAuth();
       if (!apiKey) {
@@ -1945,6 +2029,7 @@ function MusicPanel() {
       }
       const raw = await invoke<any>("music_generate", {
         args: {
+          requestId,
           prompt,
           lyrics: instrumental ? undefined : lyrics,
           instrumental,
@@ -1953,16 +2038,42 @@ function MusicPanel() {
           apiKey,
         },
       });
-      setCurrent({ id: String(raw?.id ?? Date.now()), resultUrl: raw?.resultUrl ?? null });
+      const normalized: Generation = {
+        id: String(raw?.id ?? Date.now()),
+        kind: "music",
+        prompt,
+        negative: instrumental ? null : lyrics,
+        ratio: "audio",
+        hue: 195,
+        ts: Date.now(),
+        model: `minimax/${model}`,
+        style: instrumental ? "instrumental" : "chanté",
+        status: raw?.status ?? "done",
+        resultUrl: raw?.resultUrl ?? null,
+      };
+      setCurrent({ id: String(normalized.id), resultUrl: normalized.resultUrl ?? null });
+      setGenerations((items) => [normalized, ...items]);
       if (!raw?.resultUrl) pushToast("Musique : aucun fichier reçu", "info", 4500);
       else pushToast("Morceau généré", "success", 3000);
     } catch (err) {
-      setError(String(err));
-      pushToast("Génération musique échouée", "error", 6000);
+      if (isMediaCancellation(err)) {
+        pushToast("Génération musique annulée", "info", 2500);
+      } else {
+        setError(String(err));
+        pushToast("Génération musique échouée", "error", 6000);
+      }
     } finally {
       setBusy(false);
     }
   };
+
+  useEffect(() => {
+    if (!retryDraft || retryStarted.current) return;
+    retryStarted.current = true;
+    void generate();
+    // One immutable retry handoff per mount; see the image panel above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [retryDraft]);
 
   return (
     <div className="image-shell">
@@ -1972,8 +2083,11 @@ function MusicPanel() {
             <div className="loading">
               <div className="ring"></div>
               <div style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--on-surface-variant)" }}>
-                Composition en cours… <span style={{ color: "var(--primary)" }}>{model}</span>
-                <div style={{ marginTop: 6, color: "var(--on-surface-muted)" }}>~30–60 s</div>
+                {mediaJob.progress?.message ?? "Composition en cours"} · {mediaJob.progress?.progress ?? 0}%
+                <div style={{ marginTop: 6, color: "var(--on-surface-muted)" }}>{mediaJob.progress?.phase ?? "starting"} · {model}</div>
+                <div style={{ marginTop: 7, width: 180, height: 3, borderRadius: 2, background: "var(--outline-variant)" }}>
+                  <div style={{ width: `${mediaJob.progress?.progress ?? 0}%`, height: "100%", borderRadius: 2, background: "var(--primary)", transition: "width 180ms ease" }} />
+                </div>
               </div>
             </div>
           )}
@@ -2001,7 +2115,7 @@ function MusicPanel() {
             <div className="empty">
               <Icon name="sparkle" size={28} />
               <div style={{ marginTop: 10 }}>MUSIQUE — DÉCRIS LE STYLE</div>
-              <div style={{ marginTop: 6, fontSize: 11, color: "var(--on-surface-muted)" }}>inclus dans le quota partagé de ton plan</div>
+              <div style={{ marginTop: 6, fontSize: 11, color: "var(--on-surface-muted)" }}>Génération via ta connexion MiniMax configurée localement</div>
             </div>
           )}
         </div>
@@ -2012,8 +2126,8 @@ function MusicPanel() {
           <div className="panel-title">Style / ambiance</div>
           <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="ex. epic orchestral, cinematic, rising tension…" />
           {error && <div className="image-error">{error}</div>}
-          <button className="lgb lgb-primary lgb-lg" style={{ width: "100%", marginTop: 14 }} onClick={() => void generate()} disabled={busy || !prompt.trim() || (!instrumental && !lyrics.trim())}>
-            <Icon name="sparkle" size={14} /> {busy ? "Composition…" : "Générer le morceau"}
+          <button className="lgb lgb-primary lgb-lg" style={{ width: "100%", marginTop: 14 }} onClick={() => busy ? void mediaJob.cancel() : void generate()} disabled={!busy && (!prompt.trim() || (!instrumental && !lyrics.trim()))}>
+            <Icon name={busy ? "x" : "sparkle"} size={14} /> {busy ? (mediaJob.progress?.status === "cancel_requested" ? "Annulation…" : "Annuler") : "Générer le morceau"}
           </button>
         </div>
 
@@ -2049,32 +2163,68 @@ function MusicPanel() {
 }
 
 // ─── Studio média — onglets Image / Vidéo / Musique sur la route /image ─────
-// Conserve la signature publique d'ImageView (props image) attendue par
-// routes/image.tsx : seul l'onglet « Image » consomme generations/setGenerations.
+// Les trois onglets écrivent dans la même médiathèque SQLite locale.
 export function ImageView({ generations, setGenerations }: any) {
-  const [tab, setTab] = useState<"image" | "video" | "music">("image");
+  // Reading must stay side-effect free: React StrictMode calls state
+  // initializers twice in development. Clearing here would make the committed
+  // render lose the draft consumed by the probe render.
+  const [retryDraft] = useState<Generation | null>(() => peekMediaRetry());
+  useEffect(() => {
+    if (retryDraft) clearMediaRetry();
+  }, [retryDraft]);
+  const [tab, setTab] = useState<"image" | "video" | "music">(retryDraft?.kind ?? "image");
   const tabs: { id: "image" | "video" | "music"; label: string; icon: string }[] = [
     { id: "image", label: "Image", icon: "image" },
     { id: "video", label: "Vidéo", icon: "sparkle" },
     { id: "music", label: "Musique", icon: "sparkle" },
   ];
+  const focusTab = (index: number) => {
+    const target = tabs[index];
+    if (!target) return;
+    setTab(target.id);
+    requestAnimationFrame(() => document.getElementById(`media-tab-${target.id}`)?.focus());
+  };
+  const onTabKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>, index: number) => {
+    let next = index;
+    if (event.key === "ArrowRight") next = (index + 1) % tabs.length;
+    else if (event.key === "ArrowLeft") next = (index - 1 + tabs.length) % tabs.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = tabs.length - 1;
+    else return;
+    event.preventDefault();
+    focusTab(next);
+  };
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", minHeight: 0 }}>
-      <div style={{ display: "flex", gap: 6, padding: "10px 0 12px", flex: "none" }}>
-        {tabs.map((t) => (
+      <div role="tablist" aria-label="Type de média" style={{ display: "flex", gap: 6, padding: "10px 0 12px", flex: "none" }}>
+        {tabs.map((t, index) => (
           <button
             key={t.id}
+            id={`media-tab-${t.id}`}
+            role="tab"
+            aria-selected={t.id === tab}
+            aria-controls="media-tabpanel"
+            tabIndex={t.id === tab ? 0 : -1}
             className={"lgb lgb-sm" + (t.id === tab ? " lgb-primary" : "")}
             onClick={() => setTab(t.id)}
+            onKeyDown={(event) => onTabKeyDown(event, index)}
           >
             <Icon name={t.icon} size={12} /> {t.label}
           </button>
         ))}
       </div>
-      <div style={{ flex: 1, minHeight: 0 }}>
-        {tab === "image" && <ImagePanel generations={generations} setGenerations={setGenerations} />}
-        {tab === "video" && <VideoPanel />}
-        {tab === "music" && <MusicPanel />}
+      <div
+        id="media-tabpanel"
+        role="tabpanel"
+        aria-labelledby={`media-tab-${tab}`}
+        // .image-shell is absolutely positioned. This panel must establish
+        // its containing block or the media canvas expands over the tab bar
+        // and intercepts its pointer events in the native WebView.
+        style={{ flex: 1, minHeight: 0, position: "relative", overflow: "hidden" }}
+      >
+        {tab === "image" && <ImagePanel generations={generations} setGenerations={setGenerations} retryDraft={retryDraft?.kind === "image" ? retryDraft : null} />}
+        {tab === "video" && <VideoPanel setGenerations={setGenerations} retryDraft={retryDraft?.kind === "video" ? retryDraft : null} />}
+        {tab === "music" && <MusicPanel setGenerations={setGenerations} retryDraft={retryDraft?.kind === "music" ? retryDraft : null} />}
       </div>
     </div>
   );
@@ -2133,7 +2283,7 @@ function tokenizeRust(src: string): Token[] {
       i = j; continue;
     }
     let j = i;
-    while (j < n && !/[\/"#0-9A-Za-z_]/.test(src[j])) j++;
+    while (j < n && !/[/"#0-9A-Za-z_]/.test(src[j])) j++;
     push(null, src.slice(i, j || i + 1));
     i = Math.max(j, i + 1);
   }

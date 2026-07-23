@@ -6,7 +6,7 @@
 // credentials backend (OS keychain in Tauri); discovery is invalidated on
 // any save so the ModelPicker picks up the new key on the next read.
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Icon } from "@/components/components";
 import { invoke } from "@/lib/tauri";
 import {
@@ -31,6 +31,9 @@ import { db } from "@/lib/db";
 import { getInstalledIds, getModelPath } from "@/lib/modelBundle";
 import { parseThinkingMode, serializeThinkingMode, type ThinkingMode } from "@/lib/thinkingHeuristic";
 import { McpServersSection } from "@/features/mcp/McpServersSection";
+import { useModalFocusTrap } from "@/lib/modalFocus";
+import { ProviderMark } from "@/components/ProviderMark";
+import "./connections-redesign.css";
 
 // Storage key for the persisted list of user-added custom providers. JSON-encoded
 // array of ConnCardData rows (display metadata only — secrets/configs live in
@@ -41,6 +44,9 @@ export function ConnectionsView() {
   const [tab, setTab] = useState("models");
   const [customModels, setCustomModels] = useState<ConnCardData[]>([]);
   const [adding, setAdding] = useState(false);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const toggleExpanded = (id: string) =>
+    setExpandedId((current) => (current === id ? null : id));
 
   // Restore persisted custom providers on mount. The list is metadata only —
   // each provider's actual credentials are loaded by its ConnCard via the
@@ -81,33 +87,35 @@ export function ConnectionsView() {
   // only thing that's free to change for i18n / wording.
   const cards: Record<string, ConnCardData[]> = {
     models: [
-      { id: "anthropic", name: "Anthropic", meta: "Claude / Shugu models", logo: "A", color: "#d97757", fields: [
+      { id: "anthropic", name: "Anthropic", meta: "Claude / Shugu models", logo: "A", color: "#d97757", probe: "models", fields: [
         { label: "API key", key: "apiKey", placeholder: "sk-ant-…", secret: true },
       ]},
-      { id: "openai", name: "OpenAI", meta: "GPT-4o, o1, embeddings", logo: "O", color: "#10a37f", fields: [
+      { id: "openai", name: "OpenAI", meta: "GPT-4o, o1, embeddings", logo: "O", color: "#10a37f", probe: "models", fields: [
         { label: "API key", key: "apiKey", placeholder: "sk-…", secret: true },
         { label: "Org ID",  key: "orgId",  placeholder: "org-…", secret: false },
       ]},
-      { id: "ollama", name: "Ollama", meta: "Local model server", logo: "O", color: "#000", fields: [
+      { id: "ollama", name: "Ollama", meta: "Local model server", logo: "O", color: "#000", probe: "models", fields: [
         { label: "Endpoint", key: "baseUrl", placeholder: "http://localhost:11434", secret: false },
       ]},
-      { id: "llamacpp", name: "llama.cpp", meta: "Local OpenAI-compatible server (gguf models)", logo: "L", color: "#7c3aed", fields: [
+      { id: "llamacpp", name: "llama.cpp", meta: "Local OpenAI-compatible server (gguf models)", logo: "L", color: "#7c3aed", probe: "models", fields: [
         { label: "Endpoint", key: "baseUrl", placeholder: "http://localhost:8090", secret: false },
         // HF repo:quant fed to `llama-server -hf …`. Ex: HauhauCS/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive:Q5_K_P
         { label: "Modèle HuggingFace (repo:quant)", key: "hfModel", placeholder: "user/repo:Q5_K_P", secret: false },
+        { label: "Contexte agent (tokens, optionnel)", key: "ctx", placeholder: "auto · 32768 pour Mistral", secret: false },
+        { label: "Template llama.cpp (optionnel)", key: "chatTemplate", placeholder: "ex. mistral-v3", secret: false },
         // Optional path to llama-server.exe. If empty we resolve from PATH
         // (winget install puts it there) then fall back to Docker Desktop's
         // bundled binary at ~/.docker/bin/inference/llama-server.exe.
         { label: "Binary (optionnel)", key: "binary", placeholder: "auto-détecté depuis le PATH", secret: false },
         { label: "API key (optional)", key: "apiKey", placeholder: "leave empty unless --api-key was set", secret: true },
       ]},
-      { id: "mistral", name: "Mistral", meta: "European open-weights", logo: "M", color: "#ff7000", fields: [
+      { id: "mistral", name: "Mistral", meta: "European open-weights", logo: "M", color: "#ff7000", probe: "models", fields: [
         { label: "API key", key: "apiKey", placeholder: "…", secret: true },
       ]},
-      { id: "groq", name: "Groq", meta: "Fast LPU inference", logo: "G", color: "#f55036", fields: [
+      { id: "groq", name: "Groq", meta: "Fast LPU inference", logo: "G", color: "#f55036", probe: "models", fields: [
         { label: "API key", key: "apiKey", placeholder: "gsk_…", secret: true },
       ]},
-      { id: "minimax", name: "MiniMax", meta: "OpenAI-compat · texte (vidéo/voix via MCP)", logo: "M", color: "#ff4d4f", fields: [
+      { id: "minimax", name: "MiniMax", meta: "OpenAI-compat · texte (vidéo/voix via MCP)", logo: "M", color: "#ff4d4f", probe: "models", fields: [
         { label: "API key", key: "apiKey", placeholder: "…", secret: true },
         { label: "Modèle par défaut", key: "defaultModel", placeholder: "MiniMax-M2.1 (requis si la liste auto échoue)", secret: false },
       ]},
@@ -128,20 +136,20 @@ export function ConnectionsView() {
       ]},
     ],
     tools: [
-      { id: "github", name: "GitHub", meta: "Repos, PRs, issues", logo: "G", color: "#24292f", fields: [
+      { id: "github", name: "GitHub", meta: "Repos, PRs, issues", logo: "G", color: "#24292f", available: false, unavailableReason: "Connecteur natif non implémenté — utilise un serveur MCP GitHub pour l’instant.", fields: [
         { label: "Personal token", key: "apiKey", placeholder: "ghp_…", secret: true },
       ]},
-      { id: "gitlab", name: "GitLab", meta: "Repos & CI", logo: "G", color: "#fc6d26", fields: [
+      { id: "gitlab", name: "GitLab", meta: "Repos & CI", logo: "G", color: "#fc6d26", available: false, unavailableReason: "Connecteur natif non implémenté — utilise un serveur MCP compatible.", fields: [
         { label: "Token", key: "apiKey", placeholder: "glpat-…", secret: true },
         { label: "Host",  key: "baseUrl", placeholder: "https://gitlab.com", secret: false },
       ]},
-      { id: "linear", name: "Linear", meta: "Issues & projects", logo: "L", color: "#5e6ad2", fields: [
+      { id: "linear", name: "Linear", meta: "Issues & projects", logo: "L", color: "#5e6ad2", available: false, unavailableReason: "Connecteur natif non implémenté — utilise le MCP Linear.", fields: [
         { label: "API key", key: "apiKey", placeholder: "lin_api_…", secret: true },
       ]},
-      { id: "vercel", name: "Vercel", meta: "Deploy from Forge", logo: "▲", color: "#000", fields: [
+      { id: "vercel", name: "Vercel", meta: "Deploy from Forge", logo: "▲", color: "#000", available: false, unavailableReason: "Déploiement Vercel non implémenté dans Shugu.", fields: [
         { label: "Token", key: "apiKey", placeholder: "…", secret: true },
       ]},
-      { id: "docker", name: "Docker", meta: "Local daemon", logo: "D", color: "#2496ed", fields: [
+      { id: "docker", name: "Docker", meta: "Local daemon", logo: "D", color: "#2496ed", available: false, unavailableReason: "Connexion Docker dédiée non implémentée ; les agents peuvent utiliser le CLI selon leur profil.", fields: [
         { label: "Socket", key: "endpoint", placeholder: "/var/run/docker.sock", secret: false },
       ]},
     ],
@@ -171,13 +179,13 @@ export function ConnectionsView() {
       ]},
     ],
     storage: [
-      { id: "drive",  name: "Google Drive",  meta: "Sync generations & projects", logo: "D", color: "#4285f4", fields: [] },
-      { id: "s3", name: "S3-compatible", meta: "Self-hosted bucket", logo: "S", color: "#ff9900", fields: [
+      { id: "drive",  name: "Google Drive",  meta: "Sync generations & projects", logo: "D", color: "#4285f4", available: false, unavailableReason: "Synchronisation Google Drive non implémentée.", fields: [] },
+      { id: "s3", name: "S3-compatible", meta: "Self-hosted bucket", logo: "S", color: "#ff9900", available: false, unavailableReason: "Synchronisation S3 non implémentée.", fields: [
         { label: "Endpoint", key: "endpoint", placeholder: "s3.example.com", secret: false },
         { label: "Key ID",   key: "orgId",    placeholder: "AKIA…",         secret: false },
         { label: "Secret",   key: "apiKey",   placeholder: "…",              secret: true  },
       ]},
-      { id: "icloud", name: "iCloud Drive", meta: "macOS only", logo: "i", color: "#007aff", fields: [] },
+      { id: "icloud", name: "iCloud Drive", meta: "macOS only", logo: "i", color: "#007aff", available: false, unavailableReason: "Synchronisation iCloud non implémentée.", fields: [] },
     ],
   };
 
@@ -185,23 +193,68 @@ export function ConnectionsView() {
     <div className="settings-shell scroll">
       <div className="settings-inner">
         <div className="setting-section">
-          <h3>Connections</h3>
-          <p className="sub">Branche tes outils externes. Les clés API sont stockées dans le keychain natif de l'OS (Windows Credential Manager, macOS Keychain, Linux Secret Service). Les endpoints et IDs non-secrets vont dans la base SQLite locale.</p>
+          <div className="connections-hero">
+            <div>
+              <span className="connections-eyebrow">Infrastructure IA</span>
+              <h3>Connexions</h3>
+              <p className="sub">
+                Branche tes modèles et services. Les secrets restent dans le coffre natif
+                de ton système ; Shugu vérifie les providers en direct.
+              </p>
+            </div>
+            <div className="connections-trust" aria-label="Garanties de connexion">
+              <span><Icon name="lock" size={12} /> Clés protégées</span>
+              <span><span className="connections-live-dot" /> Détection live</span>
+              <span><Icon name="list" size={12} /> Réglages repliables</span>
+            </div>
+          </div>
           <div className="conn-tabs">
             {tabs.map(t => (
-              <button key={t.v} className={"conn-tab-btn" + (tab === t.v ? " on" : "")} onClick={() => setTab(t.v)}>{t.l}</button>
+              <button
+                key={t.v}
+                className={"conn-tab-btn" + (tab === t.v ? " on" : "")}
+                onClick={() => {
+                  setTab(t.v);
+                  setExpandedId(null);
+                }}
+              >
+                {t.l}
+              </button>
             ))}
           </div>
           <div className="connections-grid">
             {(cards[tab] || []).map((c: any) =>
-              c.id === "codex" ? <CodexCard key={c.id} c={c}/> : <ConnCard key={c.id} c={c}/>,
+              c.id === "codex"
+                ? (
+                  <CodexCard
+                    key={c.id}
+                    c={c}
+                    expanded={expandedId === c.id}
+                    onToggle={() => toggleExpanded(c.id)}
+                  />
+                )
+                : (
+                  <ConnCard
+                    key={c.id}
+                    c={c}
+                    expanded={expandedId === c.id}
+                    onToggle={() => toggleExpanded(c.id)}
+                  />
+                ),
             )}
-            {tab === "models" && customModels.map((c: any) => <ConnCard key={c.id} c={c}/>)}
+            {tab === "models" && customModels.map((c: any) => (
+              <ConnCard
+                key={c.id}
+                c={c}
+                expanded={expandedId === c.id}
+                onToggle={() => toggleExpanded(c.id)}
+              />
+            ))}
             {tab === "models" && (
               <button type="button" className="conn-add-card" onClick={() => setAdding(true)} aria-label="Add custom provider">
                 <span className="plus" aria-hidden="true"><Icon name="plus" size={18}/></span>
-                <div className="t">Add custom provider</div>
-                <div className="s">OpenAI-compatible endpoint, vLLM, LM Studio, Together AI, custom router…</div>
+                <div className="t">Ajouter un provider</div>
+                <div className="s">Endpoint compatible OpenAI, vLLM, LM Studio, Together AI ou routeur personnalisé.</div>
               </button>
             )}
           </div>
@@ -229,13 +282,39 @@ export function AddProviderModal({ onClose, onAdd }: { onClose: () => void; onAd
   const [endpoint, setEndpoint] = useState("https://");
   const [key, setKey] = useState("");
   const [model, setModel] = useState("");
+  const [testState, setTestState] = useState<"idle" | "testing" | "ok" | "error">("idle");
+  const [testMessage, setTestMessage] = useState<string | null>(null);
+  const [testDetails, setTestDetails] = useState<string | null>(null);
   // `kind` here doubles as the protocol the chat dispatcher will use. We keep
   // anthropic/openai/ollama/custom in lockstep with the Rust `chat_send` match
   // arms so a user-defined provider can immediately participate in chat.
   const [kind, setKind] = useState("openai");
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const nameRef = useRef<HTMLInputElement | null>(null);
+  useModalFocusTrap({ open: true, containerRef: dialogRef, initialFocusRef: nameRef, onEscape: onClose });
   // For OpenAI-compat and Ollama, leaving the API key empty is fine (local
   // servers often don't require one). We only require name + endpoint.
   const ok = name && endpoint;
+  const testConnection = async () => {
+    if (!endpoint) return;
+    setTestState("testing");
+    setTestMessage(null);
+    setTestDetails(null);
+    try {
+      const models = await invoke<string[]>("models_discover_external", {
+        protocol: kind,
+        baseUrl: endpoint,
+        apiKey: key || null,
+      });
+      setTestState("ok");
+      setTestMessage(`Connexion vérifiée · ${models.length} modèle${models.length > 1 ? "s" : ""}`);
+    } catch (err) {
+      const details = String(err);
+      setTestState("error");
+      setTestMessage(friendlyConnectionIssue(details, "custom"));
+      setTestDetails(details);
+    }
+  };
   const submit = async () => {
     if (!ok) return;
     const id = "custom-" + Date.now();
@@ -258,6 +337,7 @@ export function AddProviderModal({ onClose, onAdd }: { onClose: () => void; onAd
       meta: kind + " · " + (model || "auto"),
       logo: name[0]?.toUpperCase() || "?",
       color: "#5063c5",
+      probe: "models",
       fields: [
         { label: "Endpoint",      key: "baseUrl",      placeholder: endpoint,      secret: false },
         { label: "API key",       key: "apiKey",       placeholder: "•••",         secret: true  },
@@ -268,7 +348,15 @@ export function AddProviderModal({ onClose, onAdd }: { onClose: () => void; onAd
   };
   return (
     <div className="palette-scrim" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <div className="palette" style={{width: "min(540px, 90%)", padding: 0}}>
+      <div
+        ref={dialogRef}
+        className="palette"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Add custom provider"
+        tabIndex={-1}
+        style={{width: "min(540px, 90%)", padding: 0}}
+      >
         <div style={{padding: "16px 18px", borderBottom: "1px solid rgba(255,255,255,0.05)"}}>
           <div style={{fontFamily: "var(--font-display)", fontWeight: 700, fontSize: 15}}>Add custom provider</div>
           <div style={{fontSize: 12, color: "var(--on-surface-variant)", marginTop: 4}}>
@@ -278,7 +366,7 @@ export function AddProviderModal({ onClose, onAdd }: { onClose: () => void; onAd
         <div style={{padding: 18, display: "flex", flexDirection: "column", gap: 12}}>
           <div className="conn-field">
             <label>Display name</label>
-            <div className="input"><input value={name} onChange={e => setName(e.target.value)} placeholder="e.g. OpenRouter, My LM Studio…" autoFocus/></div>
+            <div className="input"><input ref={nameRef} name="provider-name" autoComplete="off" aria-label="Display name" value={name} onChange={e => setName(e.target.value)} placeholder="e.g. OpenRouter, My LM Studio…"/></div>
           </div>
           <div className="conn-field">
             <label>Protocol</label>
@@ -295,21 +383,45 @@ export function AddProviderModal({ onClose, onAdd }: { onClose: () => void; onAd
           </div>
           <div className="conn-field">
             <label>Endpoint URL</label>
-            <div className="input"><input value={endpoint} onChange={e => setEndpoint(e.target.value)} placeholder="https://api.example.com/v1"/></div>
+            <div className="input"><input type="url" inputMode="url" name="provider-endpoint" autoComplete="url" aria-label="Endpoint URL" value={endpoint} onChange={e => setEndpoint(e.target.value)} placeholder="https://api.example.com/v1"/></div>
           </div>
           <div className="conn-field">
             <label>API key</label>
-            <div className="input"><input type="password" value={key} onChange={e => setKey(e.target.value)} placeholder="sk-…"/></div>
+            <div className="input"><input type="password" name="provider-api-key" autoComplete="new-password" spellCheck={false} aria-label="API key" value={key} onChange={e => setKey(e.target.value)} placeholder="sk-…"/></div>
           </div>
           <div className="conn-field">
             <label>Default model (optional)</label>
-            <div className="input"><input value={model} onChange={e => setModel(e.target.value)} placeholder="gpt-4o-mini, llama-3.3-70b, claude-3-5-sonnet…"/></div>
+            <div className="input"><input name="provider-model" autoComplete="off" spellCheck={false} aria-label="Default model" value={model} onChange={e => setModel(e.target.value)} placeholder="gpt-4o-mini, llama-3.3-70b, claude-3-5-sonnet…"/></div>
           </div>
+          {testMessage && (
+            <div
+              role={testState === "error" ? "alert" : "status"}
+              style={{
+                fontSize: 11,
+                color: testState === "error" ? "var(--error, #ff6b6b)" : "var(--success, #4ade80)",
+                overflowWrap: "anywhere",
+              }}
+            >
+              {testState === "error" ? "Échec du test · " : "✓ "}{testMessage}
+              {testDetails && (
+                <details style={{ marginTop: 6, color: "var(--on-surface-muted)" }}>
+                  <summary>Détails techniques</summary>
+                  <code>{testDetails}</code>
+                </details>
+              )}
+            </div>
+          )}
         </div>
         <div style={{padding: "12px 18px", borderTop: "1px solid rgba(255,255,255,0.05)", display: "flex", gap: 8}}>
           <button className="lgb" onClick={onClose}>Cancel</button>
           <span style={{flex:1}}></span>
-          <button className="lgb"><Icon name="thumbs" size={11}/> Test connection</button>
+          <button
+            className="lgb"
+            onClick={() => void testConnection()}
+            disabled={!endpoint || testState === "testing"}
+          >
+            <Icon name="thumbs" size={11}/> {testState === "testing" ? "Testing…" : "Test connection"}
+          </button>
           <button className="lgb lgb-primary" disabled={!ok} onClick={submit}>
             <Icon name="plus" size={12}/> Add provider
           </button>
@@ -336,15 +448,28 @@ export interface ConnCardData {
   meta: string;
   logo: string;
   color: string;
+  /** Which real health probe can justify a “connected” state. */
+  probe?: "models";
+  /** False for catalog entries whose backend does not exist yet. */
+  available?: boolean;
+  unavailableReason?: string;
   fields: ConnField[];
 }
 
-type ConnStatus = "loading" | "connected" | "disconnected";
+type ConnStatus = "loading" | "configured" | "disconnected";
 
 /** Dedicated card for the Codex CLI provider: no API key (subscription auth via
  *  `codex login`), so we show connection status + an enable toggle + the usage
  *  panel instead of the generic key fields. */
-export function CodexCard({ c }: { c: ConnCardData }) {
+export function CodexCard({
+  c,
+  expanded,
+  onToggle,
+}: {
+  c: ConnCardData;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
   const { data: auth, refetch, isFetching } = useCodexAuth();
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [dedicated, setDedicated] = useState<boolean | null>(null);
@@ -473,20 +598,32 @@ export function CodexCard({ c }: { c: ConnCardData }) {
   };
 
   return (
-    <div className={"conn-card " + (ready ? "connected" : "")}>
-      <div className="conn-head">
-        <div className="conn-logo" style={{ background: c.color, color: "rgba(0,0,0,0.7)" }}>
-          {c.logo}
-        </div>
+    <div
+      className={`conn-card conn-card-v2${ready ? " connected" : ""}${expanded ? " is-expanded" : ""}`}
+      data-provider-id={c.id}
+    >
+      <button
+        type="button"
+        className="conn-card-toggle"
+        aria-expanded={expanded}
+        onClick={onToggle}
+      >
+        <ProviderMark id={c.id} name={c.name} fallback={c.logo} color={c.color} />
         <div className="conn-info">
           <div className="conn-name">{c.name}</div>
           <div className="conn-meta">{c.meta}</div>
         </div>
-        <span className={"conn-status " + statusClass}>{statusLabel}</span>
-      </div>
+        <span className={`conn-status-v2 ${statusClass}`}>
+          <span className="conn-status-dot" />
+          {statusLabel}
+        </span>
+        <Icon name="down" size={13} className="conn-card-chevron" />
+      </button>
 
+      {expanded && (
+        <div className="conn-card-body">
       {/* Status detail + remediation */}
-      <div style={{ fontSize: 11, color: "var(--on-surface-muted)", lineHeight: 1.5, margin: "6px 0" }}>
+      <div className="conn-detail-copy">
         {!auth ? (
           "Vérification…"
         ) : ready ? (
@@ -500,7 +637,7 @@ export function CodexCard({ c }: { c: ConnCardData }) {
             ✗ Binaire <code>codex</code> introuvable. Installe-le dans un terminal :
             <br />
             <code style={{ background: "rgba(0,0,0,0.3)", padding: "1px 5px", borderRadius: 3 }}>
-              npm i -g @openai/codex
+              pnpm add -g @openai/codex
             </code>
           </>
         ) : (
@@ -655,11 +792,69 @@ export function CodexCard({ c }: { c: ConnCardData }) {
           <Icon name="check" size={11} /> {isFetching ? "Vérification…" : "Vérifier"}
         </button>
       </div>
+        </div>
+      )}
     </div>
   );
 }
 
-export function ConnCard({ c }: { c: ConnCardData }) {
+export function ConnCard({
+  c,
+  expanded,
+  onToggle,
+}: {
+  c: ConnCardData;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  if (c.available === false) {
+    return (
+      <div className="conn-card conn-card-v2 is-unavailable" aria-disabled="true">
+        <div className="conn-card-toggle">
+          <ProviderMark id={c.id} name={c.name} fallback={c.logo} color={c.color} />
+          <div className="conn-info">
+            <div className="conn-name">{c.name}</div>
+            <div className="conn-meta" title={c.unavailableReason}>{c.meta}</div>
+          </div>
+          <span className="conn-status-v2 disconnected">
+            <span className="conn-status-dot" />
+            Indisponible
+          </span>
+        </div>
+      </div>
+    );
+  }
+  return <ActiveConnCard c={c} expanded={expanded} onToggle={onToggle} />;
+}
+
+function friendlyConnectionIssue(message: string, providerId: string): string {
+  const normalized = message.toLowerCase();
+  if (
+    providerId === "llamacpp" ||
+    normalized.includes("localhost") ||
+    normalized.includes("loopback") ||
+    normalized.includes("connection refused")
+  ) {
+    return "Le serveur local n’est pas joignable. Démarre-le ou vérifie son endpoint.";
+  }
+  if (normalized.includes("401") || normalized.includes("403") || normalized.includes("auth")) {
+    return "La clé est enregistrée, mais le provider refuse l’authentification.";
+  }
+  if (normalized.includes("timeout") || normalized.includes("timed out")) {
+    return "Le provider ne répond pas dans le délai attendu.";
+  }
+  return "La configuration est enregistrée, mais la vérification a échoué.";
+}
+
+function ActiveConnCard({
+  c,
+  expanded,
+  onToggle,
+}: {
+  c: ConnCardData;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
   // `vals` is the live edited state. `saved` mirrors what's actually persisted
   // and is used to drive the "dirty" indicator + decide whether the Save
   // button has work to do. Both are keyed by `field.key`, not by label.
@@ -696,7 +891,7 @@ export function ConnCard({ c }: { c: ConnCardData }) {
       if (cancelled) return;
       setVals(initial);
       setSaved(initial);
-      setStatus(Object.keys(initial).length > 0 ? "connected" : "disconnected");
+      setStatus(Object.keys(initial).length > 0 ? "configured" : "disconnected");
     })();
     return () => { cancelled = true; };
     // Intentionally NOT including c.fields — it's a fresh array reference on
@@ -729,7 +924,7 @@ export function ConnCard({ c }: { c: ConnCardData }) {
       await setProviderEnabled(c.id, true);
       setSaved({ ...vals });
       const anyValue = c.fields.some((f) => (vals[f.key] ?? "") !== "");
-      setStatus(anyValue ? "connected" : "disconnected");
+      setStatus(anyValue ? "configured" : "disconnected");
       setSavingState("saved");
       // Tell every window that the set of usable providers may have changed
       // so the ModelPicker / chibi mood / etc. pick up the new key on next
@@ -761,110 +956,149 @@ export function ConnCard({ c }: { c: ConnCardData }) {
     }
   };
 
-  // The pill shows a more informative status when we have discovery data:
-  //   "connected · 4 models" when the discovery returned models for this provider,
-  //   "saved · ⚠ error"      when a config is saved but the discovery failed,
-  //   "connected"            when saved but discovery hasn't run yet,
-  //   "disconnected" / "loading…" otherwise.
-  const statusLabel: string = status === "loading"
-    ? "loading…"
-    : status === "connected"
-      ? (discoveryError
-          ? "saved · check error"
-          : discoveredCount > 0
-            ? `connected · ${discoveredCount} model${discoveredCount > 1 ? "s" : ""}`
-            : "saved")
-      : "disconnected";
+  const probePassed = c.probe === "models" && !discoveryError && discoveredCount > 0;
+  const visualStatus: "loading" | "connected" | "configured" | "disconnected" =
+    status === "loading" ? "loading" : probePassed ? "connected" : status;
+  const hasDiscoveryError = !!discoveryError && status === "configured";
+  const statusTone = hasDiscoveryError ? "error" : visualStatus;
+  const statusLabel: string = visualStatus === "loading"
+    ? "Vérification…"
+    : visualStatus === "connected"
+      ? `${discoveredCount} modèle${discoveredCount > 1 ? "s" : ""} prêt${discoveredCount > 1 ? "s" : ""}`
+      : visualStatus === "configured"
+        ? (discoveryError ? "À vérifier" : "Configuré")
+        : "À configurer";
 
   return (
-    <div className={"conn-card " + (status === "connected" ? "connected" : "")}>
-      <div className="conn-head">
-        <div className="conn-logo" style={{background: c.color, color: c.color === "#000" || c.color === "#24292f" ? "white" : "rgba(0,0,0,0.7)"}}>{c.logo}</div>
+    <div
+      className={`conn-card conn-card-v2${visualStatus === "connected" ? " connected" : ""}${hasDiscoveryError ? " has-error" : ""}${expanded ? " is-expanded" : ""}`}
+      data-provider-id={c.id}
+    >
+      <button
+        type="button"
+        className="conn-card-toggle"
+        aria-expanded={expanded}
+        onClick={onToggle}
+      >
+        <ProviderMark id={c.id} name={c.name} fallback={c.logo} color={c.color} />
         <div className="conn-info">
           <div className="conn-name">{c.name}</div>
-          <div className="conn-meta">{c.meta}</div>
-        </div>
-        <span className={"conn-status " + status}>{statusLabel}</span>
-      </div>
-      {c.fields.length > 0 && c.fields.map((f) => {
-        // Has a real persisted value (different from the empty default)?
-        const isSaved = (saved[f.key] ?? "") !== "";
-        return (
-          <div key={f.key} className="conn-field">
-            <label>
-              {f.label}
-              {isSaved && (
-                <span style={{
-                  marginLeft: 8,
-                  fontSize: 10,
-                  fontWeight: 600,
-                  color: "var(--success, #4ade80)",
-                  letterSpacing: 0.5,
-                  textTransform: "uppercase",
-                }}>✓ saved</span>
-              )}
-            </label>
-            <div className="input">
-              <input
-                type={f.secret && !reveal[f.key] ? "password" : "text"}
-                value={vals[f.key] ?? ""}
-                onChange={(e) => setVals((s) => ({ ...s, [f.key]: e.target.value }))}
-                // When a secret is already persisted, the input still shows
-                // dots (type=password) for the current value, but if the
-                // user starts typing replacement they get a clear placeholder.
-                // We keep the original placeholder for not-yet-saved fields.
-                placeholder={isSaved && f.secret ? "•••••••• (stored — click Reveal to show)" : f.placeholder}
-                spellCheck={false}
-                autoComplete="off"
-              />
-              {f.secret && (
-                <button onClick={() => setReveal((r) => ({ ...r, [f.key]: !r[f.key] }))} title={reveal[f.key] ? "Hide" : "Show"}>
-                  <Icon name={reveal[f.key] ? "x" : "search"} size={12}/>
-                </button>
-              )}
-            </div>
+          <div className="conn-meta" title={hasDiscoveryError ? friendlyConnectionIssue(discoveryError, c.id) : c.meta}>
+            {hasDiscoveryError ? friendlyConnectionIssue(discoveryError, c.id) : c.meta}
           </div>
-        );
-      })}
-      {discoveryError && status === "connected" && (
-        // Surface the upstream error (most often 401 from a fake key, or
-        // connection refused from a server that's down) right on the card,
-        // not just hidden in the model picker.
-        <div style={{
-          margin: "6px 0",
-          padding: "8px 10px",
-          borderRadius: 6,
-          background: "rgba(255, 107, 107, 0.08)",
-          border: "1px solid rgba(255, 107, 107, 0.25)",
-          fontSize: 11,
-          color: "var(--error, #ff6b6b)",
-          lineHeight: 1.4,
-        }}>
-          ⚠ Le provider est saved mais la liste des modèles a échoué&nbsp;: <code style={{ background: "rgba(0,0,0,0.3)", padding: "1px 4px", borderRadius: 3 }}>{discoveryError}</code>
+        </div>
+        <span className={`conn-status-v2 ${statusTone}`}>
+          <span className="conn-status-dot" />
+          {statusLabel}
+        </span>
+        <Icon name="down" size={13} className="conn-card-chevron" />
+      </button>
+
+      {expanded && (
+        <div className="conn-card-body">
+          {c.fields.length > 0 && (
+            <div className="conn-fields-grid">
+              {c.fields.map((field) => {
+                const isSaved = (saved[field.key] ?? "") !== "";
+                return (
+                  <div key={field.key} className="conn-field">
+                    <label>
+                      {field.label}
+                      {isSaved && <span className="conn-field-saved">Enregistré</span>}
+                    </label>
+                    <div className="input">
+                      <input
+                        type={field.secret && !reveal[field.key] ? "password" : "text"}
+                        value={vals[field.key] ?? ""}
+                        onChange={(event) =>
+                          setVals((current) => ({
+                            ...current,
+                            [field.key]: event.currentTarget.value,
+                          }))
+                        }
+                        placeholder={
+                          isSaved && field.secret
+                            ? "•••••••• (stockée dans le coffre système)"
+                            : field.placeholder
+                        }
+                        spellCheck={false}
+                        autoComplete="off"
+                      />
+                      {field.secret && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setReveal((current) => ({
+                              ...current,
+                              [field.key]: !current[field.key],
+                            }))
+                          }
+                          title={reveal[field.key] ? "Masquer" : "Afficher"}
+                        >
+                          <Icon name={reveal[field.key] ? "x" : "search"} size={12} />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {discoveryError && status === "configured" && (
+            <details className="conn-issue">
+              <summary>{friendlyConnectionIssue(discoveryError, c.id)}</summary>
+              <code>{discoveryError}</code>
+            </details>
+          )}
+
+          {c.id === "llamacpp" && (
+            <div className="conn-local-runtime">
+              <div className="conn-subhead">
+                <span>Serveur local</span>
+                <small>Contrôles avancés llama.cpp</small>
+              </div>
+              <LlamaServerControls
+                savedHfModel={saved.hfModel ?? ""}
+                savedBinary={saved.binary ?? ""}
+                savedCtx={saved.ctx ?? ""}
+                savedChatTemplate={saved.chatTemplate ?? ""}
+              />
+            </div>
+          )}
+
+          <div className="conn-actions">
+            <button
+              className="lgb lgb-sm lgb-primary"
+              onClick={onSave}
+              disabled={!isDirty || savingState === "saving" || status === "loading"}
+              title={isDirty ? "Enregistrer les changements" : "Aucun changement"}
+            >
+              <Icon name="sparkle" size={11} />
+              {savingState === "saving"
+                ? "Enregistrement…"
+                : savingState === "saved"
+                  ? "Enregistré ✓"
+                  : "Enregistrer"}
+            </button>
+            {status === "configured" && (
+              <button
+                className="lgb lgb-sm"
+                onClick={onDisconnect}
+                disabled={savingState === "saving"}
+              >
+                Déconnecter
+              </button>
+            )}
+            <span className="conn-actions-spacer" />
+            {savingState === "error" && (
+              <span className="conn-save-error" title={errorMsg ?? ""}>
+                Échec de l’enregistrement
+              </span>
+            )}
+          </div>
         </div>
       )}
-      {c.id === "llamacpp" && (
-        <LlamaServerControls savedHfModel={saved.hfModel ?? ""} savedBinary={saved.binary ?? ""}/>
-      )}
-      <div className="conn-actions">
-        <button
-          className="lgb lgb-sm lgb-primary"
-          onClick={onSave}
-          disabled={!isDirty || savingState === "saving" || status === "loading"}
-          title={isDirty ? "Save changes" : "Nothing to save"}
-        >
-          <Icon name="sparkle" size={11}/> {savingState === "saving" ? "Saving…" : savingState === "saved" ? "Saved ✓" : "Save"}
-        </button>
-        {status === "connected" && (
-          <button className="lgb lgb-sm" onClick={onDisconnect} disabled={savingState === "saving"}>
-            Disconnect
-          </button>
-        )}
-        <span style={{flex:1}}></span>
-        {savingState === "error" && (
-          <span style={{fontSize:11, color:"var(--error, #ff6b6b)"}} title={errorMsg ?? ""}>error · hover for details</span>
-        )}
-      </div>
     </div>
   );
 }
@@ -919,7 +1153,17 @@ function isBackendChoice(s: string | null): s is BackendChoice {
   return s === "auto" || s === "cpu" || s === "vulkan";
 }
 
-function LlamaServerControls({ savedHfModel, savedBinary }: { savedHfModel: string; savedBinary: string }) {
+function LlamaServerControls({
+  savedHfModel,
+  savedBinary,
+  savedCtx,
+  savedChatTemplate,
+}: {
+  savedHfModel: string;
+  savedBinary: string;
+  savedCtx: string;
+  savedChatTemplate: string;
+}) {
   const [status, setStatus] = useState<LlamaStatus>({ running: false, pid: null, binary: null });
   const [busy, setBusy] = useState<"idle" | "starting" | "stopping">("idle");
   const [error, setError] = useState<string | null>(null);
@@ -1000,10 +1244,22 @@ function LlamaServerControls({ savedHfModel, savedBinary }: { savedHfModel: stri
     //      autostarted Qwen can be restarted from this card with a
     //      different backend, without forcing the user to first type an
     //      hfModel into the form
-    let invokeArgs: Record<string, unknown> = {
+    const invokeArgs: Record<string, unknown> = {
       binary: savedBinary || null,
       backend: backendChoice,
     };
+    const modelName = savedHfModel.toLowerCase();
+    const parsedCtx = savedCtx.trim()
+      ? Number.parseInt(savedCtx.trim(), 10)
+      : modelName.includes("mistral")
+        ? 32_768
+        : 16_384;
+    if (!Number.isFinite(parsedCtx) || parsedCtx < 2_048 || parsedCtx > 2_000_000) {
+      setError("Contexte invalide : utilise un entier entre 2048 et 2000000 tokens.");
+      return;
+    }
+    invokeArgs.ctx = parsedCtx;
+    invokeArgs.chatTemplate = savedChatTemplate.trim() || null;
     if (savedHfModel) {
       invokeArgs.hfModel = savedHfModel;
     } else {
@@ -1307,6 +1563,7 @@ function LlamaServerControls({ savedHfModel, savedBinary }: { savedHfModel: stri
 
 function RoutingSection() {
   const { data: models } = useDiscoveredModels();
+  const [expanded, setExpanded] = useState(false);
   const [chatModel, setChatModel] = useState<string>("");
   const [orchModel, setOrchModel] = useState<string>("");
   const [advisorModel, setAdvisorModel] = useState<string>("");
@@ -1359,8 +1616,26 @@ function RoutingSection() {
   const orchModels = models.filter((m) => m.providerId !== "llamacpp");
 
   return (
-    <div className="setting-section" style={{ marginTop: 24, paddingTop: 24, borderTop: "1px solid rgba(255,255,255,0.06)" }}>
-      <h3 style={{ marginBottom: 4 }}>Routing</h3>
+    <section className={`routing-panel${expanded ? " is-expanded" : ""}`}>
+      <button
+        type="button"
+        className="routing-panel-toggle"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        <span className="routing-panel-icon"><Icon name="branch" size={15} /></span>
+        <span>
+          <strong>Routage avancé</strong>
+          <small>Chat, orchestrateur et reviewer</small>
+        </span>
+        <span className="routing-panel-summary">
+          {orchModel ? "Personnalisé" : "Automatique"}
+        </span>
+        <Icon name="down" size={13} className="routing-panel-chevron" />
+      </button>
+      {expanded && (
+      <div className="routing-panel-body">
+      <h3>Routage</h3>
       <p className="sub">
         Sépare le modèle qui parle de celui qui exécute. Les messages courts /
         casuels passent par le <b>chat model</b> (rapide, local). Les tâches
@@ -1487,7 +1762,9 @@ function RoutingSection() {
           </button>
         </div>
       </div>
-    </div>
+      </div>
+      )}
+    </section>
   );
 }
 

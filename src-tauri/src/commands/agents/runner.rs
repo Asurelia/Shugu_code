@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex};
 use rusqlite::params;
 use tauri::{AppHandle, Manager};
 
+use super::policy::ExecutionProfile;
 use super::tools::{execute_tool, ToolCall, ToolResult};
 use super::{get_conn, now_ms, persist_and_emit, AgentEvent, AgentHandle};
 use crate::commands::chat::{self, AssistantTurn, ChatMessage};
@@ -41,34 +42,10 @@ use crate::commands::chat::{self, AssistantTurn, ChatMessage};
 /// exec-directe (2026-06-10) : TOUT agent peut maintenant exécuter du code,
 /// et chaque cycle write→run-test→fix coûte une itération — l'agent a besoin
 /// de marge pour voir un échec réel, corriger, relancer. Sur la DERNIÈRE
-/// itération on injecte un message "[Shugu system] FINAL iteration" et on
-/// force-accepte ce que le modèle produit (même vide) plutôt qu'une erreur
-/// "exceeded MAX_ITERATIONS" sans output.
+/// itération on exige un bilan texte ; un modèle qui demande encore des outils
+/// est marqué incomplet au lieu de transformer des actions non exécutées en
+/// faux succès.
 const MAX_ITERATIONS: u32 = 24;
-
-/// Native tools that MUTATE persistent state — removed from the manifest AND
-/// refused by the dispatcher in plan mode (read-only). Includes `skill_save`
-/// (writes to the shared skills DB → affects all future runs ; de-facto already
-/// neutralised in plan mode since it requires a prior exit-0 `run_command`, but
-/// we block it explicitly so plan mode never persists anything). MCP tools are
-/// not classified (namespaced `mcp__…`, mutation unknown — see manifest filter).
-fn is_write_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "fs_write_file"
-            | "fs_edit"
-            | "fs_delete"
-            | "fs_move"
-            | "run_command"
-            | "skill_save"
-            | "delegate"
-    )
-}
-
-/// Returned to the model if it invokes a write tool while in plan mode
-/// (defense-in-depth — the tool is already absent from the manifest).
-const PLAN_BLOCK_MSG: &str =
-    "blocked: PLAN MODE is read-only — fs_write_file, fs_edit and run_command are disabled for this turn. Describe the change in your plan instead; the user will switch to Agent mode to execute it.";
 
 /// Max `advisor` consultations per run (par-requête, façon `max_uses` de l'outil
 /// officiel). Au-delà, l'appel renvoie une erreur et l'exécuteur continue seul —
@@ -175,7 +152,11 @@ const LOCAL_WINDOW_FALLBACK: usize = 8192;
 /// message COURANT, déjà représenté par `task` (potentiellement enrichi du
 /// contexte éditeur) — sans ce drop, le message courant apparaîtrait en double.
 /// Dégrade silencieusement en `Vec::new()` (zéro régression) sur toute erreur DB.
-fn load_conversation_history(app: &AppHandle, conversation_id: &str, limit: u32) -> Vec<AgentMessage> {
+fn load_conversation_history(
+    app: &AppHandle,
+    conversation_id: &str,
+    limit: u32,
+) -> Vec<AgentMessage> {
     let conn_mutex = match get_conn(app) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
@@ -211,14 +192,18 @@ fn load_conversation_history(app: &AppHandle, conversation_id: &str, limit: u32)
         Err(_) => return Vec::new(),
     };
     rows.reverse(); // DESC → ASC (ancien → récent)
-    // DROP le message courant (dernier, role=user) — déjà passé via `task`.
+                    // DROP le message courant (dernier, role=user) — déjà passé via `task`.
     if matches!(rows.last(), Some((role, ..)) if role == "user") {
         rows.pop();
     }
     let mut history: Vec<AgentMessage> = rows
         .into_iter()
         .filter_map(|(role, text, body, code_text, image)| {
-            let mapped_role = if role == "ai" { "assistant" } else { role.as_str() };
+            let mapped_role = if role == "ai" {
+                "assistant"
+            } else {
+                role.as_str()
+            };
             // Seuls user/assistant sont des tours de dialogue valides.
             if mapped_role != "user" && mapped_role != "assistant" {
                 return None;
@@ -226,7 +211,11 @@ fn load_conversation_history(app: &AppHandle, conversation_id: &str, limit: u32)
             let text = text.unwrap_or_default();
             let content = if image == 1 {
                 let t = text.trim();
-                if t.is_empty() { "[image attached]".to_string() } else { t.to_string() }
+                if t.is_empty() {
+                    "[image attached]".to_string()
+                } else {
+                    t.to_string()
+                }
             } else {
                 let t = text.trim();
                 if !t.is_empty() {
@@ -244,7 +233,10 @@ fn load_conversation_history(app: &AppHandle, conversation_id: &str, limit: u32)
             if content.is_empty() {
                 return None;
             }
-            Some(AgentMessage::Text { role: mapped_role.to_string(), content })
+            Some(AgentMessage::Text {
+                role: mapped_role.to_string(),
+                content,
+            })
         })
         .collect();
     // Anthropic exige que le PREMIER message (après hoisting du system) soit
@@ -362,7 +354,10 @@ fn transcript_excerpt(turns: &[AgentMessage]) -> String {
                 let c: String = content.chars().take(800).collect();
                 s.push_str(&format!("{role}: {c}\n"));
             }
-            AgentMessage::AssistantWithTools { content, tool_calls } => {
+            AgentMessage::AssistantWithTools {
+                content,
+                tool_calls,
+            } => {
                 if !content.trim().is_empty() {
                     let c: String = content.chars().take(400).collect();
                     s.push_str(&format!("assistant: {c}\n"));
@@ -396,7 +391,10 @@ fn estimate_msg_tokens(m: &AgentMessage) -> usize {
         AgentMessage::Text { role, content } => {
             (role.chars().count() + content.chars().count()) / CHARS_PER_TOKEN
         }
-        AgentMessage::AssistantWithTools { content, tool_calls } => {
+        AgentMessage::AssistantWithTools {
+            content,
+            tool_calls,
+        } => {
             let chars = content.chars().count()
                 + tool_calls
                     .iter()
@@ -427,6 +425,18 @@ fn estimate_tokens(history: &[AgentMessage]) -> usize {
 fn compaction_budget(window: usize) -> usize {
     let frac = (window as f64 * COMPACTION_BUDGET_FRACTION) as usize;
     frac.min(window.saturating_sub(COMPACTION_BUDGET_MARGIN_TOKENS))
+}
+
+/// The provider sends the tool manifest beside every history request. It is not
+/// represented by an `AgentMessage`, so reserve its estimated token cost before
+/// applying the history budget. Without this, a schema-heavy local request can
+/// exceed a real 8k/16k llama.cpp context even while `estimate_tokens(history)`
+/// still appears below the trigger.
+fn effective_history_window(context_window: usize, tools: Option<&serde_json::Value>) -> usize {
+    let tool_tokens = tools
+        .map(|manifest| manifest.to_string().chars().count() / CHARS_PER_TOKEN)
+        .unwrap_or(0);
+    context_window.saturating_sub(tool_tokens).max(2048)
 }
 
 /// Décide PUREMENT (sans I/O ni LLM) si/où compacter. Renvoie `Some(cut)` —
@@ -712,8 +722,14 @@ use crate::commands::search;
 #[derive(Clone)] // cloné par consult_advisor (rejoue la transcription au conseiller)
 #[allow(dead_code)] // variants used in match arms but rustc sees only construction
 pub(crate) enum AgentMessage {
-    Text { role: String, content: String },
-    AssistantWithTools { content: String, tool_calls: Vec<ToolCall> },
+    Text {
+        role: String,
+        content: String,
+    },
+    AssistantWithTools {
+        content: String,
+        tool_calls: Vec<ToolCall>,
+    },
     ToolResults(Vec<ToolResult>),
     /// Screenshot de l'outil `capture_screen`, ré-injecté comme tour USER
     /// multimodal juste après les tool results — openai-compat n'accepte pas
@@ -721,7 +737,10 @@ pub(crate) enum AgentMessage {
     /// `push_coalesced` fusionne légalement ce tour avec le message
     /// tool_result précédent. `data_url` vidée par `prune_user_images`
     /// (anti-bloat) → le builder retombe alors sur un message texte simple.
-    UserImage { text: String, data_url: String },
+    UserImage {
+        text: String,
+        data_url: String,
+    },
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -749,9 +768,62 @@ pub(crate) fn build_openai_messages(history: &[AgentMessage]) -> Vec<serde_json:
     for msg in history {
         match msg {
             AgentMessage::Text { role, content } => {
+                // Some OpenAI-compatible servers (notably llama.cpp with the
+                // Mistral v3 template) accept one optional leading `system`
+                // message, then require strict user/assistant alternation.
+                // Shugu composes several independent system blocks (identity,
+                // skills, lessons, runtime contract). Merge adjacent system
+                // blocks on the wire while preserving their order and
+                // boundaries; permissive providers see equivalent content and
+                // strict templates no longer reject the request before
+                // inference.
+                if matches!(role.as_str(), "system" | "user" | "assistant") {
+                    // Controller reminders are internal metadata, not a new
+                    // human turn. A strict Mistral tool template treats a
+                    // `tool` result as the user side of the alternation, so a
+                    // separate user reminder immediately after it becomes an
+                    // illegal user/user pair. Preserve the reminder by folding
+                    // it into the last tool result on the wire.
+                    if role == "user" && content.starts_with("[Shugu system]") {
+                        if let Some(previous) = out.last_mut().filter(|message| {
+                            message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+                                && message
+                                    .get("content")
+                                    .is_some_and(serde_json::Value::is_string)
+                        }) {
+                            let prior = previous
+                                .get("content")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default();
+                            previous["content"] = serde_json::Value::String(format!(
+                                "{prior}\n\n[Controller reminder]\n{content}"
+                            ));
+                            continue;
+                        }
+                    }
+                    if let Some(previous) = out.last_mut().filter(|message| {
+                        message.get("role").and_then(serde_json::Value::as_str)
+                            == Some(role.as_str())
+                            && message.get("tool_calls").is_none()
+                            && message
+                                .get("content")
+                                .is_some_and(serde_json::Value::is_string)
+                    }) {
+                        let prior = previous
+                            .get("content")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        previous["content"] =
+                            serde_json::Value::String(format!("{prior}\n\n{content}"));
+                        continue;
+                    }
+                }
                 out.push(serde_json::json!({ "role": role, "content": content }));
             }
-            AgentMessage::AssistantWithTools { content, tool_calls } => {
+            AgentMessage::AssistantWithTools {
+                content,
+                tool_calls,
+            } => {
                 let tc_json: Vec<serde_json::Value> = tool_calls
                     .iter()
                     .map(|tc| {
@@ -799,6 +871,63 @@ pub(crate) fn build_openai_messages(history: &[AgentMessage]) -> Vec<serde_json:
                         ]
                     }));
                 }
+            }
+        }
+    }
+    out
+}
+
+/// Translate the shared agent history into Ollama's native chat/tool shape.
+/// Ollama omits tool-call ids and links results through `tool_name`, so this
+/// builder keeps an internal id-to-name map while the common runtime retains
+/// ids for lifecycle events and dispatch.
+pub(crate) fn build_ollama_messages(history: &[AgentMessage]) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let mut call_names: HashMap<String, String> = HashMap::new();
+    for msg in history {
+        match msg {
+            AgentMessage::Text { role, content } => {
+                out.push(serde_json::json!({ "role": role, "content": content }));
+            }
+            AgentMessage::AssistantWithTools {
+                content,
+                tool_calls,
+            } => {
+                let calls: Vec<serde_json::Value> = tool_calls
+                    .iter()
+                    .map(|call| {
+                        call_names.insert(call.id.clone(), call.name.clone());
+                        let args = serde_json::from_str::<serde_json::Value>(&normalize_tool_args(
+                            &call.arguments,
+                        ))
+                        .unwrap_or_else(|_| serde_json::json!({}));
+                        serde_json::json!({
+                            "function": { "name": call.name, "arguments": args }
+                        })
+                    })
+                    .collect();
+                out.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": calls,
+                }));
+            }
+            AgentMessage::ToolResults(results) => {
+                for result in results {
+                    out.push(serde_json::json!({
+                        "role": "tool",
+                        "content": result.content,
+                        "tool_name": call_names
+                            .get(&result.id)
+                            .map(String::as_str)
+                            .unwrap_or("unknown_tool"),
+                    }));
+                }
+            }
+            AgentMessage::UserImage { text, .. } => {
+                // Shugu stores screenshots as data URLs while Ollama expects
+                // raw base64 in `images`; retain the grounded textual note.
+                out.push(serde_json::json!({ "role": "user", "content": text }));
             }
         }
     }
@@ -858,7 +987,10 @@ pub(crate) fn build_anthropic_native(
                     );
                 }
             }
-            AgentMessage::AssistantWithTools { content, tool_calls } => {
+            AgentMessage::AssistantWithTools {
+                content,
+                tool_calls,
+            } => {
                 let mut blocks: Vec<serde_json::Value> = Vec::new();
                 if !content.trim().is_empty() {
                     blocks.push(serde_json::json!({ "type": "text", "text": content }));
@@ -867,8 +999,8 @@ pub(crate) fn build_anthropic_native(
                     // Anthropic `tool_use.input` is a parsed JSON object, NOT the
                     // raw argument string OpenAI uses. Bad/empty args → {} so the
                     // request stays well-formed and the model sees its own error.
-                    let input: serde_json::Value =
-                        serde_json::from_str(&tc.arguments).unwrap_or_else(|_| serde_json::json!({}));
+                    let input: serde_json::Value = serde_json::from_str(&tc.arguments)
+                        .unwrap_or_else(|_| serde_json::json!({}));
                     blocks.push(serde_json::json!({
                         "type": "tool_use",
                         "id": tc.id,
@@ -961,9 +1093,7 @@ pub(super) async fn run_agent_task(
     // création) au lieu du workspace ouvert. `None` = workspace réel.
     workspace_override: Option<PathBuf>,
     system_prompt_override: Option<String>,
-    // Mode Plan (sélecteur de chat) : lecture seule. Le manifest d'outils perd
-    // fs_write_file/fs_edit/run_command et le dispatcher refuse toute mutation.
-    read_only: bool,
+    execution_profile: ExecutionProfile,
     // Mémoire de conversation : quand `Some(id)`, on recharge les tours
     // précédents de CETTE conversation dans l'historique (parité avec le chemin
     // chat-direct). `None` (Atelier/Studio/Grounded) = pas de conversation liée.
@@ -980,22 +1110,20 @@ pub(super) async fn run_agent_task(
     // Ignored when `workspace_override` is already Some (Atelier) or `read_only`
     // (Plan): those never isolate.
     isolate: bool,
+    // Claude-compatible selectors from a custom agent definition. When set,
+    // this is enforced in both the request manifest and the dispatcher.
+    definition_tools: Option<Vec<String>>,
 ) {
     let start = std::time::Instant::now();
     let protocol = protocol.unwrap_or_else(|| "openai".to_string());
     let base_url = base_url.unwrap_or_default();
 
-    // System prompt : l'Atelier passe un override par tâche ; sinon le seed
-    // STATIQUE du rôle. (Le Refiner qui faisait évoluer le prompt par
-    // « génération » est retiré — plus d'indirection ActiveHarness/generation.)
-    let mut system_prompt = system_prompt_override.unwrap_or_else(|| seed_prompt(&role));
-    // Mode Plan → on rappelle au modèle qu'il est en lecture seule : explorer +
-    // proposer un plan, ne rien écrire ni exécuter. Le filtrage d'outils (plus
-    // bas, dans tool_use_loop) est l'enforcement DUR ; ceci aligne juste le
-    // comportement pour qu'il ne PROMETTE pas d'écrire ce qu'il ne peut pas.
-    if read_only {
-        system_prompt.push_str(PLAN_MODE_PROMPT);
-    }
+    // A custom/builtin role supplies only identity and task-specific guidance.
+    // The effective profile, exact tools and project rules are composed later,
+    // after the final manifest exists, by the versioned prompt module.
+    let mut system_prompt =
+        system_prompt_override.unwrap_or_else(|| super::prompts::seed_prompt(&role));
+    let read_only = execution_profile.is_read_only();
     // Phase A (Design Studio) — when the Studio passes a design-system context,
     // append GENERATION MODE so the agent writes a complete styled project to
     // `.shugu-forge/preview/` (served live by the preview:// protocol). Chat
@@ -1003,7 +1131,7 @@ pub(super) async fn run_agent_task(
     if let Some(ctx) = design_context.as_deref() {
         if !ctx.trim().is_empty() {
             system_prompt.push_str("\n\n");
-            system_prompt.push_str(GENERATION_MODE_PROMPT);
+            system_prompt.push_str(super::prompts::GENERATION_MODE_PROMPT);
             system_prompt.push_str("\n\nGENERATION CONTEXT (apply the design system and/or colour direction below, honour the user preferences, and select the most relevant design skill):\n");
             system_prompt.push_str(ctx);
         }
@@ -1030,6 +1158,22 @@ pub(super) async fn run_agent_task(
     let api_key = match chat::resolve_key(&protocol, &api_key_opt) {
         Ok(k) => k,
         Err(e) => {
+            if isolate {
+                set_isolation_status(&app, &agent_id, "failed");
+            }
+            finish_error(&app, &state, &agent_id, &e);
+            return;
+        }
+    };
+
+    // Validate the HTTP client before creating a requested worktree. A provider
+    // setup failure must not leave an unused isolated checkout behind.
+    let client = match chat::streaming_client() {
+        Ok(c) => c,
+        Err(e) => {
+            if isolate {
+                set_isolation_status(&app, &agent_id, "failed");
+            }
             finish_error(&app, &state, &agent_id, &e);
             return;
         }
@@ -1065,9 +1209,9 @@ pub(super) async fn run_agent_task(
     // then resolves against the worktree automatically (no tool-code change), and
     // the checkpoint block below auto-skips (worktree IS the rollback unit).
     //
-    // Strictly best-effort and NEVER blocking: a missing workspace, a non-git
-    // dir, or a worktree-creation failure logs and continues IN-PLACE (the exact
-    // pre-Phase-3 behaviour). `iso_root`/`iso_entry` carry the merge-back context
+    // Isolation is a contract, not a hint: when explicitly requested, any setup
+    // failure terminates the run instead of silently mutating the real checkout.
+    // `iso_root`/`iso_entry` carry the merge-back context
     // to `finalize_isolation` after the run; they stay `None` when we didn't
     // isolate, so the finalize step is a no-op on every existing path.
     let mut workspace_override = workspace_override;
@@ -1082,6 +1226,7 @@ pub(super) async fn run_agent_task(
                             "[agents] isolation: worktree {} on branch {} (agent={agent_id})",
                             entry.path, entry.branch
                         );
+                        set_isolation_status(&app, &agent_id, "active");
                         let _ = persist_and_emit(
                             &app,
                             &AgentEvent::WorktreeStarted {
@@ -1103,6 +1248,14 @@ pub(super) async fn run_agent_task(
                                 reason: format!("espace isolé indisponible ({e})"),
                             },
                         );
+                        set_isolation_status(&app, &agent_id, "failed");
+                        finish_error(
+                            &app,
+                            &state,
+                            &agent_id,
+                            &format!("isolation demandée mais indisponible : {e}"),
+                        );
+                        return;
                     }
                 }
             } else {
@@ -1116,6 +1269,14 @@ pub(super) async fn run_agent_task(
                         reason: "ce dossier n'est pas encore suivi par git".to_string(),
                     },
                 );
+                set_isolation_status(&app, &agent_id, "failed");
+                finish_error(
+                    &app,
+                    &state,
+                    &agent_id,
+                    "isolation demandée mais le workspace n'est pas un dépôt git",
+                );
+                return;
             }
         } else {
             eprintln!("[agents] isolation skipped: no workspace open (agent={agent_id})");
@@ -1126,6 +1287,14 @@ pub(super) async fn run_agent_task(
                     reason: "aucun workspace ouvert".to_string(),
                 },
             );
+            set_isolation_status(&app, &agent_id, "failed");
+            finish_error(
+                &app,
+                &state,
+                &agent_id,
+                "isolation demandée mais aucun workspace n'est ouvert",
+            );
+            return;
         }
     }
 
@@ -1154,16 +1323,6 @@ pub(super) async fn run_agent_task(
         }
     }
 
-    // Client borné (lot timeouts) : connect 15 s + 300 s de silence max entre
-    // deux chunks — un provider mort ne pend plus l'agent indéfiniment.
-    let client = match chat::streaming_client() {
-        Ok(c) => c,
-        Err(e) => {
-            finish_error(&app, &state, &agent_id, &e);
-            return;
-        }
-    };
-
     // Whole loop racing the abort token. Inside, the multi-turn loop
     // body (`tool_use_loop`) calls the LLM, executes tools, appends to
     // history, repeats. The abort branch wins if the user kills the
@@ -1183,10 +1342,11 @@ pub(super) async fn run_agent_task(
             &mut history,
             &mut loop_metrics,
             workspace_override,
-            read_only,
+            execution_profile,
             advisor.as_ref(),
             conversation_id.as_deref(),
             0, // depth racine — un run top-level n'est jamais lui-même un sous-agent
+            definition_tools.as_deref(),
         ) => r,
         _ = abort.notified() => {
             mark_killed(&app, &agent_id);
@@ -1213,6 +1373,10 @@ pub(super) async fn run_agent_task(
                         reason: None,
                     },
                 );
+                set_isolation_status(&app, &agent_id, "discarded");
+            }
+            if let Ok(mut g) = state.lock() {
+                g.remove(&agent_id);
             }
             return;
         }
@@ -1226,17 +1390,41 @@ pub(super) async fn run_agent_task(
 
     match loop_result {
         Ok((output, reasoning)) => {
-            if let Ok(conn_mutex) = get_conn(&app) {
+            let transitioned = if let Ok(conn_mutex) = get_conn(&app) {
                 if let Ok(conn) = conn_mutex.lock() {
-                    let _ = conn.execute(
+                    conn.execute(
                         "UPDATE agents
                             SET status = 'complete',
                                 finished_at = ?1,
                                 output = ?2
-                          WHERE id = ?3",
+                          WHERE id = ?3 AND status = 'running'",
                         params![now_ms(), output, agent_id],
-                    );
+                    )
+                    .map(|changed| changed == 1)
+                    .unwrap_or(false)
+                } else {
+                    false
                 }
+            } else {
+                false
+            };
+            if !transitioned {
+                // A concurrent Kill already won the terminal-state CAS. Never
+                // resurrect it with a Complete event or merge an isolated tree.
+                if let (Some(root), Some(entry)) = (iso_root.as_ref(), iso_entry.as_ref()) {
+                    let _ = crate::commands::worktree::cleanup_inner(
+                        root,
+                        Some(&entry.id),
+                        true,
+                        false,
+                    )
+                    .await;
+                    set_isolation_status(&app, &agent_id, "discarded");
+                }
+                if let Ok(mut g) = state.lock() {
+                    g.remove(&agent_id);
+                }
+                return;
             }
             // AM-2 — remember() hook: write the salient result of this run into
             // the orchestrated `memory` collection so a future run can recall it.
@@ -1254,7 +1442,11 @@ pub(super) async fn run_agent_task(
                     agent_id: agent_id.clone(),
                     output,
                     tokens_used: None,
-                    reasoning: if reasoning.trim().is_empty() { None } else { Some(reasoning) },
+                    reasoning: if reasoning.trim().is_empty() {
+                        None
+                    } else {
+                        Some(reasoning)
+                    },
                     ms,
                 },
             );
@@ -1308,9 +1500,7 @@ async fn finalize_isolation(
     agent_id: &str,
     kind: IsolationKind,
 ) {
-    use crate::commands::worktree::{
-        cleanup_inner, commit_worktree, current_branch, diff_summary,
-    };
+    use crate::commands::worktree::{cleanup_inner, commit_worktree, current_branch, diff_summary};
 
     let wt_path = PathBuf::from(&entry.path);
 
@@ -1330,8 +1520,10 @@ async fn finalize_isolation(
         agent_id: &str,
         reason: &str,
     ) {
-        let target = current_branch(root).await.unwrap_or_else(|| "HEAD".to_string());
-        let diff = diff_summary(root, &entry.branch, &target)
+        let target = current_branch(root)
+            .await
+            .unwrap_or_else(|| "HEAD".to_string());
+        let diff = diff_summary(root, &entry.branch, &target, entry.snapshot_base.as_deref())
             .await
             .unwrap_or_default();
         let _ = persist_and_emit(
@@ -1342,10 +1534,15 @@ async fn finalize_isolation(
                 branch: Some(entry.branch.clone()),
                 path: Some(entry.path.clone()),
                 commit: None,
-                diff: if diff.trim().is_empty() { None } else { Some(diff) },
+                diff: if diff.trim().is_empty() {
+                    None
+                } else {
+                    Some(diff)
+                },
                 reason: Some(reason.to_string()),
             },
         );
+        set_isolation_status(app, agent_id, "review");
     }
 
     // 1. Commit whatever the agent left in the worktree.
@@ -1361,8 +1558,14 @@ async fn finalize_isolation(
         // ── Success, but the commit step itself failed — keep for review. ──
         (IsolationKind::Success, Err(e)) => {
             eprintln!("[agents] isolation commit failed (agent={agent_id}): {e}");
-            emit_keep_for_review(app, root, entry, agent_id, "commit failed — review manually")
-                .await;
+            emit_keep_for_review(
+                app,
+                root,
+                entry,
+                agent_id,
+                "commit failed — review manually",
+            )
+            .await;
         }
 
         // ── Success with nothing to commit — clean up silently. ──
@@ -1500,6 +1703,7 @@ pub(super) async fn run_delegated_child(
     parent_id: &str,
     depth: u32,
     task: String,
+    execution_profile: ExecutionProfile,
 ) -> Result<String, String> {
     let start = std::time::Instant::now();
     let child_id = uuid::Uuid::new_v4().to_string();
@@ -1515,6 +1719,7 @@ pub(super) async fn run_delegated_child(
         super::AgentHandle {
             role: "delegate".to_string(),
             abort: child_abort.clone(),
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
     );
 
@@ -1526,9 +1731,17 @@ pub(super) async fn run_delegated_child(
         let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT INTO agents
-                (id, role, status, parent_id, model, task, conversation_id, created_at)
-             VALUES (?1, 'delegate', 'running', ?2, ?3, ?4, NULL, ?5)",
-            params![child_id, parent_id, model, task, now_ms()],
+                (id, role, status, parent_id, model, task, conversation_id, created_at,
+                 execution_profile, isolate, profile_verified, isolation_status)
+             VALUES (?1, 'delegate', 'running', ?2, ?3, ?4, NULL, ?5, ?6, 0, 1, 'none')",
+            params![
+                child_id,
+                parent_id,
+                model,
+                task,
+                now_ms(),
+                execution_profile.as_str()
+            ],
         )
         .map_err(|e| e.to_string())?;
         Ok(())
@@ -1546,6 +1759,8 @@ pub(super) async fn run_delegated_child(
             task: task.clone(),
             model: model.to_string(),
             conversation_id: None,
+            execution_profile,
+            isolate: false,
         },
     );
 
@@ -1559,13 +1774,11 @@ pub(super) async fn run_delegated_child(
     let workspace_override: Option<PathBuf> = None;
     let ws_root = get_workspace_root(app);
     let dirty_before: std::collections::HashSet<String> = match ws_root.as_ref() {
-        Some(root) if root.join(".git").exists() => {
-            crate::commands::worktree::dirty_paths(root)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .collect()
-        }
+        Some(root) if root.join(".git").exists() => crate::commands::worktree::dirty_paths(root)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
         _ => Default::default(),
     };
 
@@ -1599,10 +1812,11 @@ pub(super) async fn run_delegated_child(
             &mut history,
             &mut metrics,
             workspace_override.clone(),
-            false, // read_only : un sous-agent peut muter (déjà gardé par is_write_tool en mode Plan côté parent)
-            None,  // advisor : pas de conseiller imbriqué en v1
-            None,  // conversation_id : contexte vierge
+            execution_profile,
+            None, // advisor : pas de conseiller imbriqué en v1
+            None, // conversation_id : contexte vierge
             depth,
+            None, // définition : manifeste natif du profil enfant
         );
         tokio::select! {
             r = tokio::time::timeout(
@@ -1615,11 +1829,6 @@ pub(super) async fn run_delegated_child(
             _ = child_abort.notified() => Err("annulé (kill en cascade)".to_string()),
         }
     };
-
-    // L'enfant a fini sa boucle (succès / timeout / abort) — retirer son handle
-    // du registre AVANT le nettoyage async (diff/finalize), pour ne pas laisser
-    // un handle « zombie » qu'un second agent_kill retrouverait.
-    registry_remove(app, &child_id);
 
     // Faits objectifs : chemins passés « dirty » PENDANT le sous-run (delta de
     // `git status` avant/après). Moins riche qu'un diff de branche, mais honnête
@@ -1645,24 +1854,31 @@ pub(super) async fn run_delegated_child(
     let ms = start.elapsed().as_millis() as u64;
     let handoff = match &outcome {
         Ok((output, _reasoning)) => {
+            let mut transitioned = false;
             if let Ok(conn_mutex) = get_conn(app) {
                 if let Ok(conn) = conn_mutex.lock() {
-                    let _ = conn.execute(
-                        "UPDATE agents SET status='complete', finished_at=?1, output=?2 WHERE id=?3",
-                        params![now_ms(), output, child_id],
-                    );
+                    transitioned = conn
+                        .execute(
+                            "UPDATE agents SET status='complete', finished_at=?1, output=?2
+                         WHERE id=?3 AND status='running'",
+                            params![now_ms(), output, child_id],
+                        )
+                        .map(|changed| changed == 1)
+                        .unwrap_or(false);
                 }
             }
-            let _ = persist_and_emit(
-                app,
-                &AgentEvent::Complete {
-                    agent_id: child_id.clone(),
-                    output: output.clone(),
-                    tokens_used: None,
-                    reasoning: None,
-                    ms,
-                },
-            );
+            if transitioned {
+                let _ = persist_and_emit(
+                    app,
+                    &AgentEvent::Complete {
+                        agent_id: child_id.clone(),
+                        output: output.clone(),
+                        tokens_used: None,
+                        reasoning: None,
+                        ms,
+                    },
+                );
+            }
             format_delegate_handoff(
                 output,
                 diff_stat.as_deref(),
@@ -1673,21 +1889,28 @@ pub(super) async fn run_delegated_child(
             )
         }
         Err(e) => {
+            let mut transitioned = false;
             if let Ok(conn_mutex) = get_conn(app) {
                 if let Ok(conn) = conn_mutex.lock() {
-                    let _ = conn.execute(
-                        "UPDATE agents SET status='error', finished_at=?1, error=?2 WHERE id=?3",
-                        params![now_ms(), e, child_id],
-                    );
+                    transitioned = conn
+                        .execute(
+                            "UPDATE agents SET status='error', finished_at=?1, error=?2
+                         WHERE id=?3 AND status='running'",
+                            params![now_ms(), e, child_id],
+                        )
+                        .map(|changed| changed == 1)
+                        .unwrap_or(false);
                 }
             }
-            let _ = persist_and_emit(
-                app,
-                &AgentEvent::Error {
-                    agent_id: child_id.clone(),
-                    error: e.clone(),
-                },
-            );
+            if transitioned {
+                let _ = persist_and_emit(
+                    app,
+                    &AgentEvent::Error {
+                        agent_id: child_id.clone(),
+                        error: e.clone(),
+                    },
+                );
+            }
             format_delegate_handoff(
                 "(le sous-agent n'a pas produit de résultat)",
                 diff_stat.as_deref(),
@@ -1699,6 +1922,7 @@ pub(super) async fn run_delegated_child(
         }
     };
 
+    registry_remove(app, &child_id);
     Ok(handoff)
 }
 
@@ -1715,6 +1939,49 @@ pub(super) struct LoopMetrics {
     pub(super) iterations: u32,
     pub(super) tool_errors: u32,
     pub(super) stuck_reason: Option<String>,
+}
+
+/// Translate Claude-compatible short tool selectors into Shugu's concrete
+/// native names. Control-plane tools remain available because they do not grant
+/// a new filesystem/network effect; mutating delegation requires an explicit
+/// mutating selector. Exact names keep MCP and future tools configurable.
+fn definition_allows_tool(selectors: Option<&[String]>, tool: &str) -> bool {
+    let Some(selectors) = selectors else {
+        return true;
+    };
+    if matches!(
+        tool,
+        "todo_write" | "ask_user" | "submit_plan" | "advisor" | "skill_save"
+    ) {
+        return true;
+    }
+
+    selectors.iter().any(|selector| {
+        let selector = selector.trim();
+        if selector == tool {
+            return true;
+        }
+        match selector.to_ascii_lowercase().as_str() {
+            "read" => matches!(
+                tool,
+                "fs_read_file" | "fs_list_dir" | "fs_search" | "code_search"
+            ),
+            "write" => matches!(tool, "fs_write_file" | "fs_delete" | "fs_move"),
+            "edit" => tool == "fs_edit",
+            "bash" | "shell" => tool == "run_command",
+            "web" => matches!(tool, "web_search" | "web_fetch"),
+            "browser" => matches!(tool, "browser_test" | "capture_screen"),
+            "mcp" => tool.starts_with("mcp__"),
+            "delegate" => tool == "delegate",
+            _ => false,
+        }
+    }) || (tool == "delegate"
+        && selectors.iter().any(|s| {
+            matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "write" | "edit" | "bash" | "shell"
+            )
+        }))
 }
 
 /// Multi-turn loop body. Returns the final answer text when the LLM
@@ -1737,9 +2004,7 @@ pub(super) async fn tool_use_loop(
     // open workspace (the Atelier's throwaway creation dir). `None` = the
     // real open workspace.
     workspace_override: Option<PathBuf>,
-    // Plan mode : lecture seule. Retire les outils mutants du manifest envoyé au
-    // modèle ET refuse leur exécution si le modèle les invoque quand même.
-    read_only: bool,
+    execution_profile: ExecutionProfile,
     // Modèle conseiller distinct pour l'outil `advisor` (v2). `None` ⇒ le
     // conseiller est le modèle de l'exécuteur (auto-consultation).
     advisor: Option<&AdvisorConfig>,
@@ -1750,7 +2015,9 @@ pub(super) async fn tool_use_loop(
     // Profondeur de délégation (0 = run racine). Borne la récursion de l'outil
     // `delegate` (cf. MAX_DELEGATION_DEPTH) et conditionne sa présence au manifest.
     depth: u32,
+    definition_tools: Option<&[String]>,
 ) -> Result<(String, String), String> {
+    let read_only = execution_profile.is_read_only();
     // Stall-detection state: repeated identical tool-call signatures and
     // consecutive tool-error rounds are the two cheap "stuck" signals, recorded
     // as telemetry on `metrics.stuck_reason`; budget exhaustion is handled in the
@@ -1787,6 +2054,7 @@ pub(super) async fn tool_use_loop(
     // prompt without displacing each other. Degrades silently on any error.
     let task_text: String = history
         .iter()
+        .rev()
         .find_map(|m| match m {
             AgentMessage::Text { role: r, content } if r.as_str() == "user" => {
                 Some(content.clone())
@@ -1856,7 +2124,8 @@ pub(super) async fn tool_use_loop(
     // `native tools (tools_json_*) ++ MCP tools (enabled servers)`, rendered for
     // THIS protocol. With no enabled server, `enabled_tools_json` returns `[]` and
     // the array is byte-identical to the native default — the no-MCP path is
-    // unchanged. `None` is threaded for the `ollama` branch (which ignores tools).
+    // unchanged. `None` is used whenever the capability matrix says the active
+    // adapter/model has no Shugu tool loop.
     // Capacité du modèle (source unique : model_capabilities) — calculée UNE
     // fois par run. Pilote la réduction de toolset pour les petits modèles. La
     // fenêtre de contexte de la compaction token-aware est résolue séparément par
@@ -1864,7 +2133,7 @@ pub(super) async fn tool_use_loop(
     // locaux). Additif : un modèle fort n'est jamais affecté.
     let caps = crate::commands::model_capabilities::capabilities(protocol, model);
 
-    let agent_tools: Option<serde_json::Value> = if protocol == "ollama" {
+    let agent_tools: Option<serde_json::Value> = if !caps.supports_tools {
         None
     } else {
         let mut arr = if protocol == "anthropic" {
@@ -1877,30 +2146,31 @@ pub(super) async fn tool_use_loop(
         if let Some(a) = arr.as_array_mut() {
             a.extend(mcp_tools);
         }
-        // Mode Plan (lecture seule) : retire les outils NATIFS mutants du manifest
-        // — le modèle ne les voit pas, donc ne les planifie pas. Enforcement DUR
-        // doublé d'une garde au dispatch (plus bas). NB : on ne classe pas les
-        // outils MCP (noms namespacés `mcp__…`, mutation inconnue) ; un MCP en
-        // écriture resterait visible — limite assumée du v1 (le plan part du
-        // cockpit où aucun MCP mutant n'est branché par défaut).
-        if read_only {
-            if let Some(a) = arr.as_array_mut() {
-                a.retain(|t| {
-                    let name = t["name"].as_str().or_else(|| t["function"]["name"].as_str());
-                    !name.is_some_and(is_write_tool)
-                });
-            }
+        // Same central profile gate as the dispatcher. Unknown MCP effects fail
+        // closed in Chat/Plan instead of bypassing the native write list.
+        if let Some(a) = arr.as_array_mut() {
+            a.retain(|t| {
+                let name = t["name"]
+                    .as_str()
+                    .or_else(|| t["function"]["name"].as_str());
+                name.is_some_and(|name| {
+                    super::execution_profile_authorized(app, execution_profile)
+                        && execution_profile.allows_tool(name)
+                })
+            });
         }
         // Gate vie privée : `agents.allowScreenCapture = "false"` retire
         // l'outil de capture d'écran du manifest (défaut ON — clé absente ou
-        // toute autre valeur laisse l'outil). Advisory : le réglage gouverne
-        // ce que le modèle VOIT, pas le dispatcher.
+        // toute autre valeur laisse l'outil). Le dispatcher revérifie aussi le
+        // réglage afin qu'un manifest déjà envoyé ne puisse pas le contourner.
         if crate::commands::mcp::read_setting(app, "agents.allowScreenCapture").as_deref()
             == Some("false")
         {
             if let Some(a) = arr.as_array_mut() {
                 a.retain(|t| {
-                    let name = t["name"].as_str().or_else(|| t["function"]["name"].as_str());
+                    let name = t["name"]
+                        .as_str()
+                        .or_else(|| t["function"]["name"].as_str());
                     name != Some("capture_screen")
                 });
             }
@@ -1930,12 +2200,12 @@ pub(super) async fn tool_use_loop(
         // un gros set et hallucine les arguments d'outils. Miroir des gates
         // read_only / capture ci-dessus. Additif : un modèle fort (Full) n'est
         // jamais affecté.
-        if caps.recommended_toolset
-            == crate::commands::model_capabilities::Toolset::Reduced
-        {
+        if caps.recommended_toolset == crate::commands::model_capabilities::Toolset::Reduced {
             if let Some(a) = arr.as_array_mut() {
                 a.retain(|t| {
-                    let name = t["name"].as_str().or_else(|| t["function"]["name"].as_str());
+                    let name = t["name"]
+                        .as_str()
+                        .or_else(|| t["function"]["name"].as_str());
                     name.is_some_and(crate::commands::model_capabilities::is_core_small_tool)
                 });
             }
@@ -1948,10 +2218,23 @@ pub(super) async fn tool_use_loop(
         if !allow_delegate {
             if let Some(a) = arr.as_array_mut() {
                 a.retain(|t| {
-                    let name = t["name"].as_str().or_else(|| t["function"]["name"].as_str());
+                    let name = t["name"]
+                        .as_str()
+                        .or_else(|| t["function"]["name"].as_str());
                     name != Some("delegate")
                 });
             }
+        }
+        // Agent-definition capabilities are an actual backend allow-list, not
+        // UI metadata. Apply them last so the prompt fingerprint describes the
+        // exact post-profile/post-model/post-MCP manifest.
+        if let Some(a) = arr.as_array_mut() {
+            a.retain(|t| {
+                let name = t["name"]
+                    .as_str()
+                    .or_else(|| t["function"]["name"].as_str());
+                name.is_some_and(|name| definition_allows_tool(definition_tools, name))
+            });
         }
         Some(arr)
     };
@@ -1982,11 +2265,68 @@ pub(super) async fn tool_use_loop(
         );
     }
 
+    // Compose the effective runtime contract only after the provider manifest
+    // has been filtered by profile, privacy, model tier, MCP policy and
+    // delegation depth. This prevents prompt/tool drift: the model sees the
+    // exact names present in this request, plus bounded rules from the effective
+    // workspace (isolated worktree when applicable).
+    let context_root = workspace_override
+        .clone()
+        .or_else(|| get_workspace_root(app));
+    let project_context = context_root
+        .as_deref()
+        .map(|root| super::project_context::load(root, &task_text))
+        .unwrap_or_default();
+    let runtime_prompt = super::prompts::compose_runtime(
+        role,
+        execution_profile,
+        protocol,
+        &caps,
+        agent_tools.as_ref(),
+        &project_context,
+    );
+    let _ = persist_and_emit(
+        app,
+        &AgentEvent::PromptComposed {
+            agent_id: agent_id.to_string(),
+            version: runtime_prompt.version.to_string(),
+            fingerprint: runtime_prompt.fingerprint.clone(),
+            execution_profile,
+            protocol: protocol.to_string(),
+            tool_names: runtime_prompt.tool_names.clone(),
+            rule_sources: project_context.rule_sources.clone(),
+            package_manager: project_context.package_manager.clone(),
+            context_truncated: project_context.truncated,
+        },
+    );
+    let _ = persist_and_emit(
+        app,
+        &AgentEvent::Message {
+            agent_id: agent_id.to_string(),
+            role: "system".to_string(),
+            content: runtime_prompt.text.clone(),
+        },
+    );
+    let head = history
+        .iter()
+        .take_while(|m| matches!(m, AgentMessage::Text { role, .. } if role == "system"))
+        .count();
+    history.insert(
+        head,
+        AgentMessage::Text {
+            role: "system".to_string(),
+            content: runtime_prompt.text,
+        },
+    );
+
     // Résout la fenêtre de contexte du modèle UNE fois par run (sonde réseau
     // best-effort pour les serveurs locaux ; table pour le cloud ; repli 8k). Le
     // déclencheur de compaction plus bas est gaté sur le budget token dérivé de
     // CETTE fenêtre, plus sur un compteur de tours fixe.
-    let context_window = resolve_context_window(client, protocol, base_url, model).await;
+    let context_window = effective_history_window(
+        resolve_context_window(client, protocol, base_url, model).await,
+        agent_tools.as_ref(),
+    );
 
     // LOT 1 — plan vivant : le dernier `todo_write` parsé en task-graph. Quand il
     // change, on le ré-injecte au tour suivant (step 0a) pour ANCRER la boucle sur
@@ -1994,6 +2334,10 @@ pub(super) async fn tool_use_loop(
     // modèle revoit son plan + la prochaine action même après compaction.
     let mut current_plan: Option<super::plan::TaskGraph> = None;
     let mut plan_dirty = false;
+    // Hard completion evidence. Prompts describe the desired cycle, while this
+    // state makes it impossible to report a mutated workspace as successfully
+    // finished without a recorded plan and a later green verification.
+    let mut run_evidence = super::lifecycle::RunEvidence::for_task(!read_only, &task_text);
 
     while iteration < budget {
         metrics.iterations = iteration + 1;
@@ -2030,15 +2374,79 @@ pub(super) async fn tool_use_loop(
                 ),
             });
         } else if last_iteration {
+            let completion_instruction = match run_evidence.completion_decision(read_only) {
+                super::lifecycle::CompletionDecision::Complete =>
+                    "Produce the final answer in plain text, synthesizing the work and the verification evidence.".to_string(),
+                super::lifecycle::CompletionDecision::Continue { nudge, .. } => format!(
+                    "{nudge}\nThere is no execution budget left after this response. Do not claim success: clearly state that the run is incomplete and name the missing proof."
+                ),
+            };
             history.push(AgentMessage::Text {
                 role: "user".to_string(),
-                content: "[Shugu system] This is the FINAL iteration. Do NOT call any more tools. Produce the final answer in plain text, synthesizing everything you've learned so far. Even partial findings are valuable — the user needs SOMETHING from you.".to_string(),
+                content: format!(
+                    "[Shugu system] This is the FINAL iteration. Do NOT call any more tools. {completion_instruction}"
+                ),
             });
         }
 
+        // Compact BEFORE the provider request. This placement covers every
+        // control-flow path, including repeated plain-text refusals that add an
+        // assistant message + controller nudge and `continue` without ever
+        // executing a tool. The old post-tool-only placement could therefore
+        // miss the trigger and let the very next request exceed n_ctx.
+        let _ = maybe_compact(
+            app,
+            history,
+            agent_id,
+            role,
+            conversation_id,
+            context_window,
+            |excerpt| {
+                summarise_turns(
+                    client,
+                    protocol,
+                    base_url,
+                    model,
+                    api_key,
+                    chat_template_kwargs,
+                    excerpt,
+                )
+            },
+        )
+        .await;
+
         // ── 1. Call the LLM with the current history + tools manifest ──
-        let (turn, reasoning) =
-            call_agent_llm_with_tools(app, client, protocol, base_url, model, history, api_key, chat_template_kwargs, agent_id, &agent_tools).await?;
+        let forced_tool = if iteration > 0 {
+            run_evidence.required_recovery_tool().filter(|wanted| {
+                agent_tools
+                    .as_ref()
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|tools| {
+                        tools.iter().any(|tool| {
+                            tool["name"]
+                                .as_str()
+                                .or_else(|| tool["function"]["name"].as_str())
+                                == Some(*wanted)
+                        })
+                    })
+            })
+        } else {
+            None
+        };
+        let (turn, reasoning) = call_agent_llm_with_tools(
+            app,
+            client,
+            protocol,
+            base_url,
+            model,
+            history,
+            api_key,
+            chat_template_kwargs,
+            agent_id,
+            &agent_tools,
+            forced_tool,
+        )
+        .await?;
 
         // ── 2. Persist Message event for this assistant turn ───────────
         let _ = persist_and_emit(
@@ -2050,28 +2458,61 @@ pub(super) async fn tool_use_loop(
             },
         );
 
-        // ── 3. No tool_calls = final answer ────────────────────────────
-        //    PLUS, sur la dernière itération, on force-accept ce que le
-        //    modèle produit, même s'il a tenté plus de tool calls. Mieux
-        //    vaut un answer partiel qu'une erreur "exceeded iterations".
+        // ── 3. No tool_calls = tentative de réponse finale ─────────────
+        //    Elle n'est acceptée que si le contrat runtime confirme qu'une
+        //    éventuelle mutation possède un plan et une vérification verte.
         if turn.tool_calls.is_empty() {
-            return Ok((turn.content, reasoning));
+            match run_evidence.completion_decision(read_only) {
+                super::lifecycle::CompletionDecision::Complete => {
+                    return Ok((turn.content, reasoning));
+                }
+                super::lifecycle::CompletionDecision::Continue { reason, nudge } => {
+                    if last_iteration {
+                        metrics.stuck_reason =
+                            Some(format!("completion_contract_{}", reason.code()));
+                        let last_response = turn.content.trim();
+                        let suffix = if last_response.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" Dernière réponse du modèle : {last_response}")
+                        };
+                        return Err(format!(
+                            "Le run a été arrêté sans faux succès : le contrat de fin n'est pas satisfait ({}).{}",
+                            reason.code(), suffix
+                        ));
+                    }
+
+                    // Preserve the attempted final answer, then give the model a
+                    // concrete repair instruction and let the normal tool loop
+                    // continue. This is the enforced agentic cycle: a plain-text
+                    // claim cannot bypass missing execution evidence.
+                    history.push(AgentMessage::Text {
+                        role: "assistant".to_string(),
+                        content: turn.content,
+                    });
+                    history.push(AgentMessage::Text {
+                        role: "user".to_string(),
+                        content: nudge,
+                    });
+                    iteration += 1;
+                    continue;
+                }
+            }
         }
         if last_iteration {
-            // Budget exhausted with the model still wanting tools = stuck.
-            metrics
-                .stuck_reason
-                .get_or_insert_with(|| "max_iterations".to_string());
-            let content = if turn.content.trim().is_empty() {
-                format!(
-                    "⚠ L'orchestrateur a épuisé son budget ({MAX_ITERATIONS} itérations) en tool-calls sans produire de réponse. \
-                     Essaye un modèle plus capable (Claude Sonnet, DeepSeek V4 Pro, GPT-5…) dans Settings → Connections → Routing, \
-                     ou reformule ta demande de manière plus ciblée."
-                )
-            } else {
-                turn.content
-            };
-            return Ok((content, reasoning));
+            // Never turn unexecuted final-round tool calls into a successful
+            // completion. The old force-accept path was the second false-success
+            // escape hatch after the no-tool shortcut above.
+            metrics.stuck_reason = Some("max_iterations".to_string());
+            let requested = turn
+                .tool_calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "L'orchestrateur a épuisé son budget ({MAX_ITERATIONS} itérations) et demandait encore des outils non exécutés ({requested}). Le run reste incomplet."
+            ));
         }
 
         // Stall signal #1 — same tool-call signature repeated across rounds.
@@ -2116,6 +2557,12 @@ pub(super) async fn tool_use_loop(
             .as_ref()
             .cloned()
             .or_else(|| get_workspace_root(app));
+        // A prompt can request plan-first behaviour, but only the dispatcher
+        // can guarantee it. Until `todo_write` has succeeded in an earlier
+        // round, every mutation-capable tool is refused before touching disk or
+        // spawning a process. Calls from the same assistant turn are treated as
+        // concurrent, so `todo_write` beside an edit cannot authorize it.
+        let enforce_plan_first = !read_only && !run_evidence.has_recorded_plan();
 
         // Lot C — MCP routing. MCP tools (`mcp__server__tool`) are executed via
         // `mcp::mcp_execute`, which is ASYNC and CANNOT run inside the sync
@@ -2133,11 +2580,8 @@ pub(super) async fn tool_use_loop(
         // ce tour en a besoin, on bascule sur le chemin SÉQUENTIEL qui gère les
         // deux genres dans l'ordre. Sans aucun appel async, le bloc parallèle
         // tourne VERBATIM (hot path no-MCP inchangé).
-        let any_async = turn
-            .tool_calls
-            .iter()
-            .any(|tc| {
-                tc.name.starts_with("mcp__")
+        let any_async = turn.tool_calls.iter().any(|tc| {
+            tc.name.starts_with("mcp__")
                     || tc.name == "web_search"
                     || tc.name == "web_fetch"
                     || tc.name == "advisor"
@@ -2150,12 +2594,53 @@ pub(super) async fn tool_use_loop(
                     // le mode Plan interactif sans dossier ouvert.
                     || tc.name == "ask_user"
                     || tc.name == "submit_plan"
-            });
+        });
 
         let results: Vec<ToolResult> = if any_async {
             let mgr = app.state::<crate::commands::mcp::McpManager>();
             let mut acc: Vec<ToolResult> = Vec::with_capacity(turn.tool_calls.len());
             for tc in &turn.tool_calls {
+                if !definition_allows_tool(definition_tools, &tc.name) {
+                    acc.push(ToolResult {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        is_error: true,
+                        content: format!(
+                            "outil `{}` refusé par la définition de cet agent",
+                            tc.name
+                        ),
+                    });
+                    continue;
+                }
+                if !super::execution_profile_authorized(app, execution_profile) {
+                    acc.push(ToolResult {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        is_error: true,
+                        content: "Full Access a été révoqué. Repasse en Auto ou réactive-le via la confirmation native."
+                            .to_string(),
+                    });
+                    continue;
+                }
+                if !execution_profile.allows_tool(&tc.name) {
+                    acc.push(ToolResult {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        is_error: true,
+                        content: format!(
+                            "outil `{}` refusé par le profil {}",
+                            tc.name,
+                            execution_profile.as_str()
+                        ),
+                    });
+                    continue;
+                }
+                if let Some(blocked) =
+                    super::lifecycle::reject_unplanned_tool(tc, enforce_plan_first)
+                {
+                    acc.push(blocked);
+                    continue;
+                }
                 if tc.name == "web_search" {
                     // Recherche web async via le client reqwest (Brave/Tavily si
                     // clé, sinon DuckDuckGo durci). Read-only → dispo en Plan.
@@ -2164,7 +2649,10 @@ pub(super) async fn tool_use_loop(
                     let query = args["query"].as_str().unwrap_or("").trim();
                     let max = args["max_results"].as_u64().unwrap_or(5).clamp(1, 10) as usize;
                     let (content, is_error) = if query.is_empty() {
-                        ("web_search: missing required field: query".to_string(), true)
+                        (
+                            "web_search: missing required field: query".to_string(),
+                            true,
+                        )
                     } else {
                         search::web_search(client, query, max).await
                     };
@@ -2189,8 +2677,10 @@ pub(super) async fn tool_use_loop(
                     let args: serde_json::Value =
                         serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
                     let url = args["url"].as_str().unwrap_or("").trim();
-                    let max_chars =
-                        args["max_chars"].as_u64().unwrap_or(48_000).clamp(500, 200_000) as usize;
+                    let max_chars = args["max_chars"]
+                        .as_u64()
+                        .unwrap_or(48_000)
+                        .clamp(500, 200_000) as usize;
                     let (content, is_error) = if url.is_empty() {
                         ("web_fetch: missing required field: url".to_string(), true)
                     } else {
@@ -2225,11 +2715,22 @@ pub(super) async fn tool_use_loop(
                         // v2 : modèle conseiller distinct si configuré, sinon
                         // auto-consultation (le modèle de l'exécuteur).
                         let (a_proto, a_base, a_model, a_key) = match advisor {
-                            Some(a) => (a.protocol.as_str(), a.base_url.as_str(), a.model.as_str(), a.api_key.as_str()),
+                            Some(a) => (
+                                a.protocol.as_str(),
+                                a.base_url.as_str(),
+                                a.model.as_str(),
+                                a.api_key.as_str(),
+                            ),
                             None => (protocol, base_url, model, api_key),
                         };
                         consult_advisor(
-                            client, a_proto, a_base, a_model, a_key, chat_template_kwargs, history,
+                            client,
+                            a_proto,
+                            a_base,
+                            a_model,
+                            a_key,
+                            chat_template_kwargs,
+                            history,
                         )
                         .await
                     };
@@ -2240,18 +2741,15 @@ pub(super) async fn tool_use_loop(
                         content,
                     });
                 } else if tc.name == "browser_test" {
-                    // Outil navigateur (façon Cursor 2.0) : navigateur headless qui
-                    // ouvre l'app de l'utilisateur, exécute des actions, lit la
-                    // console + le DOM et capture. Vérification READ-ONLY → dispo
-                    // aussi en mode Plan (comme web_fetch/capture_screen). Le contenu
-                    // (console/DOM) est EXTERNE non fiable → clôture DONNÉES (AM-3).
+                    // Outil navigateur interactif : réservé aux profils Agent.
+                    // Le verdict structuré est préfixé avant le bloc de contenu
+                    // non fiable afin que le lifecycle ne parse jamais la prose.
                     let args: serde_json::Value =
                         serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
                     let root_opt = workspace_root.as_ref().map(|p| p.as_path());
-                    let outcome = crate::commands::browser::browser_test_run(
-                        app, root_opt, agent_id, &args,
-                    )
-                    .await;
+                    let outcome =
+                        crate::commands::browser::browser_test_run(app, root_opt, agent_id, &args)
+                            .await;
                     // Chaque capture devient un event Screenshot pour la timeline du fil.
                     for (path, thumb) in &outcome.screenshots {
                         let _ = super::persist_and_emit(
@@ -2264,10 +2762,18 @@ pub(super) async fn tool_use_loop(
                             },
                         );
                     }
+                    let verification = match outcome.passed {
+                        Some(true) => "[SHUGU_VERIFY: passed]\n",
+                        Some(false) => "[SHUGU_VERIFY: failed]\n",
+                        None => "",
+                    };
                     let content = if outcome.is_error {
                         outcome.summary
                     } else {
-                        super::tools::wrap_untrusted("browser", &outcome.summary)
+                        format!(
+                            "{verification}{}",
+                            super::tools::wrap_untrusted("browser", &outcome.summary)
+                        )
                     };
                     acc.push(ToolResult {
                         id: tc.id.clone(),
@@ -2285,12 +2791,7 @@ pub(super) async fn tool_use_loop(
                     let task = args["task"].as_str().unwrap_or("").trim().to_string();
                     let focus = args["focus_hint"].as_str().unwrap_or("").trim();
                     let expected = args["expected_artifacts"].as_str().unwrap_or("").trim();
-                    let (content, is_error) = if read_only {
-                        // Defense-in-depth : Plan mode interdit un sous-agent mutant
-                        // (delegate ∈ is_write_tool → déjà hors manifest, mais M3 peut
-                        // l'émettre en texte XML).
-                        (PLAN_BLOCK_MSG.to_string(), true)
-                    } else if task.is_empty() {
+                    let (content, is_error) = if task.is_empty() {
                         ("delegate: missing required field: task".to_string(), true)
                     } else if depth >= MAX_DELEGATION_DEPTH {
                         // Garde profondeur (ceinture + bretelles avec le filtre manifest).
@@ -2317,6 +2818,7 @@ pub(super) async fn tool_use_loop(
                             agent_id,
                             depth + 1,
                             child_task,
+                            execution_profile,
                         ))
                         .await
                         {
@@ -2349,15 +2851,6 @@ pub(super) async fn tool_use_loop(
                     // qui termine le tour (break plus bas). Aucun workspace requis,
                     // donc traité ICI, avant le gate `workspace_root`.
                     acc.push(super::tools::execute_hitl_tool(tc, app, agent_id));
-                } else if read_only && is_write_tool(&tc.name) {
-                    // Plan mode : outil mutant refusé (defense-in-depth — déjà
-                    // hors manifest, mais M3 peut l'émettre en texte).
-                    acc.push(ToolResult {
-                        id: tc.id.clone(),
-                        name: tc.name.clone(),
-                        is_error: true,
-                        content: PLAN_BLOCK_MSG.to_string(),
-                    });
                 } else if let Some(root) = workspace_root.as_ref() {
                     // Native fs tool: sync dispatch on a blocking thread, same as
                     // the parallel path but awaited one at a time.
@@ -2369,8 +2862,17 @@ pub(super) async fn tool_use_loop(
                     let role_clone = role.to_string();
                     let last_exec_clone = last_exec_exit.clone();
                     let agent_id_clone = agent_id.to_string();
+                    let profile = execution_profile;
                     let r = tokio::task::spawn_blocking(move || {
-                        execute_tool(&tc_clone, &root_clone, &app_clone, &role_clone, &last_exec_clone, &agent_id_clone)
+                        execute_tool(
+                            &tc_clone,
+                            &root_clone,
+                            &app_clone,
+                            &role_clone,
+                            &last_exec_clone,
+                            &agent_id_clone,
+                            profile,
+                        )
                     })
                     .await
                     .unwrap_or_else(|join_err| ToolResult {
@@ -2404,21 +2906,38 @@ pub(super) async fn tool_use_loop(
                 // a ToolResult because tc_clone has already moved.
                 let fallback_id = tc_clone.id.clone();
                 let fallback_name = tc_clone.name.clone();
-                // Plan mode : refuse les outils mutants (defense-in-depth).
-                let blocked = read_only && is_write_tool(&tc_clone.name);
+                let profile_blocked = !execution_profile.allows_tool(&tc_clone.name);
+                let definition_blocked = !definition_allows_tool(definition_tools, &tc_clone.name);
+                let plan_blocked =
+                    super::lifecycle::reject_unplanned_tool(&tc_clone, enforce_plan_first);
                 let root_clone = root_arc.clone();
                 let app_clone = app.clone();
                 let role_clone = role.to_string();
                 let last_exec_clone = last_exec_exit.clone();
                 let agent_id_clone = agent_id.to_string();
+                let profile = execution_profile;
                 async move {
-                    if blocked {
+                    if profile_blocked || definition_blocked {
                         return ToolResult {
                             id: fallback_id,
-                            name: fallback_name,
+                            name: fallback_name.clone(),
                             is_error: true,
-                            content: PLAN_BLOCK_MSG.to_string(),
+                            content: if definition_blocked {
+                                format!(
+                                    "outil `{}` refusé par la définition de cet agent",
+                                    fallback_name
+                                )
+                            } else {
+                                format!(
+                                    "outil `{}` refusé par le profil {}",
+                                    fallback_name,
+                                    profile.as_str()
+                                )
+                            },
                         };
+                    }
+                    if let Some(blocked) = plan_blocked {
+                        return blocked;
                     }
                     // `spawn_blocking` because the fs ops are synchronous —
                     // running them on the async runtime thread would starve
@@ -2426,15 +2945,23 @@ pub(super) async fn tool_use_loop(
                     // a JoinError (panic in the closure); `execute_tool`
                     // itself never panics for normal fs failures.
                     tokio::task::spawn_blocking(move || {
-                        execute_tool(&tc_clone, &root_clone, &app_clone, &role_clone, &last_exec_clone, &agent_id_clone)
+                        execute_tool(
+                            &tc_clone,
+                            &root_clone,
+                            &app_clone,
+                            &role_clone,
+                            &last_exec_clone,
+                            &agent_id_clone,
+                            profile,
+                        )
                     })
-                        .await
-                        .unwrap_or_else(|join_err| ToolResult {
-                            id: fallback_id,
-                            name: fallback_name,
-                            is_error: true,
-                            content: format!("tool execution panicked: {join_err}"),
-                        })
+                    .await
+                    .unwrap_or_else(|join_err| ToolResult {
+                        id: fallback_id,
+                        name: fallback_name,
+                        is_error: true,
+                        content: format!("tool execution panicked: {join_err}"),
+                    })
                 }
             });
             futures_util::future::join_all(futures).await
@@ -2469,7 +2996,13 @@ pub(super) async fn tool_use_loop(
                     error: error_val,
                 },
             );
+            set_isolation_status(app, agent_id, "finalized");
         }
+
+        // Update the completion contract only from real dispatcher results.
+        // Failed writes do not create a verification debt; a non-zero command
+        // is feedback, not a green check (parsed by lifecycle.rs).
+        run_evidence.observe_round(&turn.tool_calls, &results);
 
         // Human-in-the-loop par FIN DE TOUR : `ask_user` / `submit_plan` ont émis
         // leur event au dispatch et renvoyé le sentinel. On termine le tour
@@ -2552,7 +3085,11 @@ pub(super) async fn tool_use_loop(
         let screenshot_paths: Vec<String> = results
             .iter()
             .filter(|r| !r.is_error)
-            .filter_map(|r| r.content.strip_prefix("SCREENSHOT_SAVED:").map(str::to_string))
+            .filter_map(|r| {
+                r.content
+                    .strip_prefix("SCREENSHOT_SAVED:")
+                    .map(str::to_string)
+            })
             .collect();
 
         // ── 7. Append to history for the next iteration ────────────────
@@ -2587,20 +3124,6 @@ pub(super) async fn tool_use_loop(
         // image (~400-600 Ko base64 chacune) ; les plus vieilles redeviennent
         // du texte.
         prune_user_images(history, 2);
-
-        // AM-2 — COMPACTION: once the live history outgrows its window, summarise
-        // the oldest turns into one episodic memory (written to the `memory`
-        // collection AND kept in context as a recap) instead of letting the
-        // history grow unbounded — the orchestrated replacement for the old
-        // silent 30-message drop. The summariser is a tool-less LLM sub-call on
-        // the SAME model; on any failure the history is left intact (the closure
-        // errors → maybe_compact no-ops). Awaited inline — the loop is already
-        // inside the abort `tokio::select!`, so a kill still wins at the next
-        // turn boundary.
-        let _ = maybe_compact(app, history, agent_id, role, conversation_id, context_window, |excerpt| {
-            summarise_turns(client, protocol, base_url, model, api_key, chat_template_kwargs, excerpt)
-        })
-        .await;
 
         iteration += 1;
     }
@@ -2662,6 +3185,10 @@ async fn call_agent_llm_with_tools(
     // the former hard-coded `tools: None` (= native-default) so MCP tools reach
     // the model's request body.
     tools: &Option<serde_json::Value>,
+    // Recovery constraint: when an executing model ignored a mutation task and
+    // returned prose, the next OpenAI-compatible turn is required to emit the
+    // plan tool instead of repeating another raw answer.
+    forced_tool: Option<&str>,
 ) -> Result<(AssistantTurn, String), String> {
     // Live streaming restauré post-migration TanStack (2026-05-17).
     //
@@ -2718,7 +3245,12 @@ async fn call_agent_llm_with_tools(
             // content blocks (was: tool_calls serialized into assistant text).
             let (messages, system) = build_anthropic_native(history);
             chat::call_anthropic_structured(
-                client, base_url, model, messages, system, api_key,
+                client,
+                base_url,
+                model,
+                messages,
+                system,
+                api_key,
                 /* with_tools */ true,
                 /* tools (native ++ enabled MCP) */ tools.clone(),
                 /* abort */ None,
@@ -2740,28 +3272,24 @@ async fn call_agent_llm_with_tools(
                 chat_template_kwargs,
                 /* with_tools */ true,
                 /* tools (native ++ enabled MCP) */ tools.clone(),
+                /* forced tool */ forced_tool,
                 /* abort */ None,
                 &mut on_chunk,
             )
             .await
         }
         "ollama" => {
-            // Ollama tool-use is model-specific and not handled in Phase 2.
-            // We pass the text projection so the agent at least gets a
-            // chat-shaped response, but it won't be able to actually invoke
-            // tools. The tool_use_loop will see `tool_calls.is_empty()` and
-            // exit on the first iteration with whatever Ollama produced.
-            let messages: Vec<ChatMessage> = history
-                .iter()
-                .filter_map(|m| match m {
-                    AgentMessage::Text { role, content } => Some(ChatMessage {
-                        role: role.clone(),
-                        content: content.clone(),
-                    }),
-                    _ => None,
-                })
-                .collect();
-            chat::call_ollama(client, base_url, model, &messages, None, &mut on_chunk).await
+            let messages = build_ollama_messages(history);
+            chat::call_ollama_structured(
+                client,
+                base_url,
+                model,
+                messages,
+                tools.clone(),
+                None,
+                &mut on_chunk,
+            )
+            .await
         }
         other => Err(format!("unsupported protocol for agent: {other}")),
     }?;
@@ -2807,7 +3335,8 @@ async fn consult_advisor(
     // plutôt qu'une erreur opaque. (En pratique le user(task) est toujours là.)
     if advisor_history.len() <= 1 {
         return (
-            "advisor: no conversation turns yet — call advisor after at least one step.".to_string(),
+            "advisor: no conversation turns yet — call advisor after at least one step."
+                .to_string(),
             true,
         );
     }
@@ -2819,20 +3348,24 @@ async fn consult_advisor(
         "anthropic" => {
             let (messages, system) = build_anthropic_native(&advisor_history);
             chat::call_anthropic_structured(
-                client, base_url, model, messages, system, api_key,
-                /* with_tools */ false,
-                /* tools */ None,
-                /* abort */ None,
-                &mut sink,
+                client, base_url, model, messages, system, api_key, /* with_tools */ false,
+                /* tools */ None, /* abort */ None, &mut sink,
             )
             .await
         }
         "openai" | "custom" => {
             let messages = build_openai_messages(&advisor_history);
             chat::call_openai_compat_structured(
-                client, base_url, model, messages, api_key, protocol, chat_template_kwargs,
+                client,
+                base_url,
+                model,
+                messages,
+                api_key,
+                protocol,
+                chat_template_kwargs,
                 /* with_tools */ false,
                 /* tools */ None,
+                /* forced tool */ None,
                 /* abort */ None,
                 &mut sink,
             )
@@ -2858,12 +3391,19 @@ async fn consult_advisor(
         Ok(t) => {
             let advice = t.content.trim().to_string();
             if advice.is_empty() {
-                ("advisor returned empty guidance — proceed with your own judgement.".to_string(), false)
+                (
+                    "advisor returned empty guidance — proceed with your own judgement."
+                        .to_string(),
+                    false,
+                )
             } else {
                 (advice, false)
             }
         }
-        Err(e) => (format!("advisor call failed: {e} — proceed with your own judgement."), true),
+        Err(e) => (
+            format!("advisor call failed: {e} — proceed with your own judgement."),
+            true,
+        ),
     }
 }
 
@@ -2903,20 +3443,24 @@ async fn summarise_turns(
         "anthropic" => {
             let (messages, system) = build_anthropic_native(&summary_history);
             chat::call_anthropic_structured(
-                client, base_url, model, messages, system, api_key,
-                /* with_tools */ false,
-                /* tools */ None,
-                /* abort */ None,
-                &mut sink,
+                client, base_url, model, messages, system, api_key, /* with_tools */ false,
+                /* tools */ None, /* abort */ None, &mut sink,
             )
             .await
         }
         "openai" | "custom" => {
             let messages = build_openai_messages(&summary_history);
             chat::call_openai_compat_structured(
-                client, base_url, model, messages, api_key, protocol, chat_template_kwargs,
+                client,
+                base_url,
+                model,
+                messages,
+                api_key,
+                protocol,
+                chat_template_kwargs,
                 /* with_tools */ false,
                 /* tools */ None,
+                /* forced tool */ None,
                 /* abort */ None,
                 &mut sink,
             )
@@ -2949,6 +3493,7 @@ async fn summarise_turns(
 /// complete static project to `.shugu-forge/preview/` so the live preview
 /// (`preview://` protocol) can render it. Kept as a const so the large role
 /// strings in `seed_prompt` stay untouched.
+#[allow(dead_code)] // legacy text retained temporarily for migration archaeology
 const GENERATION_MODE_PROMPT: &str = "=== GENERATION MODE (a design system is active) ===\nWhen the task asks you to build, generate, create, or design a page, site, landing page, dashboard, component, or any UI, you MUST produce a COMPLETE, SELF-CONTAINED static web project WRITTEN TO DISK using `fs_write_file` — NOT a chat answer and NOT a single fenced code block.\n\nBefore writing files, call `todo_write` with a short checklist (3-6 steps) of your plan, then update the statuses as you complete each step.\n\nRules:\n1. Write the entry point at `.shugu-forge/preview/index.html`.\n2. Put CSS in `.shugu-forge/preview/styles.css` and JS in `.shugu-forge/preview/script.js`, linked from index.html with RELATIVE paths (href=\"styles.css\", src=\"script.js\").\n3. Apply the design context below (a design system and/or a colour direction): declare its color / typography / spacing tokens as CSS custom properties in `:root { ... }`, and follow the visual direction, component patterns, and anti-patterns.\n4. Produce real, polished, responsive markup with enough sections to demonstrate the design (e.g. hero, content sections, footer). No placeholder-only output.\n5. Always (over)write the files under `.shugu-forge/preview/` so the live preview reflects the latest version; read existing files first when iterating.\n6. After writing, reply with ONE short line: what you built, which design skill(s) you applied, + the entry path `.shugu-forge/preview/index.html`.";
 
 /// Appended to the agent's system prompt in PLAN MODE (the chat's read-only
@@ -2956,11 +3501,13 @@ const GENERATION_MODE_PROMPT: &str = "=== GENERATION MODE (a design system is ac
 /// and proposes, but never mutates. The HARD enforcement is tool filtering +
 /// the dispatch guard in `tool_use_loop`; this just keeps the model honest so
 /// it doesn't promise edits it cannot perform.
+#[allow(dead_code)] // superseded by prompts::compose_runtime
 const PLAN_MODE_PROMPT: &str = "\n\n=== PLAN MODE (READ-ONLY) ===\nYou are in PLAN MODE. The write/exec tools (fs_write_file, fs_edit, run_command) are DISABLED for this turn — calling them will fail. Do NOT promise to write files or run commands.\n\nYour job is to UNDERSTAND and PROPOSE, not to act:\n1. Use the read tools (fs_list_dir, fs_read_file, fs_search) to investigate the real code as needed.\n2. If a choice is genuinely ambiguous (which stack, scope, or design direction), call `ask_user` with 1-4 clickable questions BEFORE finalizing — your turn ends and you are resumed with the user's answers.\n3. Use `todo_write` to sketch the steps you would take (it renders as a live checklist).\n4. When your plan is concrete, FINISH by calling `submit_plan(plan, title)` with the full plan in Markdown (which files you'd create/change, what each change does, how you'd verify it). Do NOT end in free text — `submit_plan` presents the plan to the user with « Approuver et exécuter » / « Continuer à planifier » buttons; approving switches you to Agent mode to execute it.";
 
 /// System prompt for a Grounded Run — the env-grounded loop on the user's REAL
 /// project (exec directe depuis le pivot 2026-06-10 ; le filet de sécurité est
 /// git, visible dans l'onglet Git de l'app).
+#[allow(dead_code)] // superseded by prompts::GROUNDED_PROMPT
 pub(super) const GROUNDED_PROMPT: &str = r#"You are Shugu's Grounded agent. You work DIRECTLY on the user's real project, with execution enabled on their machine. Git is the safety net: every change you make is visible in the app's Git panel, where the user can review and discard it. Your job: make the requested change AND prove it works by running the project's own checks.
 
 LOOP (DeepSWE-shaped):
@@ -2970,7 +3517,7 @@ LOOP (DeepSWE-shaped):
 4. READ the failure. A non-zero exit is INFORMATION, not defeat: read stderr, find the root cause, fix it, then run the check AGAIN.
 5. Declare done ONLY when the check passes (exit 0). End with a short plain-text summary of what you changed and why.
 
-TOOLCHAIN: you run on the user's real machine — `node`, `pnpm`, `npm`, `npx`, `cargo`, `git`, etc. resolve exactly as in their terminal, network included.
+TOOLCHAIN: you run on the user's real machine — `node`, package managers, `cargo`, `git`, etc. resolve exactly as in their terminal, network included. Read the project's manifest before running dependency or script commands and use its declared package manager. If `package.json` declares pnpm, use only `pnpm` / `pnpm exec` and never npm / npx.
 
 RULES (you are editing the REAL project — be surgical):
 - NEVER run destructive commands outside the task scope: no `rm`/`del` sweeps, no `git commit`, `git push`, `git checkout`, `git reset` unless the task EXPLICITLY asks for it.
@@ -2979,14 +3526,15 @@ RULES (you are editing the REAL project — be surgical):
 - Keep going until the check is green or you exhaust your iteration budget. Honest partial progress beats a confident wrong answer.
 "#;
 
+#[allow(dead_code)] // superseded by prompts::ATELIER_PROMPT
 pub(super) const ATELIER_PROMPT: &str = r#"You are Shugu's Atelier agent. You build a small WEB UI and then PROVE it works by actually driving a real browser — never by claiming it looks correct.
 
-You work in a THROWAWAY creation directory (empty temp dir), never the user's real project. All file paths are workspace-relative POSIX paths (e.g. `index.html`, `app.js`). Your tools: `fs_write_file(path, content)`, `fs_read_file(path)`, `fs_edit(path, old_string, new_string)`, `fs_list_dir(path)`, `run_command(command)`, and `skill_save(name, when_to_use, body)`. Commands run directly on the user's machine (real node/npm toolchain, network available), cwd = your creation directory.
+You work in a THROWAWAY creation directory (empty temp dir), never the user's real project. All file paths are workspace-relative POSIX paths (e.g. `index.html`, `app.js`). Your tools: `fs_write_file(path, content)`, `fs_read_file(path)`, `fs_edit(path, old_string, new_string)`, `fs_list_dir(path)`, `run_command(command)`, and `skill_save(name, when_to_use, body)`. Commands run directly on the user's machine (real Node.js/pnpm toolchain, network available), cwd = your creation directory.
 
 THE LOOP — follow it exactly:
 1. BUILD the app: write a self-contained static web app to disk — `index.html` plus optional `styles.css` / `app.js` linked with relative paths. Vanilla HTML/CSS/JS only: NO build step, NO frameworks.
 2. WRITE a browser test that DRIVES the UI. Create a CommonJS file `test.cjs` that uses Playwright for real interaction:
-   - first check Playwright resolves: `run_command("node -e \"require('playwright')\"")`. If it fails, install it locally: `run_command("npm init -y && npm install playwright && npx playwright install chromium", timeoutSecs: 300)`.
+   - first check Playwright resolves: `run_command("node -e \"require('playwright')\"")`. If it fails, install it locally: `run_command("pnpm init && pnpm add -D playwright && pnpm exec playwright install chromium", timeoutSecs: 300)`.
    - `const { chromium } = require('playwright');` and `chromium.launch()`,
    - open the page with an ABSOLUTE file URL built from the cwd: `const url = 'file:///' + process.cwd().replace(/\\/g, '/').replace(/^\//, '') + '/index.html'; await page.goto(url);`,
    - interact for real: `await page.click('#add')`, `await page.fill('#name', 'x')`, etc.,
@@ -3002,6 +3550,7 @@ Rules:
 
 /// Seed system prompt STATIQUE pour un rôle. Le Refiner qui le faisait évoluer
 /// est retiré ; l'apprentissage vit désormais dans la skill library.
+#[allow(dead_code)] // superseded by prompts::seed_prompt
 pub(crate) fn seed_prompt(role: &str) -> String {
     // Why this prompt is so directive: cloud LLMs (DeepSeek, GLM, Kimi, …) tend
     // to default to "respond from training data" when the system prompt is soft
@@ -3021,7 +3570,7 @@ pub(crate) fn seed_prompt(role: &str) -> String {
     //      `fs_list_dir` at the relevant path — cheap, gives a tree to
     //      reason from, prevents hallucinated filenames.
     match role {
-        "orchestrator" => "You are Shugu — a helpful, friendly coding companion that lives IN the user's app and works ON their real machine. You are conversational AND capable: you talk naturally, and when there is real work to do you actually DO it.\n\nADAPT to the message:\n- Greeting / thanks / chit-chat / a simple question you can answer directly → just reply, warmly and concisely. Do NOT call tools, do NOT write a plan. (e.g. « merci », « ça va ? », « c'est quoi un closure ? ».)\n- A real task — build / create / fix / modify / refactor / explore this project / anything multi-step → switch into work mode below: plan, read, write, run, verify.\n\nWhen there IS work to do, you don't just answer — you DO it: plan, read, write code, run it, verify, fix, repeat, until the task is actually finished.\n\nYour tools (all act on the REAL project; paths are WORKSPACE-RELATIVE POSIX, e.g. `src/main.js`, `.` — absolute paths and `..` are rejected):\n- `fs_list_dir(path)`, `fs_read_file(path)`, `fs_search(query)` — explore & locate BEFORE editing.\n- `fs_write_file(path, content)`, `fs_edit(path, old_string, new_string)` — create / modify files.\n- `run_command(command)` — run the project's REAL toolchain (node, pnpm, npm, cargo, git, python…) with network. Use it to install deps, build, run, and TEST what you produce.\n- `code_search(query)` — SEMANTIC search over the project's vector index; use it when you don't know the exact identifier (smarter than fs_search's literal/regex).\n- `web_search(query)` — search the public web for up-to-date info, library docs, or an error message that isn't in the local project.\n- `advisor()` — consult a senior reviewer that sees your FULL transcript; takes NO parameters. Call it BEFORE substantive work (before writing/editing or committing to an approach), when STUCK, and BEFORE declaring done. Weigh its advice, then continue.\n- `todo_write(todos)` — record and update your plan as a checklist.\n- `skill_save(...)` — save a reusable recipe after a test passes.\n\nABSOLUTE RULES — they override any other reflex:\n\n1. NEVER answer from training data about THIS project. You only know what you read via the tools in THIS conversation. If about to say \"a file like this typically contains…\" or \"I can't see your files\" — STOP and call `fs_list_dir`/`fs_read_file`/`fs_search` instead. That is what they are for.\n\n2. PLAN FIRST. For ANY build or multi-step task, call `todo_write` with a short checklist (3-7 steps) BEFORE doing the work, then update each step's status (in_progress → completed) AS YOU GO. Keep the list current — it is how the user follows your progress. On a non-trivial task, call `advisor()` for a strategic check BEFORE committing to an approach (after a little orientation, before the first write), and again BEFORE declaring done.\n\n3. EXPLORE before editing: `fs_list_dir` / `fs_search` / `fs_read_file` the relevant code. NEVER edit a file you have not read.\n\n4. BUILD IT FOR REAL, then VERIFY. After writing files, use `run_command` to install/build/run/test. A non-zero exit is INFORMATION, not defeat: read stderr, find the cause, fix it, run AGAIN. Do not declare done until it actually runs.\n\n5. Building a whole app / game / site FROM SCRATCH: create the COMPLETE project (entry point, modules, assets, a way to run it), make it runnable, and run it to prove it works. No stubs, no \"the rest is similar\", no placeholder TODOs — write complete files.\n\n6. Be surgical on EXISTING projects (git is the safety net — change only what the task needs); be COMPLETE on NEW ones.\n\n7. Finish with a SHORT plain-text summary: what you built and how you verified it (the command you ran + that it passed).".to_string(),
+        "orchestrator" => "You are Shugu — a helpful, friendly coding companion that lives IN the user's app and works ON their real machine. You are conversational AND capable: you talk naturally, and when there is real work to do you actually DO it.\n\nADAPT to the message:\n- Greeting / thanks / chit-chat / a simple question you can answer directly → just reply, warmly and concisely. Do NOT call tools, do NOT write a plan. (e.g. « merci », « ça va ? », « c'est quoi un closure ? ».)\n- A real task — build / create / fix / modify / refactor / explore this project / anything multi-step → switch into work mode below: plan, read, write, run, verify.\n\nWhen there IS work to do, you don't just answer — you DO it: plan, read, write code, run it, verify, fix, repeat, until the task is actually finished.\n\nYour tools (all act on the REAL project; paths are WORKSPACE-RELATIVE POSIX, e.g. `src/main.js`, `.` — absolute paths and `..` are rejected):\n- `fs_list_dir(path)`, `fs_read_file(path)`, `fs_search(query)` — explore & locate BEFORE editing.\n- `fs_write_file(path, content)`, `fs_edit(path, old_string, new_string)` — create / modify files.\n- `run_command(command)` — run the project's REAL toolchain with network. Read the manifest first and use its declared package manager; in a pnpm project use only `pnpm` / `pnpm exec`, never npm / npx. Use it to install deps, build, run, and TEST what you produce.\n- `code_search(query)` — SEMANTIC search over the project's vector index; use it when you don't know the exact identifier (smarter than fs_search's literal/regex).\n- `web_search(query)` — search the public web for up-to-date info, library docs, or an error message that isn't in the local project.\n- `advisor()` — consult a senior reviewer that sees your FULL transcript; takes NO parameters. Call it BEFORE substantive work (before writing/editing or committing to an approach), when STUCK, and BEFORE declaring done. Weigh its advice, then continue.\n- `todo_write(todos)` — record and update your plan as a checklist.\n- `skill_save(...)` — save a reusable recipe after a test passes.\n\nABSOLUTE RULES — they override any other reflex:\n\n1. NEVER answer from training data about THIS project. You only know what you read via the tools in THIS conversation. If about to say \"a file like this typically contains…\" or \"I can't see your files\" — STOP and call `fs_list_dir`/`fs_read_file`/`fs_search` instead. That is what they are for.\n\n2. PLAN FIRST. For ANY build or multi-step task, call `todo_write` with a short checklist (3-7 steps) BEFORE doing the work, then update each step's status (in_progress → completed) AS YOU GO. Keep the list current — it is how the user follows your progress. On a non-trivial task, call `advisor()` for a strategic check BEFORE committing to an approach (after a little orientation, before the first write), and again BEFORE declaring done.\n\n3. EXPLORE before editing: `fs_list_dir` / `fs_search` / `fs_read_file` the relevant code. NEVER edit a file you have not read.\n\n4. BUILD IT FOR REAL, then VERIFY. After writing files, use `run_command` to install/build/run/test. A non-zero exit is INFORMATION, not defeat: read stderr, find the cause, fix it, run AGAIN. Do not declare done until it actually runs.\n\n5. Building a whole app / game / site FROM SCRATCH: create the COMPLETE project (entry point, modules, assets, a way to run it), make it runnable, and run it to prove it works. No stubs, no \"the rest is similar\", no placeholder TODOs — write complete files.\n\n6. Be surgical on EXISTING projects (git is the safety net — change only what the task needs); be COMPLETE on NEW ones.\n\n7. Finish with a SHORT plain-text summary: what you built and how you verified it (the command you ran + that it passed).".to_string(),
         other => format!(
             "You are a Shugu sub-agent with role '{other}', running on the user's machine. You have three filesystem tools: `fs_read_file(path)`, `fs_write_file(path, content)`, `fs_list_dir(path)`. All paths are workspace-relative.\n\nRULE: never answer from training data about the user's project. Always use the tools to gather evidence first. If the task is about a file or directory, your first action is `fs_list_dir` or `fs_read_file`. Output only the final result."
         ),
@@ -3064,56 +3613,79 @@ fn record_outcome(
     }
 }
 
+fn set_isolation_status(app: &AppHandle, agent_id: &str, status: &str) {
+    if let Ok(conn_mutex) = get_conn(app) {
+        if let Ok(conn) = conn_mutex.lock() {
+            let _ = conn.execute(
+                "UPDATE agents SET isolation_status=?1 WHERE id=?2",
+                params![status, agent_id],
+            );
+        }
+    }
+}
+
 fn finish_error(
     app: &AppHandle,
     state: &Arc<Mutex<HashMap<String, AgentHandle>>>,
     agent_id: &str,
     err: &str,
 ) {
+    let mut transitioned = false;
     if let Ok(conn_mutex) = get_conn(app) {
         if let Ok(conn) = conn_mutex.lock() {
-            let _ = conn.execute(
-                "UPDATE agents
+            transitioned = conn
+                .execute(
+                    "UPDATE agents
                     SET status = 'error',
                         finished_at = ?1,
                         error = ?2
-                  WHERE id = ?3",
-                params![now_ms(), err, agent_id],
-            );
+                  WHERE id = ?3 AND status = 'running'",
+                    params![now_ms(), err, agent_id],
+                )
+                .map(|changed| changed == 1)
+                .unwrap_or(false);
         }
     }
-    let _ = persist_and_emit(
-        app,
-        &AgentEvent::Error {
-            agent_id: agent_id.to_string(),
-            error: err.to_string(),
-        },
-    );
+    if transitioned {
+        let _ = persist_and_emit(
+            app,
+            &AgentEvent::Error {
+                agent_id: agent_id.to_string(),
+                error: err.to_string(),
+            },
+        );
+    }
     if let Ok(mut g) = state.lock() {
         g.remove(agent_id);
     }
 }
 
 fn mark_killed(app: &AppHandle, agent_id: &str) {
+    let mut transitioned = false;
     if let Ok(conn_mutex) = get_conn(app) {
         if let Ok(conn) = conn_mutex.lock() {
-            let _ = conn.execute(
-                "UPDATE agents
+            transitioned = conn
+                .execute(
+                    "UPDATE agents
                     SET status = 'killed',
                         finished_at = ?1,
                         error = COALESCE(error, 'killed by user')
-                  WHERE id = ?2",
-                params![now_ms(), agent_id],
-            );
+                  WHERE id = ?2 AND status IN ('running', 'pending')",
+                    params![now_ms(), agent_id],
+                )
+                .map(|changed| changed == 1)
+                .unwrap_or(false);
         }
     }
-    let _ = persist_and_emit(
-        app,
-        &AgentEvent::Error {
-            agent_id: agent_id.to_string(),
-            error: "killed by user".to_string(),
-        },
-    );
+    if transitioned {
+        let _ = persist_and_emit(
+            app,
+            &AgentEvent::Error {
+                agent_id: agent_id.to_string(),
+                error: "killed by user".to_string(),
+            },
+        );
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -3125,18 +3697,33 @@ mod tests {
     use serde_json::json;
 
     fn tc(id: &str, name: &str, args: &str) -> ToolCall {
-        ToolCall { id: id.into(), name: name.into(), arguments: args.into() }
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: args.into(),
+        }
     }
     fn tr(id: &str, name: &str, is_error: bool, content: &str) -> ToolResult {
-        ToolResult { id: id.into(), name: name.into(), is_error, content: content.into() }
+        ToolResult {
+            id: id.into(),
+            name: name.into(),
+            is_error,
+            content: content.into(),
+        }
     }
 
     // ── OpenAI ────────────────────────────────────────────────────────
     #[test]
     fn openai_text_history() {
         let h = vec![
-            AgentMessage::Text { role: "system".into(), content: "sys".into() },
-            AgentMessage::Text { role: "user".into(), content: "hi".into() },
+            AgentMessage::Text {
+                role: "system".into(),
+                content: "sys".into(),
+            },
+            AgentMessage::Text {
+                role: "user".into(),
+                content: "hi".into(),
+            },
         ];
         assert_eq!(
             build_openai_messages(&h),
@@ -3145,6 +3732,83 @@ mod tests {
                 json!({ "role": "user", "content": "hi" }),
             ]
         );
+    }
+
+    #[test]
+    fn openai_coalesces_leading_system_blocks_for_strict_templates() {
+        let h = vec![
+            AgentMessage::Text {
+                role: "system".into(),
+                content: "identity".into(),
+            },
+            AgentMessage::Text {
+                role: "system".into(),
+                content: "runtime contract".into(),
+            },
+            AgentMessage::Text {
+                role: "user".into(),
+                content: "task".into(),
+            },
+        ];
+        assert_eq!(
+            build_openai_messages(&h),
+            vec![
+                json!({ "role": "system", "content": "identity\n\nruntime contract" }),
+                json!({ "role": "user", "content": "task" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn openai_coalesces_consecutive_text_nudges_for_strict_templates() {
+        let h = vec![
+            AgentMessage::Text {
+                role: "user".into(),
+                content: "repair the missing proof".into(),
+            },
+            AgentMessage::Text {
+                role: "user".into(),
+                content: "final iteration".into(),
+            },
+        ];
+        assert_eq!(
+            build_openai_messages(&h),
+            vec![json!({
+                "role": "user",
+                "content": "repair the missing proof\n\nfinal iteration"
+            })]
+        );
+    }
+
+    #[test]
+    fn openai_folds_controller_reminder_into_tool_result_for_strict_templates() {
+        let history = vec![
+            AgentMessage::AssistantWithTools {
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "call-plan".into(),
+                    name: "todo_write".into(),
+                    arguments: "{}".into(),
+                }],
+            },
+            AgentMessage::ToolResults(vec![ToolResult {
+                id: "call-plan".into(),
+                name: "todo_write".into(),
+                content: "plan recorded".into(),
+                is_error: false,
+            }]),
+            AgentMessage::Text {
+                role: "user".into(),
+                content: "[Shugu system] Plan en cours.".into(),
+            },
+        ];
+
+        let messages = build_openai_messages(&history);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1]["role"], "tool");
+        assert!(messages[1]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Plan en cours")));
     }
 
     #[test]
@@ -3169,11 +3833,45 @@ mod tests {
 
     #[test]
     fn normalize_tool_args_coerces_invalid_to_empty_object() {
-        assert_eq!(normalize_tool_args(r#"{"path":"a.ts"}"#), r#"{"path":"a.ts"}"#);
+        assert_eq!(
+            normalize_tool_args(r#"{"path":"a.ts"}"#),
+            r#"{"path":"a.ts"}"#
+        );
         assert_eq!(normalize_tool_args(""), "{}"); // no-arg call → "" rejeté par MiniMax
         assert_eq!(normalize_tool_args(r#"{"path":"trunc"#), "{}"); // streaming coupé
         assert_eq!(normalize_tool_args("\"bare string\""), "{}"); // JSON valide mais pas objet
         assert_eq!(normalize_tool_args("42"), "{}");
+    }
+
+    #[test]
+    fn ollama_history_links_tool_results_by_name() {
+        let h = vec![
+            AgentMessage::AssistantWithTools {
+                content: String::new(),
+                tool_calls: vec![tc("call_1", "fs_read_file", r#"{"path":"a.ts"}"#)],
+            },
+            AgentMessage::ToolResults(vec![tr("call_1", "fs_read_file", false, "contents")]),
+        ];
+        assert_eq!(
+            build_ollama_messages(&h),
+            vec![
+                json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "function": {
+                            "name": "fs_read_file",
+                            "arguments": {"path": "a.ts"}
+                        }
+                    }]
+                }),
+                json!({
+                    "role": "tool",
+                    "content": "contents",
+                    "tool_name": "fs_read_file"
+                }),
+            ]
+        );
     }
 
     #[test]
@@ -3197,20 +3895,35 @@ mod tests {
         ])];
         let out = build_openai_messages(&h);
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0], json!({ "role": "tool", "tool_call_id": "call_1", "content": "FILE" }));
-        assert_eq!(out[1], json!({ "role": "tool", "tool_call_id": "call_2", "content": "[]" }));
+        assert_eq!(
+            out[0],
+            json!({ "role": "tool", "tool_call_id": "call_1", "content": "FILE" })
+        );
+        assert_eq!(
+            out[1],
+            json!({ "role": "tool", "tool_call_id": "call_2", "content": "[]" })
+        );
     }
 
     // ── Anthropic ─────────────────────────────────────────────────────
     #[test]
     fn anthropic_system_hoisted_user_blocks() {
         let h = vec![
-            AgentMessage::Text { role: "system".into(), content: "S".into() },
-            AgentMessage::Text { role: "user".into(), content: "U".into() },
+            AgentMessage::Text {
+                role: "system".into(),
+                content: "S".into(),
+            },
+            AgentMessage::Text {
+                role: "user".into(),
+                content: "U".into(),
+            },
         ];
         let (msgs, system) = build_anthropic_native(&h);
         assert_eq!(system, Some("S".to_string()));
-        assert_eq!(msgs, vec![json!({ "role": "user", "content": [{ "type": "text", "text": "U" }] })]);
+        assert_eq!(
+            msgs,
+            vec![json!({ "role": "user", "content": [{ "type": "text", "text": "U" }] })]
+        );
     }
 
     #[test]
@@ -3257,24 +3970,39 @@ mod tests {
         // (Anthropic rejects two consecutive user turns).
         let h = vec![
             AgentMessage::ToolResults(vec![tr("tu_1", "x", false, "ok")]),
-            AgentMessage::Text { role: "user".into(), content: "[Shugu] final".into() },
+            AgentMessage::Text {
+                role: "user".into(),
+                content: "[Shugu] final".into(),
+            },
         ];
         let (msgs, _) = build_anthropic_native(&h);
         assert_eq!(msgs.len(), 1);
         let blocks = msgs[0]["content"].as_array().unwrap();
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0]["type"], "tool_result");
-        assert_eq!(blocks[1], json!({ "type": "text", "text": "[Shugu] final" }));
+        assert_eq!(
+            blocks[1],
+            json!({ "type": "text", "text": "[Shugu] final" })
+        );
     }
 
     #[test]
     fn anthropic_alternation_preserved_full_loop() {
         // user → assistant(tool_use) → user(tool_result) → assistant(text)
         let h = vec![
-            AgentMessage::Text { role: "user".into(), content: "task".into() },
-            AgentMessage::AssistantWithTools { content: "".into(), tool_calls: vec![tc("t", "n", "{}")] },
+            AgentMessage::Text {
+                role: "user".into(),
+                content: "task".into(),
+            },
+            AgentMessage::AssistantWithTools {
+                content: "".into(),
+                tool_calls: vec![tc("t", "n", "{}")],
+            },
             AgentMessage::ToolResults(vec![tr("t", "n", false, "r")]),
-            AgentMessage::Text { role: "assistant".into(), content: "done".into() },
+            AgentMessage::Text {
+                role: "assistant".into(),
+                content: "done".into(),
+            },
         ];
         let (msgs, _) = build_anthropic_native(&h);
         let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
@@ -3325,7 +4053,10 @@ mod tests {
 
     #[test]
     fn openai_user_image_pruned_becomes_text() {
-        let h = vec![AgentMessage::UserImage { text: "look".into(), data_url: "".into() }];
+        let h = vec![AgentMessage::UserImage {
+            text: "look".into(),
+            data_url: "".into(),
+        }];
         assert_eq!(
             build_openai_messages(&h)[0],
             json!({ "role": "user", "content": "look" })
@@ -3337,7 +4068,12 @@ mod tests {
         // tool_result (user) puis UserImage → UN SEUL message user, blocs
         // tool_result + text + image (Anthropic rejette 2 tours user de suite).
         let h = vec![
-            AgentMessage::ToolResults(vec![tr("tu_1", "capture_screen", false, "SCREENSHOT_SAVED:/x.jpg")]),
+            AgentMessage::ToolResults(vec![tr(
+                "tu_1",
+                "capture_screen",
+                false,
+                "SCREENSHOT_SAVED:/x.jpg",
+            )]),
             AgentMessage::UserImage {
                 text: "look".into(),
                 data_url: "data:image/jpeg;base64,AAAA".into(),
@@ -3384,14 +4120,23 @@ mod tests {
     #[test]
     fn transcript_excerpt_skips_system_and_flattens_tools() {
         let h = vec![
-            AgentMessage::Text { role: "system".into(), content: "SEED PROMPT".into() },
-            AgentMessage::Text { role: "user".into(), content: "build a todo app".into() },
+            AgentMessage::Text {
+                role: "system".into(),
+                content: "SEED PROMPT".into(),
+            },
+            AgentMessage::Text {
+                role: "user".into(),
+                content: "build a todo app".into(),
+            },
             AgentMessage::AssistantWithTools {
                 content: "reading".into(),
                 tool_calls: vec![tc("c1", "fs_read_file", r#"{"path":"a.ts"}"#)],
             },
             AgentMessage::ToolResults(vec![tr("c1", "fs_read_file", false, "FILE CONTENTS")]),
-            AgentMessage::Text { role: "assistant".into(), content: "done".into() },
+            AgentMessage::Text {
+                role: "assistant".into(),
+                content: "done".into(),
+            },
         ];
         let ex = transcript_excerpt(&h);
         // System block is NOT part of the episode.
@@ -3422,15 +4167,25 @@ mod tests {
     fn transcript_excerpt_truncates_long_content() {
         // 2000-char assistant message → flattened line caps the content at 400.
         let long = "x".repeat(2000);
-        let h = vec![AgentMessage::Text { role: "user".into(), content: long }];
+        let h = vec![AgentMessage::Text {
+            role: "user".into(),
+            content: long,
+        }];
         let ex = transcript_excerpt(&h);
         // "user: " prefix + at most 800 chars for a Text turn + newline.
-        assert!(ex.len() < 900, "excerpt should be bounded, got {}", ex.len());
+        assert!(
+            ex.len() < 900,
+            "excerpt should be bounded, got {}",
+            ex.len()
+        );
     }
 
     // ── AM-2 : token-aware compaction trigger (pure, no I/O) ──────────
     fn txt(role: &str, content: &str) -> AgentMessage {
-        AgentMessage::Text { role: role.into(), content: content.into() }
+        AgentMessage::Text {
+            role: role.into(),
+            content: content.into(),
+        }
     }
 
     #[test]
@@ -3447,9 +4202,15 @@ mod tests {
             text: "look".into(),
             data_url: format!("data:image/jpeg;base64,{huge_b64}"),
         }];
-        assert_eq!(estimate_tokens(&h), "look".len() / CHARS_PER_TOKEN + IMAGE_TOKENS);
+        assert_eq!(
+            estimate_tokens(&h),
+            "look".len() / CHARS_PER_TOKEN + IMAGE_TOKENS
+        );
         // A pruned image (empty data_url) carries no flat visual cost.
-        let pruned = vec![AgentMessage::UserImage { text: "look".into(), data_url: "".into() }];
+        let pruned = vec![AgentMessage::UserImage {
+            text: "look".into(),
+            data_url: "".into(),
+        }];
         assert_eq!(estimate_tokens(&pruned), "look".len() / CHARS_PER_TOKEN);
     }
 
@@ -3458,6 +4219,24 @@ mod tests {
         assert_eq!(compaction_budget(8_192), 5_192); // min(6144, 8192-3000)
         assert_eq!(compaction_budget(200_000), 150_000); // fraction dominates
         assert_eq!(compaction_budget(1_000_000), 750_000);
+    }
+
+    #[test]
+    fn tool_manifest_is_reserved_outside_history_budget() {
+        let manifest = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "large_tool",
+                "description": "x".repeat(3_000)
+            }
+        }]);
+        let expected_tool_tokens = manifest.to_string().chars().count() / CHARS_PER_TOKEN;
+        assert_eq!(
+            effective_history_window(16_384, Some(&manifest)),
+            16_384 - expected_tool_tokens
+        );
+        assert_eq!(effective_history_window(2_048, Some(&manifest)), 2_048);
+        assert_eq!(effective_history_window(16_384, None), 16_384);
     }
 
     #[test]
@@ -3471,16 +4250,27 @@ mod tests {
     #[test]
     fn plan_cut_none_under_budget() {
         // Small history, huge window → nothing to compact.
-        let h = vec![txt("system", "seed"), txt("user", "hi"), txt("assistant", "hello"),
-            txt("user", "more"), txt("assistant", "ok"), txt("user", "again")];
+        let h = vec![
+            txt("system", "seed"),
+            txt("user", "hi"),
+            txt("assistant", "hello"),
+            txt("user", "more"),
+            txt("assistant", "ok"),
+            txt("user", "again"),
+        ];
         assert_eq!(plan_compaction_cut(&h, 1_000_000), None);
     }
 
     #[test]
     fn plan_cut_none_when_dialogue_at_or_below_keep_tail() {
         // dialogue_len <= KEEP_TAIL → None even with a tiny window ("over budget").
-        let h = vec![txt("system", "seed"), txt("user", "a"), txt("assistant", "b"),
-            txt("user", "c"), txt("assistant", "d")]; // 4 dialogue turns
+        let h = vec![
+            txt("system", "seed"),
+            txt("user", "a"),
+            txt("assistant", "b"),
+            txt("user", "c"),
+            txt("assistant", "d"),
+        ]; // 4 dialogue turns
         assert_eq!(plan_compaction_cut(&h, 2_048), None);
     }
 
@@ -3495,9 +4285,15 @@ mod tests {
         let window = 8_192;
         let cut = plan_compaction_cut(&h, window).expect("should compact when over budget");
         // head == 1 (single leading system block).
-        assert!(cut - 1 >= COMPACTION_FOLD_MIN_TURNS, "must fold at least FOLD_MIN turns");
+        assert!(
+            cut - 1 >= COMPACTION_FOLD_MIN_TURNS,
+            "must fold at least FOLD_MIN turns"
+        );
         // Keep the last KEEP_TAIL dialogue turns verbatim.
-        assert!(cut <= h.len() - COMPACTION_KEEP_TAIL_TURNS, "must keep the recent tail");
+        assert!(
+            cut <= h.len() - COMPACTION_KEEP_TAIL_TURNS,
+            "must keep the recent tail"
+        );
         // After folding [1..cut] into one recap, the estimate drops under budget.
         let kept_after = estimate_tokens(&h[..1]) + RECAP_EST_TOKENS + estimate_tokens(&h[cut..]);
         assert!(
@@ -3522,7 +4318,12 @@ mod tests {
             content: fat.clone(),
             tool_calls: vec![tc("c", "fs_read_file", "{}")],
         }); // idx 6
-        h.push(AgentMessage::ToolResults(vec![tr("c", "fs_read_file", false, &fat)])); // idx 7
+        h.push(AgentMessage::ToolResults(vec![tr(
+            "c",
+            "fs_read_file",
+            false,
+            &fat,
+        )])); // idx 7
         for _ in 0..5 {
             h.push(txt("user", &fat)); // tail
         }
@@ -3536,4 +4337,35 @@ mod tests {
             "folded slab must not end on a dangling tool_call"
         );
     }
+
+    #[test]
+    fn definition_tool_selectors_are_enforced() {
+        let selectors = vec!["read".to_string(), "web".to_string()];
+        assert!(definition_allows_tool(Some(&selectors), "fs_read_file"));
+        assert!(definition_allows_tool(Some(&selectors), "code_search"));
+        assert!(definition_allows_tool(Some(&selectors), "web_search"));
+        assert!(definition_allows_tool(Some(&selectors), "todo_write"));
+        assert!(!definition_allows_tool(Some(&selectors), "fs_write_file"));
+        assert!(!definition_allows_tool(Some(&selectors), "run_command"));
+        assert!(!definition_allows_tool(Some(&selectors), "delegate"));
+    }
+
+    #[test]
+    fn definition_exact_mcp_and_mutating_delegate_rules() {
+        let exact = vec!["mcp__figma__get_file".to_string()];
+        assert!(definition_allows_tool(Some(&exact), "mcp__figma__get_file"));
+        assert!(!definition_allows_tool(
+            Some(&exact),
+            "mcp__figma__delete_file"
+        ));
+
+        let mutating = vec!["edit".to_string()];
+        assert!(definition_allows_tool(Some(&mutating), "fs_edit"));
+        assert!(definition_allows_tool(Some(&mutating), "delegate"));
+        assert!(!definition_allows_tool(Some(&mutating), "fs_write_file"));
+    }
 }
+
+#[cfg(test)]
+#[path = "runner_provider_contract_tests.rs"]
+mod provider_contract_tests;

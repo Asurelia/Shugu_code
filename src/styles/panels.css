@@ -385,7 +385,14 @@
 }
 .problem-row {
   display: flex; align-items: flex-start; gap: 10px;
+  width: 100%;
   padding: 8px 14px;
+  color: inherit;
+  text-align: left;
+  background: transparent;
+  border-top: 0;
+  border-left: 0;
+  border-right: 0;
   border-bottom: 1px solid rgba(255,255,255,0.03);
   cursor: pointer;
 }

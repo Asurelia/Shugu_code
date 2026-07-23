@@ -28,6 +28,7 @@ import {
   onProgress,
   type BundleProgress,
 } from "@/lib/modelBundle";
+import { useModalFocusTrap } from "@/lib/modalFocus";
 import { db } from "@/lib/db";
 import { useGreetingDone } from "./greetingFlag";
 
@@ -54,6 +55,7 @@ export function Onboarding() {
   const [downloading, setDownloading] = useState(false);
   const [progress, setProgress] = useState<BundleProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
 
   // Sliding-window for rate / ETA calculation. We sample every ~250 ms
   // (a few progress events per second) so the displayed rate doesn't
@@ -91,15 +93,22 @@ export function Onboarding() {
       });
     })();
     return () => unlisten?.();
-  }, []);
+  }, [qc]);
+
+  const defaultEntry = catalog[0];
+  const installed = defaultEntry ? installedIds.includes(defaultEntry.id) : false;
+  const shouldOpen =
+    dismissed !== null &&
+    greetingDone === true &&
+    !!defaultEntry &&
+    !installed &&
+    (!dismissed || downloading);
+  useModalFocusTrap({ open: shouldOpen, containerRef: dialogRef });
 
   // Wait until we know the dismissed flag before deciding to render. This
   // prevents a brief flash of the overlay on launch.
   if (dismissed === null) return null;
   if (greetingDone !== true) return null;
-
-  const defaultEntry = catalog[0];
-  const installed = defaultEntry ? installedIds.includes(defaultEntry.id) : false;
 
   // Don't show if installed, dismissed, or nothing to offer.
   if (!defaultEntry) return null;
@@ -158,6 +167,11 @@ export function Onboarding() {
       }}
     >
       <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Activate the local Shugu model"
+        tabIndex={-1}
         style={{
           maxWidth: 520,
           width: "100%",
@@ -205,7 +219,7 @@ export function Onboarding() {
         </div>
 
         {downloading && progress && (
-          <div style={{ marginBottom: 16 }}>
+          <div role="status" aria-live="polite" style={{ marginBottom: 16 }}>
             <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 6 }}>
               <span style={{ color: "var(--on-surface-muted, #aa9fc1)" }}>
                 {progress.phase === "verifying"
@@ -245,6 +259,7 @@ export function Onboarding() {
 
         {error && (
           <div
+            role="alert"
             style={{
               marginBottom: 14,
               padding: "10px 12px",

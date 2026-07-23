@@ -73,6 +73,10 @@ src-tauri/binaries/**/llama-server-*
 
 # Fastembed local model cache (87+ MB ONNX model — downloaded on first use)
 src-tauri/.fastembed_cache/
+/.fastembed_cache/
+
+# Machine-specific MSVC helper (hardcoded local Visual Studio path)
+/cargo-msvc.cmd
 
 # Snippets créés au runtime par "Open in editor" (openSnippetInEditor)
 .shugu-snippets/

@@ -59,7 +59,7 @@ use tauri_plugin_dialog::DialogExt;
 /// sans bump ici fait échouer tout run de dev/test. (La dérive est déjà
 /// arrivée : la constante est restée à 16 après l'ajout de la V17, donc le
 /// backup pré-migration v16→v17 n'a jamais été pris.)
-pub const TARGET_SCHEMA_VERSION: i64 = 19;
+pub const TARGET_SCHEMA_VERSION: i64 = 23;
 
 /// Nom du fichier base dans un bundle.
 const DB_FILE: &str = "shugu.db";
@@ -115,6 +115,11 @@ pub struct ImportResult {
     /// Chemin du backup de sécurité de l'ANCIENNE base, pris juste avant le
     /// remplacement (pour rollback manuel si besoin). Forward-slash.
     pub safety_backup: String,
+    /// Copie validée qui sera échangée avec la base avant l'ouverture de
+    /// SQLite au prochain démarrage.
+    pub pending_restore: String,
+    /// Toujours `true` pour un import lancé depuis l'application ouverte.
+    pub scheduled: bool,
     /// `true` — un redémarrage de l'app est requis pour que le pool sqlx
     /// rouvre la nouvelle base. L'UI doit l'indiquer à l'utilisateur.
     pub restart_required: bool,
@@ -199,8 +204,8 @@ fn snapshot_db(src: &Path, dest: &Path) -> Result<(), String> {
 
     // Ouverture en lecture/écriture (VACUUM a besoin d'écrire le journal de la
     // source), mais aucune donnée de la source n'est modifiée par VACUUM INTO.
-    let conn =
-        Connection::open(src).map_err(|e| format!("ouverture base source {} : {e}", src.display()))?;
+    let conn = Connection::open(src)
+        .map_err(|e| format!("ouverture base source {} : {e}", src.display()))?;
     // Le chemin destination doit être quoté en littéral SQL ; on échappe les
     // apostrophes pour éviter toute cassure de requête sur un chemin exotique.
     let dest_str = dest.to_string_lossy().replace('\'', "''");
@@ -229,9 +234,11 @@ pub(crate) fn schema_version_of(db: &Path) -> Option<i64> {
     if exists == 0 {
         return None;
     }
-    conn.query_row("SELECT MAX(version) FROM _sqlx_migrations", [], |r| r.get(0))
-        .ok()
-        .flatten()
+    conn.query_row("SELECT MAX(version) FROM _sqlx_migrations", [], |r| {
+        r.get(0)
+    })
+    .ok()
+    .flatten()
 }
 
 /// Nombre de tables utilisateur (hors tables internes sqlite_/`_sqlx_`).
@@ -415,9 +422,10 @@ pub fn auto_backup_before_migration(app: &AppHandle) -> Option<PathBuf> {
 
     let from = current.map(|v| v.to_string()).unwrap_or_else(|| "?".into());
     let dir = match backups_root(app) {
-        Ok(r) => r
-            .join("pre-migration")
-            .join(format!("v{from}-to-v{TARGET_SCHEMA_VERSION}-{}", now_millis())),
+        Ok(r) => r.join("pre-migration").join(format!(
+            "v{from}-to-v{TARGET_SCHEMA_VERSION}-{}",
+            now_millis()
+        )),
         Err(e) => {
             eprintln!("[backup] pré-migration: racine backups indisponible: {e}");
             return None;
@@ -513,7 +521,10 @@ pub async fn shugu_export_data(
         Some(d) if !d.trim().is_empty() => {
             let p = PathBuf::from(d.trim());
             if !p.is_dir() {
-                return Err(format!("dossier de destination introuvable : {}", p.display()));
+                return Err(format!(
+                    "dossier de destination introuvable : {}",
+                    p.display()
+                ));
             }
             p
         }
@@ -549,6 +560,198 @@ pub async fn shugu_export_data(
 /// (`integrity_check`) ; un bundle corrompu est refusé sans toucher à la base
 /// vivante. Le pool sqlx tient encore l'ancien fichier ouvert → un REDÉMARRAGE
 /// est requis (drapeau `restart_required`). Renvoie `Ok(None)` si annulé.
+#[cfg(test)]
+fn restore_bundle_to_live(
+    dir: &Path,
+    live: &Path,
+    safety_root: &Path,
+) -> Result<ImportResult, String> {
+    // 1. Vérifier le manifeste + la présence de la base dans le bundle.
+    let manifest_path = dir.join(MANIFEST_FILE);
+    let manifest_bytes = std::fs::read(&manifest_path).map_err(|e| {
+        format!(
+            "manifest.json illisible ({}) : {e}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: BackupManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| format!("manifest.json invalide : {e}"))?;
+    if manifest.format != "shugu-backup" {
+        return Err(format!(
+            "format de bundle inattendu : « {} »",
+            manifest.format
+        ));
+    }
+    let bundle_db = dir.join(DB_FILE);
+    if !bundle_db.is_file() {
+        return Err(format!("base absente du bundle : {}", bundle_db.display()));
+    }
+
+    // 2. Vérifier l'intégrité de la base DU BUNDLE avant de risquer un remplacement.
+    let (ok, messages) = run_integrity_check(&bundle_db)?;
+    if !ok {
+        return Err(format!(
+            "base du bundle corrompue (integrity_check) — restore refusé : {}",
+            messages.join("; ")
+        ));
+    }
+
+    // 3. Backup de sécurité de l'ANCIENNE base (si présente) avant remplacement.
+    let safety_dir = safety_root.join(format!("{}", now_millis()));
+    if live.exists() {
+        let safety_db = safety_dir.join(DB_FILE);
+        snapshot_db(live, &safety_db)?;
+    } else {
+        std::fs::create_dir_all(&safety_dir).map_err(|e| format!("mkdir pre-restore : {e}"))?;
+    }
+
+    // 4. Remplacement atomique sur le même volume et purge des sidecars.
+    let parent = live
+        .parent()
+        .ok_or_else(|| "base vivante sans dossier parent".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("mkdir config dir : {e}"))?;
+    let tmp = parent.join(format!(".shugu.db.restore-{}.tmp", now_millis()));
+    std::fs::copy(&bundle_db, &tmp).map_err(|e| format!("copie base bundle : {e}"))?;
+    for ext in ["-wal", "-shm"] {
+        let side = PathBuf::from(format!("{}{ext}", live.to_string_lossy()));
+        let _ = std::fs::remove_file(side);
+    }
+    std::fs::rename(&tmp, live).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("remplacement base vivante : {e}")
+    })?;
+
+    Ok(ImportResult {
+        bundle_dir: norm(dir),
+        manifest,
+        safety_backup: norm(&safety_dir),
+        pending_restore: String::new(),
+        scheduled: false,
+        restart_required: true,
+    })
+}
+
+fn pending_restore_path(live: &Path) -> Result<PathBuf, String> {
+    let parent = live
+        .parent()
+        .ok_or_else(|| "base vivante sans dossier parent".to_string())?;
+    Ok(parent.join("shugu.db.pending-restore"))
+}
+
+/// Validate a bundle and stage it next to the live DB. We deliberately do not
+/// replace `shugu.db` while Tauri is running: on Windows the sqlx connection
+/// holds an open file handle and a rename would fail with ERROR_ACCESS_DENIED.
+fn stage_bundle_restore(
+    dir: &Path,
+    live: &Path,
+    safety_root: &Path,
+) -> Result<ImportResult, String> {
+    let manifest_path = dir.join(MANIFEST_FILE);
+    let manifest_bytes = std::fs::read(&manifest_path).map_err(|e| {
+        format!(
+            "manifest.json illisible ({}) : {e}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: BackupManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| format!("manifest.json invalide : {e}"))?;
+    if manifest.format != "shugu-backup" {
+        return Err(format!(
+            "format de bundle inattendu : « {} »",
+            manifest.format
+        ));
+    }
+    let bundle_db = dir.join(DB_FILE);
+    if !bundle_db.is_file() {
+        return Err(format!("base absente du bundle : {}", bundle_db.display()));
+    }
+    let (ok, messages) = run_integrity_check(&bundle_db)?;
+    if !ok {
+        return Err(format!(
+            "base du bundle corrompue (integrity_check) — restore refusé : {}",
+            messages.join("; ")
+        ));
+    }
+
+    let safety_dir = safety_root.join(format!("{}", now_millis()));
+    if live.exists() {
+        snapshot_db(live, &safety_dir.join(DB_FILE))?;
+    } else {
+        std::fs::create_dir_all(&safety_dir).map_err(|e| format!("mkdir pre-restore : {e}"))?;
+    }
+
+    let pending = pending_restore_path(live)?;
+    let parent = pending
+        .parent()
+        .ok_or_else(|| "restauration préparée sans dossier parent".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("mkdir config dir : {e}"))?;
+    let temp = parent.join(format!(".shugu.db.pending-{}.tmp", now_millis()));
+    std::fs::copy(&bundle_db, &temp).map_err(|e| format!("copie restauration préparée : {e}"))?;
+    if pending.exists() {
+        std::fs::remove_file(&pending)
+            .map_err(|e| format!("remplace ancienne restauration préparée : {e}"))?;
+    }
+    std::fs::rename(&temp, &pending).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        format!("finalise restauration préparée : {e}")
+    })?;
+
+    Ok(ImportResult {
+        bundle_dir: norm(dir),
+        manifest,
+        safety_backup: norm(&safety_dir),
+        pending_restore: norm(&pending),
+        scheduled: true,
+        restart_required: true,
+    })
+}
+
+fn apply_pending_restore_file(live: &Path, pending: &Path) -> Result<bool, String> {
+    if !pending.is_file() {
+        return Ok(false);
+    }
+    let (ok, messages) = run_integrity_check(pending)?;
+    if !ok {
+        return Err(format!(
+            "restauration préparée corrompue — base courante conservée : {}",
+            messages.join("; ")
+        ));
+    }
+
+    let parent = live
+        .parent()
+        .ok_or_else(|| "base vivante sans dossier parent".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("mkdir config dir : {e}"))?;
+    let previous = parent.join(".shugu.db.pre-swap");
+    if previous.exists() {
+        std::fs::remove_file(&previous).map_err(|e| format!("clean pre-swap : {e}"))?;
+    }
+    for ext in ["-wal", "-shm"] {
+        let side = PathBuf::from(format!("{}{ext}", live.to_string_lossy()));
+        let _ = std::fs::remove_file(side);
+    }
+    if live.exists() {
+        std::fs::rename(live, &previous).map_err(|e| format!("prepare DB swap : {e}"))?;
+    }
+    if let Err(error) = std::fs::rename(pending, live) {
+        if previous.exists() {
+            let _ = std::fs::rename(&previous, live);
+        }
+        return Err(format!("apply pending DB restore: {error}"));
+    }
+    if previous.exists() {
+        let _ = std::fs::remove_file(previous);
+    }
+    Ok(true)
+}
+
+/// Called during Tauri setup, before the frontend opens `sqlite:shugu.db`.
+pub fn apply_pending_restore(app: &AppHandle) -> Result<bool, String> {
+    let live = live_db_path(app)?;
+    let pending = pending_restore_path(&live)?;
+    apply_pending_restore_file(&live, &pending)
+}
+
 #[command(rename_all = "camelCase")]
 pub async fn shugu_import_data(
     app: AppHandle,
@@ -577,77 +780,9 @@ pub async fn shugu_import_data(
         }
     };
 
-    // 1. Vérifier le manifeste + la présence de la base dans le bundle.
-    let manifest_path = dir.join(MANIFEST_FILE);
-    let manifest_bytes = std::fs::read(&manifest_path)
-        .map_err(|e| format!("manifest.json illisible ({}) : {e}", manifest_path.display()))?;
-    let manifest: BackupManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|e| format!("manifest.json invalide : {e}"))?;
-    if manifest.format != "shugu-backup" {
-        return Err(format!(
-            "format de bundle inattendu : « {} »",
-            manifest.format
-        ));
-    }
-    let bundle_db = dir.join(DB_FILE);
-    if !bundle_db.is_file() {
-        return Err(format!(
-            "base absente du bundle : {}",
-            bundle_db.display()
-        ));
-    }
-
-    // 2. Vérifier l'intégrité de la base DU BUNDLE avant de risquer un remplacement.
-    let (ok, messages) = run_integrity_check(&bundle_db)?;
-    if !ok {
-        return Err(format!(
-            "base du bundle corrompue (integrity_check) — restore refusé : {}",
-            messages.join("; ")
-        ));
-    }
-
     let live = live_db_path(&app)?;
-
-    // 3. Backup de sécurité de l'ANCIENNE base (si présente) avant remplacement.
-    let safety_dir = backups_root(&app)?
-        .join("pre-restore")
-        .join(format!("{}", now_millis()));
-    if live.exists() {
-        // On snapshot l'ancienne base (atomique) plutôt qu'un copy brut.
-        let safety_db = safety_dir.join(DB_FILE);
-        snapshot_db(&live, &safety_db)?;
-    } else {
-        std::fs::create_dir_all(&safety_dir).map_err(|e| format!("mkdir pre-restore : {e}"))?;
-    }
-
-    // 4. Remplacement atomique : on copie la base du bundle vers un fichier
-    //    temporaire à côté de la base vivante, puis rename (atomique sur le même
-    //    volume). On purge aussi les fichiers WAL/SHM périmés de l'ancienne base
-    //    pour éviter qu'un -wal résiduel ne « ressuscite » d'anciennes pages.
-    let parent = live
-        .parent()
-        .ok_or_else(|| "base vivante sans dossier parent".to_string())?;
-    std::fs::create_dir_all(parent).map_err(|e| format!("mkdir config dir : {e}"))?;
-    let tmp = parent.join(format!(".shugu.db.restore-{}.tmp", now_millis()));
-    std::fs::copy(&bundle_db, &tmp).map_err(|e| format!("copie base bundle : {e}"))?;
-
-    // Purge des sidecars WAL/SHM de l'ancienne base (best-effort).
-    for ext in ["-wal", "-shm"] {
-        let side = PathBuf::from(format!("{}{ext}", live.to_string_lossy()));
-        let _ = std::fs::remove_file(side);
-    }
-    std::fs::rename(&tmp, &live).map_err(|e| {
-        // Nettoyage du tmp en cas d'échec de rename.
-        let _ = std::fs::remove_file(&tmp);
-        format!("remplacement base vivante : {e}")
-    })?;
-
-    Ok(Some(ImportResult {
-        bundle_dir: norm(&dir),
-        manifest,
-        safety_backup: norm(&safety_dir),
-        restart_required: true,
-    }))
+    let safety_root = backups_root(&app)?.join("pre-restore");
+    Ok(Some(stage_bundle_restore(&dir, &live, &safety_root)?))
 }
 
 /// Vérifie l'intégrité de la base vivante (`PRAGMA integrity_check` +
@@ -764,7 +899,11 @@ mod tests {
         // The copy is readable and carries the data.
         let conn = Connection::open(&dest).unwrap();
         let v: String = conn
-            .query_row("SELECT value FROM settings WHERE key='workspace_root'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM settings WHERE key='workspace_root'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(v, "C:/Dev/x");
         let _ = std::fs::remove_dir_all(&dir);
@@ -809,6 +948,172 @@ mod tests {
             .execute_batch("CREATE TABLE x (a INTEGER);")
             .unwrap();
         assert_eq!(export_settings_json(&empty).unwrap(), "{}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_test_manifest(bundle: &Path, db: &Path) {
+        let manifest = BackupManifest {
+            format: "shugu-backup".to_string(),
+            bundle_version: 1,
+            app_version: "test".to_string(),
+            created_at: now_millis(),
+            db_bytes: std::fs::metadata(db).unwrap().len(),
+            schema_version: schema_version_of(db),
+            table_count: user_table_count(db),
+            integrity_ok: true,
+        };
+        std::fs::write(
+            bundle.join(MANIFEST_FILE),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn restore_roundtrip_replaces_live_and_keeps_safety_backup() {
+        let dir = temp_dir("restore_roundtrip");
+        let live = dir.join("live/shugu.db");
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+        make_db(&live, 23);
+        Connection::open(&live)
+            .unwrap()
+            .execute(
+                "UPDATE settings SET value='old-live' WHERE key='workspace_root'",
+                [],
+            )
+            .unwrap();
+
+        let bundle = dir.join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let bundle_db = bundle.join(DB_FILE);
+        make_db(&bundle_db, 23);
+        Connection::open(&bundle_db)
+            .unwrap()
+            .execute(
+                "UPDATE settings SET value='restored-value' WHERE key='workspace_root'",
+                [],
+            )
+            .unwrap();
+        write_test_manifest(&bundle, &bundle_db);
+
+        let result = restore_bundle_to_live(&bundle, &live, &dir.join("safety")).unwrap();
+        assert!(result.restart_required);
+        let restored: String = Connection::open(&live)
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key='workspace_root'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored, "restored-value");
+
+        let safety_db = PathBuf::from(result.safety_backup).join(DB_FILE);
+        let previous: String = Connection::open(safety_db)
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key='workspace_root'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(previous, "old-live");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_restore_is_rejected_before_live_is_touched() {
+        let dir = temp_dir("restore_corrupt");
+        let live = dir.join("live/shugu.db");
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+        make_db(&live, 23);
+        let bundle = dir.join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let bundle_db = bundle.join(DB_FILE);
+        std::fs::write(&bundle_db, b"not a sqlite database").unwrap();
+        let manifest = BackupManifest {
+            format: "shugu-backup".to_string(),
+            bundle_version: 1,
+            app_version: "test".to_string(),
+            created_at: now_millis(),
+            db_bytes: 21,
+            schema_version: None,
+            table_count: 0,
+            integrity_ok: false,
+        };
+        std::fs::write(
+            bundle.join(MANIFEST_FILE),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let error = restore_bundle_to_live(&bundle, &live, &dir.join("safety")).unwrap_err();
+        assert!(error.contains("integrity") || error.contains("database"));
+        let value: String = Connection::open(&live)
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key='workspace_root'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "C:/Dev/x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staged_restore_preserves_live_until_boot_then_swaps_recoverably() {
+        let dir = temp_dir("restore_staged");
+        let live = dir.join("live/shugu.db");
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+        make_db(&live, 23);
+        Connection::open(&live)
+            .unwrap()
+            .execute(
+                "UPDATE settings SET value='current-session' WHERE key='workspace_root'",
+                [],
+            )
+            .unwrap();
+
+        let bundle = dir.join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let bundle_db = bundle.join(DB_FILE);
+        make_db(&bundle_db, 23);
+        Connection::open(&bundle_db)
+            .unwrap()
+            .execute(
+                "UPDATE settings SET value='next-boot' WHERE key='workspace_root'",
+                [],
+            )
+            .unwrap();
+        write_test_manifest(&bundle, &bundle_db);
+
+        let staged = stage_bundle_restore(&bundle, &live, &dir.join("safety")).unwrap();
+        assert!(staged.scheduled);
+        let still_current: String = Connection::open(&live)
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key='workspace_root'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_current, "current-session");
+        let pending = PathBuf::from(&staged.pending_restore);
+        assert!(pending.is_file());
+
+        assert!(apply_pending_restore_file(&live, &pending).unwrap());
+        assert!(!pending.exists());
+        let applied: String = Connection::open(&live)
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key='workspace_root'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, "next-boot");
+        assert!(!apply_pending_restore_file(&live, &pending).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

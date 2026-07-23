@@ -10,7 +10,7 @@
 //                      d'expansion + appelle useGitDiff (un hook par instance,
 //                      conforme aux règles des hooks React). Monté lazily.
 
-import React, { useState, useCallback } from "react";
+import React, { useState } from "react";
 import { invoke } from "@/lib/tauri";
 import { useChatWrites, setChatWrites, markAgentWritesReverted, isAgentWritesReverted } from "./chatWritesStore";
 import type { ChatWriteRecord } from "./chatWritesStore";

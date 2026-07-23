@@ -71,7 +71,7 @@ export function StudioView() {
   const brandAssets = useMemo(
     () =>
       brandBoard.pinnedAssetIds
-        .map((id) => generations.find((g: any) => String(g.id) === id))
+        .map((id) => generations.find((g: any) => (g.kind ?? "image") === "image" && String(g.id) === id))
         .filter(Boolean)
         .map((g: any) => ({
           prompt: g.prompt,
@@ -105,7 +105,10 @@ export function StudioView() {
   const busy =
     !!lastTurn && lastStatus !== "complete" && lastStatus !== "error" && lastStatus !== "killed";
   // Display name for the auto/saved project = the brief (first turn), trimmed.
-  const projectName = () => (turns[0]?.userText ?? draft.brief).trim().slice(0, 60) || "Projet";
+  const projectName = useMemo(
+    () => (turns[0]?.userText ?? draft.brief).trim().slice(0, 60) || "Projet",
+    [turns, draft.brief],
+  );
 
   // Guaranteed preview refresh when a turn finishes (once per agent). The live
   // fs://changed reload covers in-flight writes; this is the final settle, and
@@ -120,7 +123,7 @@ export function StudioView() {
       setReloadKey((k) => k + 1);
       if (lastStatus === "complete") {
         // Auto-create/refresh this session's project snapshot (Projets grid).
-        void studioProjectUpsertAuto(projectName(), draft.convId)
+        void studioProjectUpsertAuto(projectName, draft.convId)
           .then((pid) => {
             setStudioCurrentProject(pid);
             invalidateStudioProjects();
@@ -128,7 +131,7 @@ export function StudioView() {
           .catch(() => {});
       }
     }
-  }, [lastTurn?.agentId, lastStatus]);
+  }, [lastTurn?.agentId, lastStatus, projectName, draft.convId]);
 
   // Workspace + orchestrator guards, shared by the first generation and every
   // iteration. Returns the resolved orchestrator (narrowed to ok) or null.
@@ -242,7 +245,7 @@ export function StudioView() {
   // Save the current preview as a named, frozen fork in the Projets grid.
   const onSaveAs = () => {
     if (turns.length === 0) return;
-    void studioProjectSaveAs(`${projectName()} (copie)`, draft.convId)
+    void studioProjectSaveAs(`${projectName} (copie)`, draft.convId)
       .then(() => invalidateStudioProjects())
       .catch((err) => setGateError(`Échec de la sauvegarde : ${String(err)}`));
   };

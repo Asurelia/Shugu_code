@@ -256,8 +256,6 @@ function useMascotClickThrough() {
 // scan of every open-mood PNG; the user can tune them live from
 // Settings → Mascot, persisted in localStorage. See features/mascot/
 // calibration.ts for the storage + cross-window broadcast plumbing.
-const CLUSTER_SIZE = 156;
-
 type ForcedSide = "left" | "right" | null;
 type ForcedEdge = "left" | "right" | "top" | "bottom" | null;
 
@@ -485,7 +483,7 @@ function useMascotWindowDrag(
     })();
 
     return () => { cancelled = true; cleanup?.(); };
-  }, [setForcedSide, setForceEdge]);
+  }, [setForcedSide, setForceEdge, calibrationRef]);
 }
 
 function MascotApp() {

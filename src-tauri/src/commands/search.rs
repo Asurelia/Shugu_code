@@ -146,7 +146,10 @@ async fn brave_search(
         })
         .unwrap_or_default();
     if items.is_empty() {
-        return (format!("Brave Search: aucun résultat pour « {query} »."), false);
+        return (
+            format!("Brave Search: aucun résultat pour « {query} »."),
+            false,
+        );
     }
     (format_results(query, "Brave", &items), false)
 }
@@ -180,8 +183,18 @@ async fn tavily_search(
     };
     if !resp.status().is_success() {
         let code = resp.status();
-        let snippet: String = resp.text().await.unwrap_or_default().chars().take(200).collect();
-        let hint = if code.as_u16() == 401 { " (clé Tavily invalide ?)" } else { "" };
+        let snippet: String = resp
+            .text()
+            .await
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect();
+        let hint = if code.as_u16() == 401 {
+            " (clé Tavily invalide ?)"
+        } else {
+            ""
+        };
         return (format!("Tavily: HTTP {code}{hint}. {snippet}"), true);
     }
     let json: serde_json::Value = match resp.json().await {
@@ -223,13 +236,29 @@ async fn tavily_search(
 /// plus simple et plus stable au parsing — bon filet quand le premier change.
 async fn ddg_search(client: &reqwest::Client, query: &str, max: usize) -> (String, bool) {
     // 1) endpoint HTML classique
-    if let Some(items) = ddg_fetch_and_parse(client, "https://html.duckduckgo.com/html/", query, max, false).await {
+    if let Some(items) = ddg_fetch_and_parse(
+        client,
+        "https://html.duckduckgo.com/html/",
+        query,
+        max,
+        false,
+    )
+    .await
+    {
         if !items.is_empty() {
             return (format_results(query, "DuckDuckGo", &items), false);
         }
     }
     // 2) repli endpoint lite
-    if let Some(items) = ddg_fetch_and_parse(client, "https://lite.duckduckgo.com/lite/", query, max, true).await {
+    if let Some(items) = ddg_fetch_and_parse(
+        client,
+        "https://lite.duckduckgo.com/lite/",
+        query,
+        max,
+        true,
+    )
+    .await
+    {
         if !items.is_empty() {
             return (format_results(query, "DuckDuckGo (lite)", &items), false);
         }
@@ -270,13 +299,19 @@ async fn ddg_fetch_and_parse(
 
 /// Parse `html.duckduckgo.com` : `result__a` (href+titre) + `result__snippet`.
 fn parse_ddg_html(html: &str, max: usize) -> Vec<(String, String, String)> {
-    let link_re = match Regex::new(r#"(?s)<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#) {
-        Ok(re) => re,
-        Err(_) => return Vec::new(),
-    };
+    let link_re =
+        match Regex::new(r#"(?s)<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#) {
+            Ok(re) => re,
+            Err(_) => return Vec::new(),
+        };
     let snippet_re = Regex::new(r#"(?s)<a[^>]*class="result__snippet"[^>]*>(.*?)</a>"#).ok();
     let snippets: Vec<String> = snippet_re
-        .map(|re| re.captures_iter(html).take(max).map(|c| strip_html(&c[1])).collect())
+        .map(|re| {
+            re.captures_iter(html)
+                .take(max)
+                .map(|c| strip_html(&c[1]))
+                .collect()
+        })
         .unwrap_or_default();
     link_re
         .captures_iter(html)
@@ -295,13 +330,19 @@ fn parse_ddg_html(html: &str, max: usize) -> Vec<(String, String, String)> {
 /// Parse `lite.duckduckgo.com` : liens `result-link` dans des cellules de table.
 /// Les snippets sont dans la ligne suivante (`result-snippet`).
 fn parse_ddg_lite(html: &str, max: usize) -> Vec<(String, String, String)> {
-    let link_re = match Regex::new(r#"(?s)<a[^>]*class="result-link"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#) {
-        Ok(re) => re,
-        Err(_) => return Vec::new(),
-    };
+    let link_re =
+        match Regex::new(r#"(?s)<a[^>]*class="result-link"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#) {
+            Ok(re) => re,
+            Err(_) => return Vec::new(),
+        };
     let snippet_re = Regex::new(r#"(?s)<td[^>]*class="result-snippet"[^>]*>(.*?)</td>"#).ok();
     let snippets: Vec<String> = snippet_re
-        .map(|re| re.captures_iter(html).take(max).map(|c| strip_html(&c[1])).collect())
+        .map(|re| {
+            re.captures_iter(html)
+                .take(max)
+                .map(|c| strip_html(&c[1]))
+                .collect()
+        })
         .unwrap_or_default();
     link_re
         .captures_iter(html)
@@ -326,7 +367,9 @@ fn decode_ddg_url(href: &str) -> String {
             return dec.into_owned();
         }
     }
-    href.strip_prefix("//").map(|s| format!("https://{s}")).unwrap_or_else(|| href.to_string())
+    href.strip_prefix("//")
+        .map(|s| format!("https://{s}"))
+        .unwrap_or_else(|| href.to_string())
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -343,7 +386,9 @@ pub(crate) async fn web_fetch(
     let url = url.trim();
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return (
-            format!("web_fetch: URL invalide « {url} » — elle doit commencer par http:// ou https://."),
+            format!(
+                "web_fetch: URL invalide « {url} » — elle doit commencer par http:// ou https://."
+            ),
             true,
         );
     }
@@ -358,7 +403,10 @@ pub(crate) async fn web_fetch(
         Err(e) => return (format!("web_fetch: échec réseau pour {url} ({e})."), true),
     };
     if !resp.status().is_success() {
-        return (format!("web_fetch: HTTP {} pour {url}.", resp.status()), true);
+        return (
+            format!("web_fetch: HTTP {} pour {url}.", resp.status()),
+            true,
+        );
     }
     let content_type = resp
         .headers()
@@ -368,7 +416,12 @@ pub(crate) async fn web_fetch(
         .to_string();
     let body = match resp.text().await {
         Ok(t) => t,
-        Err(e) => return (format!("web_fetch: lecture du corps impossible ({e})."), true),
+        Err(e) => {
+            return (
+                format!("web_fetch: lecture du corps impossible ({e})."),
+                true,
+            )
+        }
     };
     // Texte/JSON : renvoyer brut (pas de strip HTML). Sinon : HTML→texte.
     let is_plain = content_type.contains("text/plain")
@@ -377,7 +430,10 @@ pub(crate) async fn web_fetch(
     let text = if is_plain { body } else { html_to_text(&body) };
     let text = text.trim();
     if text.is_empty() {
-        return (format!("web_fetch: {url} n'a renvoyé aucun texte exploitable."), false);
+        return (
+            format!("web_fetch: {url} n'a renvoyé aucun texte exploitable."),
+            false,
+        );
     }
     let (clipped, truncated) = clip(text, max_chars);
     let mut out = format!("Contenu de {url} :\n\n{clipped}");
@@ -405,7 +461,9 @@ fn html_to_text(html: &str) -> String {
         s = re.replace_all(&s, " ").into_owned();
     }
     // Sauts de ligne sur les fermetures de blocs courants.
-    if let Ok(re) = Regex::new(r"(?i)</(p|div|li|tr|h[1-6]|br|section|article|header|footer|ul|ol)\s*>") {
+    if let Ok(re) =
+        Regex::new(r"(?i)</(p|div|li|tr|h[1-6]|br|section|article|header|footer|ul|ol)\s*>")
+    {
         s = re.replace_all(&s, "\n").into_owned();
     }
     if let Ok(re) = Regex::new(r"(?i)<br\s*/?>") {
@@ -439,7 +497,11 @@ fn html_to_text(html: &str) -> String {
 fn format_results(query: &str, source: &str, items: &[(String, String, String)]) -> String {
     let mut out = format!("Résultats web ({source}) pour « {query} » :\n\n");
     for (i, (title, url, snippet)) in items.iter().enumerate() {
-        let title = if title.trim().is_empty() { "(sans titre)" } else { title.trim() };
+        let title = if title.trim().is_empty() {
+            "(sans titre)"
+        } else {
+            title.trim()
+        };
         out.push_str(&format!("{}. {}\n   {}\n", i + 1, title, url.trim()));
         let snip = snippet.trim();
         if !snip.is_empty() {
@@ -532,11 +594,20 @@ mod tests {
     #[test]
     fn native_search_gating_is_conservative() {
         assert!(model_supports_native_search("anthropic", "claude-opus-4-8"));
-        assert!(model_supports_native_search("anthropic", "claude-sonnet-4-6"));
+        assert!(model_supports_native_search(
+            "anthropic",
+            "claude-sonnet-4-6"
+        ));
         assert!(model_supports_native_search("anthropic", "claude-fable-5"));
-        assert!(!model_supports_native_search("anthropic", "claude-3-5-sonnet"));
+        assert!(!model_supports_native_search(
+            "anthropic",
+            "claude-3-5-sonnet"
+        ));
         assert!(!model_supports_native_search("ollama", "llama3"));
-        assert!(model_supports_native_search("openai", "gpt-4o-search-preview"));
+        assert!(model_supports_native_search(
+            "openai",
+            "gpt-4o-search-preview"
+        ));
         assert!(!model_supports_native_search("openai", "gpt-4o"));
     }
 
@@ -572,7 +643,11 @@ mod tests {
 
     #[test]
     fn format_results_numbers_items() {
-        let items = vec![("T1".to_string(), "https://a".to_string(), "snip".to_string())];
+        let items = vec![(
+            "T1".to_string(),
+            "https://a".to_string(),
+            "snip".to_string(),
+        )];
         let out = format_results("q", "Brave", &items);
         assert!(out.contains("1. T1"));
         assert!(out.contains("https://a"));

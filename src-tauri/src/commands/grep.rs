@@ -133,14 +133,20 @@ pub(crate) fn grep_inner(
     } else {
         regex::escape(query)
     };
-    let max_results = if opts.max_results == 0 { 1000 } else { opts.max_results };
+    let max_results = if opts.max_results == 0 {
+        1000
+    } else {
+        opts.max_results
+    };
 
     let matcher = RegexMatcherBuilder::new()
         .case_insensitive(!opts.case_sensitive)
         .build(&pattern)
         .map_err(|e| format!("invalid regex: {e}"))?;
 
-    let results = Arc::new(Mutex::new(Vec::<GrepMatch>::with_capacity(max_results.min(256))));
+    let results = Arc::new(Mutex::new(Vec::<GrepMatch>::with_capacity(
+        max_results.min(256),
+    )));
     let stop = Arc::new(AtomicBool::new(false));
     let root_arc = Arc::new(root.to_path_buf());
 
@@ -186,7 +192,9 @@ pub(crate) fn grep_inner(
     // Récupère le Vec final. Arc::try_unwrap peut échouer si une closure a
     // survécu — théoriquement impossible après walker.run(), géré défensivement.
     match Arc::try_unwrap(results) {
-        Ok(mutex) => mutex.into_inner().map_err(|e| format!("results poison: {e}")),
+        Ok(mutex) => mutex
+            .into_inner()
+            .map_err(|e| format!("results poison: {e}")),
         Err(arc) => {
             let guard = arc.lock().map_err(|e| format!("results lock: {e}"))?;
             Ok(guard.clone())
@@ -208,11 +216,7 @@ struct GrepSink {
 impl Sink for GrepSink {
     type Error = std::io::Error;
 
-    fn matched(
-        &mut self,
-        _searcher: &Searcher,
-        mat: &SinkMatch<'_>,
-    ) -> Result<bool, Self::Error> {
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
         // Atomically check + insert to avoid going over max_results when the
         // parallel walker is racing on the same Mutex.
         let mut guard = self

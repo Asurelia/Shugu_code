@@ -30,6 +30,7 @@ import { fsListFiles } from "@/lib/fs";
 import {
   vecClear,
   vecIndexFile,
+  vecIndexFiles,
   vecRemoveFile,
   vecStalePaths,
   vecCodeGc,
@@ -50,6 +51,7 @@ import { startIndexing, setIndexingProgress, finishIndexing } from "./indexingSt
 // this cap, so when a repo exceeds the budget it's the DATA dumps that drop, not
 // the code. When truncated, the user is told (toast) — never a silent cap.
 const MAX_INDEX_FILES = 20_000;
+const INDEX_BATCH_SIZE = 32;
 
 // Extensions excluded from indexing — binaries, media, models/datasets, and
 // huge lockfiles. Filtered RUST-SIDE (fs_list_files) BEFORE the budget so a
@@ -215,22 +217,29 @@ async function runIndex(force = false): Promise<number> {
     let firstError = "";
     if (stale.length > 0) {
       startIndexing(stale.length);
-      // Yield to the event loop between files so the renderer thread can keep
-      // up with chat streaming, fs watcher events, and Tauri IPC traffic. The
-      // indexer is background work — slow + responsive UI > fast + frozen UI.
-      for (let i = 0; i < stale.length; i++) {
+      // Batch files so FastEmbed receives tens/hundreds of chunks per ONNX
+      // invocation instead of paying one session dispatch per chunk. The Rust
+      // command keeps the batch atomic. On a batch-level failure we retry each
+      // file through the original path: best-effort semantics and useful error
+      // attribution survive without penalising the healthy hot path.
+      for (let offset = 0; offset < stale.length; offset += INDEX_BATCH_SIZE) {
+        const batch = stale.slice(offset, offset + INDEX_BATCH_SIZE);
         try {
-          count += await vecIndexFile(stale[i]);
-        } catch (err) {
-          failures++;
-          if (!firstError) firstError = errMsg(err);
-          console.warn("[workspaceIndexer] skipping", stale[i], err);
+          count += await vecIndexFiles(batch);
+        } catch (batchError) {
+          console.warn("[workspaceIndexer] batch failed, retrying individually", batchError);
+          for (const path of batch) {
+            try {
+              count += await vecIndexFile(path);
+            } catch (err) {
+              failures++;
+              if (!firstError) firstError = errMsg(err);
+              console.warn("[workspaceIndexer] skipping", path, err);
+            }
+          }
         }
-        // Yield every 5 files to keep the UI responsive.
-        if (i > 0 && i % 5 === 0) {
-          setIndexingProgress(i + 1);
-          await new Promise((r) => setTimeout(r, 50));
-        }
+        setIndexingProgress(Math.min(offset + batch.length, stale.length));
+        await new Promise((r) => setTimeout(r, 50));
       }
     }
 

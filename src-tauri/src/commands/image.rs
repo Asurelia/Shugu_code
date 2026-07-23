@@ -2,14 +2,20 @@ use base64::{engine::general_purpose, Engine as _};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{fs, path::PathBuf, time::Duration};
-use tauri::{AppHandle, Manager};
+use std::time::Duration;
+use tauri::AppHandle;
+
+use crate::commands::media;
 
 /// Arguments received from the JS `invoke("image_generate", {...})` call.
 /// JS uses camelCase, so we rename all fields accordingly.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageGenerateArgs {
+    /// Client-generated id used for durable progress/cancellation. It is not a
+    /// provider request id and contains no credential.
+    #[serde(default)]
+    pub request_id: Option<String>,
     pub prompt: String,
     #[serde(default)]
     pub negative: Option<String>,
@@ -49,41 +55,8 @@ pub struct ImageJob {
 // Local asset persistence
 // ---------------------------------------------------------------------------
 
-fn image_asset_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("app_data_dir: {e}"))?
-        .join("image-assets");
-    fs::create_dir_all(&dir).map_err(|e| format!("create image asset dir: {e}"))?;
-    Ok(dir)
-}
-
-fn safe_asset_id(id: &str) -> String {
-    id.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string()
-}
-
 fn save_image_bytes(app: &AppHandle, id: &str, ext: &str, bytes: &[u8]) -> Result<String, String> {
-    let dir = image_asset_dir(app)?;
-    let stem = safe_asset_id(id);
-    let ext = ext.trim_start_matches('.').to_ascii_lowercase();
-    let path = dir.join(format!(
-        "{}.{}",
-        if stem.is_empty() { "image" } else { &stem },
-        ext
-    ));
-    fs::write(&path, bytes).map_err(|e| format!("write image asset: {e}"))?;
-    Ok(path.to_string_lossy().to_string())
+    media::save_bytes(app, "image-assets", id, ext, bytes)
 }
 
 fn decode_base64_image(raw: &str) -> Result<Vec<u8>, String> {
@@ -155,10 +128,7 @@ async fn download_image_to_asset(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .map(str::to_string);
-    let ext = ext_from_content_type(
-        content_type.as_deref(),
-        Some(url),
-    );
+    let ext = ext_from_content_type(content_type.as_deref(), Some(url));
     let bytes = resp
         .bytes()
         .await
@@ -298,7 +268,9 @@ fn require_key(protocol: &str, api_key: String) -> Result<String, String> {
 fn require_base_url(protocol: &str, base_url: &str) -> Result<String, String> {
     let base = base_url.trim().trim_end_matches('/').to_string();
     if base.is_empty() {
-        Err(format!("{protocol}: missing baseUrl in provider configuration"))
+        Err(format!(
+            "{protocol}: missing baseUrl in provider configuration"
+        ))
     } else {
         Ok(base)
     }
@@ -508,7 +480,9 @@ fn replicate_create_request(
         let owner = parts.next().unwrap_or("");
         let name = parts.next().unwrap_or("");
         if owner.is_empty() || name.is_empty() || parts.next().is_some() {
-            return Err("replicate: deployment model must be deployments/{owner}/{name}".to_string());
+            return Err(
+                "replicate: deployment model must be deployments/{owner}/{name}".to_string(),
+            );
         }
         let url = format!(
             "{}/v1/deployments/{}/{}/predictions",
@@ -552,10 +526,7 @@ async fn resolve_replicate_prediction(
     mut prediction: Value,
     fallback: &str,
 ) -> Result<ImageJob, String> {
-    let id = prediction["id"]
-        .as_str()
-        .unwrap_or(fallback)
-        .to_string();
+    let id = prediction["id"].as_str().unwrap_or(fallback).to_string();
 
     for attempt in 0..80 {
         let status = prediction["status"].as_str().unwrap_or("unknown");
@@ -635,7 +606,8 @@ async fn save_replicate_output(
 fn find_image_reference(value: &Value) -> Option<String> {
     match value {
         Value::String(s) => {
-            if s.starts_with("http://") || s.starts_with("https://") || s.starts_with("data:image/") {
+            if s.starts_with("http://") || s.starts_with("https://") || s.starts_with("data:image/")
+            {
                 Some(s.to_string())
             } else {
                 None
@@ -700,7 +672,9 @@ async fn call_openai_images(
     } else if let Some(url) = v["data"][0]["url"].as_str() {
         download_image_to_asset(client, app, fallback, url).await?
     } else {
-        return Err(format!("{protocol}: response did not include b64_json or url"));
+        return Err(format!(
+            "{protocol}: response did not include b64_json or url"
+        ));
     };
     Ok(ImageJob {
         id: fallback.to_string(),
@@ -846,8 +820,7 @@ async fn call_stability(
 ///   - minimax   — `MINIMAX_API_KEY`
 ///   - stability — `STABILITY_API_KEY`
 ///   - custom    — `SHUGU_CUSTOM_IMAGE_KEY`
-#[tauri::command]
-pub async fn image_generate(app: AppHandle, args: ImageGenerateArgs) -> Result<ImageJob, String> {
+async fn image_generate_inner(app: AppHandle, args: ImageGenerateArgs) -> Result<ImageJob, String> {
     // Reserved fields accepted for forward-compatibility; silence unused warnings.
     let _ = &args.style;
 
@@ -869,7 +842,16 @@ pub async fn image_generate(app: AppHandle, args: ImageGenerateArgs) -> Result<I
         }
         "replicate" => {
             let api_key = require_key("replicate", api_key)?;
-            call_replicate(&client, &app, &args.base_url, &args.model, &args, &api_key, &fid).await
+            call_replicate(
+                &client,
+                &app,
+                &args.base_url,
+                &args.model,
+                &args,
+                &api_key,
+                &fid,
+            )
+            .await
         }
         "openai" => {
             let api_key = require_key(protocol, api_key)?;
@@ -917,6 +899,49 @@ pub async fn image_generate(app: AppHandle, args: ImageGenerateArgs) -> Result<I
         }
         other => Err(format!("image: unsupported protocol '{other}'")),
     }
+}
+
+#[tauri::command]
+pub async fn image_generate(app: AppHandle, args: ImageGenerateArgs) -> Result<ImageJob, String> {
+    let job_id = args
+        .request_id
+        .clone()
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| crate::commands::media::fallback_id("media-image"));
+    let payload = serde_json::json!({
+        "prompt": args.prompt,
+        "ratio": args.ratio,
+        "model": args.model,
+        "protocol": args.protocol,
+    });
+    let control = crate::commands::media::begin_job(&app, &job_id, "media:image", payload)?;
+    crate::commands::media::progress(
+        &app,
+        &job_id,
+        "media:image",
+        "generating",
+        10,
+        "Génération de l’image",
+    );
+
+    let app_for_inner = app.clone();
+    let outcome = tokio::select! {
+        biased;
+        _ = control.cancelled() => Err(crate::commands::media::MEDIA_CANCELLED.to_string()),
+        result = image_generate_inner(app_for_inner, args) => result,
+    };
+    match &outcome {
+        Ok(job) => crate::commands::media::finish_job(
+            &app,
+            &job_id,
+            "media:image",
+            Ok(job.result_url.clone()),
+        ),
+        Err(error) => {
+            crate::commands::media::finish_job(&app, &job_id, "media:image", Err(error.clone()))
+        }
+    }
+    outcome
 }
 
 #[cfg(test)]

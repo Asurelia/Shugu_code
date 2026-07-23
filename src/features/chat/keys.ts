@@ -19,4 +19,6 @@ export const chatKeys = {
   codexEffort: () => [...chatKeys.all, "codex-effort"] as const,
   /** Active agent mode — chat | plan | agent (synthetic global state). */
   chatMode: () => [...chatKeys.all, "chat-mode"] as const,
+  /** Agent access profile — auto | fullAccess (session scoped). */
+  agentAccess: () => [...chatKeys.all, "agent-access"] as const,
 };

@@ -26,7 +26,7 @@
 // changed conv isn't the one it's currently displaying. Without that
 // filter, every keystroke in any conv would refetch in every window.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { db } from "@/lib/db";
 import { resolveCurrentProjectId } from "@/features/projects/projectsQueries";
@@ -40,7 +40,8 @@ import { fireMoodReaction } from "@/features/mascot/moodReactionStore";
 import { SHUGU_PERSONA_PROMPT, personaEnabled } from "@/features/chat/persona";
 import { parseThinkingMode, resolveThinking } from "@/lib/thinkingHeuristic";
 import { resolveRoute, parseDelegateOverride, type Route } from "@/lib/routingHeuristic";
-import { spawnAgent, agentContinue, awaitAgentComplete } from "@/lib/agents";
+import { spawnAgent, agentContinue, awaitAgentComplete, type ExecutionProfile } from "@/lib/agents";
+import { modelCapabilities } from "@/lib/modelCapabilities";
 import { readAgentDef } from "@/lib/agentDefs";
 import { superviseDeliverable, resolveReviewerArgs, resolveAdvisorArgs } from "@/lib/supervisors";
 import { getActiveDesignSystem, buildDesignSystemPrompt } from "@/features/design/activeDesignSystem";
@@ -57,6 +58,7 @@ const EVT_MESSAGES     = "chat://messages-changed";
 const EVT_ACTIVE       = "chat://active-changed";
 const EVT_ACTIVE_MODEL = "chat://active-model-changed";
 const EVT_CHAT_MODE    = "chat://chat-mode-changed";
+export const EVT_AGENT_ACCESS = "chat://agent-access-changed";
 const KEY_ACTIVE       = "shugu.chat.activeConv.v1";
 const KEY_ACTIVE_MODEL = "shugu.chat.activeModel.v1";
 const KEY_CODEX_EFFORT = "shugu.chat.codexEffort.v1";
@@ -64,6 +66,7 @@ const KEY_CODEX_EFFORT = "shugu.chat.codexEffort.v1";
 // fenêtre réceptrice — sinon `getActiveChatMode()` (lu en direct dans le chemin
 // d'envoi) verrait une valeur périmée après un changement de mode fait ailleurs.
 export const KEY_CHAT_MODE = "shugu.chat.mode.v1";
+export const KEY_AGENT_ACCESS = "shugu.chat.agentAccess.session.v1";
 
 /** Corps du message-placeholder posé pendant qu'un orchestrateur travaille, puis
  *  remplacé EN PLACE (même id) par la sortie finale. Exporté car (a) le
@@ -356,8 +359,10 @@ export async function sendChatMessage(
   // une tâche. Les exceptions historiques (image vision / never-delegate /
   // mascotte) gardent resolveRoute pour le SPLIT direct↔think.
   const chatMode = getActiveChatMode();
-  const agentMode: "plan" | "agent" = chatMode === "plan" ? "plan" : "agent";
-  const route: Route = agentDefPath
+  const agentMode: ChatMode = chatMode;
+  const route: Route = chatMode === "chat" && !isMascot
+    ? "chat-direct"
+    : agentDefPath
     ? "delegate"
     : imageDataUrl || isMascot || delegateOverride === "never-delegate"
       ? resolveRoute(trimmed, delegateOverride)
@@ -818,7 +823,7 @@ async function handleDelegate(
   task: string,
   agentDefPath?: string,
   fallbackModel?: string,
-  mode: "plan" | "agent" = "agent",
+  mode: ChatMode = "agent",
   // Texte ORIGINAL de l'utilisateur (sans l'enrichissement contexte éditeur /
   // commentaires inline). Sert UNIQUEMENT à juger la trivialité pour l'advisor :
   // sinon « merci » + un fichier ouvert ⇒ `task` long ⇒ resolveThinking=true ⇒
@@ -833,8 +838,13 @@ async function handleDelegate(
     kind?: "ask_user" | "submit_plan";
     verdict?: "approved" | "continue";
     response?: string;
+    executionProfile?: ExecutionProfile;
+    isolate?: boolean;
   },
 ): Promise<void> {
+  const executionProfile = resume?.executionProfile
+    ?? executionProfileForMode(mode, getAgentAccessProfile());
+  const isolate = resume?.isolate ?? false;
   // fallbackModel = modèle de chat actif, utilisé comme orchestrateur si aucun
   // n'est configuré (délégation « out of the box »). Un agent custom (.md)
   // épingle son propre modèle plus bas et n'utilise donc pas ce repli.
@@ -846,7 +856,7 @@ async function handleDelegate(
         role: "ai",
         body:
           "⚠ Cette demande ressemble à une tâche de développement, mais aucun **orchestrator** n'est configuré.\n\n" +
-          "Configure-le dans **Settings → Connections** (section Routing) pour activer la délégation — par exemple un Claude Sonnet via API, ou un OpenCode/Codex local.",
+          "Configure-le dans **Settings → Connections** (section Routing) avec un modèle dont la boucle d’outils est déclarée compatible.",
         ts: nowHHMM(),
       });
       try {
@@ -920,17 +930,39 @@ async function handleDelegate(
         apiKey    = defCfg.apiKey && defCfg.apiKey !== "" ? defCfg.apiKey : undefined;
       }
     } catch (err) {
-      // readAgentDef a échoué (fichier absent, frontmatter cassé…) — on continue
-      // avec les credentials de l'orchestrateur global plutôt que de bloquer.
-      // Mais on le SIGNALE visiblement : sinon l'agent démarrerait silencieusement
-      // avec le mauvais modèle/provider (revue chantier 3 — pas d'échec muet).
-      console.warn("[chat-sync] handleDelegate: readAgentDef failed, falling back to orchestrator config", err);
+      // Une définition explicite invalide ne doit jamais être remplacée
+      // silencieusement par l'orchestrateur global : ce serait un autre agent,
+      // un autre prompt et potentiellement un autre provider.
+      console.warn("[chat-sync] handleDelegate: readAgentDef failed", err);
       await appendMessage(convId, {
         id: newMessageId("e"),
         role: "ai",
-        body: `⚠ Impossible de lire la définition de l'agent (${agentDefPath}). L'orchestrateur par défaut est utilisé à la place.`,
+        body: `⚠ Impossible de lire la définition de l'agent (${agentDefPath}). Aucun agent n'a été lancé : ${String(err)}`,
         ts: nowHHMM(),
       });
+      return;
+    }
+  }
+
+  // Le backend applique le même verrou. Ce préflight donne simplement une
+  // explication utile avant de créer le placeholder de run.
+  if (executionProfile === "auto" || executionProfile === "fullAccess") {
+    try {
+      const caps = await modelCapabilities(protocol, realModel);
+      if (caps.agentLoop === "chatOnly") {
+        await appendMessage(convId, {
+          id: newMessageId("e"),
+          role: "ai",
+          body:
+            `⚠ **${protocol}/${realModel} est Chat-only dans Shugu.** ` +
+            "Aucun adaptateur d’outils agentiques vérifié n’est disponible pour ce provider/modèle. " +
+            "Choisis un modèle Anthropic/OpenAI-compatible ou repasse en mode Chat.",
+          ts: nowHHMM(),
+        });
+        return;
+      }
+    } catch (err) {
+      console.warn("[chat-sync] capability preflight unavailable; backend will enforce", err);
     }
   }
 
@@ -1003,6 +1035,8 @@ async function handleDelegate(
           model: realModel,
           answer: execTask,
           mode,
+          executionProfile,
+          isolate,
           protocol,
           baseUrl,
           apiKey,
@@ -1030,6 +1064,8 @@ async function handleDelegate(
           // Mode Plan → read_only côté runner (outils mutants retirés). Le défaut
           // "agent" laisse l'exécution directe complète.
           mode,
+          executionProfile,
+          isolate,
           // v2 : modèle conseiller distinct pour l'outil `advisor` (sinon
           // auto-consultation côté runner). Les 4 champs vont ensemble.
           advisorModel: advisor?.model,
@@ -1075,6 +1111,10 @@ async function handleDelegate(
     finishedAt: null,
     output: null,
     error: null,
+    executionProfile,
+    isolate,
+    profileVerified: true,
+    isolationStatus: isolate ? "pending" : "none",
   };
   queryClient.setQueryData<ParsedAgentTranscript>(
     agentKeys.detail(agentId),
@@ -1208,6 +1248,8 @@ export async function continueAgent(
     kind?: "ask_user" | "submit_plan";
     verdict?: "approved" | "continue";
     response?: string;
+    executionProfile?: ExecutionProfile;
+    isolate?: boolean;
   },
 ): Promise<void> {
   await handleDelegate(convId, answer, undefined, getActiveModel(), mode, answer, resume);
@@ -1500,6 +1542,57 @@ export function useChatMode(): [ChatMode, (m: ChatMode) => void] {
     })();
   }, []);
   return [mode, setMode];
+}
+
+export type AgentAccessProfile = "auto" | "fullAccess";
+
+export function parseAgentAccessProfile(raw: string | null | undefined): AgentAccessProfile {
+  return raw === "fullAccess" ? "fullAccess" : "auto";
+}
+
+/** Full Access is intentionally session-only: restarting Shugu returns to Auto. */
+export function getAgentAccessProfile(): AgentAccessProfile {
+  try {
+    return parseAgentAccessProfile(sessionStorage.getItem(KEY_AGENT_ACCESS));
+  } catch {
+    return "auto";
+  }
+}
+
+export function executionProfileForMode(
+  mode: ChatMode,
+  access: AgentAccessProfile,
+): ExecutionProfile {
+  if (mode === "chat") return "chat";
+  return mode === "plan" ? "plan" : access;
+}
+
+async function readNativeAgentAccessProfile(): Promise<AgentAccessProfile> {
+  const enabled = await invoke<boolean>("agent_full_access_status");
+  return enabled ? "fullAccess" : "auto";
+}
+
+export function useAgentAccessProfile(): [
+  AgentAccessProfile,
+  (p: AgentAccessProfile) => Promise<boolean>,
+] {
+  const { data: profile = getAgentAccessProfile() } = useQuery<AgentAccessProfile>({
+    queryKey: chatKeys.agentAccess(),
+    queryFn: readNativeAgentAccessProfile,
+    placeholderData: getAgentAccessProfile,
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  const setProfile = useCallback(async (next: AgentAccessProfile) => {
+    const enabled = next === "fullAccess"
+      ? await invoke<boolean>("agent_enable_full_access")
+      : await invoke<boolean>("agent_disable_full_access");
+    const effective: AgentAccessProfile = enabled ? "fullAccess" : "auto";
+    queryClient.setQueryData<AgentAccessProfile>(chatKeys.agentAccess(), effective);
+    try { sessionStorage.setItem(KEY_AGENT_ACCESS, effective); } catch { /* quota */ }
+    return effective === next;
+  }, []);
+  return [profile, setProfile];
 }
 
 // ─── createConversation — insert a fresh conv row + return its id ──────

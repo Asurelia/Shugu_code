@@ -1334,6 +1334,10 @@ body {
   font-size: 9.5px;
   color: rgba(255,255,255,0.78);
   text-shadow: 0 1px 4px rgba(0,0,0,0.7);
+  background: #11111e;
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 7px;
+  padding: 4px 6px;
   pointer-events: none;
 }
 .gallery-card-top { top: 10px; }
@@ -1359,6 +1363,18 @@ body {
   transform: translateY(4px);
   transition: opacity 180ms ease, transform 180ms ease;
   z-index: 3;
+}
+.gallery-actions .lgb {
+  background: #161622;
+  border-color: rgba(255,255,255,0.18);
+  color: var(--on-surface);
+}
+.gallery-actions .lgb:hover {
+  background: #242438;
+}
+.gallery-actions .lgb[style*="--danger"],
+.gallery-actions .lgb[style*="var(--danger)"] {
+  color: #ff9db2 !important;
 }
 .gallery-card:hover .gallery-actions {
   opacity: 1;

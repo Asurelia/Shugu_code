@@ -42,7 +42,7 @@ export function CommandRiskCard({
       pushToast(
         verdict === "allow"
           ? `Règle ajoutée : « ${pattern} » sera autorisé sans badge au prochain run.`
-          : `Règle ajoutée : « ${pattern} » sera signalé comme dangereux.`,
+          : `Règle ajoutée : « ${pattern} » sera bloqué avant exécution.`,
         "success",
         6000,
       );
@@ -131,7 +131,7 @@ export function CommandRiskCard({
               <p style={{ margin: 0 }}>
                 {pending.verdict === "allow"
                   ? "Toute commande correspondant à ce motif s'exécutera SANS badge de risque."
-                  : "Toute commande correspondant à ce motif sera signalée comme dangereuse."}{" "}
+                  : "Toute commande correspondant à ce motif sera refusée avant de démarrer."}{" "}
                 Le motif est un glob de tokens (se termine éventuellement par{" "}
                 <code>*</code>) — restreins-le si besoin.
               </p>

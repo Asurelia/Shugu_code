@@ -87,22 +87,30 @@ const IGNORED_SUFFIXES: &[&str] = &[".log"];
 // Une mémoire sémantique de CODE doit indexer du code, pas des dumps.
 const CODE_EXTS: &[&str] = &[
     // ipynb : notebooks Jupyter = code principal des repos ML (revue [2]).
-    "py", "pyi", "ipynb", "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "java", "kt",
-    "kts", "c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "cs", "rb", "php",
-    "swift", "scala", "sh", "bash", "zsh", "fish", "ps1", "lua", "r", "jl", "dart",
-    "ex", "exs", "erl", "hrl", "hs", "ml", "mli", "clj", "cljs", "cljc", "vue",
-    "svelte", "astro", "sql", "graphql", "gql", "proto", "md", "mdx", "rst", "adoc",
+    "py", "pyi", "ipynb", "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "java", "kt", "kts",
+    "c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hxx", "cs", "rb", "php", "swift", "scala", "sh",
+    "bash", "zsh", "fish", "ps1", "lua", "r", "jl", "dart", "ex", "exs", "erl", "hrl", "hs", "ml",
+    "mli", "clj", "cljs", "cljc", "vue", "svelte", "astro", "sql", "graphql", "gql", "proto", "md",
+    "mdx", "rst", "adoc",
 ];
 const CONFIG_EXTS: &[&str] = &[
-    "json", "jsonc", "yaml", "yml", "toml", "ini", "cfg", "conf", "xml", "html",
-    "htm", "css", "scss", "sass", "less", "gradle", "cmake", "tf", "env",
+    "json", "jsonc", "yaml", "yml", "toml", "ini", "cfg", "conf", "xml", "html", "htm", "css",
+    "scss", "sass", "less", "gradle", "cmake", "tf", "env",
 ];
 
 /// Fichiers SANS extension qui sont du code/build (revue [1]) : sinon ils
 /// tombent en tier 2 (données) et sautent avant un vulgaire .csv.
 const EXTENSIONLESS_CODE_NAMES: &[&str] = &[
-    "makefile", "dockerfile", "gemfile", "rakefile", "procfile", "jenkinsfile",
-    "vagrantfile", "brewfile", "containerfile", "justfile",
+    "makefile",
+    "dockerfile",
+    "gemfile",
+    "rakefile",
+    "procfile",
+    "jenkinsfile",
+    "vagrantfile",
+    "brewfile",
+    "containerfile",
+    "justfile",
 ];
 
 /// Tier de priorité d'indexation : 0 = code/docs, 1 = config/markup, 2 = autre
@@ -135,10 +143,7 @@ pub(crate) fn is_ignored(name: &str) -> bool {
     // Case-insensitive on Windows, case-sensitive on macOS/Linux.
     #[cfg(target_os = "windows")]
     {
-        if IGNORED_NAMES
-            .iter()
-            .any(|&n| n.eq_ignore_ascii_case(name))
-        {
+        if IGNORED_NAMES.iter().any(|&n| n.eq_ignore_ascii_case(name)) {
             return true;
         }
         return IGNORED_SUFFIXES
@@ -227,8 +232,7 @@ pub fn safe_resolve(root: &Path, rel: &str) -> Result<PathBuf, String> {
     let joined = root.join(rel_path);
     // canonicalize resolves `..`, symlinks, and normalises separators.
     // It errors if the path does not exist — correct for reads.
-    let canonical = std::fs::canonicalize(&joined)
-        .map_err(|e| format!("path not found: {e}"))?;
+    let canonical = std::fs::canonicalize(&joined).map_err(|e| format!("path not found: {e}"))?;
     if !canonical.starts_with(root) {
         return Err("path escapes workspace root".into());
     }
@@ -263,9 +267,7 @@ pub fn safe_resolve_for_write(root: &Path, rel: &str) -> Result<PathBuf, String>
             Component::Normal(part) => normalized.push(part),
             Component::CurDir => {} // `.` — skip
             // `..`, absolute prefix, root — all rejected.
-            Component::ParentDir => {
-                return Err("invalid path: parent directory traversal".into())
-            }
+            Component::ParentDir => return Err("invalid path: parent directory traversal".into()),
             Component::RootDir | Component::Prefix(_) => {
                 return Err("invalid path: must be relative".into())
             }
@@ -292,11 +294,7 @@ pub fn safe_resolve_for_write(root: &Path, rel: &str) -> Result<PathBuf, String>
     }
 
     // If even root doesn't exist (edge-case during tests), fall back to root.
-    let check_base = if ancestor.exists() {
-        ancestor
-    } else {
-        root
-    };
+    let check_base = if ancestor.exists() { ancestor } else { root };
 
     let canonical_ancestor = std::fs::canonicalize(check_base)
         .map_err(|e| format!("cannot canonicalize ancestor directory: {e}"))?;
@@ -321,8 +319,8 @@ fn open_settings_db(app: &tauri::AppHandle) -> Result<Connection, String> {
         .app_config_dir()
         .map_err(|e| format!("cannot resolve app config dir: {e}"))?
         .join("shugu.db");
-    let conn =
-        Connection::open(&db_path).map_err(|e| format!("rusqlite open {}: {e}", db_path.display()))?;
+    let conn = Connection::open(&db_path)
+        .map_err(|e| format!("rusqlite open {}: {e}", db_path.display()))?;
     // Ensure the settings table exists even on a fresh install before
     // tauri-plugin-sql has run its migrations (idempotent — no-ops if the
     // table was already created by the plugin).
@@ -500,8 +498,8 @@ fn apply_workspace_root(
     git_watcher_ctl: &tauri::State<'_, crate::commands::git_watcher::WatcherCtl>,
     raw_path: &Path,
 ) -> Result<String, String> {
-    let canonical = std::fs::canonicalize(raw_path)
-        .map_err(|e| format!("canonicalize workspace: {e}"))?;
+    let canonical =
+        std::fs::canonicalize(raw_path).map_err(|e| format!("canonicalize workspace: {e}"))?;
 
     // Store in managed state.
     // Forme IPC/affichage : préfixe verbatim `\\?\` retiré. Le STATE garde le
@@ -596,7 +594,9 @@ pub fn fs_read_dir_shallow(
         let guard = root_state
             .lock()
             .map_err(|e| format!("workspace state lock: {e}"))?;
-        guard.clone().ok_or_else(|| "no workspace open".to_string())?
+        guard
+            .clone()
+            .ok_or_else(|| "no workspace open".to_string())?
     };
 
     // Resolve the directory to list: the root itself, or a relative subdir.
@@ -626,10 +626,7 @@ pub fn fs_read_dir_shallow(
             continue;
         }
         // file_type() avoids a full stat where possible; fall back to is_dir().
-        let is_dir = entry
-            .file_type()
-            .map(|t| t.is_dir())
-            .unwrap_or(false);
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         // Workspace-relative, forward-slash path. Derive from the listed dir's
         // path relative to root, then append the child name — robust to the
         // `\\?\` prefix because we strip the canonicalized root prefix.
@@ -667,7 +664,9 @@ pub fn fs_read_dir(
         let guard = root_state
             .lock()
             .map_err(|e| format!("workspace state lock: {e}"))?;
-        guard.clone().ok_or_else(|| "no workspace open".to_string())?
+        guard
+            .clone()
+            .ok_or_else(|| "no workspace open".to_string())?
     };
 
     // TODO: add .gitignore parsing (deferred to B1.5).
@@ -723,7 +722,9 @@ pub fn fs_read_dir_scoped(
         let guard = root_state
             .lock()
             .map_err(|e| format!("workspace state lock: {e}"))?;
-        guard.clone().ok_or_else(|| "no workspace open".to_string())?
+        guard
+            .clone()
+            .ok_or_else(|| "no workspace open".to_string())?
     };
 
     // Resolve the subtree root. `safe_resolve` enforces containment + rejects
@@ -797,7 +798,9 @@ pub fn fs_list_files(
         let guard = root_state
             .lock()
             .map_err(|e| format!("workspace state lock: {e}"))?;
-        guard.clone().ok_or_else(|| "no workspace open".to_string())?
+        guard
+            .clone()
+            .ok_or_else(|| "no workspace open".to_string())?
     };
 
     // Lowercased extension set for O(1) membership (case-insensitive).
@@ -905,7 +908,9 @@ pub fn fs_read_file(
         let guard = root_state
             .lock()
             .map_err(|e| format!("workspace state lock: {e}"))?;
-        guard.clone().ok_or_else(|| "no workspace open".to_string())?
+        guard
+            .clone()
+            .ok_or_else(|| "no workspace open".to_string())?
     };
     read_file_inner(&root, &path, None)
 }
@@ -935,7 +940,9 @@ pub fn fs_read_files(
         let guard = root_state
             .lock()
             .map_err(|e| format!("workspace state lock: {e}"))?;
-        guard.clone().ok_or_else(|| "no workspace open".to_string())?
+        guard
+            .clone()
+            .ok_or_else(|| "no workspace open".to_string())?
     };
     Ok(paths
         .into_iter()
@@ -959,7 +966,9 @@ pub fn fs_write_file(
         let guard = root_state
             .lock()
             .map_err(|e| format!("workspace state lock: {e}"))?;
-        guard.clone().ok_or_else(|| "no workspace open".to_string())?
+        guard
+            .clone()
+            .ok_or_else(|| "no workspace open".to_string())?
     };
 
     // Use the write-safe resolver (file may not exist yet).
@@ -967,8 +976,7 @@ pub fn fs_write_file(
 
     // Ensure parent directory exists.
     if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create_dir_all: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create_dir_all: {e}"))?;
     }
 
     // Atomic write: write to temp file then rename.
@@ -980,8 +988,7 @@ pub fn fs_write_file(
         orig_ext
     });
 
-    std::fs::write(&tmp, content.as_bytes())
-        .map_err(|e| format!("write temp file: {e}"))?;
+    std::fs::write(&tmp, content.as_bytes()).map_err(|e| format!("write temp file: {e}"))?;
 
     if let Err(e) = std::fs::rename(&tmp, &target) {
         // Best-effort cleanup of the temp file.
@@ -1102,8 +1109,7 @@ pub fn fs_delete(
     let target = safe_resolve(&root, &path)?;
 
     // Use symlink_metadata so we see the symlink type, not its target's type.
-    let meta =
-        std::fs::symlink_metadata(&target).map_err(|e| format!("stat error: {e}"))?;
+    let meta = std::fs::symlink_metadata(&target).map_err(|e| format!("stat error: {e}"))?;
 
     if meta.is_dir() {
         delete_dir_no_follow(&target)
@@ -1137,7 +1143,9 @@ pub fn fs_get_workspace_root(
 
 /// Extract the workspace root from state, returning a clean error if unset.
 fn lock_root(state: &Mutex<Option<PathBuf>>) -> Result<PathBuf, String> {
-    let guard = state.lock().map_err(|e| format!("workspace state lock: {e}"))?;
+    let guard = state
+        .lock()
+        .map_err(|e| format!("workspace state lock: {e}"))?;
     guard.clone().ok_or_else(|| "no workspace open".to_string())
 }
 
@@ -1157,10 +1165,7 @@ fn make_tmp_path(target: &Path) -> PathBuf {
 /// Symlinks-to-dirs are treated as files by walkdir under `follow_links(false)`,
 /// so `is_dir()` returns `false` for them and they are removed with `remove_file`.
 fn delete_dir_no_follow(dir: &Path) -> Result<(), String> {
-    for result in WalkDir::new(dir)
-        .follow_links(false)
-        .contents_first(true)
-    {
+    for result in WalkDir::new(dir).follow_links(false).contents_first(true) {
         let entry = result.map_err(|e| format!("walkdir error: {e}"))?;
         let ft = entry.file_type();
         if ft.is_dir() {
@@ -1255,11 +1260,7 @@ pub(crate) fn read_file_inner(
 /// path. Creates missing parent directories. Returns the byte count written.
 /// Uses the same atomic-write contract as the existing `fs_write_file`
 /// Tauri command.
-pub(crate) fn write_file_inner(
-    root: &Path,
-    rel: &str,
-    content: &str,
-) -> Result<usize, String> {
+pub(crate) fn write_file_inner(root: &Path, rel: &str, content: &str) -> Result<usize, String> {
     let target = safe_resolve_for_write(root, rel)?;
 
     if let Some(parent) = target.parent() {
@@ -1317,7 +1318,9 @@ pub(crate) fn delete_file_inner(root: &Path, rel: &str) -> Result<(), String> {
 pub(crate) fn rename_inner(root: &Path, from: &str, to: &str) -> Result<u64, String> {
     let src = safe_resolve(root, from)?;
     if !src.is_file() {
-        return Err(format!("{from} n'est pas un fichier régulier (déplacement de dossier non supporté)"));
+        return Err(format!(
+            "{from} n'est pas un fichier régulier (déplacement de dossier non supporté)"
+        ));
     }
     let dst = safe_resolve_for_write(root, to)?;
     if dst.exists() {
@@ -1332,7 +1335,8 @@ pub(crate) fn rename_inner(root: &Path, from: &str, to: &str) -> Result<u64, Str
     // `rename` est atomique sur le même volume ; sur volumes différents il peut
     // échouer (EXDEV) → repli copy+remove pour rester robuste cross-device.
     if let Err(e) = std::fs::rename(&src, &dst) {
-        std::fs::copy(&src, &dst).map_err(|e2| format!("rename a échoué ({e}) et la copie aussi ({e2})"))?;
+        std::fs::copy(&src, &dst)
+            .map_err(|e2| format!("rename a échoué ({e}) et la copie aussi ({e2})"))?;
         // Si la suppression de la source échoue (AV/indexeur Windows qui verrouille),
         // on ANNULE la copie pour ne pas laisser source ET destination présentes —
         // sinon un retry buterait sur la garde « destination existe » (revue).
@@ -1411,7 +1415,13 @@ mod tests {
     #[test]
     fn index_tier_for_file_handles_extensionless_code() {
         // Sans extension mais code/build connu → tier 0 (pas largué en données).
-        for name in ["Makefile", "Dockerfile", "Gemfile", "Jenkinsfile", "justfile"] {
+        for name in [
+            "Makefile",
+            "Dockerfile",
+            "Gemfile",
+            "Jenkinsfile",
+            "justfile",
+        ] {
             assert_eq!(index_tier_for_file(name, ""), 0, "{name} devrait être code");
         }
         // Sans extension et inconnu → tier 2 (données/divers).
@@ -1498,8 +1508,14 @@ mod tests {
 
         let gi = build_workspace_gitignore(&root)
             .expect("une ligne invalide ne doit pas jeter le matcher");
-        assert!(gi.matched(Path::new("env"), true).is_ignore(), "règle AVANT la ligne invalide");
-        assert!(gi.matched(Path::new("data"), true).is_ignore(), "règle APRÈS la ligne invalide");
+        assert!(
+            gi.matched(Path::new("env"), true).is_ignore(),
+            "règle AVANT la ligne invalide"
+        );
+        assert!(
+            gi.matched(Path::new("data"), true).is_ignore(),
+            "règle APRÈS la ligne invalide"
+        );
         assert!(!gi.matched(Path::new("src"), true).is_ignore());
 
         cleanup(&root);
@@ -1581,7 +1597,10 @@ mod tests {
         fs::write(root.join("a.txt"), b"x").unwrap();
         let r = rename_inner(&root, "a.txt", "../escape.txt");
         assert!(r.is_err(), "expected Err for ../escape destination");
-        assert!(root.join("a.txt").exists(), "source must be untouched on guard failure");
+        assert!(
+            root.join("a.txt").exists(),
+            "source must be untouched on guard failure"
+        );
         cleanup(&root);
     }
 
@@ -1591,7 +1610,10 @@ mod tests {
         fs::write(root.join("a.txt"), b"from").unwrap();
         fs::write(root.join("b.txt"), b"to").unwrap();
         let r = rename_inner(&root, "a.txt", "b.txt");
-        assert!(r.is_err(), "expected Err — must not overwrite existing destination");
+        assert!(
+            r.is_err(),
+            "expected Err — must not overwrite existing destination"
+        );
         assert_eq!(fs::read_to_string(root.join("b.txt")).unwrap(), "to");
         cleanup(&root);
     }
@@ -1632,7 +1654,10 @@ mod tests {
         );
 
         // The file must NOT have been created as a side-effect.
-        assert!(!resolved.exists(), "safe_resolve_for_write must not create the file");
+        assert!(
+            !resolved.exists(),
+            "safe_resolve_for_write must not create the file"
+        );
 
         cleanup(&root);
     }
@@ -1661,10 +1686,7 @@ mod tests {
         assert!(result.is_err(), "expected Err for ../escape path");
 
         // CRITICAL: confirm no directory was created outside root.
-        let would_be_escape = root
-            .parent()
-            .unwrap()
-            .join("escape_target");
+        let would_be_escape = root.parent().unwrap().join("escape_target");
         assert!(
             !would_be_escape.exists(),
             "safe_resolve_for_write must NOT create directories for escaping paths"
@@ -1855,7 +1877,10 @@ mod tests {
         // The guard in fs_rename checks try_exists before calling rename.
         let to_resolved = safe_resolve_for_write(&root, "b.txt").unwrap();
         let exists = to_resolved.try_exists().unwrap();
-        assert!(exists, "to already exists — command should have returned Err");
+        assert!(
+            exists,
+            "to already exists — command should have returned Err"
+        );
         cleanup(&root);
     }
 

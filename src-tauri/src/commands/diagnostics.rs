@@ -136,10 +136,7 @@ pub fn value_looks_secret(value: &str) -> bool {
         return false;
     }
     // URL avec user:pass@
-    if let Some(rest) = v
-        .split_once("://")
-        .map(|(_, r)| r)
-    {
+    if let Some(rest) = v.split_once("://").map(|(_, r)| r) {
         if let Some((authority, _)) = rest.split_once('/') {
             if authority.contains('@') && authority.contains(':') {
                 return true;
@@ -298,11 +295,7 @@ pub async fn shugu_diag_bundle(
     app: AppHandle,
     subsystems_json: Option<String>,
 ) -> Result<DiagBundle, String> {
-    let home = app
-        .path()
-        .home_dir()
-        .ok()
-        .map(|p| norm(&p));
+    let home = app.path().home_dir().ok().map(|p| norm(&p));
     let home_ref = home.as_deref();
 
     // --- Faits système ---
@@ -335,9 +328,15 @@ pub async fn shugu_diag_bundle(
         db_facts.push(format!("- fichier : présent ({bytes} octets)"));
         if let Ok(conn) = Connection::open(&db) {
             let sv: Option<i64> = conn
-                .query_row("SELECT MAX(version) FROM _sqlx_migrations", [], |r| r.get(0))
+                .query_row("SELECT MAX(version) FROM _sqlx_migrations", [], |r| {
+                    r.get(0)
+                })
                 .ok()
                 .flatten();
+            facts.push(DiagFact {
+                label: "DB schema".to_string(),
+                value: sv.map(|v| format!("v{v}")).unwrap_or_else(|| "?".into()),
+            });
             db_facts.push(format!(
                 "- version de schéma : {}",
                 sv.map(|v| v.to_string()).unwrap_or_else(|| "?".into())
@@ -385,7 +384,11 @@ pub async fn shugu_diag_bundle(
     text.push_str("> Bundle généré localement. Les secrets sont masqués (`«redacted»`).\n\n");
     text.push_str("## Système\n");
     for f in &facts {
-        text.push_str(&format!("- **{}** : {}\n", f.label, anonymize_home(&f.value, home_ref)));
+        text.push_str(&format!(
+            "- **{}** : {}\n",
+            f.label,
+            anonymize_home(&f.value, home_ref)
+        ));
     }
     text.push_str("\n## Base de données\n");
     for line in &db_facts {

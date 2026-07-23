@@ -3,7 +3,7 @@ name = "shugu-forge"
 version = "0.1.0"
 description = "Shugu Forge — desktop workshop (Tauri 2 / React / CodeMirror 6)"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.88"
 
 [lib]
 name = "shugu_forge_lib"
@@ -55,7 +55,7 @@ serde_yaml = "0.9"
 # Shugu Forge ne fait JAMAIS de HTTPS via git2 (push/pull/fetch passent
 # par `git` CLI pour respecter les hooks/credentials/config locales).
 # Économie : pas de perl-strawberry requis pour le build MSVC.
-git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 
 # Find-in-files (LOT 2) — ripgrep en mode librairie.
 #   - `ignore` : walker qui respecte .gitignore, .ignore, et les globs custom.
@@ -96,7 +96,7 @@ rmcp = { version = "1", features = ["client", "transport-child-process", "transp
 #   image : resize (grand côté ≤ 1568 px) + encodage JPEG q80 avant l'envoi
 #           au modèle vision. Même lignée 0.25 que celle utilisée par xcap
 #           (les RgbaImage passent d'une crate à l'autre sans conversion).
-xcap = "0.9.6"
+xcap = "0.9.7"
 image = "0.25.6"
 
 # Lot parité Cursor — backend navigateur CDP 100% Rust (commands/browser.rs).

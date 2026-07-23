@@ -181,7 +181,12 @@ pub fn codex_config_path(app: &AppHandle) -> Option<PathBuf> {
 
 /// `~/.config/opencode/opencode.json`.
 pub fn opencode_config_path(app: &AppHandle) -> Option<PathBuf> {
-    Some(home_dir(app)?.join(".config").join("opencode").join("opencode.json"))
+    Some(
+        home_dir(app)?
+            .join(".config")
+            .join("opencode")
+            .join("opencode.json"),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +197,14 @@ pub fn opencode_config_path(app: &AppHandle) -> Option<PathBuf> {
 /// contient en préfixe OU suffixe est tenu pour secret. `APIKEY` couvre la forme
 /// collée du couple API+KEY.
 const SUBSTRING_NEEDLES: [&str; 8] = [
-    "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "BEARER", "APIKEY", "PRIVATEKEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "BEARER",
+    "APIKEY",
+    "PRIVATEKEY",
 ];
 
 /// Mots-clés courts/ambigus admis UNIQUEMENT comme segment exact (un segment
@@ -365,7 +377,10 @@ pub fn codex_servers(text: &str) -> Result<BTreeMap<String, McpServerConfig>, St
             .get("command")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let url = tbl.get("url").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let url = tbl
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let args = tbl
             .get("args")
             .and_then(|v| v.as_array())
@@ -524,8 +539,7 @@ pub fn scan_inventory(app: &AppHandle) -> McpInventory {
         McpSourceKind::ClaudeDesktop,
         claude_desktop_config_path(app),
         |text| {
-            claude_desktop_servers(text)
-                .map(|m| m.into_iter().map(|(n, c)| (n, c, None)).collect())
+            claude_desktop_servers(text).map(|m| m.into_iter().map(|(n, c)| (n, c, None)).collect())
         },
     );
     push_external(
@@ -543,8 +557,7 @@ pub fn scan_inventory(app: &AppHandle) -> McpInventory {
         McpSourceKind::OpenCode,
         opencode_config_path(app),
         |text| {
-            opencode_servers(text)
-                .map(|m| m.into_iter().map(|(n, (c, en))| (n, c, en)).collect())
+            opencode_servers(text).map(|m| m.into_iter().map(|(n, (c, en))| (n, c, en)).collect())
         },
     );
 
@@ -659,7 +672,10 @@ mod tests {
         let acct = cred_account_for("github", "GITHUB_PERSONAL_ACCESS_TOKEN");
         assert_eq!(acct, "mcp.github.env.GITHUB_PERSONAL_ACCESS_TOKEN");
         let sentinel = cred_sentinel_for(&acct);
-        assert_eq!(sentinel, "${cred:mcp.github.env.GITHUB_PERSONAL_ACCESS_TOKEN}");
+        assert_eq!(
+            sentinel,
+            "${cred:mcp.github.env.GITHUB_PERSONAL_ACCESS_TOKEN}"
+        );
         assert!(is_cred_sentinel(&sentinel));
         assert_eq!(extract_cred_account(&sentinel), Some(acct.as_str()));
         assert!(!is_cred_sentinel("ghp_realtoken"));
@@ -724,9 +740,21 @@ trust_level = "trusted"
         let m = codex_servers(toml_src).unwrap();
         assert_eq!(m.len(), 3);
         assert_eq!(m["node_repl"].transport(), "stdio");
-        assert_eq!(m["node_repl"].command.as_deref(), Some(r"C:\path\node_repl.exe"));
-        assert_eq!(m["node_repl"].env.get("GITHUB_TOKEN").map(String::as_str), Some("ghp_xxx"));
-        assert_eq!(m["node_repl"].env.get("NODE_REPL_NODE_PATH").map(String::as_str), Some(r"C:\path\node.exe"));
+        assert_eq!(
+            m["node_repl"].command.as_deref(),
+            Some(r"C:\path\node_repl.exe")
+        );
+        assert_eq!(
+            m["node_repl"].env.get("GITHUB_TOKEN").map(String::as_str),
+            Some("ghp_xxx")
+        );
+        assert_eq!(
+            m["node_repl"]
+                .env
+                .get("NODE_REPL_NODE_PATH")
+                .map(String::as_str),
+            Some(r"C:\path\node.exe")
+        );
         assert_eq!(m["lsmcp"].command.as_deref(), Some("cmd"));
         assert_eq!(m["lsmcp"].args, vec!["/c", "npx -y @mizchi/lsmcp"]);
         assert_eq!(m["remote_one"].transport(), "http");
@@ -764,7 +792,10 @@ trust_level = "trusted"
         let (fs, fs_en) = &m["fsLocal"];
         assert_eq!(fs.transport(), "stdio");
         assert_eq!(fs.command.as_deref(), Some("npx"));
-        assert_eq!(fs.args, vec!["-y", "@modelcontextprotocol/server-filesystem", "."]);
+        assert_eq!(
+            fs.args,
+            vec!["-y", "@modelcontextprotocol/server-filesystem", "."]
+        );
         assert_eq!(fs.env.get("API_TOKEN").map(String::as_str), Some("secret"));
         assert_eq!(*fs_en, Some(false));
     }

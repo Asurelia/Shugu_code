@@ -1,11 +1,10 @@
 // Shugu Forge — rich chat sidebar with groups, drag, context menu, filters.
 // Ported from chat-sidebar.jsx.
 
-import { useState, useEffect, useRef, useMemo } from "react";
+import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Icon } from "@/components/components";
-import { db, convoToRow } from "@/lib/db";
-import { seedIfEmpty } from "@/lib/db";
+import { db, convoToRow, ensureInitialConversation } from "@/lib/db";
 import { vecSearch } from "@/lib/vector";
 import { fsSetWorkspaceRoot } from "@/lib/fs";
 import {
@@ -15,27 +14,11 @@ import {
 } from "@/features/projects/projectsQueries";
 import { ProjectSwitcher, type ProjectViewMode } from "@/features/projects/ProjectSwitcher";
 import { projectKeys } from "@/features/projects/keys";
+import { useModalFocusTrap } from "@/lib/modalFocus";
 
-export const SEED_GROUPS = [
-  { id: "pinned",    label: "Pinned",    pinnedSection: true },
-  { id: "sdnc",      label: "SDNC" },
-  { id: "shugu",     label: "Shugu_Stream" },
-  { id: "ungrouped", label: "Ungrouped" },
-];
-
-export const SEED_CONVOS: any[] = [
-  { id: "c1", title: "amazing-grothendieck-2586d1", group: "pinned",    pinned: true,  status: "active", env: "dev",  updated: Date.now() - 4*60*1000 },
-  { id: "c2", title: "Research Liquid technology capabilities and opportunities", group: "sdnc", status: "active", env: "dev",  updated: Date.now() - 22*60*1000 },
-  { id: "c3", title: "Analyze SDNC implementation and identify issues",            group: "sdnc", status: "active", env: "prod", updated: Date.now() - 2*3600*1000 },
-  { id: "c4", title: "Deep UX audit and workflow analysis",                        group: "shugu",status: "active", env: "dev",  updated: Date.now() - 5*3600*1000 },
-  { id: "c5", title: "Veil pipeline Tauri",                                        group: "ungrouped", status: "active", env: "dev", updated: Date.now() - 26*3600*1000 },
-  { id: "c6", title: "CodeMirror 6 + neovim bindings",                             group: "ungrouped", status: "active", env: "dev", updated: Date.now() - 28*3600*1000,
-    children: [
-      { id: "c6a", title: "Vim keymap research",   group: "ungrouped", status: "active", updated: Date.now() - 29*3600*1000 },
-      { id: "c6b", title: "Insert-mode escape UX", group: "ungrouped", status: "active", updated: Date.now() - 30*3600*1000 },
-    ]
-  },
-  { id: "c7", title: "Local Ollama integration",                                   group: "ungrouped", status: "archived", env: "dev", updated: Date.now() - 4*86400*1000 },
+export const DEFAULT_GROUPS = [
+  { id: "pinned", label: "Épinglées", pinnedSection: true },
+  { id: "ungrouped", label: "Conversations" },
 ];
 
 export const FMT_RELATIVE = (ts: number) => {
@@ -52,11 +35,8 @@ export const FMT_RELATIVE = (ts: number) => {
 //
 // WHY: collapsing the left panel makes SidePanel return null (components.tsx),
 // which UNMOUNTS ChatSidebar entirely. Reopening REMOUNTS it from scratch.
-// Without this cache, every reopen re-initialised state from SEED_CONVOS and
-// flashed the hardcoded demo list ("amazing-grothendieck", "Research Liquid
-// technology"…) for the few ms of the async SQLite round-trip, before the
-// mount effect replaced it with the real list. The cache survives the
-// unmount/remount cycle so a reopen paints the real last-known list instantly.
+// The cache survives the unmount/remount cycle so a reopen paints the real
+// last-known SQLite list instantly instead of flashing an empty panel.
 //
 // It is per-window (each webview has its own module instance) and is refreshed
 // from SQLite — the source of truth — by the hydrate effect on every mount.
@@ -66,12 +46,9 @@ let groupsCache: any[] | null = null;
 
 export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
   // Initial state comes from the module cache (real data, survives remounts).
-  // On a genuine cold start the cache is empty, so we start with an EMPTY convo
-  // list — never SEED_CONVOS — and let the hydrate effect fill it from SQLite.
-  // SEED_CONVOS stays a SQLite-bootstrap concern only (db.seedIfEmpty); it must
-  // never reach the UI as a placeholder again. SEED_GROUPS is the real default
-  // group structure (groups aren't persisted), so it remains the cold fallback.
-  const [groups, setGroups]   = useState<any[]>(() => groupsCache ?? SEED_GROUPS);
+  // On a genuine cold start the cache is empty and the hydrate effect fills the
+  // conversation list from SQLite. Group labels are presentation-only.
+  const [groups, setGroups]   = useState<any[]>(() => groupsCache ?? DEFAULT_GROUPS);
   const [convos, setConvos]   = useState<any[]>(() => convosCache ?? []);
   const [filtersOpen, setFiltersOpen] = useState(false);
 
@@ -136,9 +113,8 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
   //
   // We always apply the result (no `length > 0` guard): SQLite is the source of
   // truth, so an empty list MUST be honoured — otherwise deleting every
-  // conversation would leave the stale in-memory list on screen. seedIfEmpty()
-  // re-seeds a genuinely empty table first, so a fresh install still shows the
-  // onboarding demo (loaded from SQLite, persistent — not a flashing placeholder).
+  // conversation would leave the stale in-memory list on screen. A fresh DB
+  // receives exactly one honest empty conversation, never a demo transcript.
   // Reset to the current-project view whenever the open folder changes, so
   // opening a project surfaces its conversations (not a stale "all"/"global").
   const prevProjectId = useRef<string | null | undefined>(undefined);
@@ -153,7 +129,7 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      await seedIfEmpty();
+      await ensureInitialConversation();
       const nested = await db.conversations.listNested(scope);
       if (!cancelled) {
         setConvos(nested);
@@ -254,33 +230,33 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
     })).filter((g: any) => g.items.length || !g.pinnedSection);
   }, [searchedSource, filters.groupBy, groups]);
 
-  const patch = (id: string, p: any) => setConvos(cs => cs.map((c: any) => c.id === id ? { ...c, ...p, updated: p.updated ?? c.updated } : c));
+  const patch = useCallback((id: string, p: any) => setConvos(cs => cs.map((c: any) => c.id === id ? { ...c, ...p, updated: p.updated ?? c.updated } : c)), []);
   const remove = (id: string) => {
     setConvos(cs => cs.filter((c: any) => c.id !== id));
     void db.conversations.remove(id);
   };
-  const togglePin = (id: string) => {
+  const togglePin = useCallback((id: string) => {
     const cur = convos.find((c: any) => c.id === id);
     const next = !cur?.pinned;
     patch(id, { pinned: next });
     void db.conversations.setPinned(id, next);
-  };
-  const archive   = (id: string) => {
+  }, [convos, patch]);
+  const archive = useCallback((id: string) => {
     patch(id, { status: "archived" });
     void db.conversations.setArchived(id, true);
-  };
+  }, [patch]);
   const unarchive = (id: string) => {
     patch(id, { status: "active" });
     void db.conversations.setArchived(id, false);
   };
-  const duplicate = (id: string) => {
+  const duplicate = useCallback((id: string) => {
     const c = convos.find((c: any) => c.id === id);
     if (!c) return;
     const newConvoData = { ...c, id: c.id + "-copy-" + Date.now(), title: c.title + " (copy)", updated: Date.now() };
     setConvos(cs => [newConvoData, ...cs]);
     void db.conversations.create(convoToRow(newConvoData));
     void queryClient.invalidateQueries({ queryKey: projectKeys.counts() });
-  };
+  }, [convos, queryClient]);
   // Sidebar groups are in-session organizers only (V18: decoupled from the
   // persisted project scope) — this no longer writes to the DB.
   const moveTo   = (id: string, groupId: string) => {
@@ -367,12 +343,11 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [ctx.open, hoverId, convos]);
+  }, [ctx.open, ctx.convo?.id, hoverId, convos, patch, togglePin, duplicate, archive]);
 
   const newConvo = () => {
     const id = "c-" + Date.now();
-    const titles = ["New conversation", "Untitled chat", "Fresh thread", "amazing-grothendieck-" + Math.random().toString(36).slice(2, 8), "vibrant-noether-" + Math.random().toString(36).slice(2, 8)];
-    const title = titles[Math.floor(Math.random() * titles.length)];
+    const title = "Nouvelle conversation";
     // Stamp the new conversation with the current project (open folder), and
     // snap the view to it so the fresh conversation is visible.
     const projectId = currentProject?.id ?? null;
@@ -836,17 +811,31 @@ export function ChatContextMenu({ x, y, submenu, setSubmenu, convo, groups, onCl
 
 export function NewGroupDialog({ onClose, onAdd }: any) {
   const [val, setVal] = useState("");
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  useModalFocusTrap({ open: true, containerRef: dialogRef, initialFocusRef: inputRef, onEscape: onClose });
   return (
     <div className="palette-scrim" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <div className="palette" style={{width: 380, padding: 0}}>
+      <div
+        ref={dialogRef}
+        className="palette"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Create a conversation group"
+        tabIndex={-1}
+        style={{width: 380, padding: 0}}
+      >
         <div style={{padding:"14px 16px", borderBottom:"1px solid rgba(255,255,255,0.05)"}}>
           <div style={{fontFamily:"var(--font-display)", fontWeight:700, fontSize:14}}>New group</div>
           <div style={{fontSize:12, color:"var(--on-surface-variant)", marginTop:2}}>Organize conversations by project, topic, or context.</div>
         </div>
         <div style={{padding:16}}>
           <input
-            autoFocus
+            ref={inputRef}
             className="lgi"
+            name="group-name"
+            autoComplete="off"
+            aria-label="Group name"
             value={val}
             onChange={e => setVal(e.target.value)}
             onKeyDown={e => { if (e.key === "Enter" && val.trim()) onAdd(val.trim()); }}

@@ -5,7 +5,7 @@
 // with the titlebar AccountDropdown through the same hook, so the card and this
 // page can never disagree. "Default model" is the actual active chat model
 // (native <select> so the list is never clipped by the scrolling settings
-// container). "Default language" is the real interface language setting.
+// container).
 
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "@/components/components";
@@ -18,14 +18,6 @@ import {
   detectPlatform,
   modelLabel,
 } from "@/features/profile/profileQueries";
-import {
-  loadJSON,
-  saveJSON,
-  applyInterfaceVars,
-  DEFAULT_INTERFACE,
-  LS_INTERFACE,
-  SegRow,
-} from "@/features/settings/settings-extras";
 
 /**
  * Text field that commits on blur / Enter. Shows a "modifié" dot while dirty
@@ -158,36 +150,6 @@ function ConnectedProviders() {
   );
 }
 
-/** "Default language" bound to the real interface language (single source).
- *  Mirrors InterfaceSettings' own merge shape so types stay `typeof
- *  DEFAULT_INTERFACE` (no index-signature widening from the loaded blob). */
-function LanguageField() {
-  const [lang, setLang] = useState<string>(
-    () => ({ ...DEFAULT_INTERFACE, ...loadJSON(LS_INTERFACE, {}) }).language,
-  );
-
-  const change = (v: string) => {
-    setLang(v);
-    const next = { ...DEFAULT_INTERFACE, ...loadJSON(LS_INTERFACE, {}), language: v };
-    saveJSON(LS_INTERFACE, next);        // localStorage + SQLite mirror
-    applyInterfaceVars(next);            // apply live (data-attrs / CSS vars)
-  };
-
-  return (
-    <SegRow
-      value={lang}
-      onChange={change}
-      options={[
-        { v: "en", l: "EN" },
-        { v: "fr", l: "FR" },
-        { v: "ja", l: "JA" },
-        { v: "es", l: "ES" },
-        { v: "de", l: "DE" },
-      ]}
-    />
-  );
-}
-
 export function ProfileView() {
   const { data: profile } = useProfileFields();
   const [activeModel] = useActiveModel();
@@ -241,14 +203,6 @@ export function ProfileView() {
           />
 
           <ModelField />
-
-          <div className="conn-field profile-field" style={{ marginBottom: 4 }}>
-            <label>Default language</label>
-            <LanguageField />
-          </div>
-          <p className="sub" style={{ marginTop: 0, marginBottom: 10, fontSize: 11 }}>
-            Préférence enregistrée. La traduction complète de l'interface est en cours de déploiement — certaines zones restent en français/anglais.
-          </p>
 
           <ConnectedProviders />
 

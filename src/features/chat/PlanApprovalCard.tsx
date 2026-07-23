@@ -11,7 +11,7 @@
 
 import React, { useState } from "react";
 import type { PlanApprovalData } from "./useMessageDisplay";
-import { continueAgent, useChatMode } from "./chat-sync";
+import { continueAgent, useAgentAccessProfile, useChatMode } from "./chat-sync";
 import { pushToast } from "@/components/toast";
 
 export function PlanApprovalCard({
@@ -21,7 +21,8 @@ export function PlanApprovalCard({
   data: PlanApprovalData;
   convId: string;
 }) {
-  const [, setMode] = useChatMode();
+  const [mode, setMode] = useChatMode();
+  const [, setAccess] = useAgentAccessProfile();
   const [busy, setBusy] = useState<null | "approve" | "continue">(null);
   const [done, setDone] = useState<null | "approved" | "continue">(null);
   const [feedback, setFeedback] = useState("");
@@ -29,9 +30,12 @@ export function PlanApprovalCard({
   const approve = async () => {
     if (busy || done) return;
     setBusy("approve");
+    const previousMode = mode;
     try {
-      // Bascule visible du sélecteur cockpit : Plan → Agent (exécution).
+      // Une approbation de plan démarre toujours en Auto. Full Access ne peut
+      // jamais être activé implicitement par une carte ou par le modèle.
       setMode("agent");
+      await setAccess("auto");
       const answer =
         "Le plan ci-dessous est APPROUVÉ. Exécute-le maintenant, étape par étape, " +
         "en vérifiant à chaque changement.\n\n" +
@@ -41,9 +45,12 @@ export function PlanApprovalCard({
         interactionId: `${data.agentId}:${data.toolCallId}`,
         kind: "submit_plan",
         verdict: "approved",
+        executionProfile: "auto",
+        isolate: false,
       });
       setDone("approved");
     } catch (err) {
+      setMode(previousMode);
       pushToast(`Exécution non lancée : ${String(err)}`, "error", 7000);
     } finally {
       setBusy(null);
@@ -63,6 +70,8 @@ export function PlanApprovalCard({
         kind: "submit_plan",
         verdict: "continue",
         response: fb || undefined,
+        executionProfile: "plan",
+        isolate: false,
       });
       setDone("continue");
     } catch (err) {

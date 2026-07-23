@@ -30,20 +30,20 @@ pub struct CommandRuleRow {
     pub created_at: i64,
 }
 
-/// Load every rule as a typed [`CommandRule`] for the classifier. Degrades to
-/// an empty vec on ANY DB error — a missing/locked rule table must NEVER block
-/// an agent's `run_command` (the static classifier still applies).
-pub(super) fn load_for_classify(app: &AppHandle) -> Vec<CommandRule> {
-    let Ok(conn_mutex) = get_conn(app) else {
-        return Vec::new();
-    };
-    let Ok(conn) = conn_mutex.lock() else {
-        return Vec::new();
-    };
-    let Ok(mut stmt) = conn.prepare("SELECT pattern, verdict, detail FROM agent_command_rules")
-    else {
-        return Vec::new();
-    };
+/// Load every rule as a typed [`CommandRule`] for the execution gate. Because a
+/// persisted `deny` is an authorization decision, storage, lock and row errors
+/// are returned and the caller blocks the command.
+pub(super) fn load_for_classify(app: &AppHandle) -> Result<Vec<CommandRule>, String> {
+    let conn_mutex = get_conn(app)?;
+    let conn = conn_mutex
+        .lock()
+        .map_err(|e| format!("command rules lock: {e}"))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT pattern, verdict, detail FROM agent_command_rules
+             ORDER BY length(pattern) DESC, pattern ASC",
+        )
+        .map_err(|e| format!("command rules prepare: {e}"))?;
     let rows = stmt.query_map([], |r| {
         let verdict: String = r.get(1)?;
         Ok(CommandRule {
@@ -52,10 +52,9 @@ pub(super) fn load_for_classify(app: &AppHandle) -> Vec<CommandRule> {
             detail: r.get::<_, Option<String>>(2)?,
         })
     });
-    match rows {
-        Ok(it) => it.filter_map(|r| r.ok()).collect(),
-        Err(_) => Vec::new(),
-    }
+    let rows = rows.map_err(|e| format!("command rules query: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("command rules row: {e}"))
 }
 
 fn list_inner(app: &AppHandle) -> Vec<CommandRuleRow> {

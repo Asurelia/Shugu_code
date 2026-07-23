@@ -177,7 +177,6 @@ export function GitDiffView({ path, onClose }: { path: string; onClose: () => vo
       mergeViewRef.current?.destroy();
       mergeViewRef.current = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [headText, workText, path, ready]);
 
   return (

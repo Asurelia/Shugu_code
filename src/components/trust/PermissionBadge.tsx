@@ -15,7 +15,7 @@
 
 import React from "react";
 
-export type PermissionKind = "private" | "scoped" | "guarded";
+export type PermissionKind = "private" | "readonly" | "scoped" | "guarded" | "direct";
 
 interface PermMeta {
   glyph: string;
@@ -31,6 +31,12 @@ const PERM: Record<PermissionKind, PermMeta> = {
     tint: "rgba(129, 236, 255, 0.07)",
     border: "rgba(129, 236, 255, 0.24)",
   },
+  readonly: {
+    glyph: "👁",
+    color: "var(--tertiary, #81ecff)",
+    tint: "rgba(129, 236, 255, 0.07)",
+    border: "rgba(129, 236, 255, 0.24)",
+  },
   scoped: {
     glyph: "📂",
     color: "var(--warn, #ffcf6b)",
@@ -42,6 +48,12 @@ const PERM: Record<PermissionKind, PermMeta> = {
     color: "var(--success, #8aefc7)",
     tint: "rgba(138, 239, 199, 0.07)",
     border: "rgba(138, 239, 199, 0.24)",
+  },
+  direct: {
+    glyph: "⚡",
+    color: "var(--danger, #ff6a8a)",
+    tint: "rgba(255, 106, 138, 0.08)",
+    border: "rgba(255, 106, 138, 0.28)",
   },
 };
 

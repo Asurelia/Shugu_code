@@ -26,6 +26,7 @@ const TAURI_ABSENCE_NOISE = [
   "window.__TAURI",
   "invoke",
   "Cannot read properties of undefined (reading 'invoke')",
+  "Cannot read properties of undefined (reading 'transformCallback')",
   "tauri",
   "convex", // backend bridge also absent in a static preview
   "WebSocket",

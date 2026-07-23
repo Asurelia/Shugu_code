@@ -1,12 +1,10 @@
-//! Multi-agent system foundation (Phase 0).
+//! Shugu's native multi-agent runtime.
 //!
-//! This is the plumbing for Shugu's mascot → orchestrator → sub-agents
-//! architecture. Phase 0 ships ONLY the scaffolding: spawning agents,
-//! persisting their lifecycle events, broadcasting them via the Tauri
-//! event bus, and surfacing them in the frontend's Agents panel. Real
-//! LLM calls, tool execution, and sub-agent fan-out come in Phase 1+.
+//! This module owns spawning, durable lifecycle events, provider-backed LLM
+//! loops, tool dispatch, sub-agent fan-out, cancellation, execution profiles,
+//! human-in-the-loop resumes and worktree isolation.
 //!
-//! ## Data model (V4 migration)
+//! ## Data model
 //!
 //! Two tables live next to the existing `messages` / `conversations` :
 //!
@@ -21,7 +19,7 @@
 //!
 //! Every persisted event is ALSO broadcast on the Tauri channel
 //! `"agent://lifecycle"`. The frontend keeps a single persistent listener
-//! that demultiplexes by `agentId` into a Zustand store. Pattern mirrors
+//! that demultiplexes by `agentId` into TanStack Query caches. Pattern mirrors
 //! `chat://delta` in [`crate::commands::chat`].
 //!
 //! ## DB access pattern
@@ -53,12 +51,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{Emitter, Manager, State};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use uuid::Uuid;
 
-// Phase 1 runner submodule. Owns the real LLM call loop (synthetic emitter
-// of Phase 0 lives no more — `run_agent_task` in runner.rs replaces it).
-// Split out so this file stays under the CLAUDE.md 500-line ceiling.
+// Provider-backed LLM and tool-use loop.
 pub(crate) mod runner;
+
+// Runtime-enforced plan -> mutate -> verify completion contract. Kept pure so
+// models/providers cannot bypass it and its state transitions stay unit-tested.
+mod lifecycle;
+
+// Versioned prompt composition and bounded workspace instruction discovery.
+// Kept separate from the provider loop so prompts remain pure and unit-testable.
+mod project_context;
+pub(crate) mod prompts;
 
 // Coalescing buffer for streaming Delta events — merges token-level chunks
 // into ~14 events/s per (agent, kind) before they hit the Tauri event bus.
@@ -73,10 +79,8 @@ mod delta_buffer;
 // (the `pub(super)` items) from here.
 mod tools;
 
-/// Direct command execution (pivot 2026-06-10) — runs agent commands straight
-/// on the user's machine with the real toolchain, exactly like Claude Code /
-/// Codex CLI. The safety net is git (visible in the app's Git panel); the
-/// preflight half reports whether that net is in place.
+/// Governed command execution. Auto is sandboxed and fail-closed; only a native
+/// session grant allows Full Access to use the direct process path.
 pub(crate) mod exec;
 
 /// Governed-exec layer (P0-a) — `ExecutionPolicy` (the capability envelope of a
@@ -87,15 +91,13 @@ pub(crate) mod exec;
 /// pre-flight a command string too.
 pub(crate) mod policy;
 
-/// Real process sandbox for `run_command` (ALWAYS ON — Claude-Code model). The
+/// Real Windows process sandbox for Auto `run_command`. The
 /// command runs in a write-confined / reads-open LOW-integrity child spawned via
 /// `CreateProcessAsUserW`: it can READ anywhere (so node/pnpm/cargo/git work) but
-/// can only WRITE the workspace + OS temp + package caches (a LOW mandatory label
-/// is stamped on those dirs; everything else stays MEDIUM and rejects the LOW
-/// child's writes via no-write-up). Network stays active. No toggle, no UI — the
-/// only opt-out is the emergency env `SHUGU_SANDBOX_DISABLE=1`. Any setup failure
-/// falls back to the proven direct spawn so the dev loop is never blocked. On
-/// non-Windows it is a documented no-op (the direct path runs). See
+/// can only WRITE the workspace and dedicated `.shugu/agent-runtime` caches.
+/// Global temp/user caches stay untouched. Network stays active. Any setup
+/// failure blocks the command; it never falls back to direct execution. On
+/// non-Windows Auto is unavailable until a native sandbox exists. See
 /// `docs/win-sandbox-validation.md` for the mechanism + runtime checklist.
 pub(crate) mod sandbox;
 
@@ -166,21 +168,36 @@ const EVENT_CHANNEL: &str = "agent://lifecycle";
 // ────────────────────────────────────────────────────────────────────────
 
 /// One entry per live agent. Holds the role for quick inspection AND
-/// an abort signal (`tokio::sync::Notify`) so `agent_kill` can wake the
-/// background task between SSE chunks. We chose `Notify` over
-/// `tokio_util::sync::CancellationToken` to avoid pulling a new crate —
-/// `tokio::sync::Notify` is already available via the existing
-/// `tokio = { features = ["full"] }` dep.
+/// an abort signal (`tokio::sync::Notify`) for async work plus an atomic flag
+/// polled by blocking command/process loops. Kill therefore terminates both the
+/// Rust future and its OS process tree instead of merely dropping a JoinHandle.
 pub struct AgentHandle {
     #[allow(dead_code)] // read by the runner / inspection helpers
     pub role: String,
     pub abort: Arc<tokio::sync::Notify>,
+    pub cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Tauri-managed state — the global in-flight registry. The Mutex is
 /// short-held (insert/remove only); we never hold it across awaits.
 #[derive(Default)]
 pub struct AgentManagerState(pub Arc<Mutex<HashMap<String, AgentHandle>>>);
+
+/// Native authority for direct, unsandboxed execution. The frontend can ask
+/// for the grant, but only the native confirmation dialog can enable it. The
+/// flag lives in memory, so every application restart returns to Auto.
+#[derive(Default)]
+pub struct FullAccessGrant(std::sync::atomic::AtomicBool);
+
+impl FullAccessGrant {
+    fn enabled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn set(&self, enabled: bool) {
+        self.0.store(enabled, std::sync::atomic::Ordering::Release);
+    }
+}
 
 // ────────────────────────────────────────────────────────────────────────
 // DB row shapes (frontend mirrors via TS interfaces in src/lib/agents.ts)
@@ -200,6 +217,10 @@ pub struct AgentRow {
     pub finished_at: Option<i64>,
     pub output: Option<String>,
     pub error: Option<String>,
+    pub execution_profile: String,
+    pub isolate: bool,
+    pub profile_verified: bool,
+    pub isolation_status: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -248,7 +269,11 @@ pub struct AgentTranscript {
 // variants. Verifié avec `serde 1.0.200+`.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum AgentEvent {
     Spawn {
         agent_id: String,
@@ -257,6 +282,8 @@ pub enum AgentEvent {
         task: String,
         model: String,
         conversation_id: Option<String>,
+        execution_profile: policy::ExecutionProfile,
+        isolate: bool,
     },
     Message {
         agent_id: String,
@@ -265,6 +292,21 @@ pub enum AgentEvent {
         /// require a serde rename dance.
         role: String,
         content: String,
+    },
+    /// Reproducibility metadata for the effective runtime prompt. The complete
+    /// composed fragment is persisted as the following system Message; this
+    /// event makes its version, exact tool manifest and workspace sources
+    /// queryable without reparsing prompt prose.
+    PromptComposed {
+        agent_id: String,
+        version: String,
+        fingerprint: String,
+        execution_profile: policy::ExecutionProfile,
+        protocol: String,
+        tool_names: Vec<String>,
+        rule_sources: Vec<String>,
+        package_manager: Option<String>,
+        context_truncated: bool,
     },
     ToolCall {
         agent_id: String,
@@ -404,9 +446,8 @@ pub enum AgentEvent {
         reason: Option<String>,
     },
     /// Phase 7 #4 — l'isolation a été DEMANDÉE mais n'a pas pu démarrer (pas de
-    /// dépôt git, pas de workspace, ou échec `git worktree add`). Le run continue
-    /// IN-PLACE sur le checkout — l'UI affiche un badge « exec sur checkout » pour
-    /// ne jamais laisser croire à une protection inexistante. `reason` explique.
+    /// dépôt git, pas de workspace, ou échec `git worktree add`). Le run s'arrête
+    /// avant mutation : aucune retombée silencieuse sur le checkout réel.
     WorktreeSkipped {
         agent_id: String,
         reason: String,
@@ -442,6 +483,7 @@ impl AgentEvent {
         match self {
             AgentEvent::Spawn { .. } => "spawn",
             AgentEvent::Message { .. } => "message",
+            AgentEvent::PromptComposed { .. } => "promptComposed",
             AgentEvent::ToolCall { .. } => "toolCall",
             AgentEvent::ToolResult { .. } => "toolResult",
             AgentEvent::Delta { .. } => "delta",
@@ -467,6 +509,7 @@ impl AgentEvent {
         match self {
             AgentEvent::Spawn { agent_id, .. }
             | AgentEvent::Message { agent_id, .. }
+            | AgentEvent::PromptComposed { agent_id, .. }
             | AgentEvent::ToolCall { agent_id, .. }
             | AgentEvent::ToolResult { agent_id, .. }
             | AgentEvent::Delta { agent_id, .. }
@@ -522,6 +565,9 @@ pub struct SpawnArgs {
     /// None) ⇒ exécution directe complète. Seule la délégation chat le fournit ;
     /// Atelier/Studio le laissent None (write requis).
     pub mode: Option<String>,
+    /// Effective backend-enforced profile. Legacy callers may omit it; the
+    /// backend derives Plan/Chat from `mode` and otherwise defaults to Auto.
+    pub execution_profile: Option<policy::ExecutionProfile>,
     /// Modèle CONSEILLER distinct pour l'outil `advisor` (v2). Résolu côté TS
     /// depuis `routing.advisorModel`. Quand `advisor_model` est présent, le
     /// runner consulte CE modèle (avec son provider) au lieu de l'exécuteur.
@@ -555,6 +601,8 @@ pub struct ContinueArgs {
     /// "plan" (relance après `ask_user` en Plan) ou "agent" (approbation de plan
     /// → bascule exécution). Passé tel quel à `SpawnArgs.mode`.
     pub mode: Option<String>,
+    pub execution_profile: Option<policy::ExecutionProfile>,
+    pub isolate: Option<bool>,
     /// `tool_call_id` de l'interaction consommée — clé d'idempotence (une réponse
     /// déjà consommée ne relance pas). None ⇒ pas de garde (relance directe).
     pub interaction_id: Option<String>,
@@ -613,6 +661,49 @@ pub struct GroundedArgs {
 
 static AGENTS_CONN: OnceLock<Mutex<Connection>> = OnceLock::new();
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct OrphanRecovery {
+    agents: usize,
+    interaction_claims: usize,
+}
+
+fn recover_orphans(conn: &Connection, now: i64) -> Result<OrphanRecovery, String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("begin orphan recovery: {e}"))?;
+    let agents = tx
+        .execute(
+            "UPDATE agents
+                SET status = 'error',
+                    error  = COALESCE(error, 'process restarted — agent orphaned'),
+                    finished_at = COALESCE(finished_at, ?1),
+                    isolation_status = CASE
+                      WHEN isolate = 1 THEN 'unknown'
+                      ELSE isolation_status
+                    END
+              WHERE status IN ('pending', 'running')",
+            params![now],
+        )
+        .map_err(|e| format!("recover orphan agents: {e}"))?;
+    // A process can die after atomically claiming an unanswered HITL card but
+    // before spawning/persisting the continuation. No in-memory claimant can
+    // survive a restart, so every unanswered token is stale and must be freed.
+    let interaction_claims = tx
+        .execute(
+            "UPDATE agent_interactions
+                SET claim_token = NULL
+              WHERE answered_at IS NULL AND claim_token IS NOT NULL",
+            [],
+        )
+        .map_err(|e| format!("recover interaction claims: {e}"))?;
+    tx.commit()
+        .map_err(|e| format!("commit orphan recovery: {e}"))?;
+    Ok(OrphanRecovery {
+        agents,
+        interaction_claims,
+    })
+}
+
 /// Open (or return the cached) rusqlite Connection to `shugu.db`. Same
 /// resolution as `vector.rs::get_conn` — `app_config_dir()/shugu.db` —
 /// so both rusqlite users target the file that tauri-plugin-sql migrates.
@@ -633,8 +724,7 @@ pub(crate) fn get_conn(app: &tauri::AppHandle) -> Result<&'static Mutex<Connecti
         .join("shugu.db");
 
     if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create app config dir: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create app config dir: {e}"))?;
     }
 
     let conn = Connection::open(&db_path)
@@ -667,18 +757,12 @@ pub(crate) fn get_conn(app: &tauri::AppHandle) -> Result<&'static Mutex<Connecti
     // Sweep orphans from a previous crash. Must happen BEFORE the conn is
     // cached so subsequent commands see consistent state.
     let now = now_ms();
-    let swept = conn
-        .execute(
-            "UPDATE agents
-                SET status = 'error',
-                    error  = COALESCE(error, 'process restarted — agent orphaned'),
-                    finished_at = COALESCE(finished_at, ?1)
-              WHERE status IN ('pending', 'running')",
-            params![now],
-        )
-        .map_err(|e| format!("recover orphans: {e}"))?;
-    if swept > 0 {
-        eprintln!("[agents] swept {swept} orphaned agent(s) from previous session");
+    let recovery = recover_orphans(&conn, now)?;
+    if recovery.agents > 0 || recovery.interaction_claims > 0 {
+        eprintln!(
+            "[agents] recovery: {} orphaned agent(s), {} stale interaction claim(s)",
+            recovery.agents, recovery.interaction_claims
+        );
     }
 
     // Purge legacy per-token Delta events. Pre-Phase-2-streaming-fix runs
@@ -745,6 +829,66 @@ pub(crate) fn now_ms() -> i64 {
 
 fn is_role_allowed(role: &str) -> bool {
     ALLOWED_ROLES.iter().any(|r| *r == role)
+}
+
+fn resolve_execution_profile(
+    mode: Option<&str>,
+    requested: Option<policy::ExecutionProfile>,
+) -> Result<policy::ExecutionProfile, String> {
+    match mode {
+        Some("chat") => Ok(policy::ExecutionProfile::Chat),
+        Some("plan") => Ok(match requested {
+            Some(policy::ExecutionProfile::Chat) => policy::ExecutionProfile::Chat,
+            _ => policy::ExecutionProfile::Plan,
+        }),
+        Some("agent") | None => Ok(requested.unwrap_or(policy::ExecutionProfile::Auto)),
+        Some(other) => Err(format!("mode agent invalide: {other}")),
+    }
+}
+
+fn require_profile_grant(
+    profile: policy::ExecutionProfile,
+    full_access_enabled: bool,
+) -> Result<policy::ExecutionProfile, String> {
+    if matches!(profile, policy::ExecutionProfile::FullAccess) && !full_access_enabled {
+        return Err(
+            "Full Access n'est pas autorisé pour cette session. Active-le depuis le sélecteur de mode et confirme la boîte de dialogue native."
+                .to_string(),
+        );
+    }
+    Ok(profile)
+}
+
+fn require_agent_loop_capability(
+    profile: policy::ExecutionProfile,
+    protocol: &str,
+    model: &str,
+) -> Result<(), String> {
+    if profile.is_read_only() {
+        return Ok(());
+    }
+    let caps = crate::commands::model_capabilities::capabilities(protocol, model);
+    if matches!(
+        caps.agent_loop,
+        crate::commands::model_capabilities::AgentLoopSupport::ChatOnly
+    ) {
+        return Err(format!(
+            "{protocol}/{model} est Chat-only dans cette version de Shugu : aucun adaptateur d'outils agentiques vérifié n'est disponible. Choisis un modèle Anthropic/OpenAI-compatible, ou utilise le mode Chat."
+        ));
+    }
+    Ok(())
+}
+
+/// Dispatch-time check as well as spawn-time check: revoking Full Access
+/// immediately blocks the next tool call of runs that were already active.
+pub(crate) fn execution_profile_authorized(
+    app: &tauri::AppHandle,
+    profile: policy::ExecutionProfile,
+) -> bool {
+    !matches!(profile, policy::ExecutionProfile::FullAccess)
+        || app
+            .try_state::<FullAccessGrant>()
+            .is_some_and(|grant| grant.enabled())
 }
 
 /// Persist an AgentEvent to `agent_events` AND broadcast it on the Tauri
@@ -818,8 +962,7 @@ pub(super) fn persist_and_emit(app: &tauri::AppHandle, event: &AgentEvent) -> Re
     }
 
     let conn_mutex = get_conn(app)?;
-    let payload =
-        serde_json::to_string(event).map_err(|e| format!("event serialize: {e}"))?;
+    let payload = serde_json::to_string(event).map_err(|e| format!("event serialize: {e}"))?;
     {
         let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
         conn.execute(
@@ -845,15 +988,76 @@ pub(super) fn persist_and_emit(app: &tauri::AppHandle, event: &AgentEvent) -> Re
 // Tauri commands
 // ────────────────────────────────────────────────────────────────────────
 
-/// Spawn a new agent. Phase 0: this DOES NOT call an LLM. It creates the
-/// row, fires a Spawn event, then asynchronously emits a synthetic Message
-/// (+300ms) and Complete (+800ms) so the end-to-end pipeline can be tested
-/// without a model. Phase 1 will swap the synthetic emitter for a real
-/// chat-loop driver.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AgentAccessChanged {
+    profile: &'static str,
+}
+
+fn emit_access_profile(app: &tauri::AppHandle, enabled: bool) {
+    let _ = app.emit(
+        "chat://agent-access-changed",
+        AgentAccessChanged {
+            profile: if enabled { "fullAccess" } else { "auto" },
+        },
+    );
+}
+
+/// Ask once per native app session before enabling unsandboxed execution.
+/// This cannot be bypassed by writing sessionStorage or emitting a web event.
+#[tauri::command]
+pub async fn agent_enable_full_access(
+    app: tauri::AppHandle,
+    grant: State<'_, FullAccessGrant>,
+) -> Result<bool, String> {
+    if grant.enabled() {
+        return Ok(true);
+    }
+
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .message(
+            "Full Access autorise les agents à lancer des commandes directement sur votre machine, sans sandbox et sans confirmation par commande. Les modes Chat et Plan restent en lecture seule. Cette autorisation expire au redémarrage de Shugu.",
+        )
+        .title("Activer Full Access pour cette session ?")
+        .kind(MessageDialogKind::Warning)
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Activer Full Access".to_string(),
+            "Rester en Auto".to_string(),
+        ))
+        .show(move |accepted| {
+            let _ = sender.send(accepted);
+        });
+
+    let accepted = receiver
+        .await
+        .map_err(|_| "la confirmation Full Access a été interrompue".to_string())?;
+    if accepted {
+        grant.set(true);
+    }
+    emit_access_profile(&app, grant.enabled());
+    Ok(grant.enabled())
+}
+
+#[tauri::command]
+pub fn agent_disable_full_access(app: tauri::AppHandle, grant: State<'_, FullAccessGrant>) -> bool {
+    grant.set(false);
+    emit_access_profile(&app, false);
+    false
+}
+
+#[tauri::command]
+pub fn agent_full_access_status(grant: State<'_, FullAccessGrant>) -> bool {
+    grant.enabled()
+}
+
+/// Persist and spawn a provider-backed agent run under the resolved native
+/// execution profile.
 #[tauri::command]
 pub async fn agent_spawn(
     app: tauri::AppHandle,
     state: State<'_, AgentManagerState>,
+    full_access: State<'_, FullAccessGrant>,
     mut args: SpawnArgs,
 ) -> Result<String, String> {
     // Agent custom (`.md` format Claude Code) ? Charge la définition et écrase
@@ -866,23 +1070,40 @@ pub async fn agent_spawn(
     // l'appelant TS (handleDelegate → resolveProvider + loadProviderConfig). Un
     // futur appelant qui passerait `agent_def_path` SANS résoudre le provider en
     // amont enverrait le bon model mais les mauvais protocol/clé.
-    let system_prompt_override: Option<String> = match args.agent_def_path.as_deref() {
-        Some(p) if !p.is_empty() => {
-            let def = crate::commands::agent_defs::load_def(p)?;
-            args.role = def.base_role;
-            if let Some(m) = def.model {
-                // Strip the "provider/" prefix — the API body needs the bare model name
-                // (mirrors resolveProvider() on the TS side, e.g. "openai/gpt-4o" → "gpt-4o").
-                args.model = m.split_once('/').map(|(_, n)| n.to_string()).unwrap_or(m);
+    let (system_prompt_override, definition_tools): (Option<String>, Option<Vec<String>>) =
+        match args.agent_def_path.as_deref() {
+            Some(p) if !p.is_empty() => {
+                let def = crate::commands::agent_defs::load_def(&app, p)?;
+                args.role = def.base_role;
+                if let Some(m) = def.model {
+                    // Strip the "provider/" prefix — the API body needs the bare model name
+                    // (mirrors resolveProvider() on the TS side, e.g. "openai/gpt-4o" → "gpt-4o").
+                    args.model = m.split_once('/').map(|(_, n)| n.to_string()).unwrap_or(m);
+                }
+                let tools = if def.tools.is_empty() {
+                    None
+                } else {
+                    Some(def.tools)
+                };
+                (Some(def.body), tools)
             }
-            Some(def.body)
-        }
-        _ => None,
-    };
+            _ => (None, None),
+        };
 
     if !is_role_allowed(&args.role) {
         return Err(format!("invalid role: {}", args.role));
     }
+
+    let execution_profile = require_profile_grant(
+        resolve_execution_profile(args.mode.as_deref(), args.execution_profile)?,
+        full_access.enabled(),
+    )?;
+    require_agent_loop_capability(
+        execution_profile,
+        args.protocol.as_deref().unwrap_or("openai"),
+        &args.model,
+    )?;
+    let isolate_for_task = args.isolate.unwrap_or(false) && !execution_profile.is_read_only();
 
     // Capacity check + handle insertion, both under the same mutex so two
     // concurrent spawns can't race past the cap.
@@ -900,6 +1121,7 @@ pub async fn agent_spawn(
             AgentHandle {
                 role: args.role.clone(),
                 abort: std::sync::Arc::new(tokio::sync::Notify::new()),
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
     }
@@ -911,8 +1133,9 @@ pub async fn agent_spawn(
         let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT INTO agents
-                (id, role, status, parent_id, model, task, conversation_id, created_at)
-             VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?6, ?7)",
+                (id, role, status, parent_id, model, task, conversation_id, created_at,
+                 execution_profile, isolate, profile_verified, isolation_status)
+             VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10)",
             params![
                 agent_id,
                 args.role,
@@ -920,7 +1143,10 @@ pub async fn agent_spawn(
                 args.model,
                 args.task,
                 args.conversation_id,
-                created_at
+                created_at,
+                execution_profile.as_str(),
+                isolate_for_task,
+                if isolate_for_task { "pending" } else { "none" }
             ],
         )
         .map_err(|e| {
@@ -943,6 +1169,8 @@ pub async fn agent_spawn(
             task: args.task.clone(),
             model: args.model.clone(),
             conversation_id: args.conversation_id.clone(),
+            execution_profile,
+            isolate: isolate_for_task,
         },
     )?;
 
@@ -976,9 +1204,7 @@ pub async fn agent_spawn(
     let chat_template_kwargs_for_task = args.chat_template_kwargs.clone();
     let design_context_for_task = args.design_context.clone();
     let system_prompt_override_for_task = system_prompt_override;
-    // Mode Plan → lecture seule. Le sélecteur de chat envoie `mode: "plan"` ;
-    // tout le reste (agent / Atelier / Studio) reste en exécution complète.
-    let read_only_for_task = args.mode.as_deref() == Some("plan");
+    let definition_tools_for_task = definition_tools;
     // Exécution DIRECTE par défaut (décision utilisateur 2026-07-02, retour au
     // pivot 2026-06-10 « exec directe + filet git ») : l'agent travaille sur le
     // VRAI checkout, comme Claude Code. L'isolation worktree (Phase 7 #4) reste
@@ -988,7 +1214,6 @@ pub async fn agent_spawn(
     // qu'ils sont sur une autre branche) et son résultat reste parqué sur une
     // branche tant que rien n'est mergé — deux pièges fatals pour un
     // utilisateur qui ne commit pas. JAMAIS en Plan/read-only (rien à isoler).
-    let isolate_for_task = args.isolate.unwrap_or(false) && !read_only_for_task;
     // Mémoire de conversation : le chemin chat passe la conv pour recharger les
     // tours précédents dans l'historique de l'agent.
     let conversation_id_for_task = args.conversation_id.clone();
@@ -1037,10 +1262,11 @@ pub async fn agent_spawn(
             // Exec directe pour TOUT agent (pivot 2026-06-10) : run_command tourne
             // sur la machine, le filet de sécurité est git (onglet Git de l'app).
             system_prompt_override_for_task, // None ⇒ seed_prompt ; Some ⇒ .md custom
-            read_only_for_task, // Plan mode ⇒ outils mutants retirés + refusés
+            execution_profile,
             conversation_id_for_task, // recharge les tours précédents de la conv
-            advisor_for_task, // modèle conseiller distinct (v2) ou None
-            isolate_for_task, // Phase 3 — worktree-per-agent (default OFF)
+            advisor_for_task,         // modèle conseiller distinct (v2) ou None
+            isolate_for_task,         // Phase 3 — worktree-per-agent (default OFF)
+            definition_tools_for_task,
         )
         .await;
     });
@@ -1059,42 +1285,123 @@ pub async fn agent_spawn(
 pub async fn agent_continue(
     app: tauri::AppHandle,
     state: State<'_, AgentManagerState>,
-    args: ContinueArgs,
+    full_access: State<'_, FullAccessGrant>,
+    mut args: ContinueArgs,
 ) -> Result<String, String> {
-    // Idempotence + trace : UPSERT conditionnel sur `agent_interactions`. La
-    // PREMIÈRE relance insère la ligne (answered_at = created_at) ou passe le
-    // WHERE answered_at IS NULL ⇒ 1 ligne touchée. Toute relance ultérieure voit
-    // answered_at déjà rempli ⇒ 0 ligne ⇒ on refuse (la carte est déjà consommée).
-    if let Some(tcid) = args.interaction_id.as_deref() {
-        if !tcid.is_empty() {
-            let conn_mutex = get_conn(&app)?;
-            let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
-            let now = now_ms();
-            let changed = conn
-                .execute(
-                    "INSERT INTO agent_interactions
-                        (interaction_id, conversation_id, kind, response, verdict, created_at, answered_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-                     ON CONFLICT(interaction_id) DO UPDATE SET
-                        answered_at = excluded.answered_at,
-                        response    = excluded.response,
-                        verdict     = excluded.verdict
-                     WHERE agent_interactions.answered_at IS NULL",
-                    params![
-                        tcid,
-                        args.conversation_id,
-                        args.kind,
-                        args.response,
-                        args.verdict,
-                        now
-                    ],
-                )
-                .map_err(|e| format!("agent_interactions upsert: {e}"))?;
-            if changed == 0 {
-                return Err("Cette interaction a déjà été traitée.".to_string());
+    let interaction_id = args
+        .interaction_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| "interaction_id requis pour reprendre un agent".to_string())?
+        .to_string();
+    let claim_token = Uuid::new_v4().to_string();
+
+    // Claim transactionnel : crée aussi la ligne pending pour les anciennes
+    // cartes V18 qui ont été émises avant la migration V21.
+    let (stored_kind, source_profile, source_isolate) = {
+        let conn_mutex = get_conn(&app)?;
+        let mut conn = conn_mutex.lock().map_err(|e| e.to_string())?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("interaction transaction: {e}"))?;
+        let source_from_id = interaction_id
+            .split_once(':')
+            .map(|(id, _)| id)
+            .unwrap_or("");
+        tx.execute(
+            "INSERT OR IGNORE INTO agent_interactions
+                (interaction_id, conversation_id, kind, created_at,
+                 source_agent_id, source_execution_profile, source_isolate)
+             SELECT ?1, COALESCE(?2, conversation_id), ?3, ?4,
+                    id, execution_profile, isolate
+               FROM agents WHERE id=?5",
+            params![
+                interaction_id,
+                args.conversation_id,
+                args.kind,
+                now_ms(),
+                source_from_id
+            ],
+        )
+        .map_err(|e| format!("interaction bootstrap: {e}"))?;
+
+        let row: Option<(
+            Option<String>,
+            Option<String>,
+            Option<bool>,
+            Option<i64>,
+            Option<String>,
+        )> = tx
+            .query_row(
+                "SELECT kind, source_execution_profile, source_isolate, answered_at, claim_token
+                   FROM agent_interactions WHERE interaction_id=?1",
+                params![interaction_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("interaction lookup: {e}"))?;
+        let (stored_kind, source_profile, source_isolate, answered_at, existing_claim) =
+            row.ok_or_else(|| "interaction inconnue ou agent source introuvable".to_string())?;
+        if answered_at.is_some() {
+            return Err("Cette interaction a déjà été traitée.".to_string());
+        }
+        if existing_claim.is_some() {
+            return Err("Cette interaction est déjà en cours de traitement.".to_string());
+        }
+        if let (Some(expected), Some(received)) = (stored_kind.as_deref(), args.kind.as_deref()) {
+            if expected != received {
+                return Err(format!(
+                    "type d'interaction incohérent : attendu {expected}, reçu {received}"
+                ));
             }
         }
-    }
+        let changed = tx
+            .execute(
+                "UPDATE agent_interactions SET claim_token=?1
+                  WHERE interaction_id=?2 AND answered_at IS NULL AND claim_token IS NULL",
+                params![claim_token, interaction_id],
+            )
+            .map_err(|e| format!("interaction claim: {e}"))?;
+        if changed != 1 {
+            return Err("Cette interaction est déjà en cours de traitement.".to_string());
+        }
+        let source_profile =
+            policy::ExecutionProfile::from_persisted(source_profile.as_deref().unwrap_or("plan"))
+                .ok_or_else(|| "profil source de l'interaction invalide".to_string())?;
+        tx.commit()
+            .map_err(|e| format!("interaction claim commit: {e}"))?;
+        (
+            stored_kind.unwrap_or_else(|| "ask_user".to_string()),
+            source_profile,
+            source_isolate.unwrap_or(false),
+        )
+    };
+
+    let effective_profile = match (stored_kind.as_str(), args.verdict.as_deref()) {
+        ("submit_plan", Some("approved")) => policy::ExecutionProfile::Auto,
+        ("submit_plan", _) => policy::ExecutionProfile::Plan,
+        _ => source_profile,
+    };
+    args.execution_profile = Some(effective_profile);
+    args.mode = Some(
+        match effective_profile {
+            policy::ExecutionProfile::Chat => "chat",
+            policy::ExecutionProfile::Plan => "plan",
+            policy::ExecutionProfile::Auto | policy::ExecutionProfile::FullAccess => "agent",
+        }
+        .to_string(),
+    );
+    args.isolate = Some(source_isolate && !effective_profile.is_read_only());
+    let response_for_record = args.response.clone();
+    let verdict_for_record = args.verdict.clone();
 
     // Relance : réutilise INTÉGRALEMENT le chemin `agent_spawn` (cap, INSERT row,
     // Spawn, run_agent_task avec rechargement d'historique par conversation_id).
@@ -1112,13 +1419,80 @@ pub async fn agent_continue(
         design_context: None,
         agent_def_path: None,
         mode: args.mode,
+        execution_profile: args.execution_profile,
         advisor_model: args.advisor_model,
         advisor_protocol: args.advisor_protocol,
         advisor_base_url: args.advisor_base_url,
         advisor_api_key: args.advisor_api_key,
-        isolate: None,
+        isolate: args.isolate,
     };
-    agent_spawn(app, state, spawn_args).await
+    let manager_after_spawn = state.0.clone();
+    let spawn = agent_spawn(app.clone(), state, full_access, spawn_args).await;
+    match spawn {
+        Ok(agent_id) => {
+            let finalized = (|| -> Result<(), String> {
+                let conn_mutex = get_conn(&app)?;
+                let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
+                let changed = conn
+                    .execute(
+                        "UPDATE agent_interactions
+                        SET response=?1, verdict=?2, answered_at=?3,
+                            continuation_agent_id=?4, claim_token=NULL
+                      WHERE interaction_id=?5 AND claim_token=?6 AND answered_at IS NULL",
+                        params![
+                            response_for_record,
+                            verdict_for_record,
+                            now_ms(),
+                            agent_id,
+                            interaction_id,
+                            claim_token
+                        ],
+                    )
+                    .map_err(|e| format!("interaction finalize: {e}"))?;
+                if changed != 1 {
+                    return Err("l'interaction n'a pas pu être finalisée".into());
+                }
+                Ok(())
+            })();
+            if let Err(err) = finalized {
+                // Do not leave an untracked duplicate continuation running. The
+                // runner observes both signals and terminates its process tree.
+                if let Ok(guard) = manager_after_spawn.lock() {
+                    if let Some(handle) = guard.get(&agent_id) {
+                        handle
+                            .cancelled
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        handle.abort.notify_waiters();
+                    }
+                }
+                if let Ok(conn_mutex) = get_conn(&app) {
+                    if let Ok(conn) = conn_mutex.lock() {
+                        let _ = conn.execute(
+                            "UPDATE agent_interactions SET claim_token=NULL
+                              WHERE interaction_id=?1 AND claim_token=?2 AND answered_at IS NULL",
+                            params![interaction_id, claim_token],
+                        );
+                    }
+                }
+                return Err(format!(
+                    "la reprise a été annulée car sa trace atomique a échoué : {err}"
+                ));
+            }
+            Ok(agent_id)
+        }
+        Err(err) => {
+            if let Ok(conn_mutex) = get_conn(&app) {
+                if let Ok(conn) = conn_mutex.lock() {
+                    let _ = conn.execute(
+                        "UPDATE agent_interactions SET claim_token=NULL
+                          WHERE interaction_id=?1 AND claim_token=?2 AND answered_at IS NULL",
+                        params![interaction_id, claim_token],
+                    );
+                }
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Atelier run — the env-grounded learning loop. Spawns an `atelier` agent in a
@@ -1153,6 +1527,7 @@ pub async fn agent_atelier_run(
             AgentHandle {
                 role: role.to_string(),
                 abort: std::sync::Arc::new(tokio::sync::Notify::new()),
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
     }
@@ -1176,8 +1551,9 @@ pub async fn agent_atelier_run(
         let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT INTO agents
-                (id, role, status, parent_id, model, task, conversation_id, created_at)
-             VALUES (?1, ?2, 'running', NULL, ?3, ?4, NULL, ?5)",
+                (id, role, status, parent_id, model, task, conversation_id, created_at,
+                 execution_profile, isolate, profile_verified, isolation_status)
+             VALUES (?1, ?2, 'running', NULL, ?3, ?4, NULL, ?5, 'auto', 0, 1, 'none')",
             params![agent_id, role, args.model, args.task, created_at],
         )
         .map_err(|e| {
@@ -1197,6 +1573,8 @@ pub async fn agent_atelier_run(
             task: args.task.clone(),
             model: args.model.clone(),
             conversation_id: None,
+            execution_profile: policy::ExecutionProfile::Auto,
+            isolate: false,
         },
     )?;
 
@@ -1227,11 +1605,12 @@ pub async fn agent_atelier_run(
             None, // design_context
             abort_token,
             Some(ws_for_task), // workspace_override — the throwaway creation dir
-            Some(runner::ATELIER_PROMPT.to_string()),
-            false, // read_only — l'Atelier doit écrire/exécuter (build→test→learn)
+            Some(prompts::ATELIER_PROMPT.to_string()),
+            policy::ExecutionProfile::Auto,
             None,  // conversation_id — l'Atelier n'est pas lié à une conversation
             None,  // advisor — pas de conseiller distinct pour l'Atelier
             false, // isolate — l'Atelier a DÉJÀ son dossier jetable (override Some)
+            None,  // definition_tools — preset interne
         )
         .await;
         // The creation dir is intentionally left on disk so the preview pane can
@@ -1263,8 +1642,11 @@ pub async fn agent_exec_preflight(app: tauri::AppHandle) -> Result<exec::ExecCap
 pub async fn agent_classify_command(
     command: String,
     read_only: Option<bool>,
+    execution_profile: Option<policy::ExecutionProfile>,
 ) -> Result<policy::CommandRisk, String> {
-    let pol = policy::policy_for_run(read_only.unwrap_or(false));
+    let pol = execution_profile
+        .map(policy::ExecutionProfile::policy)
+        .unwrap_or_else(|| policy::policy_for_run(read_only.unwrap_or(false)));
     Ok(policy::classify_command(&command, pol))
 }
 
@@ -1302,6 +1684,7 @@ pub async fn agent_grounded_run(
             AgentHandle {
                 role: role.to_string(),
                 abort: std::sync::Arc::new(tokio::sync::Notify::new()),
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
     }
@@ -1313,8 +1696,9 @@ pub async fn agent_grounded_run(
         let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
         conn.execute(
             "INSERT INTO agents
-                (id, role, status, parent_id, model, task, conversation_id, created_at)
-             VALUES (?1, ?2, 'running', NULL, ?3, ?4, NULL, ?5)",
+                (id, role, status, parent_id, model, task, conversation_id, created_at,
+                 execution_profile, isolate, profile_verified, isolation_status)
+             VALUES (?1, ?2, 'running', NULL, ?3, ?4, NULL, ?5, 'auto', 1, 1, 'pending')",
             params![agent_id, role, args.model, args.task, created_at],
         )
         .map_err(|e| {
@@ -1334,12 +1718,14 @@ pub async fn agent_grounded_run(
             task: args.task.clone(),
             model: args.model.clone(),
             conversation_id: None,
+            execution_profile: policy::ExecutionProfile::Auto,
+            isolate: true,
         },
     )?;
 
     // System prompt = GROUNDED_PROMPT + the project's verification command (if
     // provided) so the agent runs EXACTLY that after each change.
-    let mut system_prompt = runner::GROUNDED_PROMPT.to_string();
+    let mut system_prompt = prompts::GROUNDED_PROMPT.to_string();
     if let Some(cmd) = args.test_command.as_deref() {
         let cmd = cmd.trim();
         if !cmd.is_empty() {
@@ -1376,11 +1762,12 @@ pub async fn agent_grounded_run(
             abort_token,
             None, // workspace_override — the REAL open workspace
             Some(system_prompt),
-            false, // read_only — Grounded Run écrit/exécute sur le vrai projet
-            None,  // conversation_id — Grounded Run n'est pas lié à une conversation
-            None,  // advisor — pas de conseiller distinct pour Grounded Run
-            true,  // isolate — Phase 7 #4 : Grounded Run isolé par défaut (Option B,
-                   // cohérence « autonomie fiable » ; merge-back opt-in via l'UI)
+            policy::ExecutionProfile::Auto,
+            None, // conversation_id — Grounded Run n'est pas lié à une conversation
+            None, // advisor — pas de conseiller distinct pour Grounded Run
+            true, // isolate — Phase 7 #4 : Grounded Run isolé par défaut (Option B,
+            // cohérence « autonomie fiable » ; merge-back opt-in via l'UI)
+            None, // definition_tools — preset interne
         )
         .await;
     });
@@ -1432,17 +1819,24 @@ pub async fn agent_kill(
         }
     }
 
-    // Abort + retrait des handles : descendants (best-effort) PUIS la cible —
-    // une seule section critique par lock. La cible DOIT exister (préservé).
+    // Signal async + flag atomique pour les boucles bloquantes. Les handles
+    // restent enregistrés jusqu'à ce que leurs runners aient effectivement
+    // arrêté les processus enfants ; la capacité reflète ainsi le travail réel.
     let abort_token = {
-        let mut guard = state.0.lock().map_err(|e| e.to_string())?;
+        let guard = state.0.lock().map_err(|e| e.to_string())?;
         for d in &descendants {
-            if let Some(h) = guard.remove(d) {
+            if let Some(h) = guard.get(d) {
+                h.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
                 h.abort.notify_one();
             }
         }
-        match guard.remove(&agent_id) {
-            Some(handle) => handle.abort,
+        match guard.get(&agent_id) {
+            Some(handle) => {
+                handle
+                    .cancelled
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                handle.abort.clone()
+            }
             None => return Err(format!("agent not found: {agent_id}")),
         }
     };
@@ -1452,24 +1846,29 @@ pub async fn agent_kill(
 
     // UPDATE status='killed' pour la cible + tous les descendants.
     let finished_at = now_ms();
+    let mut killed_ids: Vec<String> = Vec::new();
     {
         let conn_mutex = get_conn(&app)?;
         let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
         for id in std::iter::once(&agent_id).chain(descendants.iter()) {
-            conn.execute(
-                "UPDATE agents
+            let changed = conn
+                .execute(
+                    "UPDATE agents
                     SET status = 'killed',
                         finished_at = ?1,
                         error = COALESCE(error, 'killed by user')
                   WHERE id = ?2 AND status IN ('running', 'pending')",
-                params![finished_at, id],
-            )
-            .map_err(|e| format!("update agents kill: {e}"))?;
+                    params![finished_at, id],
+                )
+                .map_err(|e| format!("update agents kill: {e}"))?;
+            if changed == 1 {
+                killed_ids.push(id.clone());
+            }
         }
     }
 
-    // Emit Error pour la cible + descendants (l'UI les marque arrêtés).
-    for id in std::iter::once(&agent_id).chain(descendants.iter()) {
+    // Emit only for rows whose terminal-state CAS we actually won.
+    for id in &killed_ids {
         persist_and_emit(
             &app,
             &AgentEvent::Error {
@@ -1491,7 +1890,8 @@ pub async fn agent_list_active(app: tauri::AppHandle) -> Result<Vec<AgentRow>, S
     let mut stmt = conn
         .prepare(
             "SELECT id, role, status, parent_id, model, task, conversation_id,
-                    created_at, finished_at, output, error
+                    created_at, finished_at, output, error, execution_profile, isolate,
+                    profile_verified, isolation_status
                FROM agents
               WHERE status IN ('pending', 'running')
               ORDER BY created_at ASC",
@@ -1519,7 +1919,8 @@ pub async fn agent_get_transcript(
     let agent: AgentRow = conn
         .query_row(
             "SELECT id, role, status, parent_id, model, task, conversation_id,
-                    created_at, finished_at, output, error
+                    created_at, finished_at, output, error, execution_profile, isolate,
+                    profile_verified, isolation_status
                FROM agents
               WHERE id = ?1",
             params![agent_id],
@@ -1566,7 +1967,8 @@ pub async fn agent_list_by_conversation(
     let mut stmt = conn
         .prepare(
             "SELECT id, role, status, parent_id, model, task, conversation_id,
-                    created_at, finished_at, output, error
+                    created_at, finished_at, output, error, execution_profile, isolate,
+                    profile_verified, isolation_status
                FROM agents
               WHERE conversation_id = ?1
               ORDER BY created_at ASC",
@@ -1598,5 +2000,143 @@ fn row_to_agent(r: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRow> {
         finished_at: r.get(8)?,
         output: r.get(9)?,
         error: r.get(10)?,
+        execution_profile: r.get(11)?,
+        isolate: r.get(12)?,
+        profile_verified: r.get(13)?,
+        isolation_status: r.get(14)?,
     })
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_modes_are_authoritative_read_only_profiles() {
+        assert_eq!(
+            resolve_execution_profile(Some("chat"), Some(policy::ExecutionProfile::FullAccess))
+                .unwrap(),
+            policy::ExecutionProfile::Chat
+        );
+        assert_eq!(
+            resolve_execution_profile(Some("plan"), Some(policy::ExecutionProfile::FullAccess))
+                .unwrap(),
+            policy::ExecutionProfile::Plan
+        );
+    }
+
+    #[test]
+    fn agent_defaults_auto_and_full_access_must_be_explicit() {
+        assert_eq!(
+            resolve_execution_profile(Some("agent"), None).unwrap(),
+            policy::ExecutionProfile::Auto
+        );
+        assert_eq!(
+            resolve_execution_profile(Some("agent"), Some(policy::ExecutionProfile::FullAccess))
+                .unwrap(),
+            policy::ExecutionProfile::FullAccess
+        );
+        assert_eq!(
+            resolve_execution_profile(None, Some(policy::ExecutionProfile::Plan)).unwrap(),
+            policy::ExecutionProfile::Plan
+        );
+        assert_eq!(
+            resolve_execution_profile(Some("agent"), Some(policy::ExecutionProfile::Chat)).unwrap(),
+            policy::ExecutionProfile::Chat
+        );
+        assert!(resolve_execution_profile(Some("bogus"), None).is_err());
+    }
+
+    #[test]
+    fn full_access_requires_the_native_session_grant() {
+        assert!(require_profile_grant(policy::ExecutionProfile::FullAccess, false).is_err());
+        assert_eq!(
+            require_profile_grant(policy::ExecutionProfile::FullAccess, true).unwrap(),
+            policy::ExecutionProfile::FullAccess
+        );
+        assert_eq!(
+            require_profile_grant(policy::ExecutionProfile::Auto, false).unwrap(),
+            policy::ExecutionProfile::Auto
+        );
+    }
+
+    #[test]
+    fn mutating_agent_rejects_chat_only_but_accepts_native_ollama_tools() {
+        assert!(require_agent_loop_capability(
+            policy::ExecutionProfile::Auto,
+            "ollama",
+            "gemma2:9b"
+        )
+        .is_err());
+        assert!(require_agent_loop_capability(
+            policy::ExecutionProfile::Auto,
+            "ollama",
+            "qwen2.5:32b"
+        )
+        .is_ok());
+        assert!(require_agent_loop_capability(
+            policy::ExecutionProfile::FullAccess,
+            "codex",
+            "gpt-5-codex"
+        )
+        .is_err());
+        assert!(require_agent_loop_capability(
+            policy::ExecutionProfile::Plan,
+            "ollama",
+            "gemma2:9b"
+        )
+        .is_ok());
+        assert!(require_agent_loop_capability(
+            policy::ExecutionProfile::Auto,
+            "custom",
+            "tool-model"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn restart_recovery_frees_hitl_claims_and_marks_isolation_unknown() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agents (
+                id TEXT PRIMARY KEY, status TEXT, error TEXT, finished_at INTEGER,
+                isolate INTEGER NOT NULL, isolation_status TEXT NOT NULL
+             );
+             CREATE TABLE agent_interactions (
+                interaction_id TEXT PRIMARY KEY, answered_at INTEGER, claim_token TEXT
+             );
+             INSERT INTO agents VALUES ('a1','running',NULL,NULL,1,'active');
+             INSERT INTO agents VALUES ('a2','complete',NULL,10,0,'none');
+             INSERT INTO agent_interactions VALUES ('i1',NULL,'stale-token');
+             INSERT INTO agent_interactions VALUES ('i2',123,'kept-token');",
+        )
+        .unwrap();
+
+        let recovered = recover_orphans(&conn, 456).unwrap();
+        assert_eq!(
+            recovered,
+            OrphanRecovery {
+                agents: 1,
+                interaction_claims: 1,
+            }
+        );
+        let agent: (String, i64, String) = conn
+            .query_row(
+                "SELECT status, finished_at, isolation_status FROM agents WHERE id='a1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(agent, ("error".into(), 456, "unknown".into()));
+        let claims: Vec<Option<String>> = {
+            let mut stmt = conn
+                .prepare("SELECT claim_token FROM agent_interactions ORDER BY interaction_id")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(claims, vec![None, Some("kept-token".into())]);
+    }
 }

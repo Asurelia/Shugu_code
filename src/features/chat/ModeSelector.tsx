@@ -1,22 +1,28 @@
 // Shugu Forge — Mode selector (Chat / Plan / Agent).
 //
 // Remplace l'ancienne pastille décorative « Accès complet » du composer. C'est
-// un VRAI sélecteur de mode, façon Claude Code, mais adapté au pivot Shugu
-// « exec directe + filet git » (pas de système de permissions) :
+// un VRAI sélecteur de mode :
 //
 //   • Chat  💬 — lecture + recherche : web_search / web_fetch / code_search +
 //                lecture fs, JAMAIS d'écriture ni d'exécution (rapide, sûr).
 //   • Plan  📋 — lecture seule : l'agent explore + propose un plan, sans rien
 //                modifier ni exécuter (enforcement read_only côté runner Rust).
-//   • Agent ⚡ — défaut : l'agent complet lit / écrit / lance / vérifie.
+//   • Agent ⚡ — cycle complet. Auto confine les écritures au workspace ;
+//                Full Access exige un grant natif sessionnel.
 //
 // L'état vit dans `useChatMode` (localStorage + event cross-fenêtre), partagé
 // entre le cockpit et la mascotte. Le popover réutilise la charte `.model-pop`.
 
 import { useEffect, useRef, useState, useCallback } from "react";
 import { Icon } from "@/components/components";
-import { useChatMode, type ChatMode } from "./chat-sync";
+import {
+  useAgentAccessProfile,
+  useChatMode,
+  type AgentAccessProfile,
+  type ChatMode,
+} from "./chat-sync";
 import { RiskBadge, modeToRisk, toTrustMode } from "@/components/trust";
+import { pushToast } from "@/components/toast";
 
 interface ModeDef {
   id: ChatMode;
@@ -28,13 +34,28 @@ interface ModeDef {
 // Ordre d'affichage = du plus léger au plus puissant (Chat → Plan → Agent),
 // pour que la « montée en capacité » se lise de haut en bas dans le popover.
 const MODES: ModeDef[] = [
-  { id: "chat", icon: "chat", label: "Chat", desc: "Lecture & recherche — web, fetch, code. Aucune écriture ni exécution." },
+  { id: "chat", icon: "chat", label: "Chat", desc: "Conversation avec outils de lecture configurés. Aucune écriture ni commande." },
   { id: "plan", icon: "list", label: "Plan", desc: "Lecture seule — explore et propose un plan, sans rien modifier." },
-  { id: "agent", icon: "agent", label: "Agent", desc: "Exécution directe — lit, écrit, lance, vérifie (git = filet)." },
+  { id: "agent", icon: "agent", label: "Agent", desc: "Cycle complet — lit, planifie, modifie, exécute et vérifie." },
+];
+
+const ACCESS: { id: AgentAccessProfile; label: string; desc: string }[] = [
+  {
+    id: "auto",
+    label: "Auto",
+    desc: "Recommandé — écrit uniquement dans le workspace et ses caches dédiés. Lecture machine et réseau restent actifs.",
+  },
+  {
+    id: "fullAccess",
+    label: "Full Access",
+    desc: "Accès direct à la machine après une confirmation native unique ; aucune confirmation par commande. Réinitialisé au redémarrage.",
+  },
 ];
 
 export function ModeSelector({ className = "" }: { className?: string }) {
   const [mode, setMode] = useChatMode();
+  const [access, setAccess] = useAgentAccessProfile();
+  const [accessBusy, setAccessBusy] = useState(false);
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLSpanElement | null>(null);
 
@@ -65,6 +86,19 @@ export function ModeSelector({ className = "" }: { className?: string }) {
     [setMode],
   );
 
+  const pickAccess = useCallback(async (profile: AgentAccessProfile) => {
+    if (accessBusy || profile === access) return;
+    setAccessBusy(true);
+    try {
+      const selected = await setAccess(profile);
+      if (selected) setOpen(false);
+    } catch (err) {
+      pushToast(`Changement d’accès impossible : ${String(err)}`, "error", 7000);
+    } finally {
+      setAccessBusy(false);
+    }
+  }, [access, accessBusy, setAccess]);
+
   return (
     <span ref={ref} style={{ position: "relative", display: "inline-flex" }}>
       <button
@@ -77,7 +111,9 @@ export function ModeSelector({ className = "" }: { className?: string }) {
       >
         <span className="dot" />
         <Icon name={active.icon} size={12} />
-        <span className="mode-label">{active.label}</span>
+        <span className="mode-label">
+          {active.label}{mode === "agent" ? ` · ${access === "auto" ? "Auto" : "Full"}` : ""}
+        </span>
         <Icon name="down" size={9} />
       </button>
       {open && (
@@ -109,6 +145,29 @@ export function ModeSelector({ className = "" }: { className?: string }) {
               {m.id === mode && <span className="check">✓</span>}
             </button>
           ))}
+          {mode === "agent" && (
+            <>
+              <div className="model-pop-group">Accès d’exécution</div>
+              {ACCESS.map((profile) => (
+                <button
+                  key={profile.id}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={profile.id === access}
+                  disabled={accessBusy}
+                  className={`model-pop-item mode-item mode-agent${profile.id === access ? " on" : ""}`}
+                  onClick={() => { void pickAccess(profile.id); }}
+                >
+                  <Icon name={profile.id === "auto" ? "shield" : "bolt"} size={15} />
+                  <span className="mode-item-text">
+                    <span className="name">{profile.label}</span>
+                    <span className="mode-item-desc">{profile.desc}</span>
+                  </span>
+                  {profile.id === access && <span className="check">✓</span>}
+                </button>
+              ))}
+            </>
+          )}
         </div>
       )}
     </span>

@@ -5,7 +5,7 @@
 // scrim + popover que AccountDropdown (fixed transparent scrim → clic
 // extérieur ferme, Escape ferme).
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { Icon } from "@/components/components";
 import {
   useNotifications,
@@ -13,19 +13,15 @@ import {
   clearNotifications,
   formatRelativeTime,
 } from "./notifications";
+import { useModalFocusTrap } from "@/lib/modalFocus";
 
 export function NotificationCenter({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  useModalFocusTrap({ open, containerRef: dialogRef, onEscape: onClose });
   // Ouvrir le panneau = consulter → tout passe en lu (le badge s'éteint).
   useEffect(() => {
     if (open) markAllNotificationsRead();
   }, [open]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onEsc = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
-    document.addEventListener("keydown", onEsc);
-    return () => document.removeEventListener("keydown", onEsc);
-  }, [open, onClose]);
 
   const notifications = useNotifications();
 
@@ -34,7 +30,7 @@ export function NotificationCenter({ open, onClose }: { open: boolean; onClose: 
   return (
     <>
       <div style={{ position: "fixed", inset: 0, zIndex: 199 }} onClick={onClose} />
-      <div className="notif-pop" role="dialog" aria-label="Notifications">
+      <div ref={dialogRef} className="notif-pop" role="dialog" aria-modal="true" aria-label="Notifications" tabIndex={-1}>
         <div className="notif-head">
           <div className="notif-title">Notifications</div>
           <div style={{ flex: 1 }} />

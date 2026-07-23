@@ -34,6 +34,8 @@ export interface ImportResult {
   bundleDir: string;
   manifest: BackupManifest;
   safetyBackup: string;
+  pendingRestore: string;
+  scheduled: boolean;
   restartRequired: boolean;
 }
 

@@ -25,6 +25,7 @@ import { semanticSearch, type VecHit } from "@/lib/vector";
 import { parseVecHit, buildResultLabel } from "./parseVecHit";
 import { Icon } from "@/components/components";
 import type { CodeMirrorEditorHandle } from "./CodeMirrorEditor";
+import { useModalFocusTrap } from "@/lib/modalFocus";
 
 const SEARCH_K = 20;
 const DEBOUNCE_MS = 200;
@@ -71,6 +72,8 @@ export function SemanticSearchPalette({
   // qui pilote l'empty-state pédagogique (index froid) vs l'invite initiale.
   const [searched, setSearched] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  useModalFocusTrap({ open, containerRef: dialogRef, initialFocusRef: inputRef, onEscape: onClose });
   // Ref sur le bouton-résultat actif : sert à le faire défiler dans la vue
   // quand on flèche sous la ligne de pli (k=20 → la sélection peut sortir de
   // la zone visible de .palette-list). Le focus DOM reste sur l'input (pattern
@@ -86,7 +89,6 @@ export function SemanticSearchPalette({
     setHits([]);
     setLoading(false);
     setSearched(false);
-    requestAnimationFrame(() => inputRef.current?.focus());
   }, [open]);
 
   // Recherche débouncée (~200 ms). On annule le timer ET on ignore les
@@ -200,9 +202,12 @@ export function SemanticSearchPalette({
       }}
     >
       <div
+        ref={dialogRef}
         className="palette"
         role="dialog"
+        aria-modal="true"
         aria-label="Recherche sémantique dans le code"
+        tabIndex={-1}
       >
         <div className="palette-search">
           <Icon name="search" size={16} />

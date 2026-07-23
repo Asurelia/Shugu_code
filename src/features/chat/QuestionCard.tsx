@@ -61,6 +61,8 @@ export function QuestionCard({
         interactionId: `${data.agentId}:${data.toolCallId}`,
         kind: "ask_user",
         response: answer,
+        executionProfile: "plan",
+        isolate: false,
       });
       setSent(true);
     } catch (err) {

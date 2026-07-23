@@ -121,22 +121,31 @@ pub(crate) fn apply_no_window_pub(cmd: &mut Command) {
 // ────────────────────────────────────────────────────────────────────────
 
 /// Locate a runnable `codex`, preferring the native exe (no node, no cmd.exe).
-/// Order: explicit override → real `codex.exe` on PATH (Store/standalone) →
+/// Order: explicit override → spawnable standalone `codex.exe` on PATH →
 /// the native exe nested in the npm package → `node` + `codex.js` fallback.
 fn resolve_codex() -> Result<CodexCmd, String> {
     // 1. Power-user override.
     if let Some(p) = std::env::var_os("SHUGU_CODEX_BIN") {
         let p = PathBuf::from(p);
         if p.exists() {
-            return Ok(CodexCmd { program: p.to_string_lossy().into_owned(), prefix_args: vec![] });
+            return Ok(CodexCmd {
+                program: p.to_string_lossy().into_owned(),
+                prefix_args: vec![],
+            });
         }
     }
 
-    // 2. A REAL `codex.exe` (or `codex` on unix) on PATH — Store / standalone
-    //    installs put the native binary directly on PATH. (npm installs do NOT;
+    // 2. A REAL `codex.exe` (or `codex` on unix) on PATH — standalone installs
+    //    put the native binary directly on PATH. (npm installs do NOT;
     //    they only add the .cmd/.ps1/sh shims, which `which` would also return —
     //    so we explicitly require the executable, and on Windows the shim is
     //    `codex.cmd`, not `codex.exe`, so this only matches a true native exe.)
+    //
+    //    Do NOT select the executable inside Program Files\WindowsApps. That is
+    //    the packaged Codex Desktop payload, not a normal CLI installation.
+    //    `which` can see it while CreateProcess from an unpackaged Tauri app is
+    //    rejected with ERROR_ACCESS_DENIED. Fall through to the npm-native CLI,
+    //    which uses the same ~/.codex authentication and is spawnable.
     #[cfg(windows)]
     let path_name = "codex.exe";
     #[cfg(not(windows))]
@@ -144,14 +153,20 @@ fn resolve_codex() -> Result<CodexCmd, String> {
     if let Ok(p) = which::which(path_name) {
         // Guard: skip if it's actually a shim under the npm dir (defensive).
         let s = p.to_string_lossy();
-        if !s.ends_with(".cmd") && !s.ends_with(".ps1") {
-            return Ok(CodexCmd { program: p.to_string_lossy().into_owned(), prefix_args: vec![] });
+        if !s.ends_with(".cmd") && !s.ends_with(".ps1") && !is_windowsapps_package_path(&p) {
+            return Ok(CodexCmd {
+                program: p.to_string_lossy().into_owned(),
+                prefix_args: vec![],
+            });
         }
     }
 
     // 3. Native exe nested in the npm global package.
     if let Some(exe) = find_npm_native_exe() {
-        return Ok(CodexCmd { program: exe.to_string_lossy().into_owned(), prefix_args: vec![] });
+        return Ok(CodexCmd {
+            program: exe.to_string_lossy().into_owned(),
+            prefix_args: vec![],
+        });
     }
 
     // 4. Fallback: `node <…>/@openai/codex/bin/codex.js` (node is a clean exe,
@@ -163,34 +178,84 @@ fn resolve_codex() -> Result<CodexCmd, String> {
         });
     }
 
-    Err("binaire `codex` introuvable. Installe-le (`npm i -g @openai/codex`) puis \
+    Err(
+        "binaire `codex` introuvable. Installe-le (`pnpm add -g @openai/codex`) puis \
          connecte-toi avec `codex login`, ou définis SHUGU_CODEX_BIN."
-        .into())
+            .into(),
+    )
 }
 
-/// Default npm global prefix dir on each OS.
-fn npm_global_root() -> Option<PathBuf> {
+/// True for executables exposed from an MSIX/AppX payload. Those paths may be
+/// discoverable through PATH while remaining non-spawnable by this Tauri app.
+fn is_windowsapps_package_path(path: &std::path::Path) -> bool {
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+        .contains("\\program files\\windowsapps\\")
+}
+
+/// Candidate global package roots. Smoke tests deliberately override APPDATA,
+/// while PATH still points at the user's global CLI shim, so relying on APPDATA
+/// alone makes the resolver lose a perfectly valid Codex installation.
+fn npm_global_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut push = |candidate: PathBuf| {
+        if !roots.contains(&candidate) {
+            roots.push(candidate);
+        }
+    };
+
     #[cfg(windows)]
     {
         // npm's default global prefix on Windows is %APPDATA%\npm.
-        std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("npm"))
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            push(PathBuf::from(appdata).join("npm"));
+        }
+        // APPDATA may be process-isolated. The shim path on PATH remains an
+        // authoritative way to recover the actual global package root.
+        if let Ok(shim) = which::which("codex.cmd") {
+            if let Some(parent) = shim.parent() {
+                push(parent.to_path_buf());
+            }
+        }
+        // Last deterministic Windows fallback when PATHEXT/which cannot see the
+        // .cmd shim but USERPROFILE is available.
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            push(
+                PathBuf::from(home)
+                    .join("AppData")
+                    .join("Roaming")
+                    .join("npm"),
+            );
+        }
     }
     #[cfg(not(windows))]
     {
         // Common default: $HOME/.npm-global or /usr/local. We probe a couple.
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".npm-global"))
+        if let Some(home) = std::env::var_os("HOME") {
+            push(PathBuf::from(home).join(".npm-global"));
+        }
+        if let Ok(shim) = which::which("codex") {
+            if let Some(parent) = shim.parent() {
+                push(parent.to_path_buf());
+            }
+        }
     }
+
+    roots
 }
 
 /// `<npm>/node_modules/@openai/codex/bin/codex.js` if present.
 fn find_npm_codex_js() -> Option<PathBuf> {
-    let js = npm_global_root()?
-        .join("node_modules")
-        .join("@openai")
-        .join("codex")
-        .join("bin")
-        .join("codex.js");
-    js.exists().then_some(js)
+    npm_global_roots().into_iter().find_map(|root| {
+        let js = root
+            .join("node_modules")
+            .join("@openai")
+            .join("codex")
+            .join("bin")
+            .join("codex.js");
+        js.is_file().then_some(js)
+    })
 }
 
 /// Walk the nested platform sub-package to the native `codex.exe`/`codex`:
@@ -198,9 +263,6 @@ fn find_npm_codex_js() -> Option<PathBuf> {
 /// We read_dir the `vendor/` level so the target-triple folder name need not be
 /// hard-coded (survives arch/version drift).
 fn find_npm_native_exe() -> Option<PathBuf> {
-    let root = npm_global_root()?;
-    let codex_pkg = root.join("node_modules").join("@openai").join("codex");
-
     #[cfg(windows)]
     let (plat_glob, exe_name) = ("codex-win32", "codex.exe");
     #[cfg(target_os = "macos")]
@@ -208,20 +270,31 @@ fn find_npm_native_exe() -> Option<PathBuf> {
     #[cfg(all(unix, not(target_os = "macos")))]
     let (plat_glob, exe_name) = ("codex-linux", "codex");
 
-    let platform_parent = codex_pkg.join("node_modules").join("@openai");
-    let entries = std::fs::read_dir(&platform_parent).ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with(plat_glob) {
+    for root in npm_global_roots() {
+        let platform_parent = root
+            .join("node_modules")
+            .join("@openai")
+            .join("codex")
+            .join("node_modules")
+            .join("@openai");
+        let Ok(entries) = std::fs::read_dir(&platform_parent) else {
             continue;
-        }
-        let vendor = entry.path().join("vendor");
-        let Ok(triples) = std::fs::read_dir(&vendor) else { continue };
-        for triple in triples.flatten() {
-            let candidate = triple.path().join("codex").join(exe_name);
-            if candidate.exists() {
-                return Some(candidate);
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with(plat_glob) {
+                continue;
+            }
+            let vendor = entry.path().join("vendor");
+            let Ok(triples) = std::fs::read_dir(&vendor) else {
+                continue;
+            };
+            for triple in triples.flatten() {
+                let candidate = triple.path().join("codex").join(exe_name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
             }
         }
     }
@@ -250,7 +323,13 @@ pub fn codex_auth_status(app: AppHandle) -> CodexAuth {
         Ok(c) => (true, Some(c.program)),
         Err(_) => (false, None),
     };
-    CodexAuth { logged_in, path, binary_found, binary, dedicated }
+    CodexAuth {
+        logged_in,
+        path,
+        binary_found,
+        binary,
+        dedicated,
+    }
 }
 
 /// Small extension so we don't depend on the `Manager`/`path()` trait import
@@ -326,7 +405,11 @@ pub async fn codex_models(app: AppHandle) -> Result<Vec<CodexModel>, String> {
             })
             .unwrap_or_default();
         out.push(CodexModel {
-            model: m.get("model").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            model: m
+                .get("model")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
             display_name: m
                 .get("displayName")
                 .and_then(|x| x.as_str())
@@ -337,7 +420,10 @@ pub async fn codex_models(app: AppHandle) -> Result<Vec<CodexModel>, String> {
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string(),
-            is_default: m.get("isDefault").and_then(|x| x.as_bool()).unwrap_or(false),
+            is_default: m
+                .get("isDefault")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
             default_reasoning_effort: m
                 .get("defaultReasoningEffort")
                 .and_then(|x| x.as_str())
@@ -357,7 +443,10 @@ pub async fn codex_rate_limits(app: AppHandle) -> Result<CodexRateLimits, String
     let resp = srv
         .request("account/rateLimits/read", serde_json::json!({}))
         .await?;
-    let snap = resp.get("rateLimits").cloned().unwrap_or(serde_json::Value::Null);
+    let snap = resp
+        .get("rateLimits")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let parse_window = |w: &serde_json::Value| -> Option<CodexRateWindow> {
         if w.is_null() {
             return None;
@@ -387,8 +476,12 @@ pub async fn codex_rate_limits(app: AppHandle) -> Result<CodexRateLimits, String
 /// settings table). Read directly here so EVERY codex spawn (chat, worker, login,
 /// logout, status) is consistent without threading the flag through callers.
 fn codex_dedicated(app: &AppHandle) -> bool {
-    let Ok(conn_mutex) = get_conn(app) else { return false };
-    let Ok(conn) = conn_mutex.lock() else { return false };
+    let Ok(conn_mutex) = get_conn(app) else {
+        return false;
+    };
+    let Ok(conn) = conn_mutex.lock() else {
+        return false;
+    };
     conn.query_row(
         "SELECT value FROM settings WHERE key = 'provider.codex.dedicated' LIMIT 1",
         [],
@@ -515,7 +608,11 @@ fn parse_semver_triple(raw: &str) -> (Option<u32>, Option<u32>, Option<u32>) {
                 break;
             }
             // Continue only if the next char is a dot followed by a digit.
-            if j < bytes.len() && bytes[j] == b'.' && j + 1 < bytes.len() && bytes[j + 1].is_ascii_digit() {
+            if j < bytes.len()
+                && bytes[j] == b'.'
+                && j + 1 < bytes.len()
+                && bytes[j + 1].is_ascii_digit()
+            {
                 j += 1; // consume the dot
             } else {
                 break;
@@ -558,7 +655,11 @@ pub async fn codex_detect_version() -> Result<CodexVersion, String> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let raw = {
         let s = stdout.trim();
-        if s.is_empty() { stderr.trim() } else { s }
+        if s.is_empty() {
+            stderr.trim()
+        } else {
+            s
+        }
     }
     .to_string();
 
@@ -567,7 +668,12 @@ pub async fn codex_detect_version() -> Result<CodexVersion, String> {
     }
 
     let (major, minor, patch) = parse_semver_triple(&raw);
-    let version = CodexVersion { raw: raw.clone(), major, minor, patch };
+    let version = CodexVersion {
+        raw: raw.clone(),
+        major,
+        minor,
+        patch,
+    };
     eprintln!(
         "[codex] detected version: {raw} (parsed {}.{}.{})",
         major.map(|n| n.to_string()).unwrap_or_else(|| "?".into()),
@@ -679,7 +785,9 @@ pub fn parse_exec_line(line: &str) -> Option<CodexExecEvent> {
         }
         // Reasoning/thinking delta.
         t if t.contains("reasoning") && t.contains("delta") => {
-            let text = first_str_field(&v, &["delta", "text"]).unwrap_or("").to_string();
+            let text = first_str_field(&v, &["delta", "text"])
+                .unwrap_or("")
+                .to_string();
             CodexExecEvent::ReasoningDelta { text }
         }
         // Completed item — only the `agent_message` item type carries the
@@ -715,7 +823,11 @@ pub fn parse_exec_line(line: &str) -> Option<CodexExecEvent> {
             CodexExecEvent::Failed { message }
         }
         _ => CodexExecEvent::Unknown {
-            kind: if raw_type.is_empty() { "<no-type>".to_string() } else { raw_type.to_string() },
+            kind: if raw_type.is_empty() {
+                "<no-type>".to_string()
+            } else {
+                raw_type.to_string()
+            },
         },
     };
     Some(event)
@@ -744,7 +856,9 @@ pub fn collect_exec_stream(stdout: &str) -> CodexExecOutcome {
     let mut out = CodexExecOutcome::default();
     let mut streamed_any_delta = false;
     for line in stdout.lines() {
-        let Some(ev) = parse_exec_line(line) else { continue };
+        let Some(ev) = parse_exec_line(line) else {
+            continue;
+        };
         match ev {
             CodexExecEvent::AgentMessageDelta { text } => {
                 if !text.is_empty() {
@@ -809,7 +923,11 @@ pub struct CodexExecProbe {
 /// never mutate files. Never spawns cmd.exe (resolved native binary + node
 /// fallback prefix args), and honors the dedicated/shared CODEX_HOME.
 #[tauri::command]
-pub async fn codex_exec_probe(app: AppHandle, prompt: Option<String>) -> Result<CodexExecProbe, String> {
+pub async fn codex_exec_probe(
+    app: AppHandle,
+    prompt: Option<String>,
+    model: Option<String>,
+) -> Result<CodexExecProbe, String> {
     // Best-effort version detection — a failure here is not fatal to the probe
     // (we still try the exec run), it just leaves `version: None`.
     let version = codex_detect_version().await.ok();
@@ -831,8 +949,11 @@ pub async fn codex_exec_probe(app: AppHandle, prompt: Option<String>) -> Result<
         .arg("exec")
         .arg("--json")
         .arg("--sandbox")
-        .arg("read-only")
-        .arg(ask);
+        .arg("read-only");
+    if let Some(model) = model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        command.arg("--model").arg(model);
+    }
+    command.arg(ask);
     apply_codex_home(&app, &mut command);
     apply_no_window(&mut command);
     command.stdout(std::process::Stdio::piped());
@@ -843,10 +964,13 @@ pub async fn codex_exec_probe(app: AppHandle, prompt: Option<String>) -> Result<
         .map_err(|e| format!("codex exec spawn failed: {e}"))?;
 
     // Bound the whole run so a hung Codex can't wedge the probe.
-    let output = tokio::time::timeout(std::time::Duration::from_secs(120), child.wait_with_output())
-        .await
-        .map_err(|_| "codex exec probe timed out (120 s)".to_string())?
-        .map_err(|e| format!("codex exec wait failed: {e}"))?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| "codex exec probe timed out (120 s)".to_string())?
+    .map_err(|e| format!("codex exec wait failed: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let outcome = collect_exec_stream(&stdout);
@@ -989,8 +1113,8 @@ pub async fn codex_chat_turn(
         let next = tokio::time::timeout(std::time::Duration::from_secs(300), rx.recv()).await;
         let v = match next {
             Ok(Some(v)) => v,
-            Ok(None) => break,  // connection dropped
-            Err(_) => break,    // overall timeout
+            Ok(None) => break, // connection dropped
+            Err(_) => break,   // overall timeout
         };
         let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let p = v.get("params").cloned().unwrap_or(serde_json::Value::Null);
@@ -1054,7 +1178,9 @@ pub async fn codex_chat_turn(
 // ────────────────────────────────────────────────────────────────────────
 
 fn record_usage(app: &AppHandle, run_id: &str, model: &str, u: &CodexUsage, surface: &str) {
-    let Ok(conn_mutex) = get_conn(app) else { return };
+    let Ok(conn_mutex) = get_conn(app) else {
+        return;
+    };
     let Ok(conn) = conn_mutex.lock() else { return };
     let _ = conn.execute(
         "INSERT INTO codex_usage
@@ -1074,7 +1200,9 @@ fn record_usage(app: &AppHandle, run_id: &str, model: &str, u: &CodexUsage, surf
 }
 
 fn record_limit_event(app: &AppHandle, kind: &str, message: &str) {
-    let Ok(conn_mutex) = get_conn(app) else { return };
+    let Ok(conn_mutex) = get_conn(app) else {
+        return;
+    };
     let Ok(conn) = conn_mutex.lock() else { return };
     let _ = conn.execute(
         "INSERT INTO codex_limit_events (ts, kind, message) VALUES (?1, ?2, ?3)",
@@ -1179,7 +1307,11 @@ pub fn codex_limit_recent(app: AppHandle) -> Result<Option<CodexLimitEvent>, Str
 #[tauri::command]
 pub async fn codex_login(app: AppHandle, device_auth: bool) -> Result<(), String> {
     let srv = crate::commands::codex_app_server::ensure(&app).await?;
-    let kind = if device_auth { "chatgptDeviceCode" } else { "chatgpt" };
+    let kind = if device_auth {
+        "chatgptDeviceCode"
+    } else {
+        "chatgpt"
+    };
     let resp = srv
         .request("account/login/start", serde_json::json!({ "type": kind }))
         .await?;
@@ -1253,21 +1385,43 @@ pub async fn codex_logout(app: AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod version_isolation_tests {
     use super::{
-        canonical_event_type, collect_exec_stream, parse_exec_line, parse_semver_triple,
-        CodexExecEvent,
+        canonical_event_type, collect_exec_stream, is_windowsapps_package_path, parse_exec_line,
+        parse_semver_triple, CodexExecEvent,
     };
 
     #[test]
     fn semver_triple_parses_the_known_codex_spellings() {
-        assert_eq!(parse_semver_triple("codex-cli 0.142.0-alpha.1"), (Some(0), Some(142), Some(0)));
-        assert_eq!(parse_semver_triple("codex 0.125.0"), (Some(0), Some(125), Some(0)));
-        assert_eq!(parse_semver_triple("0.130.0"), (Some(0), Some(130), Some(0)));
+        assert_eq!(
+            parse_semver_triple("codex-cli 0.142.0-alpha.1"),
+            (Some(0), Some(142), Some(0))
+        );
+        assert_eq!(
+            parse_semver_triple("codex 0.125.0"),
+            (Some(0), Some(125), Some(0))
+        );
+        assert_eq!(
+            parse_semver_triple("0.130.0"),
+            (Some(0), Some(130), Some(0))
+        );
         assert_eq!(parse_semver_triple("1.2.3"), (Some(1), Some(2), Some(3)));
         // Two-component version ⇒ patch is None, still usable.
         assert_eq!(parse_semver_triple("v2.5 build"), (Some(2), Some(5), None));
         // No version present ⇒ all None (never panics).
         assert_eq!(parse_semver_triple("no numbers here"), (None, None, None));
         assert_eq!(parse_semver_triple(""), (None, None, None));
+    }
+
+    #[test]
+    fn windowsapps_payload_is_not_treated_as_a_spawnable_cli() {
+        assert!(is_windowsapps_package_path(std::path::Path::new(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_1.0.0_x64\app\resources\codex.exe"
+        )));
+        assert!(is_windowsapps_package_path(std::path::Path::new(
+            "C:/Program Files/WindowsApps/OpenAI.Codex_1.0.0_x64/app/resources/codex.exe"
+        )));
+        assert!(!is_windowsapps_package_path(std::path::Path::new(
+            r"C:\Users\me\AppData\Roaming\npm\node_modules\@openai\codex\vendor\codex.exe"
+        )));
     }
 
     #[test]
@@ -1282,7 +1436,9 @@ mod version_isolation_tests {
         // Exactly the JSONL captured in the module header for v0.125.0.
         assert_eq!(
             parse_exec_line(r#"{"type":"thread.started","thread_id":"t1"}"#),
-            Some(CodexExecEvent::ThreadStarted { thread_id: Some("t1".into()) })
+            Some(CodexExecEvent::ThreadStarted {
+                thread_id: Some("t1".into())
+            })
         );
         assert_eq!(
             parse_exec_line(r#"{"type":"turn.started"}"#),
@@ -1292,7 +1448,9 @@ mod version_isolation_tests {
             parse_exec_line(
                 r#"{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"hi there"}}"#
             ),
-            Some(CodexExecEvent::AgentMessage { text: "hi there".into() })
+            Some(CodexExecEvent::AgentMessage {
+                text: "hi there".into()
+            })
         );
         match parse_exec_line(
             r#"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}"#,
@@ -1310,17 +1468,23 @@ mod version_isolation_tests {
         // Slashed type spelling (a plausible drift) + `delta` text key.
         assert_eq!(
             parse_exec_line(r#"{"type":"item/agent_message/delta","delta":"chunk"}"#),
-            Some(CodexExecEvent::AgentMessageDelta { text: "chunk".into() })
+            Some(CodexExecEvent::AgentMessageDelta {
+                text: "chunk".into()
+            })
         );
         // camelCase thread id field.
         assert_eq!(
             parse_exec_line(r#"{"type":"thread.started","threadId":"t2"}"#),
-            Some(CodexExecEvent::ThreadStarted { thread_id: Some("t2".into()) })
+            Some(CodexExecEvent::ThreadStarted {
+                thread_id: Some("t2".into())
+            })
         );
         // Reasoning delta variant.
         assert_eq!(
             parse_exec_line(r#"{"type":"item.reasoning.delta","text":"thinking"}"#),
-            Some(CodexExecEvent::ReasoningDelta { text: "thinking".into() })
+            Some(CodexExecEvent::ReasoningDelta {
+                text: "thinking".into()
+            })
         );
     }
 
@@ -1329,19 +1493,25 @@ mod version_isolation_tests {
         // Unknown event type ⇒ Unknown (carries the raw type), never an error.
         assert_eq!(
             parse_exec_line(r#"{"type":"brand.new.event.v2","payload":{"x":1}}"#),
-            Some(CodexExecEvent::Unknown { kind: "brand.new.event.v2".into() })
+            Some(CodexExecEvent::Unknown {
+                kind: "brand.new.event.v2".into()
+            })
         );
         // Unknown completed-item subtype ⇒ Unknown, not a crash.
         assert_eq!(
             parse_exec_line(
                 r#"{"type":"item.completed","item":{"type":"command_execution","cmd":"ls"}}"#
             ),
-            Some(CodexExecEvent::Unknown { kind: "item.completed:command_execution".into() })
+            Some(CodexExecEvent::Unknown {
+                kind: "item.completed:command_execution".into()
+            })
         );
         // Missing `type` ⇒ Unknown<no-type>.
         assert_eq!(
             parse_exec_line(r#"{"foo":"bar"}"#),
-            Some(CodexExecEvent::Unknown { kind: "<no-type>".into() })
+            Some(CodexExecEvent::Unknown {
+                kind: "<no-type>".into()
+            })
         );
         // Non-JSON banner line ⇒ skipped (None), never panics.
         assert_eq!(parse_exec_line("Codex CLI starting…"), None);
@@ -1356,17 +1526,26 @@ mod version_isolation_tests {
     #[test]
     fn collect_stream_assembles_deltas_usage_and_counts_drift() {
         let transcript = concat!(
-            r#"{"type":"thread.started","thread_id":"t1"}"#, "\n",
-            r#"{"type":"turn.started"}"#, "\n",
-            r#"{"type":"item/agent_message/delta","delta":"Hello"}"#, "\n",
-            r#"{"type":"item/agent_message/delta","delta":", world"}"#, "\n",
-            r#"{"type":"some.future.event"}"#, "\n",
-            r#"{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":7}}"#, "\n",
+            r#"{"type":"thread.started","thread_id":"t1"}"#,
+            "\n",
+            r#"{"type":"turn.started"}"#,
+            "\n",
+            r#"{"type":"item/agent_message/delta","delta":"Hello"}"#,
+            "\n",
+            r#"{"type":"item/agent_message/delta","delta":", world"}"#,
+            "\n",
+            r#"{"type":"some.future.event"}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":7}}"#,
+            "\n",
         );
         let outcome = collect_exec_stream(transcript);
         assert_eq!(outcome.text, "Hello, world");
         assert_eq!(outcome.failure, None);
-        assert_eq!(outcome.unknown_events, 1, "the future event should be counted as drift");
+        assert_eq!(
+            outcome.unknown_events, 1,
+            "the future event should be counted as drift"
+        );
         let usage = outcome.usage.expect("usage should be parsed");
         assert_eq!(usage.input_tokens, 12);
         assert_eq!(usage.output_tokens, 7);
@@ -1376,9 +1555,12 @@ mod version_isolation_tests {
     fn collect_stream_adopts_completed_item_when_no_deltas() {
         // Older-version shape: only the completed item, no streaming deltas.
         let transcript = concat!(
-            r#"{"type":"thread.started","thread_id":"t1"}"#, "\n",
-            r#"{"type":"item.completed","item":{"type":"agent_message","text":"full answer"}}"#, "\n",
-            r#"{"type":"turn.completed","usage":{"input_tokens":3,"output_tokens":4}}"#, "\n",
+            r#"{"type":"thread.started","thread_id":"t1"}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"full answer"}}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":3,"output_tokens":4}}"#,
+            "\n",
         );
         let outcome = collect_exec_stream(transcript);
         assert_eq!(outcome.text, "full answer");
@@ -1390,8 +1572,10 @@ mod version_isolation_tests {
         // Simulate a schema so changed that NOTHING is recognized: graceful
         // degradation = empty text + unknown_events count, no error/panic.
         let transcript = concat!(
-            r#"{"type":"v9.alpha.thing","a":1}"#, "\n",
-            r#"{"type":"v9.alpha.other","b":2}"#, "\n",
+            r#"{"type":"v9.alpha.thing","a":1}"#,
+            "\n",
+            r#"{"type":"v9.alpha.other","b":2}"#,
+            "\n",
         );
         let outcome = collect_exec_stream(transcript);
         assert_eq!(outcome.text, "");
@@ -1401,8 +1585,7 @@ mod version_isolation_tests {
 
     #[test]
     fn collect_stream_surfaces_failure_message() {
-        let transcript =
-            r#"{"type":"turn.failed","error":{"message":"upstream exploded"}}"#;
+        let transcript = r#"{"type":"turn.failed","error":{"message":"upstream exploded"}}"#;
         let outcome = collect_exec_stream(transcript);
         assert_eq!(outcome.failure.as_deref(), Some("upstream exploded"));
     }

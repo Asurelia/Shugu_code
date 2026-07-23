@@ -13,8 +13,18 @@ import { Icon } from "@/components/components";
 import { Terminal } from "@xterm/xterm";
 import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { forEachDiagnostic, type Diagnostic } from "@codemirror/lint";
+import { useQuery } from "@tanstack/react-query";
 import "@xterm/xterm/css/xterm.css";
 import { invoke, listen } from "@/lib/tauri";
+import { db } from "@/lib/db";
+import { useShell } from "@/routes/shell-context";
+import {
+  sendChatMessage,
+  useActiveConv,
+  useActiveModel,
+  useMessages,
+} from "@/features/chat/chat-sync";
 
 // ─── Dock workspace: editor + dock as constraint-solved resizable panels ──
 // Replaces the old hand-rolled CSS-grid + mousemove resize, which could squeeze
@@ -117,8 +127,6 @@ function DockPanelInner({ dockState, setDockState, fileContents, onDockDragStart
   const paneTabs = (paneIdx: 0 | 1) => tabs.filter((t: any) => (t.pane ?? 0) === paneIdx);
   const mainTabs = paneTabs(0);
   const splitTabs = paneTabs(1);
-
-  const moveDock = (next: string) => set({ side: next });
 
   const closeTab = (id: string) => {
     const closing = tabs.find((t: any) => t.id === id);
@@ -364,43 +372,11 @@ function DockAddMenu({ onPick }: { onPick: (k: string) => void }) {
   );
 }
 
-function DockSideMenu({ side, onPick }: { side: string; onPick: (s: string) => void }) {
-  const [open, setOpen] = useState(false);
-  return (
-    <span style={{position:"relative"}}>
-      <button className="dock-act" title="Dock position" onClick={() => setOpen(o => !o)}>
-        <Icon name="folder" size={13}/>
-      </button>
-      {open && (
-        <>
-          <div style={{position:"fixed",inset:0,zIndex:9}} onClick={() => setOpen(false)}/>
-          <div className="ctx-menu" style={{position:"absolute", top:30, right:0, minWidth:180, zIndex:20}}>
-            <div className="ctx-section">Dock to</div>
-            {[
-              { v: "bottom", l: "Bottom", kbd: "⌘J" },
-              { v: "top",    l: "Top" },
-              { v: "left",   l: "Left" },
-              { v: "right",  l: "Right" },
-            ].map(o => (
-              <button key={o.v} className={"ctx-item" + (side === o.v ? " active" : "")} onClick={() => { onPick(o.v); setOpen(false); }}>
-                <span className="ico"><Icon name={o.v === "bottom" || o.v === "top" ? "down" : "right"} size={13}/></span>
-                <span className="label">{o.l}</span>
-                {o.kbd && <span className="kbd">{o.kbd}</span>}
-                {side === o.v && <span className="submark">✓</span>}
-              </button>
-            ))}
-          </div>
-        </>
-      )}
-    </span>
-  );
-}
-
-function DockPaneContent({ tab, fileContents }: any) {
+function DockPaneContent({ tab }: any) {
   if (!tab) return <div style={{padding:24, color:"var(--on-surface-muted)", fontSize:12, fontFamily:"var(--font-mono)"}}>No tab</div>;
   if (tab.kind === "term") return <DockTerminal tabId={tab.id} name={tab.name}/>;
   if (tab.kind === "output") return <DockOutput/>;
-  if (tab.kind === "problems") return <DockProblems fileContents={fileContents}/>;
+  if (tab.kind === "problems") return <DockProblems/>;
   return null;
 }
 
@@ -684,46 +660,48 @@ export function DockTerminal({ tabId, name: _name }: { tabId: string; name: stri
 
 // ─── Dock Agent Chat ────────────────────────────────────────
 export function DockAgentChat() {
-  const [msgs, setMsgs] = useState<any[]>([
-    { who: "ai",  text: "Hey. Je suis branché sur ce terminal. Demande-moi un script, un diagnostic, ou laisse-moi exécuter quelque chose.", ts: "now" },
-    { who: "user", text: "Trouve toutes les `console.log` dans src/ et propose-moi un script pour les remplacer par un vrai logger.", ts: "now" },
-    { who: "ai", text: "Voici la commande, clique pour l'envoyer dans le terminal :", ts: "now" },
-    { who: "cmd", text: `rg "console\\.log" src/ -l | xargs -I {} sed -i '' 's/console.log/logger.debug/g' {}` },
-    { who: "ai", text: "65 fichiers concernés. Je peux aussi ajouter l'import du logger en haut de chacun si tu veux.", ts: "now" },
-  ]);
+  const [convId] = useActiveConv();
+  const [model] = useActiveModel();
+  const { data: messages, isLoading } = useMessages(convId);
   const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
   const feedRef = useRef<HTMLDivElement | null>(null);
-  useEffect(() => { if (feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight; }, [msgs]);
+  useEffect(() => { if (feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight; }, [messages]);
 
-  const send = () => {
+  const send = async () => {
     const t = input.trim();
-    if (!t) return;
-    setMsgs(m => [...m, { who: "user", text: t, ts: "now" }]);
+    if (!t || sending) return;
     setInput("");
-    setTimeout(() => setMsgs(m => [...m, { who: "ai", text: "Je regarde ça — un instant…", ts: "now" }]), 700);
+    setSending(true);
+    try {
+      await sendChatMessage(convId, t, model);
+    } finally {
+      setSending(false);
+    }
   };
   const quick = (q: string) => { setInput(q); };
 
   return (
     <div className="agentpane">
       <div className="agentpane-head">
-        <div className="who">terminal agent · shugu-haiku</div>
+        <div className="who">conversation active · {model || "aucun modèle"}</div>
         <span style={{flex:1}}></span>
-        <button className="dock-act" title="Settings"><Icon name="gear" size={12}/></button>
-        <button className="dock-act" title="Clear"><Icon name="copy" size={12}/></button>
+        <span className="chip">SQLite</span>
       </div>
       <div className="agentpane-feed" ref={feedRef}>
-        {msgs.map((m, i) => (
-          m.who === "cmd"
-            ? <div key={i} className="agentpane-msg cmd" title="Click to send to active terminal">
-                <span>$ {m.text}</span>
-                <span className="run">RUN</span>
-              </div>
-            : <div key={i} className={"agentpane-msg " + (m.who === "user" ? "user" : "")}>
-                <span className={"meta " + (m.who === "user" ? "you" : "ai")}>{m.who === "user" ? "you" : "shugu"} · {m.ts}</span>
-                {m.text}
-              </div>
-        ))}
+        {isLoading && <div className="agentpane-msg">Chargement…</div>}
+        {!isLoading && messages.length === 0 && (
+          <div className="agentpane-msg">Aucun message dans cette conversation.</div>
+        )}
+        {messages.slice(-30).map((message) => {
+          const user = message.role === "user";
+          return (
+            <div key={message.id} className={"agentpane-msg " + (user ? "user" : "")}>
+              <span className={"meta " + (user ? "you" : "ai")}>{user ? "you" : "shugu"} · {message.ts}</span>
+              {message.body ?? message.text ?? ""}
+            </div>
+          );
+        })}
       </div>
       <div className="agentpane-quick">
         {["explain output", "fix this error", "write a test", "git status?", "kill port 1420"].map(q => (
@@ -734,11 +712,11 @@ export function DockAgentChat() {
         <textarea
           value={input}
           onChange={e => setInput(e.target.value)}
-          onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+          onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); } }}
           placeholder="Ask about the terminal output, or paste an error…"
           rows={1}
         />
-        <button className="send" disabled={!input.trim()} onClick={send}>
+        <button className="send" disabled={!input.trim() || sending || !model} onClick={() => void send()}>
           <Icon name="send" size={11}/>
         </button>
       </div>
@@ -748,22 +726,21 @@ export function DockAgentChat() {
 
 // ─── Output pane ────────────────────────────────────────────
 export function DockOutput() {
-  const lines = [
-    { t: "info", time: "14:32:01", text: "[vite] hmr update /src/components/Forge.tsx" },
-    { t: "info", time: "14:32:01", text: "[vite] page reload required" },
-    { t: "ok",   time: "14:32:02", text: "[tauri] webview reloaded" },
-    { t: "warn", time: "14:32:05", text: "[tsc] src/lib/store.ts(34,5): warning TS7053 — element implicitly has 'any' type" },
-    { t: "info", time: "14:32:08", text: "[cargo] Compiling shugu-forge v0.4.0" },
-    { t: "info", time: "14:32:09", text: "[cargo] Finished release [optimized] target(s) in 18.42s" },
-    { t: "err",  time: "14:32:12", text: "[ipc] command \"image::generate\" panicked: model `flux.1-veil` not found on disk" },
-    { t: "info", time: "14:32:13", text: "[forge] retrying with model `flux.1-schnell`…" },
-    { t: "ok",   time: "14:32:18", text: "[forge] generation complete · 1024×1024 · 4.2s" },
-  ];
+  const { data: lines = [], isLoading } = useQuery({
+    queryKey: ["dock", "app-logs"],
+    queryFn: () => db.logs.recent(200),
+    refetchInterval: 2_000,
+  });
   return (
     <div className="output-pane">
-      {lines.map((l, i) => (
-        <div key={i} className={"out-" + l.t}>
-          <span className="out-time">{l.time}</span>{l.text}
+      {isLoading && <div className="agentpane-msg">Chargement du journal local…</div>}
+      {!isLoading && lines.length === 0 && (
+        <div className="agentpane-msg">Aucune entrée dans le journal local.</div>
+      )}
+      {lines.slice().reverse().map((line) => (
+        <div key={line.id} className={"out-" + (line.level === "error" ? "err" : line.level === "warn" ? "warn" : "info")}>
+          <span className="out-time">{new Date(line.ts).toLocaleTimeString()}</span>
+          [{line.source ?? "app"}] {line.message}
         </div>
       ))}
     </div>
@@ -771,25 +748,68 @@ export function DockOutput() {
 }
 
 // ─── Problems pane ──────────────────────────────────────────
-export function DockProblems({ fileContents: _fc }: any) {
-  const problems = [
-    { sev: "err",  file: "src/lib/store.ts", loc: "34:5",  msg: "Property 'messages' does not exist on type 'ForgeStore'." },
-    { sev: "warn", file: "src/lib/store.ts", loc: "12:18", msg: "'persist' is declared but never used in this scope." },
-    { sev: "warn", file: "src/components/Forge.tsx", loc: "28:9", msg: "React Hook useEffect has a missing dependency: 'model'." },
-    { sev: "err",  file: "src-tauri/src/main.rs", loc: "18:5", msg: "cannot find function `image::generate` in this scope" },
-    { sev: "warn", file: "src/views/ImageView.tsx", loc: "47:11", msg: "unused variable: `negative`" },
-  ];
+interface DockDiagnostic {
+  diagnostic: Diagnostic;
+  from: number;
+  to: number;
+  line: number;
+  column: number;
+}
+
+export function DockProblems() {
+  const { editorViewRef, activeFile } = useShell();
+  const [problems, setProblems] = useState<DockDiagnostic[]>([]);
+
+  useEffect(() => {
+    const refresh = () => {
+      const view = editorViewRef?.current?.getView();
+      if (!view) {
+        setProblems([]);
+        return;
+      }
+      const next: DockDiagnostic[] = [];
+      forEachDiagnostic(view.state, (diagnostic, from, to) => {
+        const line = view.state.doc.lineAt(from);
+        next.push({
+          diagnostic,
+          from,
+          to,
+          line: line.number,
+          column: from - line.from + 1,
+        });
+      });
+      setProblems(next);
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 500);
+    return () => window.clearInterval(timer);
+  }, [activeFile, editorViewRef]);
+
+  const reveal = (problem: DockDiagnostic) => {
+    const view = editorViewRef?.current?.getView();
+    if (!view) return;
+    view.dispatch({
+      selection: { anchor: problem.from, head: problem.to },
+      scrollIntoView: true,
+    });
+    view.focus();
+  };
+
   return (
     <div className="problems-pane">
-      {problems.map((p, i) => (
-        <div key={i} className="problem-row">
-          <span className={"sev " + p.sev}>{p.sev === "err" ? "!" : "▲"}</span>
+      {!activeFile && <div className="agentpane-msg">Ouvre un fichier pour voir ses diagnostics LSP.</div>}
+      {activeFile && problems.length === 0 && <div className="agentpane-msg">Aucun diagnostic actif pour {activeFile}.</div>}
+      {problems.map((problem, index) => (
+        <button key={`${problem.from}:${problem.to}:${index}`} className="problem-row" onClick={() => reveal(problem)}>
+          <span className={"sev " + (problem.diagnostic.severity === "error" ? "err" : "warn")}>
+            {problem.diagnostic.severity === "error" ? "!" : "▲"}
+          </span>
           <div style={{flex:1, minWidth:0}}>
-            <div><span className="file">{p.file}</span> <span className="loc">:{p.loc}</span></div>
-            <div className="msg">{p.msg}</div>
+            <div><span className="file">{activeFile}</span> <span className="loc">:{problem.line}:{problem.column}</span></div>
+            <div className="msg">{problem.diagnostic.message}</div>
           </div>
-          <button className="dock-act" title="Ask Shugu"><Icon name="sparkle" size={12}/></button>
-        </div>
+          {problem.diagnostic.source && <span className="chip">{problem.diagnostic.source}</span>}
+        </button>
       ))}
     </div>
   );

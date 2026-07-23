@@ -17,6 +17,7 @@ import { RailChibi } from "@/features/mascot/RailChibi";
 // composer du ChatView (insertion d'une @-mention).
 import { requestChatMention } from "@/features/chat/chatMentionStore";
 import { pushToast } from "@/components/toast";
+import { useModalFocusTrap } from "@/lib/modalFocus";
 
 // ── Icons (24x24 stroke) ────────────────────────────────────
 export function Icon({ name, size = 18, className = "" }: { name: string; size?: number; className?: string }) {
@@ -135,7 +136,7 @@ async function windowToggleMaximize(): Promise<void> {
   }
 }
 
-export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, onSettings, sideCollapsed, onToggleSide, menu, onHistory, onBell, bellCount = 0, avatar }: any) {
+export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, sideCollapsed, onToggleSide, menu, onHistory, onBell, bellCount = 0, avatar }: any) {
   return (
     <div className="titlebar">
       <div className="traffic">
@@ -563,8 +564,7 @@ export function FileNode({
           : <span className="label">{node.name}</span>}
         {!isRenaming && !isDir && (gitChar || node.git) && (() => {
           // LOT 3 git-ui — gitChar (live status) takes precedence over the
-          // legacy static `node.git` field (mock data still ships in
-          // RootLayout for the demo workspace). Color map mirrors the
+          // legacy static `node.git` field. Color map mirrors the
           // VSCode SCM color tokens : warn = modified, success = added,
           // tertiary = untracked, danger = conflicted / deleted, muted otherwise.
           const ch = (gitChar ?? node.git) as string;
@@ -790,16 +790,26 @@ function FileCtxMenu({ node, x, y, onClose, onAction }: { node: any; x: number; 
 // ── Delete confirmation modal ───────────────────────────────
 // Centered overlay; click on backdrop = cancel, Escape = cancel.
 function FileDeleteConfirm({ node, onCancel, onConfirm }: { node: any; onCancel: () => void; onConfirm: () => void }) {
-  useEffect(() => {
-    const onEsc = (e: KeyboardEvent) => { if (e.key === "Escape") onCancel(); };
-    document.addEventListener("keydown", onEsc);
-    return () => document.removeEventListener("keydown", onEsc);
-  }, [onCancel]);
-
   const isDir = node.isDir ?? Array.isArray(node.children);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const cancelRef = useRef<HTMLButtonElement | null>(null);
+  useModalFocusTrap({
+    open: true,
+    containerRef: dialogRef,
+    initialFocusRef: cancelRef,
+    onEscape: onCancel,
+  });
   return (
     <div className="file-delete-overlay" onClick={onCancel}>
-      <div className="file-delete-modal" onClick={(e) => e.stopPropagation()}>
+      <div
+        ref={dialogRef}
+        className="file-delete-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Delete ${isDir ? "folder" : "file"} ${node.name}?`}
+        tabIndex={-1}
+        onClick={(e) => e.stopPropagation()}
+      >
         <h3>Delete {isDir ? "folder" : "file"}?</h3>
         <p>
           <strong>{node.name}</strong> will be permanently removed
@@ -807,7 +817,7 @@ function FileDeleteConfirm({ node, onCancel, onConfirm }: { node: any; onCancel:
         </p>
         <p className="muted">This cannot be undone.</p>
         <div className="file-delete-actions">
-          <button className="lgb lgb-sm" onClick={onCancel}>Cancel</button>
+          <button ref={cancelRef} className="lgb lgb-sm" onClick={onCancel}>Cancel</button>
           <button className="lgb lgb-sm danger" onClick={onConfirm}>Delete</button>
         </div>
       </div>

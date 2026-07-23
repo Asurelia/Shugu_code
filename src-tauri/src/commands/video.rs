@@ -25,6 +25,8 @@ const POLL_INTERVAL_SECS: u64 = 10;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VideoGenerateArgs {
+    #[serde(default)]
+    pub request_id: Option<String>,
     pub prompt: String,
     /// ex. "MiniMax-Hailuo-02", "MiniMax-Hailuo-2.3", "T2V-01-Director"…
     pub model: String,
@@ -50,8 +52,11 @@ pub struct VideoJob {
 }
 
 /// Génération vidéo MiniMax → chemin d'un .mp4 local prêt pour `<video src=…>`.
-#[tauri::command]
-pub async fn video_generate(app: AppHandle, args: VideoGenerateArgs) -> Result<VideoJob, String> {
+async fn video_generate_inner(
+    app: AppHandle,
+    args: VideoGenerateArgs,
+    job_id: &str,
+) -> Result<VideoJob, String> {
     let prompt = args.prompt.trim();
     let has_first_frame = args
         .first_frame_image
@@ -82,7 +87,11 @@ pub async fn video_generate(app: AppHandle, args: VideoGenerateArgs) -> Result<V
         "model": model,
         "prompt": prompt,
     });
-    if let Some(img) = args.first_frame_image.as_deref().filter(|s| !s.trim().is_empty()) {
+    if let Some(img) = args
+        .first_frame_image
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
         body["first_frame_image"] = Value::String(img.trim().to_string());
     }
     if let Some(d) = args.duration {
@@ -115,6 +124,14 @@ pub async fn video_generate(app: AppHandle, args: VideoGenerateArgs) -> Result<V
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| "minimax video: réponse de soumission sans task_id".to_string())?
         .to_string();
+    media::progress(
+        &app,
+        job_id,
+        "media:video",
+        "queued",
+        15,
+        format!("Tâche MiniMax {task_id} soumise"),
+    );
 
     // 2. Polling du statut jusqu'à Success/Fail.
     // task_id vient de l'API : on l'encode malgré tout (défense en profondeur,
@@ -140,6 +157,19 @@ pub async fn video_generate(app: AppHandle, args: VideoGenerateArgs) -> Result<V
             Ok(v) => v,
             Err(_) => continue,
         };
+        let percent = 15 + (((attempt + 1) * 65) / POLL_ATTEMPTS) as u8;
+        media::progress(
+            &app,
+            job_id,
+            "media:video",
+            "polling",
+            percent,
+            format!(
+                "Génération distante — contrôle {}/{}",
+                attempt + 1,
+                POLL_ATTEMPTS
+            ),
+        );
         // Erreur logique MiniMax pendant le polling (quota, auth, task invalide)
         // = HTTP 200 + base_resp.status_code != 0 → fail-fast au lieu de boucler 10 min.
         media::check_base_resp(&v, "video polling")?;
@@ -152,7 +182,9 @@ pub async fn video_generate(app: AppHandle, args: VideoGenerateArgs) -> Result<V
                     .and_then(|f| f.as_str())
                     .filter(|s| !s.trim().is_empty())
                     .ok_or_else(|| {
-                        format!("minimax video: tâche {task_id} terminée (Success) mais sans file_id")
+                        format!(
+                            "minimax video: tâche {task_id} terminée (Success) mais sans file_id"
+                        )
                     })?
                     .to_string();
                 break;
@@ -198,13 +230,65 @@ pub async fn video_generate(app: AppHandle, args: VideoGenerateArgs) -> Result<V
         .ok_or_else(|| "minimax video: réponse retrieve sans download_url".to_string())?
         .to_string();
 
-    let result_url =
-        media::download_to_asset(&client, &app, "video-assets", &task_id, "mp4", &download_url)
-            .await?;
+    media::progress(
+        &app,
+        job_id,
+        "media:video",
+        "downloading",
+        90,
+        "Téléchargement de la vidéo",
+    );
+
+    let result_url = media::download_to_asset(
+        &client,
+        &app,
+        "video-assets",
+        &task_id,
+        "mp4",
+        &download_url,
+    )
+    .await?;
 
     Ok(VideoJob {
         id: task_id,
         status: "done".into(),
         result_url: Some(result_url),
     })
+}
+
+#[tauri::command]
+pub async fn video_generate(app: AppHandle, args: VideoGenerateArgs) -> Result<VideoJob, String> {
+    let job_id = args
+        .request_id
+        .clone()
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| media::fallback_id("media-video"));
+    let payload = serde_json::json!({
+        "prompt": args.prompt,
+        "model": args.model,
+        "duration": args.duration,
+        "resolution": args.resolution,
+        "hasFirstFrame": args.first_frame_image.as_deref().is_some_and(|value| !value.trim().is_empty()),
+    });
+    let control = media::begin_job(&app, &job_id, "media:video", payload)?;
+    media::progress(
+        &app,
+        &job_id,
+        "media:video",
+        "submitting",
+        5,
+        "Soumission à MiniMax",
+    );
+
+    let app_for_inner = app.clone();
+    let outcome = tokio::select! {
+        biased;
+        _ = control.cancelled() => Err(media::MEDIA_CANCELLED.to_string()),
+        result = video_generate_inner(app_for_inner, args, &job_id) => result,
+    };
+    match &outcome {
+        Ok(job) => media::finish_job(&app, &job_id, "media:video", Ok(job.result_url.clone())),
+        Err(error) => media::finish_job(&app, &job_id, "media:video", Err(error.clone())),
+    }
+    outcome
 }

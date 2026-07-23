@@ -6,9 +6,10 @@
 // recherche : ≤ 8 entrées, le filtre serait du bruit. Navigation ↑/↓ + Entrée,
 // Échap/scrim pour fermer.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Icon } from "@/components/components";
 import { listRecentWorkspaces } from "./recentWorkspaces";
+import { useModalFocusTrap } from "@/lib/modalFocus";
 
 export function RecentWorkspacesPalette({
   open,
@@ -22,6 +23,8 @@ export function RecentWorkspacesPalette({
 }) {
   const [paths, setPaths] = useState<string[]>([]);
   const [idx, setIdx] = useState(0);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  useModalFocusTrap({ open, containerRef: dialogRef, onEscape: onClose });
 
   useEffect(() => {
     if (!open) return;
@@ -65,7 +68,7 @@ export function RecentWorkspacesPalette({
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="palette">
+      <div ref={dialogRef} className="palette" role="dialog" aria-modal="true" aria-label="Recent workspaces" tabIndex={-1}>
         <div className="palette-search">
           <Icon name="folder" size={16} />
           <span style={{ flex: 1, fontSize: 13, color: "var(--on-surface)" }}>
@@ -78,9 +81,11 @@ export function RecentWorkspacesPalette({
             const slash = p.lastIndexOf("/");
             const base = slash >= 0 ? p.slice(slash + 1) : p;
             return (
-              <div
+              <button
+                type="button"
                 key={p}
                 className={"palette-item" + (me === idx ? " active" : "")}
+                style={{ width: "100%", border: 0, font: "inherit", textAlign: "left" }}
                 onMouseEnter={() => setIdx(me)}
                 onClick={() => {
                   onPick(p);
@@ -94,7 +99,7 @@ export function RecentWorkspacesPalette({
                   <div className="name">{base}</div>
                   <div className="hint">{p}</div>
                 </div>
-              </div>
+              </button>
             );
           })}
           {paths.length === 0 && (

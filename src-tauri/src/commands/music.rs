@@ -17,6 +17,8 @@ use crate::commands::media;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MusicGenerateArgs {
+    #[serde(default)]
+    pub request_id: Option<String>,
     /// Description du style / de l'ambiance (requis, ≤ 2000 caractères).
     pub prompt: String,
     /// Paroles (≤ 3500 caractères). Requis pour une chanson chantée
@@ -42,8 +44,11 @@ pub struct MusicJob {
 }
 
 /// Génération musicale MiniMax → chemin d'un .mp3 local prêt pour `<audio src=…>`.
-#[tauri::command]
-pub async fn music_generate(app: AppHandle, args: MusicGenerateArgs) -> Result<MusicJob, String> {
+async fn music_generate_inner(
+    app: AppHandle,
+    args: MusicGenerateArgs,
+    job_id: &str,
+) -> Result<MusicJob, String> {
     let prompt = args.prompt.trim();
     if prompt.is_empty() {
         return Err("music: prompt (style/ambiance) vide".to_string());
@@ -103,6 +108,14 @@ pub async fn music_generate(app: AppHandle, args: MusicGenerateArgs) -> Result<M
         .await
         .map_err(|e| format!("minimax music: réponse JSON invalide: {e}"))?;
     media::check_base_resp(&v, "music")?;
+    media::progress(
+        &app,
+        job_id,
+        "media:music",
+        "saving",
+        85,
+        "Sauvegarde locale du morceau",
+    );
 
     // Robuste aux deux schémas de réponse : output_format "hex" → data.audio
     // (encodé HEX, comme le TTS), "url" (ou repli serveur) → data.audio_url (24 h).
@@ -131,4 +144,40 @@ pub async fn music_generate(app: AppHandle, args: MusicGenerateArgs) -> Result<M
         status: "done".into(),
         result_url: Some(result_url),
     })
+}
+
+#[tauri::command]
+pub async fn music_generate(app: AppHandle, args: MusicGenerateArgs) -> Result<MusicJob, String> {
+    let job_id = args
+        .request_id
+        .clone()
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| media::fallback_id("media-music"));
+    let payload = serde_json::json!({
+        "prompt": args.prompt,
+        "model": args.model,
+        "instrumental": args.instrumental,
+        "hasLyrics": args.lyrics.as_deref().is_some_and(|value| !value.trim().is_empty()),
+    });
+    let control = media::begin_job(&app, &job_id, "media:music", payload)?;
+    media::progress(
+        &app,
+        &job_id,
+        "media:music",
+        "generating",
+        10,
+        "Composition MiniMax",
+    );
+
+    let app_for_inner = app.clone();
+    let outcome = tokio::select! {
+        biased;
+        _ = control.cancelled() => Err(media::MEDIA_CANCELLED.to_string()),
+        result = music_generate_inner(app_for_inner, args, &job_id) => result,
+    };
+    match &outcome {
+        Ok(job) => media::finish_job(&app, &job_id, "media:music", Ok(job.result_url.clone())),
+        Err(error) => media::finish_job(&app, &job_id, "media:music", Err(error.clone())),
+    }
+    outcome
 }

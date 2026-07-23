@@ -17,6 +17,7 @@ import "./styles/studio.css";
 import "./styles/shell-extras.css";
 // EN DERNIER — surcharges typographie puis densité/hiérarchie.
 import "./styles/typography.css";
+import "./components/provider-mark.css";
 import "./styles/density.css";
 
 import { RouterProvider } from "@tanstack/react-router";
@@ -74,7 +75,6 @@ void (async () => {
       if (!path) return;
       // tanstack-router strict mode wants a typed `to`; runtime-routed paths
       // are still valid, we just cast through `any` to satisfy the compiler.
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       void router.navigate({ to: path as any });
     });
   } catch (err) {

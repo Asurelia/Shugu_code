@@ -39,6 +39,7 @@ import { openReviewDialog } from "./reviewDialogStore";
 import { StashList } from "./components/StashList";
 import { RemoteManager } from "./components/RemoteManager";
 import type { GitFileStatus } from "@/lib/types";
+import { ConfirmDialog } from "@/components/trust";
 
 // Conventional status → glyph + color triad (VSCode-faithful colors).
 function statusGlyph(s: GitFileStatus): { ch: string; color: string; title: string } {
@@ -134,69 +135,17 @@ function DiscardConfirm({
   onCancel: () => void;
   onConfirm: () => void;
 }): JSX.Element {
-  return createPortal(
-    <div
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onCancel();
-      }}
-      style={{
-        position: "fixed",
-        inset: 0,
-        zIndex: 9500,
-        background: "rgba(0,0,0,0.55)",
-        backdropFilter: "blur(4px)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-      }}
-    >
-      <div
-        style={{
-          width: "min(420px, 92vw)",
-          background:
-            "linear-gradient(180deg, rgba(20,16,38,0.96), rgba(12,10,24,0.98))",
-          border: "1px solid rgba(255,255,255,0.08)",
-          borderRadius: 12,
-          padding: 16,
-          display: "flex",
-          flexDirection: "column",
-          gap: 12,
-        }}
-      >
-        <div style={{ fontWeight: 600 }}>Discard local changes?</div>
-        <div
-          style={{
-            fontSize: 12,
-            color: "var(--on-surface-variant)",
-            fontFamily: "var(--font-mono)",
-            wordBreak: "break-all",
-          }}
-        >
-          {path}
-        </div>
-        <div
-          style={{
-            fontSize: 11,
-            color: "var(--warn)",
-          }}
-        >
-          This cannot be undone.
-        </div>
-        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-          <button className="lgb lgb-sm" onClick={onCancel}>
-            Cancel
-          </button>
-          <button
-            className="lgb lgb-sm"
-            style={{ borderColor: "rgba(255,106,138,0.4)", color: "var(--danger)" }}
-            onClick={onConfirm}
-          >
-            Discard
-          </button>
-        </div>
-      </div>
-    </div>,
-    document.body,
+  return (
+    <ConfirmDialog
+      open
+      title="Discard local changes?"
+      body={<><code style={{ overflowWrap: "anywhere" }}>{path}</code><br />This cannot be undone.</>}
+      confirmLabel="Discard"
+      cancelLabel="Cancel"
+      tone="danger"
+      onCancel={onCancel}
+      onConfirm={onConfirm}
+    />
   );
 }
 

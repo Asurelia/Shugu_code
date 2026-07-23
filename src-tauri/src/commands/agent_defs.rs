@@ -31,7 +31,7 @@ use gray_matter::{engine::YAML, Matter};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
-use crate::commands::agents::{runner::seed_prompt, ALLOWED_ROLES};
+use crate::commands::agents::{prompts::seed_prompt, ALLOWED_ROLES};
 
 // ─────────────────────────────────────────────────────────────────────────
 // Types
@@ -202,7 +202,10 @@ fn parse_md_lenient(content: &str, path: &Path, scope: &str) -> Result<AgentDef,
     }
 
     let name = name.ok_or_else(|| {
-        format!("champ `name` manquant dans frontmatter de {}", path.display())
+        format!(
+            "champ `name` manquant dans frontmatter de {}",
+            path.display()
+        )
     })?;
 
     Ok(AgentDef {
@@ -257,8 +260,7 @@ fn claude_agents_dir(app: &AppHandle, scope: &str) -> Result<PathBuf, String> {
             Ok(home.join(".claude").join("agents"))
         }
         "workspace" => {
-            let root =
-                workspace_root(app).ok_or_else(|| "aucun workspace ouvert".to_string())?;
+            let root = workspace_root(app).ok_or_else(|| "aucun workspace ouvert".to_string())?;
             Ok(root.join(".claude").join("agents"))
         }
         other => Err(format!("scope invalide: {other}")),
@@ -275,8 +277,7 @@ fn shugu_agents_alias(app: &AppHandle, scope: &str) -> Result<PathBuf, String> {
             Ok(home.join(".shugu").join("agents"))
         }
         "workspace" => {
-            let root =
-                workspace_root(app).ok_or_else(|| "aucun workspace ouvert".to_string())?;
+            let root = workspace_root(app).ok_or_else(|| "aucun workspace ouvert".to_string())?;
             Ok(root.join(".shugu").join("agents"))
         }
         other => Err(format!("scope invalide: {other}")),
@@ -336,8 +337,7 @@ fn ensure_dirs_and_link(app: &AppHandle, scope: &str) -> Result<(), String> {
 fn seed_builtin_if_missing(app: &AppHandle) -> Result<(), String> {
     let dir = claude_agents_dir(app, "global")?;
     if !dir.exists() {
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("create {}: {e}", dir.display()))?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     }
     for role in ALLOWED_ROLES {
         let path = dir.join(format!("{role}.md"));
@@ -346,8 +346,7 @@ fn seed_builtin_if_missing(app: &AppHandle) -> Result<(), String> {
         }
         let def = builtin_def_for(role, &path);
         let content = serialize_md(&def)?;
-        std::fs::write(&path, content)
-            .map_err(|e| format!("write {}: {e}", path.display()))?;
+        std::fs::write(&path, content).map_err(|e| format!("write {}: {e}", path.display()))?;
     }
     Ok(())
 }
@@ -362,6 +361,8 @@ fn builtin_def_for(role: &str, path: &Path) -> AgentDef {
             "write".into(),
             "edit".into(),
             "bash".into(),
+            "web".into(),
+            "browser".into(),
         ],
         icon: None,
         color: None,
@@ -410,8 +411,8 @@ pub async fn agent_def_list(app: AppHandle, scope: String) -> Result<Vec<AgentDe
         if !dir.exists() {
             continue;
         }
-        let entries = std::fs::read_dir(&dir)
-            .map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
+        let entries =
+            std::fs::read_dir(&dir).map_err(|e| format!("read_dir {}: {e}", dir.display()))?;
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|x| x.to_str()) != Some("md") {
@@ -430,29 +431,59 @@ pub async fn agent_def_list(app: AppHandle, scope: String) -> Result<Vec<AgentDe
     Ok(out)
 }
 
-/// Lit un agent par chemin absolu. Le frontend conserve `path` tel que renvoyé
-/// par `agent_def_list` — pas de re-résolution côté JS.
-#[tauri::command]
-pub async fn agent_def_read(path: String) -> Result<AgentDef, String> {
-    let p = PathBuf::from(&path);
-    let scope = if path_under_home(&p) {
-        "global"
+/// Resolve an agent file to one of the two canonical agent directories. The
+/// parent is canonicalized before comparison, so junctions and `..` cannot turn
+/// an IPC path into an arbitrary file read/write.
+fn resolve_allowed_agent_path(
+    app: &AppHandle,
+    p: &Path,
+    must_exist: bool,
+) -> Result<(PathBuf, &'static str), String> {
+    if p.extension().and_then(|x| x.to_str()) != Some("md") {
+        return Err("refus : extension `.md` requise".into());
+    }
+    let resolved = if must_exist {
+        std::fs::canonicalize(p).map_err(|e| format!("canonicalize {}: {e}", p.display()))?
     } else {
-        "workspace"
+        let parent = p
+            .parent()
+            .ok_or_else(|| "refus : chemin agent sans parent".to_string())?;
+        let parent = std::fs::canonicalize(parent)
+            .map_err(|e| format!("canonicalize {}: {e}", parent.display()))?;
+        let name = p
+            .file_name()
+            .ok_or_else(|| "refus : nom de fichier agent absent".to_string())?;
+        parent.join(name)
     };
-    let content =
-        std::fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
-    parse_md(&content, &p, scope)
+
+    for scope in ["global", "workspace"] {
+        let Ok(dir) = claude_agents_dir(app, scope) else {
+            continue;
+        };
+        let Ok(dir) = std::fs::canonicalize(dir) else {
+            continue;
+        };
+        if resolved.parent() == Some(dir.as_path()) {
+            return Ok((
+                resolved,
+                if scope == "global" {
+                    "global"
+                } else {
+                    "workspace"
+                },
+            ));
+        }
+    }
+    Err("refus : le fichier doit être directement dans un dossier d'agents Shugu autorisé".into())
 }
 
-fn path_under_home(p: &Path) -> bool {
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from);
-    match home {
-        Some(h) => p.starts_with(h),
-        None => false,
-    }
+/// Lit un agent par chemin absolu. Le frontend conserve `path` tel que renvoyé
+/// par `agent_def_list`, mais le backend revalide toujours la racine canonique.
+#[tauri::command]
+pub async fn agent_def_read(app: AppHandle, path: String) -> Result<AgentDef, String> {
+    let (p, scope) = resolve_allowed_agent_path(&app, Path::new(&path), true)?;
+    let content = std::fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
+    parse_md(&content, &p, scope)
 }
 
 /// Écrit/met à jour un agent. Atomique (tmp + rename) pour éviter qu'un crash
@@ -476,6 +507,7 @@ pub async fn agent_def_write(app: AppHandle, def: AgentDef) -> Result<String, St
     } else {
         PathBuf::from(&def.path)
     };
+    let (final_path, _) = resolve_allowed_agent_path(&app, &final_path, false)?;
     let mut def_to_write = def.clone();
     def_to_write.path = final_path.to_string_lossy().into_owned();
     let content = serialize_md(&def_to_write)?;
@@ -486,19 +518,10 @@ pub async fn agent_def_write(app: AppHandle, def: AgentDef) -> Result<String, St
     Ok(final_path.to_string_lossy().into_owned())
 }
 
-/// Supprime un agent. Garde-fou : refuse tout path qui n'est pas dans un
-/// dossier `agents/` (anti-frontend-corrompu).
+/// Supprime un agent après validation canonique de son scope.
 #[tauri::command]
-pub async fn agent_def_delete(path: String) -> Result<(), String> {
-    let p = PathBuf::from(&path);
-    let parent_name = p
-        .parent()
-        .and_then(|x| x.file_name())
-        .and_then(|x| x.to_str())
-        .unwrap_or_default();
-    if parent_name != "agents" {
-        return Err("refus : le path n'est pas dans un dossier `agents/`".into());
-    }
+pub async fn agent_def_delete(app: AppHandle, path: String) -> Result<(), String> {
+    let (p, _) = resolve_allowed_agent_path(&app, Path::new(&path), true)?;
     std::fs::remove_file(&p).map_err(|e| format!("remove {}: {e}", p.display()))
 }
 
@@ -509,27 +532,11 @@ pub async fn agent_def_delete(path: String) -> Result<(), String> {
 // Même garde-chemin que delete (parent dir `agents/`) + check extension `.md`.
 // ─────────────────────────────────────────────────────────────────────────
 
-fn guard_md_in_agents_dir(p: &Path) -> Result<(), String> {
-    let parent_name = p
-        .parent()
-        .and_then(|x| x.file_name())
-        .and_then(|x| x.to_str())
-        .unwrap_or_default();
-    if parent_name != "agents" {
-        return Err("refus : le path n'est pas dans un dossier `agents/`".into());
-    }
-    if p.extension().and_then(|x| x.to_str()) != Some("md") {
-        return Err("refus : extension `.md` requise".into());
-    }
-    Ok(())
-}
-
 /// Lit le contenu BRUT d'un `.md` agent (frontmatter YAML + body markdown) —
 /// pour l'onglet "Source `.md`" qui expose l'édition raw aux devs.
 #[tauri::command]
-pub async fn agent_def_read_raw(path: String) -> Result<String, String> {
-    let p = PathBuf::from(&path);
-    guard_md_in_agents_dir(&p)?;
+pub async fn agent_def_read_raw(app: AppHandle, path: String) -> Result<String, String> {
+    let (p, _) = resolve_allowed_agent_path(&app, Path::new(&path), true)?;
     std::fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display()))
 }
 
@@ -538,9 +545,12 @@ pub async fn agent_def_read_raw(path: String) -> Result<String, String> {
 /// devient invalide après l'édition, `agent_def_list` skippera ce fichier au
 /// prochain refetch (best-effort) jusqu'à ce que le dev corrige.
 #[tauri::command]
-pub async fn agent_def_write_raw(path: String, content: String) -> Result<(), String> {
-    let p = PathBuf::from(&path);
-    guard_md_in_agents_dir(&p)?;
+pub async fn agent_def_write_raw(
+    app: AppHandle,
+    path: String,
+    content: String,
+) -> Result<(), String> {
+    let (p, _) = resolve_allowed_agent_path(&app, Path::new(&path), true)?;
     let tmp = p.with_extension("md.tmp");
     std::fs::write(&tmp, &content).map_err(|e| format!("write tmp: {e}"))?;
     std::fs::rename(&tmp, &p).map_err(|e| format!("rename {}: {e}", p.display()))?;
@@ -550,15 +560,9 @@ pub async fn agent_def_write_raw(path: String, content: String) -> Result<(), St
 /// Charge une définition d'agent depuis un path absolu — helper sync utilisé
 /// par `agent_spawn` quand `agent_def_path` est fourni. Pas `#[tauri::command]`
 /// (pas exposé directement à JS — `agent_def_read` joue ce rôle côté UI).
-pub(crate) fn load_def(path: &str) -> Result<AgentDef, String> {
-    let p = PathBuf::from(path);
-    let scope = if path_under_home(&p) {
-        "global"
-    } else {
-        "workspace"
-    };
-    let content =
-        std::fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
+pub(crate) fn load_def(app: &AppHandle, path: &str) -> Result<AgentDef, String> {
+    let (p, scope) = resolve_allowed_agent_path(app, Path::new(path), true)?;
+    let content = std::fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
     parse_md(&content, &p, scope)
 }
 

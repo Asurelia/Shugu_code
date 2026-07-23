@@ -80,7 +80,10 @@ fn pick_monitor(idx: Option<usize>) -> Result<xcap::Monitor, String> {
 
 /// Capture le moniteur choisi, redimensionne (grand côté ≤ max_edge),
 /// encode en JPEG. Synchrone — à appeler dans spawn_blocking.
-fn capture_and_encode(monitor: Option<usize>, max_edge: u32) -> Result<(Vec<u8>, u32, u32), String> {
+fn capture_and_encode(
+    monitor: Option<usize>,
+    max_edge: u32,
+) -> Result<(Vec<u8>, u32, u32), String> {
     let mon = pick_monitor(monitor)?;
     let rgba = mon
         .capture_image()
@@ -221,7 +224,11 @@ pub(crate) fn capture_for_agent_blocking(
     std::fs::write(&path, &jpeg).map_err(|e| format!("write screenshot: {e}"))?;
 
     let img = image::load_from_memory(&jpeg).map_err(|e| format!("decode for thumb: {e}"))?;
-    let thumb = img.resize(THUMB_EDGE, THUMB_EDGE, image::imageops::FilterType::Triangle);
+    let thumb = img.resize(
+        THUMB_EDGE,
+        THUMB_EDGE,
+        image::imageops::FilterType::Triangle,
+    );
     let thumb_rgb = image::DynamicImage::ImageRgb8(thumb.to_rgb8());
     let mut buf = Vec::new();
     thumb_rgb

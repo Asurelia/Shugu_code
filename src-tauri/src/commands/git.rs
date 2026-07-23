@@ -38,9 +38,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{OnceLock, RwLock};
 
-use git2::{
-    BlameOptions, BranchType, DiffFormat, DiffOptions, Repository, Sort, StatusOptions,
-};
+use git2::{BlameOptions, BranchType, DiffFormat, DiffOptions, Repository, Sort, StatusOptions};
 use serde::{Deserialize, Serialize};
 use tauri::{command, AppHandle, Manager};
 use tokio::io::AsyncWriteExt;
@@ -126,17 +124,12 @@ async fn run_git_cli(root: &Path, args: &[&str]) -> Result<String, String> {
         return Err(format!("git error: {first_lines}"));
     }
 
-    let raw =
-        String::from_utf8(output.stdout).map_err(|e| format!("git stdout utf8: {e}"))?;
+    let raw = String::from_utf8(output.stdout).map_err(|e| format!("git stdout utf8: {e}"))?;
     Ok(raw.replace("\r\n", "\n"))
 }
 
 /// Run `git <args>` piping `stdin_data` into stdin. Returns stdout on success.
-async fn run_git_cli_stdin(
-    root: &Path,
-    args: &[&str],
-    stdin_data: &str,
-) -> Result<String, String> {
+async fn run_git_cli_stdin(root: &Path, args: &[&str], stdin_data: &str) -> Result<String, String> {
     let mut child = TokioCommand::new("git")
         .args(args)
         .current_dir(root)
@@ -181,8 +174,7 @@ async fn run_git_cli_stdin(
         return Err(format!("git error: {first_lines}"));
     }
 
-    let raw =
-        String::from_utf8(output.stdout).map_err(|e| format!("git stdout utf8: {e}"))?;
+    let raw = String::from_utf8(output.stdout).map_err(|e| format!("git stdout utf8: {e}"))?;
     Ok(raw.replace("\r\n", "\n"))
 }
 
@@ -397,8 +389,7 @@ pub async fn git_show_head(app: AppHandle, path: String) -> Result<Option<String
         })?;
 
     if output.status.success() {
-        let raw = String::from_utf8(output.stdout)
-            .map_err(|e| format!("git show utf8: {e}"))?;
+        let raw = String::from_utf8(output.stdout).map_err(|e| format!("git show utf8: {e}"))?;
         let normalized = raw.replace("\r\n", "\n");
         return Ok(Some(normalized));
     }
@@ -444,7 +435,7 @@ fn git_status_inner(root: &Path) -> Result<Vec<GitFileStatus>, String> {
 
     let mut out = Vec::with_capacity(statuses.len());
     for entry in statuses.iter() {
-        let Some(raw_path) = entry.path() else {
+        let Ok(raw_path) = entry.path() else {
             continue;
         };
         let s = entry.status();
@@ -604,7 +595,13 @@ pub async fn git_discard(app: AppHandle, paths: Vec<String>) -> Result<(), Strin
 async fn git_stage_hunk_inner(root: &Path, hunk_patch: &str) -> Result<(), String> {
     run_git_cli_stdin(
         root,
-        &["apply", "--cached", "--unidiff-zero", "--whitespace=nowarn", "-"],
+        &[
+            "apply",
+            "--cached",
+            "--unidiff-zero",
+            "--whitespace=nowarn",
+            "-",
+        ],
         hunk_patch,
     )
     .await?;
@@ -829,8 +826,15 @@ fn git_init_inner(root: &Path) -> Result<(), String> {
     let tree_id = index.write_tree().map_err(libgit2_err)?;
     let tree = repo.find_tree(tree_id).map_err(libgit2_err)?;
     let sig = git2::Signature::now("shugu", "shugu@localhost").map_err(libgit2_err)?;
-    repo.commit(Some("HEAD"), &sig, &sig, "Commit initial (Shugu)", &tree, &[])
-        .map_err(libgit2_err)?;
+    repo.commit(
+        Some("HEAD"),
+        &sig,
+        &sig,
+        "Commit initial (Shugu)",
+        &tree,
+        &[],
+    )
+    .map_err(libgit2_err)?;
     Ok(())
 }
 
@@ -945,11 +949,7 @@ pub async fn git_worktree_add(
 }
 
 #[command]
-pub async fn git_worktree_remove(
-    app: AppHandle,
-    path: String,
-    force: bool,
-) -> Result<(), String> {
+pub async fn git_worktree_remove(app: AppHandle, path: String, force: bool) -> Result<(), String> {
     let root = workspace_root_required(&app)?;
     let mut args: Vec<&str> = vec!["worktree", "remove"];
     if force {
@@ -1012,18 +1012,20 @@ fn git_log_inner(
     let repo = open_repo_at(root)?;
 
     let mut revwalk = repo.revwalk().map_err(libgit2_err)?;
-    revwalk
-        .set_sorting(Sort::TIME)
-        .map_err(libgit2_err)?;
+    revwalk.set_sorting(Sort::TIME).map_err(libgit2_err)?;
 
     match branch {
         Some(b) => {
             // Try local first, then remote.
             let local = repo.find_branch(b, BranchType::Local).ok();
             let target_oid = if let Some(br) = local {
-                br.get().target().ok_or_else(|| "branch has no target".to_string())?
+                br.get()
+                    .target()
+                    .ok_or_else(|| "branch has no target".to_string())?
             } else if let Ok(br) = repo.find_branch(b, BranchType::Remote) {
-                br.get().target().ok_or_else(|| "branch has no target".to_string())?
+                br.get()
+                    .target()
+                    .ok_or_else(|| "branch has no target".to_string())?
             } else if let Ok(r) = repo.revparse_single(b) {
                 r.id()
             } else {
@@ -1047,13 +1049,12 @@ fn git_log_inner(
         }
         let oid = oid_result.map_err(libgit2_err)?;
         let commit = repo.find_commit(oid).map_err(libgit2_err)?;
-        let summary = commit.summary().unwrap_or("").to_string();
+        let summary = commit.summary().ok().flatten().unwrap_or("").to_string();
         let message = commit.message().unwrap_or("").to_string();
         let author = commit.author();
         let oid_str = oid.to_string();
         let short = oid_str.chars().take(7).collect::<String>();
-        let parents: Vec<String> =
-            commit.parent_ids().map(|p| p.to_string()).collect();
+        let parents: Vec<String> = commit.parent_ids().map(|p| p.to_string()).collect();
 
         out.push(GitLogEntry {
             oid: oid_str,
@@ -1093,7 +1094,7 @@ fn git_branches_inner(root: &Path) -> Result<GitBranchList, String> {
 
     if let Ok(head) = repo.head() {
         if head.is_branch() {
-            if let Some(name) = head.shorthand() {
+            if let Ok(name) = head.shorthand() {
                 current = Some(name.to_string());
             }
         }
@@ -1117,19 +1118,15 @@ fn git_branches_inner(root: &Path) -> Result<GitBranchList, String> {
                     .upstream()
                     .ok()
                     .and_then(|u| u.name().ok().flatten().map(|s| s.to_string()));
-                let (ahead, behind) = if let Some(up) = br
-                    .upstream()
-                    .ok()
-                    .and_then(|u| u.get().target())
-                {
-                    let local_oid =
-                        br.get().target().ok_or_else(|| "no target".to_string())?;
-                    repo.graph_ahead_behind(local_oid, up)
-                        .map(|(a, b)| (a as u32, b as u32))
-                        .unwrap_or((0, 0))
-                } else {
-                    (0, 0)
-                };
+                let (ahead, behind) =
+                    if let Some(up) = br.upstream().ok().and_then(|u| u.get().target()) {
+                        let local_oid = br.get().target().ok_or_else(|| "no target".to_string())?;
+                        repo.graph_ahead_behind(local_oid, up)
+                            .map(|(a, b)| (a as u32, b as u32))
+                            .unwrap_or((0, 0))
+                    } else {
+                        (0, 0)
+                    };
                 (upstream_name, ahead, behind)
             }
             BranchType::Remote => (None, 0u32, 0u32),
@@ -1184,8 +1181,7 @@ fn git_blame_inner(root: &Path, path: &str) -> Result<Vec<GitBlameLine>, String>
     // Load the worktree file contents to count lines and detect uncommitted.
     let wd = workdir(&repo)?;
     let full = wd.join(rel_path);
-    let contents = std::fs::read_to_string(&full)
-        .map_err(|e| format!("read file: {e}"))?;
+    let contents = std::fs::read_to_string(&full).map_err(|e| format!("read file: {e}"))?;
     let total_lines: u32 = contents.lines().count().max(1) as u32;
 
     // Apply blame to the buffer to capture uncommitted lines correctly.
@@ -1194,7 +1190,7 @@ fn git_blame_inner(root: &Path, path: &str) -> Result<Vec<GitBlameLine>, String>
         .map_err(libgit2_err)?;
 
     let mut out: Vec<GitBlameLine> = Vec::with_capacity(total_lines as usize);
-    let zero_oid = git2::Oid::zero();
+    let zero_oid = git2::Oid::ZERO_SHA1;
 
     for line_idx in 0..total_lines {
         let line_no = line_idx + 1;
@@ -1222,19 +1218,18 @@ fn git_blame_inner(root: &Path, path: &str) -> Result<Vec<GitBlameLine>, String>
         let oid_str = oid.to_string();
         let short = oid_str.chars().take(7).collect::<String>();
 
-        let (author_name, author_email, timestamp, summary) =
-            match repo.find_commit(oid) {
-                Ok(c) => {
-                    let a = c.author();
-                    (
-                        a.name().unwrap_or("").to_string(),
-                        a.email().unwrap_or("").to_string(),
-                        a.when().seconds(),
-                        c.summary().unwrap_or("").to_string(),
-                    )
-                }
-                Err(_) => (String::new(), String::new(), 0, String::new()),
-            };
+        let (author_name, author_email, timestamp, summary) = match repo.find_commit(oid) {
+            Ok(c) => {
+                let a = c.author();
+                (
+                    a.name().unwrap_or("").to_string(),
+                    a.email().unwrap_or("").to_string(),
+                    a.when().seconds(),
+                    c.summary().ok().flatten().unwrap_or("").to_string(),
+                )
+            }
+            Err(_) => (String::new(), String::new(), 0, String::new()),
+        };
 
         out.push(GitBlameLine {
             line_number: line_no,
@@ -1304,13 +1299,17 @@ fn git_remotes_inner(root: &Path) -> Result<Vec<GitRemote>, String> {
     let repo = open_repo_at(root)?;
     let names = repo.remotes().map_err(libgit2_err)?;
     let mut out: Vec<GitRemote> = Vec::new();
-    for name in names.iter().flatten() {
+    for name in names.iter().filter_map(|name| name.ok().flatten()) {
         let remote = match repo.find_remote(name) {
             Ok(r) => r,
             Err(_) => continue,
         };
         let url = remote.url().unwrap_or("").to_string();
-        let push_url = remote.pushurl().map(|s| s.to_string());
+        let push_url = remote
+            .pushurl()
+            .ok()
+            .flatten()
+            .map(|value| value.to_string());
         let push_url = match push_url {
             Some(p) if p != url => Some(p),
             _ => None,
@@ -1355,7 +1354,8 @@ mod tests {
     }
 
     fn make_temp_repo(suffix: &str) -> PathBuf {
-        let base = std::env::temp_dir().join(format!("shugu_git_test_{suffix}_{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("shugu_git_test_{suffix}_{}", std::process::id()));
         if base.exists() {
             let _ = fs::remove_dir_all(&base);
         }
@@ -1371,10 +1371,8 @@ mod tests {
     /// Dossier temporaire canonicalisé mais SANS `git init` — pour tester
     /// `git_init_inner` sur un dossier vierge (make_temp_repo initialise déjà).
     fn make_temp_dir_plain(suffix: &str) -> PathBuf {
-        let base = std::env::temp_dir().join(format!(
-            "shugu_git_test_{suffix}_{}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("shugu_git_test_{suffix}_{}", std::process::id()));
         if base.exists() {
             let _ = fs::remove_dir_all(&base);
         }
@@ -1473,7 +1471,10 @@ mod tests {
             "l'existant doit être conservé, got: {content}"
         );
         assert_eq!(
-            content.lines().filter(|l| l.trim() == "node_modules/").count(),
+            content
+                .lines()
+                .filter(|l| l.trim() == "node_modules/")
+                .count(),
             1,
             "node_modules/ ne doit PAS être dupliqué, got: {content}"
         );
@@ -1508,7 +1509,11 @@ mod tests {
         let root = make_temp_repo("status_clean");
         commit_file(&root, "a.txt", "alpha\n");
         let result = git_status_inner(&root).unwrap();
-        assert!(result.is_empty(), "expected clean tree, got {:?}", result.iter().map(|s| &s.path).collect::<Vec<_>>());
+        assert!(
+            result.is_empty(),
+            "expected clean tree, got {:?}",
+            result.iter().map(|s| &s.path).collect::<Vec<_>>()
+        );
         cleanup(&root);
     }
 
@@ -1657,7 +1662,10 @@ mod tests {
     fn remotes_lists_added_remote() {
         let root = make_temp_repo("remotes_basic");
         commit_file(&root, "a.txt", "1\n");
-        run_git(&root, &["remote", "add", "origin", "https://example.invalid/r.git"]);
+        run_git(
+            &root,
+            &["remote", "add", "origin", "https://example.invalid/r.git"],
+        );
         let remotes = git_remotes_inner(&root).unwrap();
         assert_eq!(remotes.len(), 1);
         assert_eq!(remotes[0].name, "origin");
@@ -1739,7 +1747,11 @@ mod tests {
             .output()
             .await
             .unwrap();
-        assert!(out.status.success(), "commit stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "commit stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
 
         let entries = git_log_inner(&root, 10, None).unwrap();
         assert_eq!(entries.len(), 1);
@@ -1751,7 +1763,9 @@ mod tests {
     async fn run_git_cli_returns_stdout_normalized() {
         let root = make_temp_repo("cli_basic");
         commit_file(&root, "a.txt", "x\n");
-        let out = run_git_cli(&root, &["log", "-1", "--pretty=%s"]).await.unwrap();
+        let out = run_git_cli(&root, &["log", "-1", "--pretty=%s"])
+            .await
+            .unwrap();
         assert!(out.contains("add a.txt"));
         assert!(!out.contains("\r\n"));
         cleanup(&root);
@@ -1760,7 +1774,9 @@ mod tests {
     #[tokio::test]
     async fn run_git_cli_propagates_error() {
         let root = make_temp_repo("cli_err");
-        let err = run_git_cli(&root, &["nonexistent-subcommand"]).await.unwrap_err();
+        let err = run_git_cli(&root, &["nonexistent-subcommand"])
+            .await
+            .unwrap_err();
         assert!(err.starts_with("git error:"));
         cleanup(&root);
     }
@@ -1771,13 +1787,18 @@ mod tests {
         commit_file(&root, "a.txt", "alpha\n");
         fs::write(root.join("a.txt"), "alpha2\n").unwrap();
 
-        git_stage_inner(&root, &["a.txt".to_string()]).await.unwrap();
+        git_stage_inner(&root, &["a.txt".to_string()])
+            .await
+            .unwrap();
 
         let status = git_status_inner(&root).unwrap();
         assert!(
             status.iter().any(|s| s.path == "a.txt" && s.is_staged),
             "expected a.txt to be staged, got {:?}",
-            status.iter().map(|s| (&s.path, s.is_staged)).collect::<Vec<_>>()
+            status
+                .iter()
+                .map(|s| (&s.path, s.is_staged))
+                .collect::<Vec<_>>()
         );
         cleanup(&root);
     }
@@ -1796,9 +1817,13 @@ mod tests {
         let root = make_temp_repo("inner_unstage");
         commit_file(&root, "a.txt", "alpha\n");
         fs::write(root.join("a.txt"), "alpha2\n").unwrap();
-        git_stage_inner(&root, &["a.txt".to_string()]).await.unwrap();
+        git_stage_inner(&root, &["a.txt".to_string()])
+            .await
+            .unwrap();
 
-        git_unstage_inner(&root, &["a.txt".to_string()]).await.unwrap();
+        git_unstage_inner(&root, &["a.txt".to_string()])
+            .await
+            .unwrap();
 
         let status = git_status_inner(&root).unwrap();
         // After unstage, the modification is still in the worktree but not in the index.
@@ -1822,7 +1847,9 @@ mod tests {
         commit_file(&root, "a.txt", "original\n");
         fs::write(root.join("a.txt"), "modified\n").unwrap();
 
-        git_discard_inner(&root, &["a.txt".to_string()]).await.unwrap();
+        git_discard_inner(&root, &["a.txt".to_string()])
+            .await
+            .unwrap();
 
         let contents = fs::read_to_string(root.join("a.txt")).unwrap();
         assert_eq!(contents.trim_end_matches(['\r', '\n']), "original");
@@ -1881,9 +1908,13 @@ diff --git a/code.txt b/code.txt
     async fn commit_inner_creates_commit_returns_oid() {
         let root = make_temp_repo("commit_inner");
         fs::write(root.join("x.txt"), "x\n").unwrap();
-        git_stage_inner(&root, &["x.txt".to_string()]).await.unwrap();
+        git_stage_inner(&root, &["x.txt".to_string()])
+            .await
+            .unwrap();
 
-        let oid = git_commit_inner(&root, "first commit", false).await.unwrap();
+        let oid = git_commit_inner(&root, "first commit", false)
+            .await
+            .unwrap();
 
         assert_eq!(oid.len(), 40, "expected 40-char OID, got: {oid}");
         let log = git_log_inner(&root, 10, None).unwrap();
@@ -1900,7 +1931,9 @@ diff --git a/code.txt b/code.txt
         let first_oid = git_log_inner(&root, 1, None).unwrap()[0].oid.clone();
 
         fs::write(root.join("b.txt"), "2\n").unwrap();
-        git_stage_inner(&root, &["b.txt".to_string()]).await.unwrap();
+        git_stage_inner(&root, &["b.txt".to_string()])
+            .await
+            .unwrap();
         let amended_oid = git_commit_inner(&root, "amended", true).await.unwrap();
 
         assert_ne!(amended_oid, first_oid);

@@ -75,6 +75,20 @@ fn not_found() -> Response<Cow<'static, [u8]>> {
     )
 }
 
+/// An absent Studio entry point is a normal first-run state, not a failed
+/// network resource. Return a successful placeholder so WebView2 does not emit
+/// a console 404 while the user has not generated a project yet. Missing assets
+/// and rejected paths continue to use [`not_found`].
+fn empty_preview() -> Response<Cow<'static, [u8]>> {
+    respond(
+        200,
+        "text/html; charset=utf-8",
+        Cow::Borrowed(
+            b"<!doctype html><meta charset=utf-8><body style=\"font-family:system-ui;color:#a5a0bf;background:#0d0d18;display:grid;place-items:center;height:100vh;margin:0\">Aucun projet g\xc3\xa9n\xc3\xa9r\xc3\xa9 pour l'instant.</body>" as &[u8],
+        ),
+    )
+}
+
 /// A tiny controller injected into every served HTML page so the Studio can
 /// reach into the cross-origin iframe. Two jobs, both inert until the parent
 /// asks via `postMessage`:
@@ -158,13 +172,14 @@ fn inject_controller(html: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Resolve + read a file under `<workspace>/.shugu-forge/preview/`. Returns a
-/// 404 response when there is no open workspace, the path escapes the base, or
-/// the file is missing.
+/// Resolve + read a file under `<workspace>/.shugu-forge/preview/`. A missing
+/// root `index.html` renders the normal empty Studio state with HTTP 200.
+/// Escapes and genuinely missing assets remain 404.
 pub fn serve(app: &AppHandle, raw_path: &str) -> Response<Cow<'static, [u8]>> {
     // Decode %xx, drop the leading slash.
     let decoded = percent_encoding::percent_decode_str(raw_path).decode_utf8_lossy();
     let rel = decoded.trim_start_matches('/');
+    let is_index_request = rel.is_empty() || rel == "index.html";
 
     // Atelier preview: `__atelier__/<agentId>/<path>` serves from that run's
     // THROWAWAY creation dir under the OS temp dir — the Atelier never writes
@@ -186,6 +201,7 @@ pub fn serve(app: &AppHandle, raw_path: &str) -> Response<Cow<'static, [u8]>> {
         };
         match guard.clone() {
             Some(r) => r,
+            None if is_index_request => return empty_preview(),
             None => return not_found(),
         }
     };
@@ -208,7 +224,11 @@ pub fn serve(app: &AppHandle, raw_path: &str) -> Response<Cow<'static, [u8]>> {
         }
     }
 
-    read_and_respond(&target)
+    if is_index_request && !target.is_file() {
+        empty_preview()
+    } else {
+        read_and_respond(&target)
+    }
 }
 
 /// Serve a file from an Atelier run's throwaway creation dir: `rest` is
@@ -218,7 +238,11 @@ pub fn serve(app: &AppHandle, raw_path: &str) -> Response<Cow<'static, [u8]>> {
 fn serve_atelier(rest: &str) -> Response<Cow<'static, [u8]>> {
     let mut it = rest.splitn(2, '/');
     let agent_id = it.next().unwrap_or("");
-    if agent_id.is_empty() || !agent_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+    if agent_id.is_empty()
+        || !agent_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
         return not_found();
     }
     let sub = it.next().unwrap_or("");
@@ -290,4 +314,28 @@ pub async fn preview_detect_server(ports: Vec<u16>) -> Result<Vec<u16>, String> 
     }
     open.sort_unstable();
     Ok(open)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{empty_preview, inject_controller, not_found};
+
+    #[test]
+    fn empty_studio_entry_is_success_but_missing_assets_remain_not_found() {
+        let empty = empty_preview();
+        assert_eq!(empty.status(), 200);
+        assert!(String::from_utf8_lossy(empty.body()).contains("Aucun projet"));
+
+        let missing = not_found();
+        assert_eq!(missing.status(), 404);
+    }
+
+    #[test]
+    fn controller_is_injected_before_body_close() {
+        let html = inject_controller(b"<!doctype html><body>preview</body>");
+        let rendered = String::from_utf8(html).unwrap();
+        let script = rendered.find("window.__shuguStudio").unwrap();
+        let close = rendered.find("</body>").unwrap();
+        assert!(script < close);
+    }
 }

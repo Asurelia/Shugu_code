@@ -14,7 +14,12 @@ import { resolveProvider } from "@/lib/providers";
 export interface ModelCapabilities {
   tier: "strong" | "small";
   supportsTools: boolean;
+  supportsStreaming: boolean;
   supportsVision: boolean;
+  supportsReasoning: boolean;
+  supportsMcp: boolean;
+  supportsEffort: boolean;
+  agentLoop: "native" | "compatible" | "chatOnly";
   contextWindow: number;
   recommendedToolset: "full" | "reduced";
 }

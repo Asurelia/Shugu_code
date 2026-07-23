@@ -46,7 +46,9 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
+use notify::{
+    Event, EventKind, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher,
+};
 use tauri::{Emitter, Manager};
 
 use super::fs::{build_workspace_gitignore, is_ignored, is_index_ignored};
@@ -133,21 +135,19 @@ fn manager_loop(rx_root: Receiver<PathBuf>, tx_evt: Sender<(ChangeKind, Vec<Path
 
         // Build a new watcher whose callback filters ignored paths and
         // forwards relevant events (with their kind + paths) to the debouncer.
-        let mut watcher = match notify::recommended_watcher(
-            move |res: NotifyResult<Event>| {
-                if let Ok(event) = res {
-                    if should_forward(&event) {
-                        // Best-effort send; if the debouncer thread died, we
-                        // just stop forwarding — don't panic the watcher. We
-                        // forward the FULL path set (the debouncer relativizes +
-                        // re-filters ignored ones per path); `should_forward`
-                        // already guarantees at least one path is relevant.
-                        let kind = classify(&event.kind);
-                        let _ = tx_evt_clone.send((kind, event.paths.clone()));
-                    }
+        let mut watcher = match notify::recommended_watcher(move |res: NotifyResult<Event>| {
+            if let Ok(event) = res {
+                if should_forward(&event) {
+                    // Best-effort send; if the debouncer thread died, we
+                    // just stop forwarding — don't panic the watcher. We
+                    // forward the FULL path set (the debouncer relativizes +
+                    // re-filters ignored ones per path); `should_forward`
+                    // already guarantees at least one path is relevant.
+                    let kind = classify(&event.kind);
+                    let _ = tx_evt_clone.send((kind, event.paths.clone()));
                 }
-            },
-        ) {
+            }
+        }) {
             Ok(w) => w,
             Err(e) => {
                 eprintln!("[watcher] failed to create watcher: {e}");
@@ -206,11 +206,7 @@ fn debouncer_loop(rx_evt: Receiver<(ChangeKind, Vec<PathBuf>)>, app: tauri::AppH
         let wait = match (fs_changed_deadline, reindex_deadline) {
             (None, None) => None, // nothing pending — block until next event
             (a, b) => {
-                let next = [a, b]
-                    .into_iter()
-                    .flatten()
-                    .min()
-                    .unwrap_or(now);
+                let next = [a, b].into_iter().flatten().min().unwrap_or(now);
                 Some(next.saturating_duration_since(now))
             }
         };
@@ -279,8 +275,7 @@ fn flush_reindex(app: &tauri::AppHandle, pending: &mut HashMap<PathBuf, ChangeKi
     }
     // Drain the buffer regardless of outcome so a transient error can't pin
     // stale entries into the next window.
-    let drained: Vec<(ChangeKind, PathBuf)> =
-        pending.drain().map(|(p, k)| (k, p)).collect();
+    let drained: Vec<(ChangeKind, PathBuf)> = pending.drain().map(|(p, k)| (k, p)).collect();
 
     // Resolve the workspace root from managed state. If none is open we can't
     // relativize — drop the batch (the next full index/reopen rebuilds it).
@@ -464,7 +459,11 @@ mod tests {
     use notify::event::{CreateKind, ModifyKind, RemoveKind};
 
     fn make_event(kind: EventKind, paths: Vec<PathBuf>) -> Event {
-        Event { kind, paths, attrs: Default::default() }
+        Event {
+            kind,
+            paths,
+            attrs: Default::default(),
+        }
     }
 
     #[test]
@@ -520,7 +519,10 @@ mod tests {
                 PathBuf::from("/workspace/src/new_file.rs"),
             ],
         );
-        assert!(should_forward(&evt), "mixed events should forward when any path is outside ignored");
+        assert!(
+            should_forward(&evt),
+            "mixed events should forward when any path is outside ignored"
+        );
     }
 
     #[test]
@@ -544,7 +546,9 @@ mod tests {
             ChangeKind::AddedOrModified
         );
         assert_eq!(
-            classify(&EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content))),
+            classify(&EventKind::Modify(ModifyKind::Data(
+                notify::event::DataChange::Content
+            ))),
             ChangeKind::AddedOrModified
         );
         assert_eq!(
@@ -571,10 +575,7 @@ mod tests {
             Some("src/main.rs".to_string())
         );
         // Outside the root → None.
-        assert_eq!(
-            relativize(&root, &PathBuf::from("/elsewhere/x.rs")),
-            None
-        );
+        assert_eq!(relativize(&root, &PathBuf::from("/elsewhere/x.rs")), None);
         // The root itself → None.
         assert_eq!(relativize(&root, &root), None);
     }
@@ -586,7 +587,10 @@ mod tests {
             (ChangeKind::AddedOrModified, PathBuf::from("/ws/src/a.ts")),
             (ChangeKind::Removed, PathBuf::from("/ws/src/b.ts")),
             // ignored dir → dropped
-            (ChangeKind::AddedOrModified, PathBuf::from("/ws/node_modules/x/i.js")),
+            (
+                ChangeKind::AddedOrModified,
+                PathBuf::from("/ws/node_modules/x/i.js"),
+            ),
             // outside root → dropped
             (ChangeKind::AddedOrModified, PathBuf::from("/other/c.ts")),
         ];
@@ -672,8 +676,14 @@ mod tests {
         // `.claude`/`venv` : le reindex les JETTE (ils ne nourrissent jamais
         // vec_code)…
         let events = vec![
-            (ChangeKind::AddedOrModified, PathBuf::from("/ws/.claude/plans/p.md")),
-            (ChangeKind::AddedOrModified, PathBuf::from("/ws/venv/lib/x.py")),
+            (
+                ChangeKind::AddedOrModified,
+                PathBuf::from("/ws/.claude/plans/p.md"),
+            ),
+            (
+                ChangeKind::AddedOrModified,
+                PathBuf::from("/ws/venv/lib/x.py"),
+            ),
             (ChangeKind::AddedOrModified, PathBuf::from("/ws/src/ok.ts")),
         ];
         match plan_reindex(&root, &events, None) {
@@ -705,8 +715,14 @@ mod tests {
 
         let events = vec![
             // Règle RÉPERTOIRE : doit couvrir un événement FICHIER en dessous.
-            (ChangeKind::AddedOrModified, PathBuf::from("/ws/env/lib/site.py")),
-            (ChangeKind::AddedOrModified, PathBuf::from("/ws/src/api.gen.ts")),
+            (
+                ChangeKind::AddedOrModified,
+                PathBuf::from("/ws/env/lib/site.py"),
+            ),
+            (
+                ChangeKind::AddedOrModified,
+                PathBuf::from("/ws/src/api.gen.ts"),
+            ),
             (ChangeKind::AddedOrModified, PathBuf::from("/ws/src/api.ts")),
         ];
         match plan_reindex(&root, &events, Some(&gi)) {

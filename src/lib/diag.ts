@@ -55,7 +55,6 @@ export function diag(category: string, msg: string): void {
   if (!DIAG_ENABLED) return;
   if (DIAG_CATEGORIES && !DIAG_CATEGORIES.has(category)) return;
   const line = `[${category}] ${msg}`;
-  // eslint-disable-next-line no-console
   console.log(line);
   void invoke("js_diag", { category, msg }).catch(() => {
     // Silently ignore — Rust diag is best-effort. Console log still

@@ -1,11 +1,11 @@
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use tauri::{AppHandle, Emitter, State};
-use serde::Serialize;
 
 // Ring-buffer size per PTY for the snapshot/replay system. xterm.js + ANSI
 // escape sequences reconstruct full visual state from a stream of bytes,
@@ -34,17 +34,25 @@ pub struct PtyHandle {
 pub struct PtyRegistry(pub Mutex<HashMap<String, PtyHandle>>);
 
 #[derive(Clone, Serialize)]
-struct TermOutput { data: String }
+struct TermOutput {
+    data: String,
+}
 
 fn resolve_shell(explicit: Option<String>) -> String {
-    if let Some(s) = explicit { return s; }
-    #[cfg(target_os = "windows")] {
+    if let Some(s) = explicit {
+        return s;
+    }
+    #[cfg(target_os = "windows")]
+    {
         for c in ["pwsh.exe", "powershell.exe"] {
-            if which::which(c).is_ok() { return c.to_string(); }
+            if which::which(c).is_ok() {
+                return c.to_string();
+            }
         }
         std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
     }
-    #[cfg(not(target_os = "windows"))] {
+    #[cfg(not(target_os = "windows"))]
+    {
         std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
     }
 }
@@ -53,9 +61,13 @@ fn resolve_cwd(
     explicit: Option<String>,
     workspace_root: &State<'_, Mutex<Option<PathBuf>>>,
 ) -> PathBuf {
-    if let Some(p) = explicit { return PathBuf::from(p); }
+    if let Some(p) = explicit {
+        return PathBuf::from(p);
+    }
     if let Ok(g) = workspace_root.lock() {
-        if let Some(p) = g.as_ref() { return p.clone(); }
+        if let Some(p) = g.as_ref() {
+            return p.clone();
+        }
     }
     if let Ok(h) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
         return PathBuf::from(h);
@@ -131,7 +143,12 @@ pub fn term_spawn(
 
     let pty_system = native_pty_system();
     let pair = pty_system
-        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .map_err(|e| e.to_string())?;
 
     let mut builder = CommandBuilder::new(&shell_path);
@@ -144,7 +161,10 @@ pub fn term_spawn(
     }
     builder.cwd(&cwd_path);
 
-    let child = pair.slave.spawn_command(builder).map_err(|e| e.to_string())?;
+    let child = pair
+        .slave
+        .spawn_command(builder)
+        .map_err(|e| e.to_string())?;
     let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
 
@@ -169,7 +189,9 @@ pub fn term_spawn(
             let mut buf = [0u8; 4096];
             let chan = format!("term://output/{}", tab_id);
             loop {
-                if shutdown.load(Ordering::Relaxed) { break; }
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
@@ -177,7 +199,9 @@ pub fn term_spawn(
                         // listener is attached, the bytes are kept).
                         if let Ok(mut b) = buffer.lock() {
                             let want_room = (b.len() + n).saturating_sub(SNAPSHOT_MAX_BYTES);
-                            for _ in 0..want_room { b.pop_front(); }
+                            for _ in 0..want_room {
+                                b.pop_front();
+                            }
                             b.extend(buf[..n].iter().copied());
                         }
                         let data = String::from_utf8_lossy(&buf[..n]).to_string();
@@ -191,7 +215,16 @@ pub fn term_spawn(
     }
 
     let mut g = registry.0.lock().map_err(|e| e.to_string())?;
-    g.insert(tab_id, PtyHandle { writer, master: pair.master, shutdown, child, buffer });
+    g.insert(
+        tab_id,
+        PtyHandle {
+            writer,
+            master: pair.master,
+            shutdown,
+            child,
+            buffer,
+        },
+    );
     Ok(())
 }
 
@@ -202,8 +235,13 @@ pub fn term_write(
     registry: State<'_, PtyRegistry>,
 ) -> Result<(), String> {
     let mut g = registry.0.lock().map_err(|e| e.to_string())?;
-    let handle = g.get_mut(&tab_id).ok_or_else(|| format!("no pty {}", tab_id))?;
-    handle.writer.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
+    let handle = g
+        .get_mut(&tab_id)
+        .ok_or_else(|| format!("no pty {}", tab_id))?;
+    handle
+        .writer
+        .write_all(data.as_bytes())
+        .map_err(|e| e.to_string())?;
     handle.writer.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -217,16 +255,20 @@ pub fn term_resize(
 ) -> Result<(), String> {
     let g = registry.0.lock().map_err(|e| e.to_string())?;
     let handle = g.get(&tab_id).ok_or_else(|| format!("no pty {}", tab_id))?;
-    handle.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+    handle
+        .master
+        .resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
-pub fn term_kill(
-    tab_id: String,
-    registry: State<'_, PtyRegistry>,
-) -> Result<(), String> {
+pub fn term_kill(tab_id: String, registry: State<'_, PtyRegistry>) -> Result<(), String> {
     let mut g = registry.0.lock().map_err(|e| e.to_string())?;
     if let Some(mut handle) = g.remove(&tab_id) {
         handle.shutdown.store(true, Ordering::Relaxed);
@@ -243,10 +285,7 @@ pub fn term_kill(
 /// scrollback, screen mode. Returns empty string if the tab has no
 /// PTY (or was just freshly spawned with no output yet).
 #[tauri::command]
-pub fn term_snapshot(
-    tab_id: String,
-    registry: State<'_, PtyRegistry>,
-) -> Result<String, String> {
+pub fn term_snapshot(tab_id: String, registry: State<'_, PtyRegistry>) -> Result<String, String> {
     let g = registry.0.lock().map_err(|e| e.to_string())?;
     if let Some(handle) = g.get(&tab_id) {
         let b = handle.buffer.lock().map_err(|e| e.to_string())?;

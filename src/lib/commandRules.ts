@@ -2,10 +2,9 @@
 //
 // Wrappers Tauri + helpers PURS pour le système de règles auto-allow/deny.
 // Le backend classe chaque commande (CommandRisk) et, pour une commande Danger,
-// PRÉFIXE sa sortie par « [RISK: <reason>] <detail> » (non-bloquant — la
-// fluidité prime, cf. policy.rs / tools.rs). Une règle « allow » silencie ce
-// flag pour un motif de commande ; une règle « deny » flagge un motif que le
-// classifieur statique rate. Persistées globalement (table agent_command_rules).
+// PRÉFIXE sa sortie par « [RISK: <reason>] <detail> ». Une règle « allow »
+// silencie ce flag pour un motif simple ; une règle « deny » bloque réellement
+// la commande avant son démarrage. Persistées globalement.
 
 import { invoke } from "@/lib/tauri";
 

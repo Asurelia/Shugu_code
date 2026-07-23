@@ -19,6 +19,7 @@ import {
   detectPlatform,
   modelLabel,
 } from "@/features/profile/profileQueries";
+import { useModalFocusTrap } from "@/lib/modalFocus";
 
 interface AccountDropdownProps {
   open: boolean;
@@ -74,15 +75,7 @@ export function AccountDropdown({ open, onClose, onView }: AccountDropdownProps)
   const [activeModel] = useActiveModel();
   const reduced = useReducedMotion();
   const popRef = useRef<HTMLDivElement | null>(null);
-
-  // Focus the popover on open (a11y) and wire Escape-to-close.
-  useEffect(() => {
-    if (!open) return;
-    popRef.current?.focus();
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
+  useModalFocusTrap({ open, containerRef: popRef, onEscape: onClose });
 
   if (!open) return null;
 
@@ -99,6 +92,7 @@ export function AccountDropdown({ open, onClose, onView }: AccountDropdownProps)
       <div
         className="account-pop"
         role="dialog"
+        aria-modal="true"
         aria-label="Compte et profil"
         tabIndex={-1}
         ref={popRef}

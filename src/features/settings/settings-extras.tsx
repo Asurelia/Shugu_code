@@ -1,12 +1,13 @@
 // Shugu Forge — Interface customization + interactive Shortcuts mapper.
 // Ported from settings-extras.jsx.
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Icon } from "@/components/components";
 import { SettingRow, Switch } from "@/features/code/views-code";
 import { db } from "@/lib/db";
 import { queryClient } from "@/lib/queryClient";
 import { COMMANDS } from "@/lib/commands";
+import { useModalFocusTrap } from "@/lib/modalFocus";
 
 // ─── DEFAULT_SHORTCUTS derived from COMMANDS ──────────────────
 //
@@ -44,22 +45,21 @@ export const DEFAULT_INTERFACE = {
   uiDensity: "comfortable",
   animations: true,
   reducedMotion: false,
-  showTooltips: true,
-  language: "en",
   glassEnabled: true,
-  showLineNumbers: true,
   monoFont: "JetBrains Mono",
-  brandName: "Shugu Forge",
-  greeting: "Ready. Message Space Agent…",
-  emojis: false,
-  railLabels: false,
 };
 
 const LS_SHORTCUTS = "shugu.shortcuts.v1";
-// Exported so the Profile view can read/write the SAME interface blob (the
-// "Default language" field there is a view onto this single source of truth,
-// not a second copy).
 export const LS_INTERFACE = "shugu.interface.v1";
+
+const MONO_STACKS: Record<string, string> = {
+  "JetBrains Mono": "'JetBrains Mono', ui-monospace, monospace",
+  "Fira Code": "'Fira Code', ui-monospace, monospace",
+  "IBM Plex Mono": "'IBM Plex Mono', ui-monospace, monospace",
+  "Cascadia Code": "'Cascadia Code', ui-monospace, monospace",
+  "SF Mono": "'SF Mono', ui-monospace, monospace",
+  "ui-monospace": "ui-monospace, monospace",
+};
 
 /**
  * Settings persistence strategy — localStorage-primary + SQLite mirror.
@@ -107,6 +107,7 @@ export function applyInterfaceVars(s: typeof DEFAULT_INTERFACE) {
   r.style.setProperty("--ui-font-scale", (s.fontScale / 100).toString());
   r.style.setProperty("--ui-density", s.uiDensity);
   r.style.setProperty("--ui-glass", s.glassEnabled ? "1" : "0");
+  r.style.setProperty("--font-mono", MONO_STACKS[s.monoFont] ?? MONO_STACKS["ui-monospace"]);
   if (!s.glassEnabled) r.style.setProperty("--lg-blur", "0px");
   r.dataset.density = s.uiDensity;
   r.dataset.animations = s.animations ? "on" : "off";
@@ -144,6 +145,12 @@ export function ShortcutsSettings() {
   const [recordingId, setRecordingId] = useState<string | null>(null);
   const [recordedKeys, setRecordedKeys] = useState<string[]>([]);
   const [conflict, setConflict] = useState<any>(null);
+  const conflictDialogRef = useRef<HTMLDivElement | null>(null);
+  useModalFocusTrap({
+    open: !!conflict,
+    containerRef: conflictDialogRef,
+    onEscape: () => setConflict(null),
+  });
 
   useEffect(() => saveJSON(LS_SHORTCUTS, map), [map]);
 
@@ -221,6 +228,10 @@ export function ShortcutsSettings() {
     }
   };
 
+  const copyJson = async () => {
+    await navigator.clipboard.writeText(JSON.stringify(map, null, 2));
+  };
+
   const filtered = map.map(g => ({
     ...g,
     items: g.items.filter(it =>
@@ -247,7 +258,7 @@ export function ShortcutsSettings() {
                 onChange={e => setQuery(e.target.value)}
               />
             </div>
-            <button className="lgb"><Icon name="download" size={11}/> Export</button>
+            <button className="lgb" onClick={() => void copyJson()}><Icon name="copy" size={11}/> Copier JSON</button>
             <button className="lgb" onClick={resetAll}>Reset all</button>
           </div>
         </div>
@@ -292,7 +303,7 @@ export function ShortcutsSettings() {
 
       {conflict && (
         <div className="palette-scrim" onClick={() => setConflict(null)}>
-          <div className="palette" style={{width: 420, padding: 0}} onClick={e => e.stopPropagation()}>
+          <div ref={conflictDialogRef} className="palette" role="dialog" aria-modal="true" aria-label="Keyboard shortcut conflict" tabIndex={-1} style={{width: 420, padding: 0}} onClick={e => e.stopPropagation()}>
             <div style={{padding:"14px 16px", borderBottom:"1px solid rgba(255,255,255,0.05)"}}>
               <div style={{fontFamily:"var(--font-display)", fontWeight:700, fontSize:14, color:"var(--warn)"}}>Conflict</div>
               <div style={{fontSize:12, color:"var(--on-surface-variant)", marginTop:4, lineHeight:1.5}}>
@@ -361,22 +372,6 @@ export function InterfaceSettings() {
             <Switch on={s.reducedMotion} onChange={set("reducedMotion")}/>
           </SettingRow>
 
-          <SettingRow label="Tooltips" desc="Affiche les bulles d'aide au survol.">
-            <Switch on={s.showTooltips} onChange={set("showTooltips")}/>
-          </SettingRow>
-
-          <SettingRow label="Rail labels" desc="Texte à côté de chaque icône de la barre d'activité.">
-            <Switch on={s.railLabels} onChange={set("railLabels")}/>
-          </SettingRow>
-
-          <SettingRow label="Line numbers in editor" desc="Visible dans CodeMirror.">
-            <Switch on={s.showLineNumbers} onChange={set("showLineNumbers")}/>
-          </SettingRow>
-
-          <SettingRow label="Use emoji icons" desc="Sur les cartes d'agents et certains badges (sinon fallback monochrome).">
-            <Switch on={s.emojis} onChange={set("emojis")}/>
-          </SettingRow>
-
           <AutoEditorContextRow/>
           <ChatToolsRow
             settingKey="chat.readTools"
@@ -398,18 +393,8 @@ export function InterfaceSettings() {
         </div>
 
         <div className="setting-section">
-          <h3>Affichage & langue</h3>
-          <SettingRow label="Language" desc="Interface display language.">
-            <SegRow value={s.language} onChange={set("language")} options={[
-              { v: "en", l: "EN" },
-              { v: "fr", l: "FR" },
-              { v: "ja", l: "JA" },
-              { v: "es", l: "ES" },
-              { v: "de", l: "DE" },
-            ]}/>
-          </SettingRow>
-
-          <SettingRow label="Monospace font" desc="Pour code, terminal, labels.">
+          <h3>Typographie</h3>
+          <SettingRow label="Police monospace" desc="Appliquée immédiatement au code, au terminal et aux libellés techniques.">
             <select className="lgi lgi-select" value={s.monoFont} onChange={e => set("monoFont")(e.target.value)} style={{width:180}}>
               <option>JetBrains Mono</option>
               <option>Fira Code</option>
@@ -421,43 +406,6 @@ export function InterfaceSettings() {
           </SettingRow>
         </div>
 
-        <div className="setting-section">
-          <h3>Texte & branding</h3>
-          <p className="sub">Personnalise les libellés visibles aux utilisateurs (white-label rapide).</p>
-
-          <div className="conn-field" style={{marginBottom:10}}>
-            <label>Product name</label>
-            <div className="input">
-              <input value={s.brandName} onChange={e => set("brandName")(e.target.value)} placeholder="Shugu Forge"/>
-            </div>
-          </div>
-
-          <div className="conn-field" style={{marginBottom:10}}>
-            <label>Float chat greeting</label>
-            <div className="input">
-              <input value={s.greeting} onChange={e => set("greeting")(e.target.value)} placeholder="Ready. Message Space Agent…"/>
-            </div>
-          </div>
-
-          <div className="conn-field">
-            <label>Empty-state hint</label>
-            <div className="input">
-              <input defaultValue="No conversation yet — say something." placeholder="Affiché quand la conversation est vide"/>
-            </div>
-          </div>
-        </div>
-
-        <div className="setting-section">
-          <h3>Preview</h3>
-          <p className="sub">Un échantillon de l'UI à l'échelle actuelle.</p>
-          <div style={{display:"flex", gap:10, flexWrap:"wrap", padding:14, background:"rgba(7,7,16,0.5)", border:"1px solid rgba(255,255,255,0.04)", borderRadius:12}}>
-            <button className="lgb lgb-primary">{s.brandName}</button>
-            <button className="lgb"><Icon name="sparkle" size={12}/> Action</button>
-            <span className="chip primary">PRO</span>
-            <span className="chip success">connected</span>
-            <KeyCombo keys={["Cmd", "K"]}/>
-          </div>
-        </div>
       </div>
     </div>
   );

@@ -156,9 +156,21 @@ fn path_to_file_uri(path: &std::path::Path) -> String {
     use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
     // Encode tout SAUF : alphanumeric, unreserved (-_.~), et / : (séparateurs).
     const PATH_SET: &AsciiSet = &CONTROLS
-        .add(b' ').add(b'"').add(b'<').add(b'>').add(b'\\').add(b'^')
-        .add(b'`').add(b'{').add(b'|').add(b'}').add(b'?').add(b'#')
-        .add(b'%').add(b'[').add(b']');
+        .add(b' ')
+        .add(b'"')
+        .add(b'<')
+        .add(b'>')
+        .add(b'\\')
+        .add(b'^')
+        .add(b'`')
+        .add(b'{')
+        .add(b'|')
+        .add(b'}')
+        .add(b'?')
+        .add(b'#')
+        .add(b'%')
+        .add(b'[')
+        .add(b']');
 
     // Strip Windows extended-length prefix BEFORE encoding ; sinon le `?`
     // serait percent-encodé en `%3F` et le LSP server reconstruirait un
@@ -316,9 +328,8 @@ async fn read_one_lsp_message(
     }
     let mut payload = vec![0u8; n];
     reader.read_exact(&mut payload).await?;
-    let message = String::from_utf8(payload).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-    })?;
+    let message = String::from_utf8(payload)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     Ok(Some(message))
 }
 
@@ -459,7 +470,9 @@ pub async fn lsp_init(
     // (renvoyé même si la session existe déjà).
     let workspace_root: std::path::PathBuf = {
         let ws_state = app.state::<std::sync::Mutex<Option<std::path::PathBuf>>>();
-        let guard = ws_state.lock().map_err(|e| format!("workspace lock: {e}"))?;
+        let guard = ws_state
+            .lock()
+            .map_err(|e| format!("workspace lock: {e}"))?;
         guard.clone().ok_or("no workspace open")?
     };
     let workspace_uri = path_to_file_uri(&workspace_root);
@@ -533,12 +546,12 @@ pub async fn lsp_shutdown(
     // Tente le graceful shutdown via JSON-RPC. Les ID sont arbitraires
     // mais doivent être uniques dans la session (on n'en a pas envoyé
     // d'autres pour ces ID, donc safe).
-    let _ = session.stdin_tx.send(
-        r#"{"jsonrpc":"2.0","id":9999,"method":"shutdown"}"#.to_string(),
-    );
-    let _ = session.stdin_tx.send(
-        r#"{"jsonrpc":"2.0","method":"exit"}"#.to_string(),
-    );
+    let _ = session
+        .stdin_tx
+        .send(r#"{"jsonrpc":"2.0","id":9999,"method":"shutdown"}"#.to_string());
+    let _ = session
+        .stdin_tx
+        .send(r#"{"jsonrpc":"2.0","method":"exit"}"#.to_string());
     // 500 ms pour laisser le LSP server traiter shutdown+exit et fermer
     // proprement avant le SIGKILL via force_kill(). Si le LSP est bloqué
     // (deadlock JSON-RPC), force_kill garantit qu'on libère le process.

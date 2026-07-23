@@ -13,8 +13,9 @@
 //   • Real <button> elements (no div-onClick).
 //   • `tone="danger"` paints the confirm button red for irreversible/risky ops.
 
-import React, { useEffect, useId, useRef } from "react";
+import React, { useId, useRef } from "react";
 import { createPortal } from "react-dom";
+import { useModalFocusTrap } from "@/lib/modalFocus";
 
 export function ConfirmDialog({
   open,
@@ -42,29 +43,16 @@ export function ConfirmDialog({
   initialFocusRef?: React.RefObject<HTMLElement | null>;
 }) {
   const confirmRef = useRef<HTMLButtonElement | null>(null);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
   const titleId = useId();
   const bodyId = useId();
 
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        onCancel();
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    // Focus le champ éditable fourni (initialFocusRef) sinon le bouton Confirmer.
-    // Focus trappé au début du modal (l'utilisateur atterrit DANS, pas derrière).
-    const t = window.setTimeout(
-      () => (initialFocusRef?.current ?? confirmRef.current)?.focus(),
-      0,
-    );
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      window.clearTimeout(t);
-    };
-  }, [open, onCancel, initialFocusRef]);
+  useModalFocusTrap({
+    open,
+    containerRef: dialogRef,
+    initialFocusRef: initialFocusRef ?? confirmRef,
+    onEscape: onCancel,
+  });
 
   if (!open) return null;
 
@@ -90,11 +78,13 @@ export function ConfirmDialog({
       }}
     >
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
         aria-describedby={body ? bodyId : undefined}
         className={`trust-confirm-modal trust-confirm-${tone}`}
+        tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
         style={{
           width: "min(420px, calc(100vw - 48px))",

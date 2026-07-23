@@ -10,7 +10,6 @@
 
 import type { Generation } from "@/lib/types";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Database = any;
 
 let _dbPromise: Promise<Database> | null = null;
@@ -92,6 +91,7 @@ export interface ProjectRow {
 
 export interface GenerationRow {
   id: string;
+  kind: "image" | "video" | "music";
   prompt: string;
   negative: string | null;
   ratio: string | null;
@@ -174,7 +174,7 @@ export interface MascotMemoryRow {
 
 // ---------------------------------------------------------------------------
 // Shape mappers: UI <-> Row
-// The UI shape used by ChatSidebar/SEED_CONVOS differs from the DDL row.
+// The UI shape used by ChatSidebar differs from the DDL row.
 // ---------------------------------------------------------------------------
 
 export interface ConvoUI {
@@ -235,6 +235,7 @@ export function convoToRow(c: ConvoUI): ConversationRow {
 export function toGenerationRow(g: Generation): GenerationRow {
   return {
     id: String(g.id),
+    kind: g.kind ?? "image",
     prompt: g.prompt,
     negative: g.negative ?? null,
     ratio: g.ratio ?? null,
@@ -674,9 +675,9 @@ const generations = {
     const db = await getDb();
     await db.execute(
       `INSERT OR IGNORE INTO generations
-         (id, prompt, negative, ratio, model, seed, steps, guidance, style, hue, status, result_url, ts)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-      [row.id, row.prompt, row.negative, row.ratio, row.model,
+         (id, kind, prompt, negative, ratio, model, seed, steps, guidance, style, hue, status, result_url, ts)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+      [row.id, row.kind, row.prompt, row.negative, row.ratio, row.model,
        row.seed, row.steps, row.guidance, row.style, row.hue,
        row.status, row.result_url, row.ts]
     );
@@ -692,9 +693,9 @@ const generations = {
     for (const r of rows) {
       await db.execute(
         `INSERT OR REPLACE INTO generations
-           (id, prompt, negative, ratio, model, seed, steps, guidance, style, hue, status, result_url, ts)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-        [r.id, r.prompt, r.negative, r.ratio, r.model,
+           (id, kind, prompt, negative, ratio, model, seed, steps, guidance, style, hue, status, result_url, ts)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+        [r.id, r.kind, r.prompt, r.negative, r.ratio, r.model,
          r.seed, r.steps, r.guidance, r.style, r.hue,
          r.status, r.result_url, r.ts]
       );
@@ -1035,91 +1036,26 @@ export const db = {
 };
 
 // ---------------------------------------------------------------------------
-// seedIfEmpty — bootstrap a fresh Tauri DB with prototype data
-//
-// NOTE: import SEED_CONVOS / SEED_GROUPS from chat-sidebar at call sites
-// (circular-import safe because they are plain data, no hooks).
-// This function is called from ChatSidebar and RootLayout on mount.
-//
-// Children in SEED_CONVOS (e.g. c6.children) are flattened into top-level
-// rows with parent_id set. Re-nesting on read-back is not implemented yet —
-// the sidebar renders them as top-level items when loaded from SQLite.
-// TODO: reconstruct children array from parent_id on read.
+// ensureInitialConversation — a fresh database gets one honest, empty thread.
+// Product/demo transcripts are never inserted into a user's database.
 // ---------------------------------------------------------------------------
 
-export async function seedIfEmpty(): Promise<void> {
+export async function ensureInitialConversation(): Promise<void> {
   const database = await getDb();
-
   const existing: ConversationRow[] = await database.select(
     "SELECT id FROM conversations LIMIT 1"
   );
-  const conversationsAlreadySeeded = existing.length > 0;
-
-  if (!conversationsAlreadySeeded) {
-    // Lazy-import seed data to avoid circular dependency at module level
-    const { SEED_CONVOS } = await import("@/features/chat/chat-sidebar");
-
-    // Flatten conversations (including children with parent_id)
-    const allConvos: ConvoUI[] = [];
-    for (const c of SEED_CONVOS) {
-      allConvos.push(c);
-      if (c.children) {
-        for (const child of c.children) {
-          allConvos.push({ ...child, parent_id: c.id });
-        }
-      }
-    }
-
-    await conversations.upsertMany(allConvos.map(convoToRow));
-    // (Le seed des 18 fausses générations dans `generations` a été retiré —
-    //  la galerie part désormais honnêtement vide.)
-  }
-
-  // ─── Seed messages for the c1 conversation if it has none yet ──────────
-  //
-  // This is conditional on c1's per-conversation emptiness, NOT on the
-  // global messages table being empty (per M4 advisor note #4). Rationale:
-  // a user who has chatted in other conversations might still have an
-  // untouched c1; we want to seed it so the prototype demo content renders
-  // on first open. We do NOT overwrite an existing c1 conversation — if
-  // the user has already written messages there, leave them alone.
-  const c1Exists = await database.select(
-    "SELECT id FROM conversations WHERE id = $1 LIMIT 1",
-    ["c1"]
-  );
-  if (c1Exists.length > 0) {
-    const c1Messages = await database.select(
-      "SELECT id FROM messages WHERE conversation_id = $1 LIMIT 1",
-      ["c1"]
-    );
-    if (c1Messages.length === 0) {
-      const { seedMessages } = await import("@/mocks/seedMessages");
-      // Spread the seed messages over a 60-second window ending now, so
-      // the read-back ORDER BY ts ASC preserves the prototype's narrative
-      // sequence. Original seed used "14:30"/"14:31" string timestamps —
-      // we lose the absolute clock value but keep the relative order.
-      const base = Date.now() - 60_000;
-      const messageRows: MessageRow[] = seedMessages.map((m, i) => ({
-        id: String(m.id),
-        conversation_id: "c1",
-        role: m.role,
-        reasoning: null,
-        agent_id: null,
-        via_agent: 0,
-        text: m.text ?? null,
-        body: m.body ?? null,
-        code_lang: m.code?.lang ?? null,
-        code_text: m.code?.text ?? null,
-        image: m.image ? 1 : 0,
-        ts: base + i * 1000,
-        // V6 columns — all null for seed data (messages start unedited, undeleted)
-        edited_at: null,
-        deleted_at: null,
-        parent_id: null,
-      }));
-      for (const row of messageRows) {
-        await messages.append(row);
-      }
-    }
+  if (existing.length === 0) {
+    await conversations.create({
+      id: "c1",
+      title: "Nouvelle conversation",
+      project_id: null,
+      pinned: 0,
+      archived: 0,
+      unread: 0,
+      env: null,
+      parent_id: null,
+      updated_at: Date.now(),
+    });
   }
 }

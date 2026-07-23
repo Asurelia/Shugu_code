@@ -1,9 +1,10 @@
 // Shugu Forge — Playwright config (quality-gates lane).
 //
-// ── Scope: a WEB SMOKE, not a full Tauri desktop E2E. ────────────────────────
-// Shugu is a Tauri 2 app. Driving the real desktop binary end-to-end requires
-// `tauri-driver` + a WebDriver bridge (tauri-apps/tauri-driver) and a headed
-// WebView2 session — heavy, flaky in CI, and out of scope for a first gate.
+// ── Scope: this file remains the deterministic WEB smoke. ───────────────────
+// The real Tauri 2/WebView2 gate now lives in scripts/native-smoke.ps1 +
+// scripts/native-smoke.mjs and runs with `pnpm native:smoke`. It connects to
+// the actual desktop WebView over CDP, uses an isolated Tauri identifier/SQLite
+// profile, performs two boots for restore, and verifies exact teardown.
 //
 // What this config DOES give us, cheaply and deterministically: it builds the
 // app with Vite (`vite build`) and serves the production bundle with
@@ -17,12 +18,8 @@
 // stubbed/absent in the browser; the smoke spec guards against that by only
 // asserting framework-agnostic boot signals. See e2e/smoke.spec.ts.
 //
-// ── Upgrade path to true Tauri E2E (documented, not implemented here) ────────
-//   1. `cargo install tauri-driver` (and ensure msedgedriver matches WebView2).
-//   2. Build the Tauri debug binary: `pnpm tauri build --debug`.
-//   3. Add a webdriverio/Playwright-CDP harness that launches tauri-driver,
-//      points at the built binary, and drives the real window.
-// That work belongs to a dedicated desktop-E2E lane, not this gate.
+// Keep the two gates separate: this config catches production-bundle boot/CSP
+// regressions cheaply, while `native:smoke` proves Tauri IPC and desktop state.
 
 import { defineConfig, devices } from "@playwright/test";
 
@@ -59,7 +56,7 @@ export default defineConfig({
   // to respond before running specs, and tears the server down afterwards.
   // `reuseExistingServer` lets a developer keep `vite preview` running locally.
   webServer: {
-    command: "npm run build && npm run preview -- --port " + PREVIEW_PORT,
+    command: "pnpm build && pnpm preview -- --port " + PREVIEW_PORT,
     url: BASE_URL,
     timeout: 180_000,
     reuseExistingServer: !process.env.CI,

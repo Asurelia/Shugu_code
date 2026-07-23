@@ -21,10 +21,10 @@
 
 import { useEffect } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { listen } from "@/lib/tauri";
+import { invoke, listen } from "@/lib/tauri";
 import type { AgentEvent } from "@/lib/agents";
 import { chatKeys } from "./keys";
-import { KEY_CHAT_MODE } from "./chat-sync";
+import { EVT_AGENT_ACCESS, KEY_AGENT_ACCESS, KEY_CHAT_MODE } from "./chat-sync";
 
 const EVT_MESSAGES = "chat://messages-changed";
 const EVT_ACTIVE = "chat://active-changed";
@@ -139,6 +139,26 @@ export function useChatEvents(): void {
         unlistens.push(un);
       } catch (err) {
         console.warn("[useChatEvents] chat-mode listen failed:", err);
+      }
+
+      try {
+        const un = await listen<{ profile?: string }>(EVT_AGENT_ACCESS, () => {
+          if (cancelled) return;
+          // Never trust a frontend event as the Full Access authority. Re-read
+          // the in-memory native grant so a forged/reordered event can only
+          // trigger a harmless status refresh.
+          void invoke<boolean>("agent_full_access_status").then((enabled) => {
+            if (cancelled) return;
+            const profile = enabled ? "fullAccess" : "auto";
+            qc.setQueryData(chatKeys.agentAccess(), profile);
+            try { sessionStorage.setItem(KEY_AGENT_ACCESS, profile); } catch { /* quota */ }
+          }).catch((err) => {
+            console.warn("[useChatEvents] agent-access status failed:", err);
+          });
+        });
+        unlistens.push(un);
+      } catch (err) {
+        console.warn("[useChatEvents] agent-access listen failed:", err);
       }
     })();
 

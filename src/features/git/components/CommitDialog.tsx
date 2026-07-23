@@ -13,11 +13,12 @@
 // when the file is expanded so opening the modal stays cheap with 100+
 // staged files.
 
-import { useState, useEffect } from "react";
+import { useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Icon } from "@/components/components";
 import { useGitStatus, useGitDiff } from "@/features/git/queries";
 import { useCommit } from "@/features/git/mutations";
+import { useModalFocusTrap } from "@/lib/modalFocus";
 
 function FileDiffRow({ path }: { path: string }): JSX.Element {
   const [expanded, setExpanded] = useState(false);
@@ -106,16 +107,16 @@ export function CommitDialog({
   const [doAmend, setDoAmend] = useState(amend);
   const { data: status } = useGitStatus();
   const commit = useCommit();
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const messageRef = useRef<HTMLTextAreaElement | null>(null);
+  useModalFocusTrap({
+    open: true,
+    containerRef: dialogRef,
+    initialFocusRef: messageRef,
+    onEscape: commit.isPending ? undefined : onClose,
+  });
 
   const stagedFiles = (status ?? []).filter((s) => s.isStaged);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !commit.isPending) onClose();
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [onClose, commit.isPending]);
 
   const submit = () => {
     const msg = message.trim();
@@ -143,6 +144,11 @@ export function CommitDialog({
       }}
     >
       <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Commit staged changes"
+        tabIndex={-1}
         style={{
           width: "min(720px, 90vw)",
           maxHeight: "85vh",
@@ -174,6 +180,7 @@ export function CommitDialog({
             disabled={commit.isPending}
             className="lgb lgb-sm"
             title="Close"
+            aria-label="Close commit dialog"
             style={{ padding: "4px 8px" }}
           >
             <Icon name="x" size={11} />
@@ -215,6 +222,10 @@ export function CommitDialog({
           }}
         >
           <textarea
+            ref={messageRef}
+            name="commit-message"
+            aria-label="Commit message"
+            autoComplete="off"
             value={message}
             onChange={(e) => setMessage(e.target.value)}
             placeholder="Commit message (first line = summary)"

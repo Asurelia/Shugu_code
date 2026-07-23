@@ -37,7 +37,9 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
+use notify::{
+    Event, EventKind, RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher,
+};
 use tauri::Emitter;
 
 // ---------------------------------------------------------------------------
@@ -90,15 +92,13 @@ fn manager_loop(rx_root: Receiver<PathBuf>, tx_evt: Sender<()>) {
         let tx_evt_clone = tx_evt.clone();
         let git_dir_for_filter = git_dir.clone();
 
-        let mut watcher = match notify::recommended_watcher(
-            move |res: NotifyResult<Event>| {
-                if let Ok(event) = res {
-                    if should_forward(&event, &git_dir_for_filter) {
-                        let _ = tx_evt_clone.send(());
-                    }
+        let mut watcher = match notify::recommended_watcher(move |res: NotifyResult<Event>| {
+            if let Ok(event) = res {
+                if should_forward(&event, &git_dir_for_filter) {
+                    let _ = tx_evt_clone.send(());
                 }
-            },
-        ) {
+            }
+        }) {
             Ok(w) => w,
             Err(e) => {
                 eprintln!("[git-watcher] failed to create watcher: {e}");
@@ -377,10 +377,7 @@ mod tests {
     fn mixed_events_forward_when_any_target() {
         let evt = make_event(
             EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Content)),
-            vec![
-                join(&["objects", "pack", "abc.pack"]),
-                join(&["HEAD"]),
-            ],
+            vec![join(&["objects", "pack", "abc.pack"]), join(&["HEAD"])],
         );
         assert!(should_forward(&evt, &git_dir()));
     }

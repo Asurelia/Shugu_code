@@ -35,6 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tauri::{command, AppHandle, Manager};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
 
 // ---------------------------------------------------------------------------
@@ -54,6 +55,14 @@ pub struct WorktreeEntry {
     pub branch: String,
     /// Base ref this worktree was forked from (branch name or OID).
     pub base: String,
+    /// Synthetic commit containing the user's tracked + untracked local state
+    /// at creation time. Agent-only diffs start after this commit so existing
+    /// work is visible to the model without being attributed to it.
+    #[serde(default)]
+    pub snapshot_base: Option<String>,
+    /// Workspace-relative paths captured in `snapshot_base` (diagnostic/UI).
+    #[serde(default)]
+    pub snapshot_paths: Vec<String>,
     /// Free-form label set by the caller (e.g. the agent / turn name).
     pub label: Option<String>,
     /// Creation time, unix seconds (UTC).
@@ -85,7 +94,7 @@ struct WorktreeModel {
     entries: Vec<WorktreeEntry>,
 }
 
-const MODEL_VERSION: u32 = 1;
+const MODEL_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Workspace / path helpers (local — no dependency on git.rs)
@@ -169,6 +178,46 @@ pub(crate) async fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String>
     Ok(raw.replace("\r\n", "\n"))
 }
 
+async fn run_git_with_input(cwd: &Path, args: &[&str], input: &[u8]) -> Result<String, String> {
+    let mut child = TokioCommand::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "git not found".to_string()
+            } else {
+                format!("git spawn: {e}")
+            }
+        })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(input)
+            .await
+            .map_err(|e| format!("git stdin: {e}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("git wait: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let details = stderr
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .take(6)
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(format!("git error: {details}"));
+    }
+    String::from_utf8(output.stdout)
+        .map(|text| text.replace("\r\n", "\n"))
+        .map_err(|e| format!("git stdout utf8: {e}"))
+}
+
 /// Set of absolute worktree paths currently registered with git (normalized,
 /// forward-slashed). Used to detect orphans.
 async fn git_registered_worktree_paths(root: &Path) -> Result<Vec<String>, String> {
@@ -205,8 +254,8 @@ fn load_model(root: &Path) -> Result<WorktreeModel, String> {
 fn save_model(root: &Path, model: &WorktreeModel) -> Result<(), String> {
     let dir = shugu_dir(root);
     std::fs::create_dir_all(&dir).map_err(|e| format!(".shugu mkdir: {e}"))?;
-    let json =
-        serde_json::to_string_pretty(model).map_err(|e| format!("git-worktrees.json encode: {e}"))?;
+    let json = serde_json::to_string_pretty(model)
+        .map_err(|e| format!("git-worktrees.json encode: {e}"))?;
     let tmp = model_path(root).with_extension("json.tmp");
     std::fs::write(&tmp, json.as_bytes()).map_err(|e| format!("git-worktrees.json write: {e}"))?;
     std::fs::rename(&tmp, model_path(root))
@@ -257,6 +306,64 @@ fn branch_for(id: &str, label: Option<&str>) -> String {
         }
         _ => format!("shugu/wt/{id}"),
     }
+}
+
+/// Project the user's current uncommitted state into a fresh worktree and
+/// freeze it as a synthetic baseline commit. The source checkout is never
+/// staged, stashed or mutated. Tracked changes travel as a binary patch;
+/// untracked (non-ignored) files are copied byte-for-byte.
+async fn apply_local_snapshot(
+    root: &Path,
+    wt_path: &Path,
+) -> Result<(Option<String>, Vec<String>), String> {
+    let tracked_patch = run_git(root, &["diff", "--binary", "HEAD"]).await?;
+    let untracked_raw =
+        run_git(root, &["ls-files", "--others", "--exclude-standard", "-z"]).await?;
+    let untracked: Vec<String> = untracked_raw
+        .split('\0')
+        .map(str::trim)
+        .filter(|path| !path.is_empty() && !path.starts_with(".shugu/"))
+        .map(normalize_path_str)
+        .collect();
+    let mut snapshot_paths = dirty_paths(root).await.unwrap_or_default();
+    snapshot_paths.retain(|path| !path.starts_with(".shugu/"));
+    snapshot_paths.sort();
+    snapshot_paths.dedup();
+
+    if tracked_patch.trim().is_empty() && untracked.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+
+    if !tracked_patch.trim().is_empty() {
+        run_git_with_input(
+            wt_path,
+            &["apply", "--whitespace=nowarn", "--recount", "-"],
+            tracked_patch.as_bytes(),
+        )
+        .await
+        .map_err(|e| format!("apply local tracked snapshot: {e}"))?;
+    }
+
+    for relative in &untracked {
+        let source = root.join(relative);
+        let destination = wt_path.join(relative);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("snapshot mkdir {}: {e}", parent.display()))?;
+        }
+        std::fs::copy(&source, &destination).map_err(|e| {
+            format!(
+                "snapshot copy {} -> {}: {e}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+    }
+
+    let snapshot_base = commit_worktree(wt_path, "shugu snapshot: local uncommitted state")
+        .await?
+        .ok_or_else(|| "local snapshot had paths but produced no commit".to_string())?;
+    Ok((Some(snapshot_base), snapshot_paths))
 }
 
 pub(crate) async fn create_inner(
@@ -316,22 +423,26 @@ pub(crate) async fn create_inner(
     // base commit and checks it out in the new worktree.
     run_git(
         root,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            &branch,
-            &wt_path_str,
-            &base_oid,
-        ],
+        &["worktree", "add", "-b", &branch, &wt_path_str, &base_oid],
     )
     .await?;
+
+    let (snapshot_base, snapshot_paths) = match apply_local_snapshot(root, &wt_path).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let _ = run_git(root, &["worktree", "remove", "--force", &wt_path_str]).await;
+            let _ = run_git(root, &["branch", "-D", &branch]).await;
+            return Err(error);
+        }
+    };
 
     let entry = WorktreeEntry {
         id,
         path: normalize_path(&wt_path),
         branch,
         base: base_oid,
+        snapshot_base,
+        snapshot_paths,
         label: label.map(|s| s.to_string()),
         created_at: now_unix(),
     };
@@ -356,9 +467,7 @@ async fn list_inner(root: &Path) -> Result<Vec<WorktreeStatus>, String> {
         // Compare against the normalized git-registered paths. We also normalize
         // the entry path defensively in case of casing/slash drift.
         let entry_norm = normalize_path_str(&entry.path);
-        let registered_in_git = registered
-            .iter()
-            .any(|p| paths_equal(p, &entry_norm));
+        let registered_in_git = registered.iter().any(|p| paths_equal(p, &entry_norm));
         let is_orphan = !(exists_on_disk && registered_in_git);
         out.push(WorktreeStatus {
             entry,
@@ -551,25 +660,39 @@ pub(crate) async fn commit_worktree(
 /// tree + index). Each porcelain line is `XY <path>` — we take everything after
 /// the first 3 chars and normalize. Rename lines (`R  old -> new`) keep both.
 pub(crate) async fn dirty_paths(root: &Path) -> Result<Vec<String>, String> {
-    let out = run_git(root, &["status", "--porcelain"]).await?;
+    // `-z` disables C-style path quoting and separates records with NUL, so
+    // spaces/Unicode/newlines remain unambiguous. `--untracked-files=all`
+    // records concrete files instead of collapsing a whole directory to
+    // `?? notes/`, which is required for a reproducible overlay manifest.
+    let out = run_git(
+        root,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )
+    .await?;
     let mut paths = Vec::new();
-    for line in out.lines() {
-        if line.len() < 4 {
+    let mut records = out.split('\0').filter(|record| !record.is_empty());
+    while let Some(record) = records.next() {
+        if record.len() < 4 {
             continue;
         }
-        let rest = &line[3..];
-        if let Some((old, new)) = rest.split_once(" -> ") {
-            paths.push(normalize_path_str(old.trim()));
-            paths.push(normalize_path_str(new.trim()));
-        } else {
-            paths.push(normalize_path_str(rest.trim()));
+        let status = &record[..2];
+        paths.push(normalize_path_str(&record[3..]));
+        // In porcelain -z, rename/copy records are `XY new\0old\0` (no arrow).
+        if status.contains('R') || status.contains('C') {
+            if let Some(original) = records.next() {
+                paths.push(normalize_path_str(original));
+            }
         }
     }
     Ok(paths)
 }
 
 /// Paths a branch changed relative to a base ref (`git diff --name-only base..branch`).
-async fn branch_changed_paths(root: &Path, base: &str, branch: &str) -> Result<Vec<String>, String> {
+async fn branch_changed_paths(
+    root: &Path,
+    base: &str,
+    branch: &str,
+) -> Result<Vec<String>, String> {
     let range = format!("{base}..{branch}");
     let out = run_git(root, &["diff", "--name-only", &range]).await?;
     Ok(out
@@ -621,7 +744,9 @@ pub(crate) async fn merge_back(root: &Path, branch: &str) -> Result<MergeOutcome
         let changed = branch_changed_paths(root, &merge_base, branch)
             .await
             .unwrap_or_default();
-        let overlap = dirty.iter().any(|d| changed.iter().any(|c| paths_equal(c, d)));
+        let overlap = dirty
+            .iter()
+            .any(|d| changed.iter().any(|c| paths_equal(c, d)));
         if overlap {
             return Ok(MergeOutcome::DirtyTarget);
         }
@@ -679,8 +804,15 @@ pub(crate) async fn merge_back(root: &Path, branch: &str) -> Result<MergeOutcome
 /// bloat the review diff with unrelated work the user already merged. `target`
 /// is typically the root's current branch name or `HEAD`. Empty string when the
 /// branch adds nothing over the target.
-pub(crate) async fn diff_summary(root: &Path, branch: &str, target: &str) -> Result<String, String> {
-    let range = format!("{target}...{branch}");
+pub(crate) async fn diff_summary(
+    root: &Path,
+    branch: &str,
+    target: &str,
+    snapshot_base: Option<&str>,
+) -> Result<String, String> {
+    let range = snapshot_base
+        .map(|base| format!("{base}..{branch}"))
+        .unwrap_or_else(|| format!("{target}...{branch}"));
     run_git(root, &["diff", "--stat", &range]).await
 }
 
@@ -688,7 +820,9 @@ pub(crate) async fn diff_summary(root: &Path, branch: &str, target: &str) -> Res
 /// user checked out a raw commit / tag). Callers use `None` to (a) surface a
 /// clear "HEAD détachée" reason and (b) fall back to `HEAD` for diffing.
 pub(crate) async fn current_branch(root: &Path) -> Option<String> {
-    let out = run_git(root, &["symbolic-ref", "--short", "HEAD"]).await.ok()?;
+    let out = run_git(root, &["symbolic-ref", "--short", "HEAD"])
+        .await
+        .ok()?;
     let name = out.trim();
     if name.is_empty() {
         None
@@ -798,18 +932,28 @@ pub struct MergeReport {
 pub async fn worktree_merge_back(app: AppHandle, branch: String) -> Result<MergeReport, String> {
     let root = workspace_root_required(&app)?;
     let model = load_model(&root)?;
-    let Some(id) = model.entries.iter().find(|e| e.branch == branch).map(|e| e.id.clone())
+    let Some(id) = model
+        .entries
+        .iter()
+        .find(|e| e.branch == branch)
+        .map(|e| e.id.clone())
     else {
         // Idempotence (revue H1) : la branche n'est plus dans le modèle = déjà
         // mergée+nettoyée (ex. double-clic après un reload qui a réinitialisé le
         // `busy` côté UI). On renvoie un rapport BÉNIN plutôt qu'une erreur.
-        return Ok(MergeReport { outcome: "no-changes".to_string(), commit: None, files: None });
+        return Ok(MergeReport {
+            outcome: "no-changes".to_string(),
+            commit: None,
+            files: None,
+        });
     };
 
     // HEAD détachée → pas de merge possible (raison explicite, cohérent avec
     // l'ancien finalize_isolation).
     if current_branch(&root).await.is_none() {
-        return Err("HEAD détachée sur le dépôt — checkout une branche avant de merger".to_string());
+        return Err(
+            "HEAD détachée sur le dépôt — checkout une branche avant de merger".to_string(),
+        );
     }
 
     // Sérialise les merges concurrents dans l'arbre de l'utilisateur.
@@ -819,18 +963,30 @@ pub async fn worktree_merge_back(app: AppHandle, branch: String) -> Result<Merge
     match merge_back(&root, &branch).await? {
         MergeOutcome::Merged { commit } => {
             let _ = cleanup_inner(&root, Some(&id), true, false).await;
-            Ok(MergeReport { outcome: "merged".to_string(), commit: Some(commit), files: None })
+            Ok(MergeReport {
+                outcome: "merged".to_string(),
+                commit: Some(commit),
+                files: None,
+            })
         }
         MergeOutcome::NoChanges => {
             let _ = cleanup_inner(&root, Some(&id), true, false).await;
-            Ok(MergeReport { outcome: "no-changes".to_string(), commit: None, files: None })
+            Ok(MergeReport {
+                outcome: "no-changes".to_string(),
+                commit: None,
+                files: None,
+            })
         }
-        MergeOutcome::Conflict { files } => {
-            Ok(MergeReport { outcome: "conflict".to_string(), commit: None, files: Some(files) })
-        }
-        MergeOutcome::DirtyTarget => {
-            Ok(MergeReport { outcome: "dirty".to_string(), commit: None, files: None })
-        }
+        MergeOutcome::Conflict { files } => Ok(MergeReport {
+            outcome: "conflict".to_string(),
+            commit: None,
+            files: Some(files),
+        }),
+        MergeOutcome::DirtyTarget => Ok(MergeReport {
+            outcome: "dirty".to_string(),
+            commit: None,
+            files: None,
+        }),
     }
 }
 
@@ -841,11 +997,18 @@ pub async fn worktree_merge_back(app: AppHandle, branch: String) -> Result<Merge
 pub async fn worktree_discard(app: AppHandle, branch: String) -> Result<(), String> {
     let root = workspace_root_required(&app)?;
     let model = load_model(&root)?;
-    let Some(id) = model.entries.iter().find(|e| e.branch == branch).map(|e| e.id.clone()) else {
+    let Some(id) = model
+        .entries
+        .iter()
+        .find(|e| e.branch == branch)
+        .map(|e| e.id.clone())
+    else {
         return Ok(()); // déjà nettoyé
     };
     // cleanup_inner renvoie les ids supprimés ; le frontend n'en a pas besoin.
-    cleanup_inner(&root, Some(&id), true, false).await.map(|_| ())
+    cleanup_inner(&root, Some(&id), true, false)
+        .await
+        .map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -858,10 +1021,8 @@ mod tests {
     use std::process::Command as StdCommand;
 
     fn make_temp_dir(suffix: &str) -> PathBuf {
-        let base = std::env::temp_dir().join(format!(
-            "shugu_wt_test_{suffix}_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("shugu_wt_test_{suffix}_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).expect("create temp dir");
         // Canonicalize for stable comparisons, then strip the Windows
         // extended-length prefix (`\\?\`) — `git worktree add` refuses to
@@ -933,6 +1094,8 @@ mod tests {
                 path: "/tmp/wt".into(),
                 branch: "shugu/wt/id1".into(),
                 base: "deadbeef".into(),
+                snapshot_base: None,
+                snapshot_paths: Vec::new(),
                 label: Some("turn-1".into()),
                 created_at: 1234,
             }],
@@ -984,6 +1147,130 @@ mod tests {
         // Model now empty.
         assert!(list_inner(&root).await.unwrap().is_empty());
 
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn isolated_worktree_starts_from_local_uncommitted_snapshot() {
+        if which_git().is_none() {
+            return;
+        }
+        let root = make_temp_dir("dirty_overlay");
+        init_repo(&root);
+        std::fs::write(root.join("seed.txt"), b"local dirty value").unwrap();
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::write(root.join("notes/draft.txt"), b"untracked draft").unwrap();
+
+        let entry = create_inner(&root, None, Some("overlay"))
+            .await
+            .expect("create with local overlay");
+        let wt = PathBuf::from(&entry.path);
+        assert!(
+            entry.snapshot_base.is_some(),
+            "snapshot commit must be recorded"
+        );
+        assert!(entry.snapshot_paths.iter().any(|path| path == "seed.txt"));
+        assert!(entry
+            .snapshot_paths
+            .iter()
+            .any(|path| path == "notes/draft.txt"));
+        assert_eq!(
+            read_file(&wt, "seed.txt").as_deref(),
+            Some("local dirty value")
+        );
+        assert_eq!(
+            read_file(&wt, "notes/draft.txt").as_deref(),
+            Some("untracked draft")
+        );
+        assert!(
+            run_git(&wt, &["status", "--porcelain"])
+                .await
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "snapshot is a clean baseline for the agent"
+        );
+        assert!(
+            !run_git(&root, &["status", "--porcelain"])
+                .await
+                .unwrap()
+                .trim()
+                .is_empty(),
+            "source checkout must remain dirty and untouched"
+        );
+
+        std::fs::write(wt.join("agent-only.txt"), b"agent").unwrap();
+        commit_worktree(&wt, "agent-only change")
+            .await
+            .expect("commit agent change");
+        let target = current_branch(&root).await.unwrap();
+        let summary = diff_summary(
+            &root,
+            &entry.branch,
+            &target,
+            entry.snapshot_base.as_deref(),
+        )
+        .await
+        .unwrap();
+        assert!(summary.contains("agent-only.txt"), "got {summary:?}");
+        assert!(
+            !summary.contains("seed.txt"),
+            "user change leaked into agent diff: {summary:?}"
+        );
+        assert!(
+            !summary.contains("draft.txt"),
+            "user untracked file leaked into agent diff: {summary:?}"
+        );
+
+        cleanup_inner(&root, Some(&entry.id), true, false)
+            .await
+            .unwrap();
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn dirty_snapshot_merge_waits_for_user_commit_then_lands_agent_delta() {
+        if which_git().is_none() {
+            return;
+        }
+        let root = make_temp_dir("dirty_overlay_merge");
+        init_repo(&root);
+        std::fs::write(root.join("seed.txt"), b"user work").unwrap();
+        std::fs::write(root.join("local.txt"), b"local untracked").unwrap();
+
+        let entry = create_inner(&root, None, Some("overlay-merge"))
+            .await
+            .expect("create with overlay");
+        let wt = PathBuf::from(&entry.path);
+        std::fs::write(wt.join("agent.txt"), b"agent delta").unwrap();
+        commit_worktree(&wt, "agent delta").await.unwrap();
+
+        assert_eq!(
+            merge_back(&root, &entry.branch).await.unwrap(),
+            MergeOutcome::DirtyTarget,
+            "merge must not stage or commit the user's dirty source tree"
+        );
+        assert!(!root.join("agent.txt").exists());
+
+        run(&root, &["add", "-A"]);
+        run(&root, &["commit", "-q", "-m", "user saves local work"]);
+        assert!(matches!(
+            merge_back(&root, &entry.branch).await.unwrap(),
+            MergeOutcome::Merged { .. }
+        ));
+        assert_eq!(read_file(&root, "seed.txt").as_deref(), Some("user work"));
+        assert_eq!(
+            read_file(&root, "local.txt").as_deref(),
+            Some("local untracked")
+        );
+        assert_eq!(
+            read_file(&root, "agent.txt").as_deref(),
+            Some("agent delta")
+        );
+
+        cleanup_inner(&root, Some(&entry.id), true, false)
+            .await
+            .unwrap();
         cleanup(&root);
     }
 
@@ -1042,9 +1329,7 @@ mod tests {
         assert!(!listed[0].exists_on_disk);
 
         // Prune orphans (no id target).
-        let removed = cleanup_inner(&root, None, true, true)
-            .await
-            .expect("prune");
+        let removed = cleanup_inner(&root, None, true, true).await.expect("prune");
         assert_eq!(removed, vec![entry.id]);
         assert!(list_inner(&root).await.unwrap().is_empty());
 
@@ -1143,8 +1428,13 @@ mod tests {
         let wt = PathBuf::from(&entry.path);
 
         // No edits → nothing to commit.
-        let committed = commit_worktree(&wt, "no-op").await.expect("commit_worktree");
-        assert!(committed.is_none(), "expected None for an unchanged worktree");
+        let committed = commit_worktree(&wt, "no-op")
+            .await
+            .expect("commit_worktree");
+        assert!(
+            committed.is_none(),
+            "expected None for an unchanged worktree"
+        );
 
         cleanup(&root);
     }
@@ -1267,9 +1557,14 @@ mod tests {
 
         // Diff against the root's current branch (the target), not the stale base.
         let target = current_branch(&root).await.expect("current_branch");
-        let summary = diff_summary(&root, &entry.branch, &target)
-            .await
-            .expect("diff_summary");
+        let summary = diff_summary(
+            &root,
+            &entry.branch,
+            &target,
+            entry.snapshot_base.as_deref(),
+        )
+        .await
+        .expect("diff_summary");
         assert!(summary.contains("new.txt"), "got summary: {summary:?}");
 
         let _ = cleanup_inner(&root, Some(&entry.id), true, false).await;
@@ -1308,9 +1603,14 @@ mod tests {
         run(&root, &["commit", "-q", "-m", "user advances target"]);
 
         let target = current_branch(&root).await.expect("current_branch");
-        let summary = diff_summary(&root, &entry.branch, &target)
-            .await
-            .expect("diff_summary");
+        let summary = diff_summary(
+            &root,
+            &entry.branch,
+            &target,
+            entry.snapshot_base.as_deref(),
+        )
+        .await
+        .expect("diff_summary");
 
         // The review diff shows the agent's file…
         assert!(

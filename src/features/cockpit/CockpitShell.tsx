@@ -110,7 +110,7 @@ export function CockpitShell({ activeConv }: { activeConv: string }) {
     if (!p) return;
     if (layout.rightPanelOpen && p.isCollapsed()) p.expand(layout.sizes[1]);
     if (!layout.rightPanelOpen && !p.isCollapsed()) p.collapse();
-  }, [layout.rightPanelOpen]);
+  }, [layout.rightPanelOpen, layout.sizes]);
 
   // Drive the imperative collapse/expand of the BOTTOM dock from the store.
   // Same pattern as above: expand with the persisted size.
@@ -119,7 +119,7 @@ export function CockpitShell({ activeConv }: { activeConv: string }) {
     if (!b) return;
     if (layout.bottomDockOpen && b.isCollapsed()) b.expand(layout.bottomDockSize);
     if (!layout.bottomDockOpen && !b.isCollapsed()) b.collapse();
-  }, [layout.bottomDockOpen]);
+  }, [layout.bottomDockOpen, layout.bottomDockSize]);
 
   // Ctrl+` keyboard shortcut: toggle the bottom terminal dock.
   // Uses getLayout() (non-hook) to read live state without stale closure.
@@ -193,7 +193,16 @@ export function CockpitShell({ activeConv }: { activeConv: string }) {
               if (sizes.length === 2 && sizes[1] > 1) setSizes([sizes[0], sizes[1]]);
             }}
           >
-            <Panel id="cockpit-chat" order={1} minSize={chatMinPct} defaultSize={layout.sizes[0]}>
+            <Panel
+              id="cockpit-chat"
+              order={1}
+              minSize={chatMinPct}
+              // A collapsed sibling contributes 0%, so the remaining panel
+              // must start at 100%. Passing the persisted 55% beside 0%
+              // forces react-resizable-panels to normalize the layout and
+              // produces a warning on every fresh native launch.
+              defaultSize={layout.rightPanelOpen ? layout.sizes[0] : 100}
+            >
               {/* position:relative + overflow:hidden is REQUIRED here: ChatView's
                   root `.cx` is `position:absolute; inset:0`, so without a positioned
                   wrapper it fills the whole `.cockpit` instead of this panel — the

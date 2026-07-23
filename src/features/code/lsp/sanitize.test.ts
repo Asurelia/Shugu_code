@@ -18,6 +18,15 @@ describe("sanitizeLspHtml", () => {
     expect(out.toLowerCase()).not.toContain("javascript:");
   });
 
+  it("strips mixed-case executable markup in the structural safety pass", () => {
+    const out = sanitizeLspHtml(
+      '<ScRiPt src="https://evil.invalid/x.js"></ScRiPt><a HREF="  vbscript:alert(1)" OnClick="alert(1)">x</a>',
+    );
+    expect(out.toLowerCase()).not.toContain("script");
+    expect(out.toLowerCase()).not.toContain("vbscript:");
+    expect(out.toLowerCase()).not.toContain("onclick");
+  });
+
   it("keeps legitimate hover markup (code + safe link)", () => {
     const out = sanitizeLspHtml('<pre><code>fn main() {}</code></pre><a href="https://docs.rs">docs</a>');
     expect(out).toContain("fn main()");
