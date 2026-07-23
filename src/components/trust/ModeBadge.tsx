@@ -2,7 +2,7 @@
 //
 // The Ask/Plan/Act pill shown in each agent message's meta row, so the reader
 // can tell at a glance HOW the agent was operating (read-only Plan vs full Act).
-// Internally the modes are chat/plan/agent (chat-sync's ChatMode); the badge
+// Internally the modes are chat/plan/agent/goal (chat-sync's ChatMode); the badge
 // surfaces the Claude-Code Ask/Plan/Act wording and a risk-colored dot.
 //
 // Color encodes the same blast-radius taxonomy as RiskBadge (read=cyan,
@@ -16,7 +16,7 @@ export function ModeBadge({
   mode,
   className = "",
 }: {
-  /** A ChatMode value ("chat" | "plan" | "agent"); anything else falls back to "agent". */
+  /** A ChatMode value; anything else falls back to "agent". */
   mode: string | null | undefined;
   className?: string;
 }) {

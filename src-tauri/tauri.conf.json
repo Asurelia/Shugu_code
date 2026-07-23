@@ -21,7 +21,8 @@
         "decorations": false,
         "transparent": false,
         "resizable": true,
-        "fullscreen": false
+        "fullscreen": false,
+        "focus": false
       },
       {
         "label": "mascot",
@@ -36,6 +37,7 @@
         "shadow": false,
         "resizable": false,
         "focus": false,
+        "focusable": false,
         "visible": true
       }
     ],

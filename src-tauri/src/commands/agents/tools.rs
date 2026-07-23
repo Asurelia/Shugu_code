@@ -1251,7 +1251,7 @@ fn dispatch_inner(
             // "code", peuplée par le workspace indexer). Rend le système vectoriel
             // — jusqu'ici réservé au RAG passif du chat-direct — appelable par
             // l'agent. Dégrade proprement si l'index n'est pas encore construit.
-            match crate::commands::vector::vec_search_internal(app, "code", query, k) {
+            match crate::commands::vector::code_search_internal(app, root, query, k) {
                 Ok(hits) if hits.is_empty() => Ok(
                     "no semantic matches — the code index may not be built yet for this workspace. \
                      Use fs_search (literal/regex) instead, or open the workspace so it gets indexed."

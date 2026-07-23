@@ -20,5 +20,7 @@ describe("agent execution profiles", () => {
   it("maps Agent to the explicitly selected access profile", () => {
     expect(executionProfileForMode("agent", "auto")).toBe("auto");
     expect(executionProfileForMode("agent", "fullAccess")).toBe("fullAccess");
+    expect(executionProfileForMode("goal", "auto")).toBe("auto");
+    expect(executionProfileForMode("goal", "fullAccess")).toBe("fullAccess");
   });
 });

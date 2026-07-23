@@ -118,6 +118,14 @@ pub(crate) mod command_rules;
 /// into the agent's context so past mistakes compound into future improvements.
 mod lessons;
 
+/// Faits de profil explicitement validés par l'utilisateur, injectés comme
+/// données bornées dans les rôles conversationnels (orchestrator/mascot).
+mod profile_memory;
+
+/// Durable user objectives. A Goal owns successive agent runs and remains
+/// resumable across reloads/restarts.
+pub(crate) mod goals;
+
 /// LOT 1 — Task-graph d'orchestration. Logique PURE (aucune I/O) qui transforme
 /// les args de `todo_write` en graphe de tâches dependency-aware : validation
 /// (ids/deps/cycles), prochaine tâche actionnable, accusé utile pour le modèle
@@ -221,6 +229,7 @@ pub struct AgentRow {
     pub isolate: bool,
     pub profile_verified: bool,
     pub isolation_status: String,
+    pub goal_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -284,6 +293,8 @@ pub enum AgentEvent {
         conversation_id: Option<String>,
         execution_profile: policy::ExecutionProfile,
         isolate: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        goal_id: Option<String>,
     },
     Message {
         agent_id: String,
@@ -584,6 +595,13 @@ pub struct SpawnArgs {
     /// (read-only never mutates, so it never isolates). Serializes from the
     /// camelCase `isolate` field.
     pub isolate: Option<bool>,
+    /// Existing durable Goal to resume. `mode="goal"` without this field creates
+    /// a new Goal atomically with the run.
+    pub goal_id: Option<String>,
+    /// User-facing Goal metadata. Kept separate from `task`, which may contain
+    /// injected editor context and is therefore not a good durable objective.
+    pub goal_title: Option<String>,
+    pub goal_objective: Option<String>,
 }
 
 /// Arguments for `agent_continue` — human-in-the-loop resume after the user
@@ -665,6 +683,7 @@ static AGENTS_CONN: OnceLock<Mutex<Connection>> = OnceLock::new();
 struct OrphanRecovery {
     agents: usize,
     interaction_claims: usize,
+    goals_paused: usize,
 }
 
 fn recover_orphans(conn: &Connection, now: i64) -> Result<OrphanRecovery, String> {
@@ -696,11 +715,13 @@ fn recover_orphans(conn: &Connection, now: i64) -> Result<OrphanRecovery, String
             [],
         )
         .map_err(|e| format!("recover interaction claims: {e}"))?;
+    let goals_paused = goals::pause_orphaned_on_conn(&tx, now)?;
     tx.commit()
         .map_err(|e| format!("commit orphan recovery: {e}"))?;
     Ok(OrphanRecovery {
         agents,
         interaction_claims,
+        goals_paused,
     })
 }
 
@@ -758,10 +779,10 @@ pub(crate) fn get_conn(app: &tauri::AppHandle) -> Result<&'static Mutex<Connecti
     // cached so subsequent commands see consistent state.
     let now = now_ms();
     let recovery = recover_orphans(&conn, now)?;
-    if recovery.agents > 0 || recovery.interaction_claims > 0 {
+    if recovery.agents > 0 || recovery.interaction_claims > 0 || recovery.goals_paused > 0 {
         eprintln!(
-            "[agents] recovery: {} orphaned agent(s), {} stale interaction claim(s)",
-            recovery.agents, recovery.interaction_claims
+            "[agents] recovery: {} orphaned agent(s), {} stale interaction claim(s), {} resumable goal(s)",
+            recovery.agents, recovery.interaction_claims, recovery.goals_paused
         );
     }
 
@@ -841,7 +862,9 @@ fn resolve_execution_profile(
             Some(policy::ExecutionProfile::Chat) => policy::ExecutionProfile::Chat,
             _ => policy::ExecutionProfile::Plan,
         }),
-        Some("agent") | None => Ok(requested.unwrap_or(policy::ExecutionProfile::Auto)),
+        Some("agent") | Some("goal") | None => {
+            Ok(requested.unwrap_or(policy::ExecutionProfile::Auto))
+        }
         Some(other) => Err(format!("mode agent invalide: {other}")),
     }
 }
@@ -964,13 +987,19 @@ pub(super) fn persist_and_emit(app: &tauri::AppHandle, event: &AgentEvent) -> Re
     let conn_mutex = get_conn(app)?;
     let payload = serde_json::to_string(event).map_err(|e| format!("event serialize: {e}"))?;
     {
-        let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
-        conn.execute(
+        let mut conn = conn_mutex.lock().map_err(|e| e.to_string())?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("begin agent spawn: {e}"))?;
+        tx.execute(
             "INSERT INTO agent_events (agent_id, ts, kind, payload)
              VALUES (?1, ?2, ?3, ?4)",
             params![event.agent_id(), now_ms(), event.kind_str(), payload],
         )
         .map_err(|e| format!("persist event: {e}"))?;
+        goals::apply_event_on_conn(&tx, event, now_ms())?;
+        tx.commit()
+            .map_err(|e| format!("commit agent event: {e}"))?;
     }
     let emit_result = app.emit(EVENT_CHANNEL, event);
     if cfg!(debug_assertions) {
@@ -1126,16 +1155,51 @@ pub async fn agent_spawn(
         );
     }
 
-    // INSERT the agents row.
+    // INSERT the agent and its durable Goal attachment in one transaction. A
+    // Goal-mode run without goal_id creates a new objective; a continuation
+    // passes the existing id and becomes its new current attempt.
     let created_at = now_ms();
-    {
+    let persist_spawn = (|| -> Result<Option<String>, String> {
         let conn_mutex = get_conn(&app)?;
-        let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
-        conn.execute(
+        let mut conn = conn_mutex.lock().map_err(|e| e.to_string())?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("begin agent spawn transaction: {e}"))?;
+        let goal_requested = args.mode.as_deref() == Some("goal") || args.goal_id.is_some();
+        let attached_goal_id = if goal_requested {
+            let conversation_id = args
+                .conversation_id
+                .as_deref()
+                .ok_or_else(|| "le mode Goal exige une conversation".to_string())?;
+            let workspace_id = runner::get_workspace_root(&app)
+                .as_deref()
+                .map(crate::commands::vector::workspace_id);
+            Some(goals::attach_run_on_conn(
+                &tx,
+                goals::AttachGoal {
+                    existing_goal_id: args.goal_id.as_deref(),
+                    conversation_id,
+                    workspace_id: workspace_id.as_deref(),
+                    title: args.goal_title.as_deref(),
+                    objective: args.goal_objective.as_deref().unwrap_or(&args.task),
+                    role: &args.role,
+                    model: &args.model,
+                    protocol: args.protocol.as_deref(),
+                    base_url: args.base_url.as_deref(),
+                    execution_profile: execution_profile.as_str(),
+                    isolate: isolate_for_task,
+                    agent_id: &agent_id,
+                    now: created_at,
+                },
+            )?)
+        } else {
+            None
+        };
+        tx.execute(
             "INSERT INTO agents
                 (id, role, status, parent_id, model, task, conversation_id, created_at,
-                 execution_profile, isolate, profile_verified, isolation_status)
-             VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10)",
+                 execution_profile, isolate, profile_verified, isolation_status, goal_id)
+             VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11)",
             params![
                 agent_id,
                 args.role,
@@ -1146,18 +1210,24 @@ pub async fn agent_spawn(
                 created_at,
                 execution_profile.as_str(),
                 isolate_for_task,
-                if isolate_for_task { "pending" } else { "none" }
+                if isolate_for_task { "pending" } else { "none" },
+                attached_goal_id,
             ],
         )
-        .map_err(|e| {
-            // Roll back the in-memory handle if the row insert failed —
-            // otherwise the capacity cap leaks one slot.
-            if let Ok(mut g) = state.0.lock() {
-                g.remove(&agent_id);
+        .map_err(|e| format!("insert agents row: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit agent spawn transaction: {e}"))?;
+        Ok(attached_goal_id)
+    })();
+    let attached_goal_id = match persist_spawn {
+        Ok(goal_id) => goal_id,
+        Err(error) => {
+            if let Ok(mut guard) = state.0.lock() {
+                guard.remove(&agent_id);
             }
-            format!("insert agents row: {e}")
-        })?;
-    }
+            return Err(error);
+        }
+    };
 
     // Emit Spawn now that the row exists.
     persist_and_emit(
@@ -1171,6 +1241,7 @@ pub async fn agent_spawn(
             conversation_id: args.conversation_id.clone(),
             execution_profile,
             isolate: isolate_for_task,
+            goal_id: attached_goal_id.clone(),
         },
     )?;
 
@@ -1298,7 +1369,7 @@ pub async fn agent_continue(
 
     // Claim transactionnel : crée aussi la ligne pending pour les anciennes
     // cartes V18 qui ont été émises avant la migration V21.
-    let (stored_kind, source_profile, source_isolate) = {
+    let (stored_kind, source_profile, source_isolate, source_goal_id) = {
         let conn_mutex = get_conn(&app)?;
         let mut conn = conn_mutex.lock().map_err(|e| e.to_string())?;
         let tx = conn
@@ -1331,10 +1402,14 @@ pub async fn agent_continue(
             Option<bool>,
             Option<i64>,
             Option<String>,
+            Option<String>,
         )> = tx
             .query_row(
-                "SELECT kind, source_execution_profile, source_isolate, answered_at, claim_token
-                   FROM agent_interactions WHERE interaction_id=?1",
+                "SELECT i.kind, i.source_execution_profile, i.source_isolate,
+                        i.answered_at, i.claim_token, a.goal_id
+                   FROM agent_interactions i
+                   LEFT JOIN agents a ON a.id=i.source_agent_id
+                  WHERE i.interaction_id=?1",
                 params![interaction_id],
                 |row| {
                     Ok((
@@ -1343,13 +1418,20 @@ pub async fn agent_continue(
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
             .optional()
             .map_err(|e| format!("interaction lookup: {e}"))?;
-        let (stored_kind, source_profile, source_isolate, answered_at, existing_claim) =
-            row.ok_or_else(|| "interaction inconnue ou agent source introuvable".to_string())?;
+        let (
+            stored_kind,
+            source_profile,
+            source_isolate,
+            answered_at,
+            existing_claim,
+            source_goal_id,
+        ) = row.ok_or_else(|| "interaction inconnue ou agent source introuvable".to_string())?;
         if answered_at.is_some() {
             return Err("Cette interaction a déjà été traitée.".to_string());
         }
@@ -1382,6 +1464,7 @@ pub async fn agent_continue(
             stored_kind.unwrap_or_else(|| "ask_user".to_string()),
             source_profile,
             source_isolate.unwrap_or(false),
+            source_goal_id,
         )
     };
 
@@ -1425,6 +1508,9 @@ pub async fn agent_continue(
         advisor_base_url: args.advisor_base_url,
         advisor_api_key: args.advisor_api_key,
         isolate: args.isolate,
+        goal_id: source_goal_id,
+        goal_title: None,
+        goal_objective: None,
     };
     let manager_after_spawn = state.0.clone();
     let spawn = agent_spawn(app.clone(), state, full_access, spawn_args).await;
@@ -1575,6 +1661,7 @@ pub async fn agent_atelier_run(
             conversation_id: None,
             execution_profile: policy::ExecutionProfile::Auto,
             isolate: false,
+            goal_id: None,
         },
     )?;
 
@@ -1720,6 +1807,7 @@ pub async fn agent_grounded_run(
             conversation_id: None,
             execution_profile: policy::ExecutionProfile::Auto,
             isolate: true,
+            goal_id: None,
         },
     )?;
 
@@ -1891,7 +1979,7 @@ pub async fn agent_list_active(app: tauri::AppHandle) -> Result<Vec<AgentRow>, S
         .prepare(
             "SELECT id, role, status, parent_id, model, task, conversation_id,
                     created_at, finished_at, output, error, execution_profile, isolate,
-                    profile_verified, isolation_status
+                    profile_verified, isolation_status, goal_id
                FROM agents
               WHERE status IN ('pending', 'running')
               ORDER BY created_at ASC",
@@ -1920,7 +2008,7 @@ pub async fn agent_get_transcript(
         .query_row(
             "SELECT id, role, status, parent_id, model, task, conversation_id,
                     created_at, finished_at, output, error, execution_profile, isolate,
-                    profile_verified, isolation_status
+                    profile_verified, isolation_status, goal_id
                FROM agents
               WHERE id = ?1",
             params![agent_id],
@@ -1968,7 +2056,7 @@ pub async fn agent_list_by_conversation(
         .prepare(
             "SELECT id, role, status, parent_id, model, task, conversation_id,
                     created_at, finished_at, output, error, execution_profile, isolate,
-                    profile_verified, isolation_status
+                    profile_verified, isolation_status, goal_id
                FROM agents
               WHERE conversation_id = ?1
               ORDER BY created_at ASC",
@@ -2004,6 +2092,7 @@ fn row_to_agent(r: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRow> {
         isolate: r.get(12)?,
         profile_verified: r.get(13)?,
         isolation_status: r.get(14)?,
+        goal_id: r.get(15)?,
     })
 }
 
@@ -2118,6 +2207,7 @@ mod profile_tests {
             OrphanRecovery {
                 agents: 1,
                 interaction_claims: 1,
+                goals_paused: 0,
             }
         );
         let agent: (String, i64, String) = conn

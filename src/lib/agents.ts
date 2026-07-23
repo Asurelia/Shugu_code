@@ -80,6 +80,8 @@ export interface AgentRow {
     | "finalized"
     | "discarded"
     | "unknown";
+  /** Durable high-level objective this run belongs to, when launched in Goal mode. */
+  goalId?: string | null;
 }
 
 export interface AgentEventRow {
@@ -116,6 +118,7 @@ export type AgentEvent =
       /** Optional for transcripts created before schema V20. */
       executionProfile?: ExecutionProfile;
       isolate?: boolean;
+      goalId?: string;
     }
   | {
       kind: "message";
@@ -324,7 +327,7 @@ export interface SpawnArgs {
    *  (le runner retire fs_write_file/fs_edit/run_command du manifest et refuse
    *  toute mutation). `"agent"` (ou absent) ⇒ exécution directe complète.
    *  Sérialise vers le champ Rust `mode` (SpawnArgs). */
-  mode?: "chat" | "plan" | "agent" | (string & {});
+  mode?: "chat" | "plan" | "agent" | "goal" | (string & {});
   executionProfile?: ExecutionProfile;
   /** Modèle CONSEILLER distinct pour l'outil `advisor` in-loop (v2). Résolu
    *  côté appelant depuis `routing.advisorModel` (provider compris). Quand
@@ -345,6 +348,10 @@ export interface SpawnArgs {
    *  Ignored in Plan mode (read-only never mutates). Serializes to the Rust
    *  `isolate` field (SpawnArgs). */
   isolate?: boolean;
+  /** Existing Goal to resume, or omitted to create one when mode="goal". */
+  goalId?: string;
+  goalTitle?: string;
+  goalObjective?: string;
 }
 
 /** Spawn an agent. Returns the freshly minted agent id (UUID v4 string).

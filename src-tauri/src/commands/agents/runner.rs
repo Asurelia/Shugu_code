@@ -271,11 +271,24 @@ fn load_conversation_history(
 /// render them as a compact, role-prefixed block. Returns `(block, count)` —
 /// `("", 0)` when nothing relevant (empty index, all hits too far, or any
 /// error). Never panics, never blocks.
-fn recall_block(app: &AppHandle, task: &str) -> (String, usize) {
+fn recall_block(
+    app: &AppHandle,
+    task: &str,
+    workspace_id: Option<&str>,
+    conversation_id: Option<&str>,
+    role: &str,
+) -> (String, usize) {
     if task.trim().is_empty() {
         return (String::new(), 0);
     }
-    let hits = match crate::commands::vector::memory_recall(app, task, RECALL_TOP_K) {
+    let hits = match crate::commands::vector::memory_recall(
+        app,
+        task,
+        RECALL_TOP_K,
+        workspace_id,
+        conversation_id,
+        Some(role),
+    ) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("[memory] recall failed, skipping injection: {e}");
@@ -315,6 +328,7 @@ fn remember_run(
     app: &AppHandle,
     role: &str,
     conversation_id: Option<&str>,
+    workspace_id: Option<&str>,
     task: &str,
     output: &str,
 ) {
@@ -332,9 +346,14 @@ fn remember_run(
         let out_snip: String = out.chars().take(1600).collect();
         format!("Tâche : {task_snip}\nRésultat : {out_snip}")
     };
-    if let Err(e) =
-        crate::commands::vector::memory_remember(app, "fact", role, conversation_id, &text)
-    {
+    if let Err(e) = crate::commands::vector::memory_remember(
+        app,
+        "fact",
+        role,
+        conversation_id,
+        workspace_id,
+        &text,
+    ) {
         eprintln!("[memory] remember failed (non-fatal): {e}");
     }
 }
@@ -381,6 +400,25 @@ fn transcript_excerpt(turns: &[AgentMessage]) -> String {
         }
     }
     s
+}
+
+/// Some tool failures cannot be repaired by another model turn. In particular,
+/// Auto execution is fail-closed when the native sandbox cannot arm. Feeding
+/// that same result back to the model only makes it retry equivalent shell
+/// commands and burns the user's iteration/token budget. Surface the required
+/// user action immediately while preserving every ToolResult event emitted by
+/// the caller.
+fn hard_execution_blocker(results: &[ToolResult]) -> Option<String> {
+    results
+        .iter()
+        .find(|result| result.is_error && result.content.contains("sandbox Auto indisponible ("))
+        .map(|_| {
+            "Le sandbox Auto ne peut pas s'armer pour ce workspace. Aucune commande n'a été \
+             exécutée directement. Active Full Access une seule fois pour cette session, puis \
+             reprends le Goal ; les commandes suivantes ne demanderont pas de confirmation \
+             individuelle."
+                .to_string()
+        })
 }
 
 /// Estimation pessimiste du coût en tokens d'UN message (cf. `CHARS_PER_TOKEN`).
@@ -630,6 +668,7 @@ async fn maybe_compact<F, Fut>(
     agent_id: &str,
     role: &str,
     conversation_id: Option<&str>,
+    workspace_id: Option<&str>,
     window: usize,
     summarise: F,
 ) -> bool
@@ -664,9 +703,14 @@ where
     };
 
     // Persist the episode to memory so it's recallable in FUTURE runs too.
-    if let Err(e) =
-        crate::commands::vector::memory_remember(app, "episode", role, conversation_id, &summary)
-    {
+    if let Err(e) = crate::commands::vector::memory_remember(
+        app,
+        "episode",
+        role,
+        conversation_id,
+        workspace_id,
+        &summary,
+    ) {
         eprintln!("[memory] compaction episode write failed (non-fatal): {e}");
     }
 
@@ -1327,6 +1371,12 @@ pub(super) async fn run_agent_task(
     // body (`tool_use_loop`) calls the LLM, executes tools, appends to
     // history, repeats. The abort branch wins if the user kills the
     // agent mid-flight.
+    let memory_workspace_root = workspace_override
+        .clone()
+        .or_else(|| get_workspace_root(&app));
+    let memory_workspace_id = memory_workspace_root
+        .as_deref()
+        .map(crate::commands::vector::workspace_id);
     let mut loop_metrics = LoopMetrics::default();
     let loop_result = tokio::select! {
         r = tool_use_loop(
@@ -1341,7 +1391,7 @@ pub(super) async fn run_agent_task(
             &role,
             &mut history,
             &mut loop_metrics,
-            workspace_override,
+            workspace_override.clone(),
             execution_profile,
             advisor.as_ref(),
             conversation_id.as_deref(),
@@ -1433,6 +1483,7 @@ pub(super) async fn run_agent_task(
                 &app,
                 &role,
                 conversation_id.as_deref(),
+                memory_workspace_id.as_deref(),
                 &remember_task,
                 &output,
             );
@@ -1761,6 +1812,7 @@ pub(super) async fn run_delegated_child(
             conversation_id: None,
             execution_profile,
             isolate: false,
+            goal_id: None,
         },
     );
 
@@ -2018,6 +2070,12 @@ pub(super) async fn tool_use_loop(
     definition_tools: Option<&[String]>,
 ) -> Result<(String, String), String> {
     let read_only = execution_profile.is_read_only();
+    let memory_workspace_root = workspace_override
+        .clone()
+        .or_else(|| get_workspace_root(app));
+    let memory_workspace_id = memory_workspace_root
+        .as_deref()
+        .map(crate::commands::vector::workspace_id);
     // Stall-detection state: repeated identical tool-call signatures and
     // consecutive tool-error rounds are the two cheap "stuck" signals, recorded
     // as telemetry on `metrics.stuck_reason`; budget exhaustion is handled in the
@@ -2032,11 +2090,25 @@ pub(super) async fn tool_use_loop(
     let budget = MAX_ITERATIONS;
     let mut iteration: u32 = 0;
 
+    // Capture the actual request before inserting any learned system blocks.
+    // Relevance selection, lessons, memory recall and completion evidence must
+    // all be anchored to the same user task.
+    let task_text: String = history
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            AgentMessage::Text { role: r, content } if r.as_str() == "user" => {
+                Some(content.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_default();
+
     // Load this role's learned skills (Voyager/Hermes) into context, right after
     // the system prompt — so the agent applies what it has already figured out
     // instead of re-deriving it. No-op when the role has no skills yet. This is
     // the reuse half of skill-learning; `skill_save` is the capture half.
-    let skills_block = super::skills::skills_prompt_block(app, role);
+    let skills_block = super::skills::skills_prompt_block(app, role, &task_text);
     if !skills_block.is_empty() {
         let pos = history.len().min(1);
         history.insert(
@@ -2048,20 +2120,26 @@ pub(super) async fn tool_use_loop(
         );
     }
 
+    // User-controlled companion memory. Unlike automatic episodic recall,
+    // these are explicit validated profile facts from Settings. Keep them in a
+    // dedicated bounded system block so the mascot/orchestrator can actually
+    // use what the user chose to teach Shugu.
+    let profile_memory_block = super::profile_memory::profile_memory_prompt_block(app, role);
+    if !profile_memory_block.is_empty() {
+        let pos = history.len().min(1);
+        history.insert(
+            pos,
+            AgentMessage::Text {
+                role: "system".to_string(),
+                content: profile_memory_block,
+            },
+        );
+    }
+
     // S3 — Closed-loop lesson injection: retrieve validated past-run reviews
     // for tasks semantically similar to this one and prepend them to context.
     // Injected AFTER skills (position 2) so both blocks ride behind the system
     // prompt without displacing each other. Degrades silently on any error.
-    let task_text: String = history
-        .iter()
-        .rev()
-        .find_map(|m| match m {
-            AgentMessage::Text { role: r, content } if r.as_str() == "user" => {
-                Some(content.clone())
-            }
-            _ => None,
-        })
-        .unwrap_or_default();
     let (lessons_block, lessons_count) =
         super::lessons::lessons_prompt_block(app, role, &task_text);
     if !lessons_block.is_empty() {
@@ -2091,7 +2169,13 @@ pub(super) async fn tool_use_loop(
     // skills/lessons (a system message AFTER the user turn is rejected by
     // Anthropic). This is the half that makes long-session knowledge resurface
     // instead of evaporating; `remember_run` + compaction are the write halves.
-    let (recall_block_text, recall_count) = recall_block(app, &task_text);
+    let (recall_block_text, recall_count) = recall_block(
+        app,
+        &task_text,
+        memory_workspace_id.as_deref(),
+        conversation_id,
+        role,
+    );
     if !recall_block_text.is_empty() {
         let pos = history.len().min(1);
         history.insert(
@@ -2400,6 +2484,7 @@ pub(super) async fn tool_use_loop(
             agent_id,
             role,
             conversation_id,
+            memory_workspace_id.as_deref(),
             context_window,
             |excerpt| {
                 summarise_turns(
@@ -3003,6 +3088,15 @@ pub(super) async fn tool_use_loop(
         // Failed writes do not create a verification debt; a non-zero command
         // is feedback, not a green check (parsed by lifecycle.rs).
         run_evidence.observe_round(&turn.tool_calls, &results);
+
+        // Infrastructure/authority blockers are not model-repairable. Tool
+        // events are already persisted above, so stopping here keeps the audit
+        // trail complete while preventing an expensive retry loop.
+        if let Some(message) = hard_execution_blocker(&results) {
+            metrics.tool_errors += results.iter().filter(|r| r.is_error).count() as u32;
+            metrics.stuck_reason = Some("sandbox_unavailable".to_string());
+            return Err(message);
+        }
 
         // Human-in-the-loop par FIN DE TOUR : `ask_user` / `submit_plan` ont émis
         // leur event au dispatch et renvoyé le sentinel. On termine le tour
@@ -4336,6 +4430,27 @@ mod tests {
             !matches!(h[cut - 1], AgentMessage::AssistantWithTools { .. }),
             "folded slab must not end on a dangling tool_call"
         );
+    }
+
+    #[test]
+    fn sandbox_unavailable_is_a_hard_execution_blocker() {
+        let results = vec![tr(
+            "run-1",
+            "run_command",
+            true,
+            "sandbox Auto indisponible (sandboxSetupFailed) : commande non exécutée",
+        )];
+
+        let message = hard_execution_blocker(&results).expect("hard blocker");
+        assert!(message.contains("Full Access"));
+        assert!(message.contains("une seule fois"));
+    }
+
+    #[test]
+    fn ordinary_tool_error_remains_repairable_by_the_model() {
+        let results = vec![tr("read-1", "fs_read_file", true, "file not found")];
+
+        assert_eq!(hard_execution_blocker(&results), None);
     }
 
     #[test]

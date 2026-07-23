@@ -27,6 +27,7 @@ import { agentKeys } from "./keys";
 import { fireMoodReaction } from "@/features/mascot/moodReactionStore";
 import { sayMascot, truncateSpeech } from "@/features/mascot/speechStore";
 import { pushToast } from "@/components/toast";
+import { goalKeys } from "@/features/goals/queries";
 
 export function useAgentEvents(): void {
   const qc = useQueryClient();
@@ -95,6 +96,7 @@ export function useAgentEvents(): void {
                     isolate: event.isolate ?? false,
                     profileVerified: true,
                     isolationStatus: event.isolate ? "pending" : "none",
+                    goalId: event.goalId ?? null,
                   };
                   return { agent: agentRow, events: [event] };
                 }
@@ -114,6 +116,7 @@ export function useAgentEvents(): void {
                   isolate: false,
                   profileVerified: false,
                   isolationStatus: "unknown",
+                  goalId: null,
                 };
                 return { agent: minimalAgent, events: [event] };
               }
@@ -231,6 +234,18 @@ export function useAgentEvents(): void {
               `Je me suis arrêté avant de modifier tes fichiers (${truncateSpeech(event.reason, 50)}).`,
               { tone: "error", ttlMs: 6000, agentId: event.agentId },
             );
+          }
+
+          // Goal rows transition from the same durable agent events. Invalidate
+          // only on states that can change the compact Goal card.
+          if (
+            event.kind === "spawn"
+            || event.kind === "questionAsked"
+            || event.kind === "planSubmitted"
+            || event.kind === "complete"
+            || event.kind === "error"
+          ) {
+            void qc.invalidateQueries({ queryKey: goalKeys.all });
           }
         });
         diag("agent-events", `LISTEN ATTACHED cancelled=${cancelled}`);

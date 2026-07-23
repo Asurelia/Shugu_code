@@ -148,7 +148,9 @@ export function StudioView() {
       setGateError(
         orch.kind === "no-orchestrator"
           ? "Aucun orchestrator configuré. Va dans Settings → Connections (section Routing)."
-          : `Le provider orchestrator « ${orch.providerId} » n'est pas activé (Settings → Connections).`,
+          : orch.kind === "disabled"
+            ? `Le provider orchestrator « ${orch.providerId} » n'est pas activé (Settings → Connections).`
+            : `Le provider orchestrator « ${orch.providerId} » est inutilisable : ${orch.reason}.`,
       );
       return null;
     }

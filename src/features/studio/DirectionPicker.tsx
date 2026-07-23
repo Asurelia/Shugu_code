@@ -45,7 +45,9 @@ export function DirectionPicker({
       setNote(
         orch.kind === "no-orchestrator"
           ? "Aucun orchestrator configuré (Settings → Connections → Routing) — directions curatées affichées."
-          : `Provider « ${orch.providerId} » désactivé — directions curatées affichées.`,
+          : orch.kind === "disabled"
+            ? `Provider « ${orch.providerId} » désactivé — directions curatées affichées.`
+            : `Provider « ${orch.providerId} » inutilisable (${orch.reason}) — directions curatées affichées.`,
       );
       return;
     }

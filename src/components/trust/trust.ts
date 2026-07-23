@@ -12,8 +12,8 @@
 //   write → warn (amber)      — edits files on disk
 //   exec  → danger (red)      — runs real commands with your toolchain
 //
-// These map onto the three chat MODES too (see modeToRisk): Chat/Ask = read,
-// Plan = read, Agent/Act = exec. The badge color is therefore a truthful,
+// These map onto the chat MODES too (see modeToRisk): Chat/Ask = read,
+// Plan = read, Agent/Act and Goal = exec. The badge color is therefore a truthful,
 // at-a-glance signal of blast radius.
 
 /** Capability tiers, ordered by blast radius (ascending). */
@@ -68,7 +68,7 @@ export const RISK: Record<RiskLevel, RiskMeta> = {
 /** The three chat modes, kept in sync with chat-sync's ChatMode union. We don't
  *  import the type here to avoid a feature→component dependency cycle; the values
  *  are validated against ChatMode at the call sites in views-chat / ModeSelector. */
-export type TrustMode = "chat" | "plan" | "agent";
+export type TrustMode = "chat" | "plan" | "agent" | "goal";
 
 export interface ModeMeta {
   id: TrustMode;
@@ -87,12 +87,15 @@ export const MODE_META: Record<TrustMode, ModeMeta> = {
   chat:  { id: "chat",  badge: "Ask",  label: "Chat", risk: "read" },
   plan:  { id: "plan",  badge: "Plan", label: "Plan", risk: "read" },
   agent: { id: "agent", badge: "Act",  label: "Agent", risk: "exec" },
+  goal:  { id: "goal",  badge: "Goal", label: "Goal", risk: "exec" },
 };
 
 /** Coerce an arbitrary string (e.g. from localStorage or a Rust row) to a known
  *  mode, defaulting to "agent" — the same default chat-sync uses. */
 export function toTrustMode(raw: string | null | undefined): TrustMode {
-  return raw === "chat" || raw === "plan" || raw === "agent" ? raw : "agent";
+  return raw === "chat" || raw === "plan" || raw === "agent" || raw === "goal"
+    ? raw
+    : "agent";
 }
 
 /** Map a chat mode to its risk tier. */

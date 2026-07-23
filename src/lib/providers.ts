@@ -77,7 +77,10 @@ export function resolveProvider(modelId: string): {
   const entry  = PROVIDER_REGISTRY[prefix];
 
   if (!entry) {
-    if (!_warnedPrefixes.has(prefix)) {
+    // `custom-<timestamp>` is the normal id shape created by Connections.
+    // It is resolved from SQLite immediately afterwards, so warning for it
+    // only makes a healthy configured provider look broken in diagnostics.
+    if (!prefix.startsWith("custom-") && !_warnedPrefixes.has(prefix)) {
       console.warn("[providers] unknown prefix in model id", { prefix, modelId });
       _warnedPrefixes.add(prefix);
     }

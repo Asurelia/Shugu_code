@@ -1,4 +1,4 @@
-// Shugu Forge — Mode selector (Chat / Plan / Agent).
+// Shugu Forge — Mode selector (Chat / Plan / Agent / Goal).
 //
 // Remplace l'ancienne pastille décorative « Accès complet » du composer. C'est
 // un VRAI sélecteur de mode :
@@ -37,6 +37,7 @@ const MODES: ModeDef[] = [
   { id: "chat", icon: "chat", label: "Chat", desc: "Conversation avec outils de lecture configurés. Aucune écriture ni commande." },
   { id: "plan", icon: "list", label: "Plan", desc: "Lecture seule — explore et propose un plan, sans rien modifier." },
   { id: "agent", icon: "agent", label: "Agent", desc: "Cycle complet — lit, planifie, modifie, exécute et vérifie." },
+  { id: "goal", icon: "goal", label: "Goal", desc: "Objectif durable — cycle complet, état persistant et reprise après interruption." },
 ];
 
 const ACCESS: { id: AgentAccessProfile; label: string; desc: string }[] = [
@@ -112,7 +113,7 @@ export function ModeSelector({ className = "" }: { className?: string }) {
         <span className="dot" />
         <Icon name={active.icon} size={12} />
         <span className="mode-label">
-          {active.label}{mode === "agent" ? ` · ${access === "auto" ? "Auto" : "Full"}` : ""}
+          {active.label}{mode === "agent" || mode === "goal" ? ` · ${access === "auto" ? "Auto" : "Full"}` : ""}
         </span>
         <Icon name="down" size={9} />
       </button>
@@ -145,7 +146,7 @@ export function ModeSelector({ className = "" }: { className?: string }) {
               {m.id === mode && <span className="check">✓</span>}
             </button>
           ))}
-          {mode === "agent" && (
+          {(mode === "agent" || mode === "goal") && (
             <>
               <div className="model-pop-group">Accès d’exécution</div>
               {ACCESS.map((profile) => (

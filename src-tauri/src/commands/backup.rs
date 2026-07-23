@@ -59,7 +59,7 @@ use tauri_plugin_dialog::DialogExt;
 /// sans bump ici fait échouer tout run de dev/test. (La dérive est déjà
 /// arrivée : la constante est restée à 16 après l'ajout de la V17, donc le
 /// backup pré-migration v16→v17 n'a jamais été pris.)
-pub const TARGET_SCHEMA_VERSION: i64 = 23;
+pub const TARGET_SCHEMA_VERSION: i64 = 24;
 
 /// Nom du fichier base dans un bundle.
 const DB_FILE: &str = "shugu.db";

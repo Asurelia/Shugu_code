@@ -40,11 +40,13 @@ import {
   InlineNotice,
 } from "@/components/trust";
 import { pushToast } from "@/components/toast";
+import { Icon } from "@/components/components";
 import {
   worktreeMergeBack,
   worktreeDiscard,
   extractWorktreeStatus,
 } from "@/lib/worktree";
+import "./agents-knowledge.css";
 
 // Resolve the active model → provider routing (protocol / baseUrl / key), exactly
 // like the chat delegate flow: the key stays in the keychain, never cleartext.
@@ -1425,81 +1427,49 @@ export function AgentsPanel() {
 
 function SkillsSection({ role }: { role: string }) {
   const { data: skills = [] } = useSkillsList(role);
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = useState(false);
   if (skills.length === 0) return null;
   return (
-    <div
-      style={{
-        marginTop: 14,
-        borderTop: "1px solid rgba(150,150,150,0.12)",
-        paddingTop: 8,
-      }}
-    >
+    <section className="agent-skills">
       <button
+        type="button"
+        className="agent-skills-head"
         onClick={() => setOpen((o) => !o)}
-        style={{
-          fontSize: 11,
-          fontWeight: 700,
-          color: "var(--success, #4ade80)",
-          background: "transparent",
-          border: "none",
-          cursor: "pointer",
-          padding: 0,
-        }}
+        aria-expanded={open}
       >
-        🎓 Compétences apprises — {role} ({skills.length}) {open ? "▾" : "▸"}
+        <span className="agent-skills-icon"><Icon name="sparkle" size={13} /></span>
+        <span className="agent-skills-title">
+          <span>Compétences · {role}</span>
+          <small>Sélectionnées automatiquement selon la tâche</small>
+        </span>
+        <span className="agent-skills-count">{skills.length}</span>
+        <Icon name="down" size={10} className={open ? "agent-skills-chevron open" : "agent-skills-chevron"} />
       </button>
       {open && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 8 }}>
+        <div className="agent-skills-list">
           {skills.map((s) => (
-            <div
-              key={s.name}
-              style={{
-                padding: "6px 8px",
-                borderRadius: 6,
-                background: s.createdBy === "advisor"
-                  ? "rgba(124, 58, 237, 0.06)"
-                  : "rgba(74, 222, 128, 0.06)",
-                border: s.createdBy === "advisor"
-                  ? "1px solid rgba(124, 58, 237, 0.18)"
-                  : "1px solid rgba(74, 222, 128, 0.18)",
-              }}
-            >
-              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                <div
-                  style={{ fontSize: 11, fontWeight: 600, color: "var(--on-surface, #ddd)" }}
-                >
-                  {s.name}
+            <details className={`agent-skill${s.createdBy === "advisor" ? " from-advisor" : ""}`} key={s.name}>
+              <summary>
+                <span className="agent-skill-copy">
+                  <strong>{s.name}</strong>
+                  <small>{s.whenToUse || "Procédure réutilisable"}</small>
+                </span>
+                <span className={`agent-skill-source ${s.createdBy}`}>
+                  {s.createdBy === "advisor" ? "distillé" : "testé"}
+                </span>
+              </summary>
+              <div className="agent-skill-body">
+                <div className="agent-skill-note">
+                  {s.createdBy === "advisor"
+                    ? "Synthèse proposée par le reviewer après une exécution."
+                    : "Enregistré par l’agent après une commande de vérification réussie."}
                 </div>
-                {s.createdBy === "advisor" && (
-                  <span
-                    title="Distillé par l'advisor (reviewer externe)"
-                    style={{
-                      fontSize: 9,
-                      fontWeight: 700,
-                      padding: "1px 5px",
-                      borderRadius: 99,
-                      background: "rgba(124, 58, 237, 0.2)",
-                      color: "var(--primary, #7c3aed)",
-                      border: "1px solid rgba(124, 58, 237, 0.4)",
-                      lineHeight: "14px",
-                    }}
-                  >
-                    via advisor
-                  </span>
-                )}
+                <pre>{s.body}</pre>
               </div>
-              {s.whenToUse && (
-                <div
-                  style={{ fontSize: 10, color: "var(--on-surface-muted)", marginTop: 2 }}
-                >
-                  {s.whenToUse}
-                </div>
-              )}
-            </div>
+            </details>
           ))}
         </div>
       )}
-    </div>
+    </section>
   );
 }

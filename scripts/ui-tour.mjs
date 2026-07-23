@@ -28,6 +28,7 @@ const PORT = Number(process.env.PORT ?? 4173);
 const BASE = `http://localhost:${PORT}`;
 const OUT = "dev-logs/ui-tour";
 const FOCUSED = process.env.SHUGU_UI_TOUR_FOCUSED === "1";
+const NOTIFICATION_ONLY = process.env.SHUGU_UI_TOUR_NOTIFICATION_ONLY === "1";
 mkdirSync(OUT, { recursive: true });
 
 function resolveChromium() {
@@ -89,6 +90,26 @@ const browser = await chromium.launch({
 });
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 page.setDefaultTimeout(3_000);
+const pageErrors = new Set();
+page.on("pageerror", (error) => {
+  const message = error?.stack || error?.message || String(error);
+  if (
+    message.includes("reading 'invoke'") ||
+    message.includes("reading 'transformCallback'")
+  ) return;
+  if (pageErrors.has(message)) return;
+  pageErrors.add(message);
+  console.error(`[ui:tour pageerror] ${message}`);
+});
+page.on("console", (entry) => {
+  if (entry.type() !== "error") return;
+  const message = entry.text();
+  if (
+    message.includes("reading 'invoke'") ||
+    message.includes("reading 'transformCallback'")
+  ) return;
+  console.error(`[ui:tour console] ${message}`);
+});
 const cdp = await page.context().newCDPSession(page);
 const fastClick = async (locator) =>
   locator.first().evaluate((element) => element.click()).catch(() => {});
@@ -167,8 +188,25 @@ if (!FOCUSED) {
   // ── Centre de notifications ─────────────────────────────────────────────
   await fastClick(page.locator(".tb-bell"));
   await page.waitForTimeout(400);
+  const routeError = page.getByText("Something went wrong!", { exact: true });
+  if (await routeError.count()) {
+    await fastClick(page.getByRole("button", { name: "Show Error" }));
+    await page.waitForTimeout(100);
+    console.error(`[ui:tour route-error]\n${await page.locator("body").innerText()}`);
+    missing.push("crash React à l'ouverture des notifications");
+  }
   await need(".notif-pop", "panneau notifications");
   await screenshot(`${OUT}/02-notification-center.png`);
+  if (NOTIFICATION_ONLY) {
+    await browser.close();
+    if (preview) await preview.close();
+    if (missing.length) {
+      console.error("❌ Notification UI :\n  - " + missing.join("\n  - "));
+      process.exit(1);
+    }
+    console.log(`✅ Notification UI OK — capture dans ${OUT}/02-notification-center.png`);
+    process.exit(0);
+  }
   await page.keyboard.press("Escape");
   await page.waitForTimeout(200);
 

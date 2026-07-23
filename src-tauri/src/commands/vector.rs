@@ -43,6 +43,7 @@
 
 use rusqlite::{ffi::sqlite3_auto_extension, params, Connection};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use tauri::Manager;
@@ -188,8 +189,14 @@ fn get_conn(app: &tauri::AppHandle) -> Result<&'static Mutex<Connection>, String
         eprintln!("[vector] connection journal_mode={mode}, busy_timeout={BUSY_TIMEOUT_MS}ms");
     });
 
-    // Create vec0 virtual tables for every allowed collection.
+    // Create vec0 virtual tables for every non-code collection. Code uses a
+    // workspace PARTITION KEY (below) so kNN search itself is isolated: merely
+    // prefixing ids would still let another workspace win the global nearest
+    // neighbour search.
     for name in ALLOWED_COLLECTIONS {
+        if matches!(*name, "code" | "memory") {
+            continue;
+        }
         let ddl = format!(
             "CREATE VIRTUAL TABLE IF NOT EXISTS vec_{name} \
              USING vec0(id TEXT PRIMARY KEY, embedding FLOAT[{EMBED_DIM}])"
@@ -214,6 +221,7 @@ fn get_conn(app: &tauri::AppHandle) -> Result<&'static Mutex<Connection>, String
             kind            TEXT NOT NULL,
             role            TEXT NOT NULL,
             conversation_id TEXT,
+            workspace_id    TEXT NOT NULL DEFAULT '__legacy__',
             text            TEXT NOT NULL,
             ts              INTEGER NOT NULL
         );
@@ -223,23 +231,118 @@ fn get_conn(app: &tauri::AppHandle) -> Result<&'static Mutex<Connection>, String
             ON agent_memory(ts);",
     )
     .map_err(|e| format!("create agent_memory: {e}"))?;
+    let has_memory_workspace = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(agent_memory)")
+            .map_err(|e| format!("inspect agent_memory schema: {e}"))?;
+        let found = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| format!("read agent_memory schema: {e}"))?
+            .filter_map(Result::ok)
+            .any(|name| name == "workspace_id");
+        found
+    };
+    if !has_memory_workspace {
+        conn.execute_batch(
+            "ALTER TABLE agent_memory
+                 ADD COLUMN workspace_id TEXT NOT NULL DEFAULT '__legacy__';",
+        )
+        .map_err(|e| format!("migrate agent_memory workspace scope: {e}"))?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_agent_memory_workspace
+             ON agent_memory(workspace_id);",
+    )
+    .map_err(|e| format!("index agent_memory workspace: {e}"))?;
 
-    // Phase 5 — side table tracking, per workspace-relative file, the EXACT set
+    // MEMORY2 — vector partition mirrors the payload's workspace scope. Old
+    // embeddings are dropped but their payloads remain in `agent_memory`; the
+    // first recall repairs missing vectors in bounded batches, preserving old
+    // memories without allowing them to contaminate another project.
+    let memory_schema: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE name = 'vec_memory'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    let memory_is_partitioned = memory_schema.as_deref().is_some_and(|sql| {
+        sql.to_ascii_lowercase()
+            .contains("workspace_id text partition key")
+    });
+    if !memory_is_partitioned {
+        conn.execute_batch("DROP TABLE IF EXISTS vec_memory;")
+            .map_err(|e| format!("migrate legacy memory index: {e}"))?;
+    }
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS vec_memory
+             USING vec0(
+                 id TEXT PRIMARY KEY,
+                 workspace_id TEXT PARTITION KEY,
+                 embedding FLOAT[{EMBED_DIM}]
+             );"
+    ))
+    .map_err(|e| format!("create partitioned vec_memory: {e}"))?;
+
+    // VEC3 — workspace-partitioned code index. Older Shugu builds created a
+    // global `vec_code(id, embedding)` table and keyed `vec_code_files` by the
+    // relative path alone. That made workspace switches either re-embed the
+    // whole tree or retain cross-project/orphaned hits. The legacy vectors
+    // cannot be assigned reliably to a workspace after the fact, so migration
+    // is intentionally a ONE-TIME rebuild: drop only the code index, keep every
+    // other vector collection and all relational/user data.
+    let code_schema: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_schema WHERE name = 'vec_code'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    let code_is_partitioned = code_schema.as_deref().is_some_and(|sql| {
+        sql.to_ascii_lowercase()
+            .contains("workspace_id text partition key")
+    });
+    if !code_is_partitioned {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS vec_code;
+             DROP TABLE IF EXISTS vec_code_files;",
+        )
+        .map_err(|e| format!("migrate legacy code index: {e}"))?;
+        eprintln!(
+            "[vector] legacy global code index removed; rebuilding once with workspace partitions"
+        );
+    }
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS vec_code
+             USING vec0(
+                 id TEXT PRIMARY KEY,
+                 workspace_id TEXT PARTITION KEY,
+                 embedding FLOAT[{EMBED_DIM}]
+             );"
+    ))
+    .map_err(|e| format!("create partitioned vec_code: {e}"))?;
+
+    // Phase 5/VEC3 — side table tracking, per workspace + relative file, the EXACT set
     // of chunk ids currently indexed for it in `vec_code`. vec0 has no
     // DELETE-by-LIKE / range query, so to re-index a single file we must know its
     // PRIOR ids to delete them precisely before inserting the new chunks. Storing
     // the id list as a JSON array keeps it one row per file (no fan-out table) and
     // lets `index_file_internal` diff old→new deterministically. `indexed_at` is a
     // millisecond timestamp for observability / future staleness checks.
+    //   - `workspace_id`: canonical, normalized workspace root
     //   - `path`       : workspace-relative, forward-slash (same space as chunk ids)
     //   - `chunk_ids`  : JSON array of `path#Lstart-end` strings (current chunks)
     //   - `indexed_at` : last (re)index time (ms since epoch)
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS vec_code_files (
-            path       TEXT PRIMARY KEY,
-            chunk_ids  TEXT NOT NULL,
-            indexed_at INTEGER NOT NULL
-        );",
+            workspace_id TEXT NOT NULL,
+            path         TEXT NOT NULL,
+            chunk_ids    TEXT NOT NULL,
+            indexed_at   INTEGER NOT NULL,
+            PRIMARY KEY (workspace_id, path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_vec_code_files_workspace
+            ON vec_code_files(workspace_id);",
     )
     .map_err(|e| format!("create vec_code_files: {e}"))?;
 
@@ -278,23 +381,125 @@ static EMBED_MODEL: OnceLock<Result<TextEmbedding, String>> = OnceLock::new();
 /// as the desktop memory/throughput compromise.
 const FASTEMBED_INFERENCE_BATCH: usize = 4;
 
+fn copy_cache_tree(
+    source_root: &std::path::Path,
+    target_root: &std::path::Path,
+    source: &std::path::Path,
+    target: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_cache_tree(source_root, target_root, &source_path, &target_path)?;
+            continue;
+        }
+        if target_path.exists() {
+            continue;
+        }
+        if file_type.is_symlink() {
+            // HuggingFace snapshots are symlinks into `blobs/`. Copying a
+            // symlink with `fs::copy` follows it and stores a second ~90 MB
+            // model. Recreate it as a hard link inside the stable cache:
+            // unlike a symlink this works on Windows without Developer Mode,
+            // and both paths remain self-contained if the legacy cache is
+            // removed later.
+            let link = std::fs::read_link(&source_path)?;
+            let resolved_source = if link.is_absolute() {
+                link
+            } else {
+                source_path.parent().unwrap_or(source_root).join(link)
+            }
+            .canonicalize()?;
+            if let Ok(relative_target) = resolved_source.strip_prefix(source_root) {
+                let cached_blob = target_root.join(relative_target);
+                if !cached_blob.exists() {
+                    if let Some(parent) = cached_blob.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::copy(&resolved_source, &cached_blob)?;
+                }
+                if std::fs::hard_link(&cached_blob, &target_path).is_ok() {
+                    continue;
+                }
+            }
+            // Unusual external link or filesystem without hard-link support:
+            // remain functional, accepting one copied file as the fallback.
+            std::fs::copy(&resolved_source, &target_path)?;
+        } else {
+            std::fs::copy(&source_path, &target_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_cache_dir(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+    let source_root = source.canonicalize()?;
+    std::fs::create_dir_all(target)?;
+    copy_cache_tree(&source_root, target, &source_root, target)
+}
+
+fn migrate_legacy_embedding_cache(cache_dir: &std::path::Path) {
+    let target_has_data = std::fs::read_dir(cache_dir)
+        .ok()
+        .and_then(|mut entries| entries.next())
+        .is_some();
+    if target_has_data {
+        return;
+    }
+    let Ok(current_dir) = std::env::current_dir() else {
+        return;
+    };
+    let legacy = current_dir.join(".fastembed_cache");
+    if legacy == cache_dir || !legacy.is_dir() {
+        return;
+    }
+    match copy_cache_dir(&legacy, cache_dir) {
+        Ok(()) => eprintln!(
+            "[vector] reused legacy FastEmbed cache {} -> {}",
+            legacy.display(),
+            cache_dir.display()
+        ),
+        Err(error) => eprintln!(
+            "[vector] legacy FastEmbed cache copy skipped ({}): {error}",
+            legacy.display()
+        ),
+    }
+}
+
 /// Lazily initialise the fastembed model.
 ///
 /// On Windows, the ONNX Runtime native DLL is downloaded on first use from
 /// HuggingFace.  If init fails (network, ONNX runtime mismatch, etc.), this
 /// returns `Err(...)` and every call to `embed()` propagates that error
 /// gracefully — no panic.
-fn get_model() -> Result<&'static TextEmbedding, String> {
+fn get_model(app: &tauri::AppHandle) -> Result<&'static TextEmbedding, String> {
     let result = EMBED_MODEL.get_or_init(|| {
-        TextEmbedding::try_new(InitOptions::new(EmbeddingModel::AllMiniLML6V2))
-            .map_err(|e| format!("embedding model unavailable: {e}"))
+        let cache_dir = app
+            .path()
+            .app_local_data_dir()
+            .map_err(|e| format!("cannot resolve embedding cache dir: {e}"))?
+            .join("fastembed_cache");
+        std::fs::create_dir_all(&cache_dir)
+            .map_err(|e| format!("create embedding cache {}: {e}", cache_dir.display()))?;
+        // Pre-fix builds cached relative to the process CWD. Reuse that model
+        // once instead of downloading ~90 MB again, but keep the old folder as
+        // a recoverable copy until the user chooses to remove it.
+        migrate_legacy_embedding_cache(&cache_dir);
+        TextEmbedding::try_new(
+            InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_cache_dir(cache_dir),
+        )
+        .map_err(|e| format!("embedding model unavailable: {e}"))
     });
     result.as_ref().map_err(|e| e.clone())
 }
 
 /// Embed a single string into an `EMBED_DIM`-dimensional f32 vector.
-fn embed(text: &str) -> Result<Vec<f32>, String> {
-    embed_many(&[text.to_string()])?
+fn embed(app: &tauri::AppHandle, text: &str) -> Result<Vec<f32>, String> {
+    embed_many(app, &[text.to_string()])?
         .pop()
         .ok_or_else(|| format!("expected {EMBED_DIM}-dim vector, got unexpected output"))
 }
@@ -306,11 +511,11 @@ fn embed(text: &str) -> Result<Vec<f32>, String> {
 /// dispatches. FastEmbed is designed for batches; validating cardinality and
 /// dimensions here lets file and workspace indexing share the efficient path
 /// without weakening the single-text API used by search/memory.
-fn embed_many(texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+fn embed_many(app: &tauri::AppHandle, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
     if texts.is_empty() {
         return Ok(Vec::new());
     }
-    let model = get_model()?;
+    let model = get_model(app)?;
     let batch = model
         .embed(texts.to_vec(), Some(FASTEMBED_INFERENCE_BATCH))
         .map_err(|e| format!("embed batch error: {e}"))?;
@@ -640,6 +845,46 @@ fn chunk_id(path: &str, start: usize, end: usize) -> String {
     format!("{path}#L{start}-{end}")
 }
 
+/// Stable workspace partition key. Canonicalisation collapses junction/symlink
+/// aliases when possible; the fallback still normalises Windows verbatim
+/// prefixes and separators. Drive/path casing is folded on Windows where the
+/// filesystem is normally case-insensitive.
+pub(crate) fn workspace_id(root: &Path) -> String {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let normalized = crate::commands::pathutil::norm_display(&canonical)
+        .trim_end_matches('/')
+        .to_string();
+    #[cfg(target_os = "windows")]
+    {
+        normalized.to_lowercase()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        normalized
+    }
+}
+
+fn workspace_id_prefix(workspace_id: &str) -> String {
+    let digest = format!("{:x}", Sha256::digest(workspace_id.as_bytes()));
+    digest[..16].to_string()
+}
+
+/// `vec_code.id` remains globally unique even though kNN is partitioned by
+/// `workspace_id`. The prefix is stripped before any hit crosses the Rust API,
+/// so frontend parsers and model tools continue seeing `path#Lstart-end`.
+fn scoped_chunk_id(workspace_id: &str, path: &str, start: usize, end: usize) -> String {
+    format!(
+        "{}::{}",
+        workspace_id_prefix(workspace_id),
+        chunk_id(path, start, end)
+    )
+}
+
+fn unscoped_chunk_id<'a>(workspace_id: &str, id: &'a str) -> &'a str {
+    let prefix = format!("{}::", workspace_id_prefix(workspace_id));
+    id.strip_prefix(&prefix).unwrap_or(id)
+}
+
 // ---------------------------------------------------------------------------
 // Phase 5 — code-eligibility filter (mirror of workspaceIndexer.ts gates)
 // ---------------------------------------------------------------------------
@@ -797,14 +1042,16 @@ const INDEX_FILE_BATCH_MAX: usize = 64;
 /// Replace one file's prior chunks inside an already-open batch transaction.
 fn replace_prepared_file(
     tx: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
     rel: &str,
     prepared: &[(String, Vec<u8>)],
     indexed_at: i64,
 ) -> Result<(), String> {
     let prior_json: Option<String> = tx
         .query_row(
-            "SELECT chunk_ids FROM vec_code_files WHERE path = ?1",
-            params![rel],
+            "SELECT chunk_ids FROM vec_code_files
+              WHERE workspace_id = ?1 AND path = ?2",
+            params![workspace_id, rel],
             |r| r.get(0),
         )
         .ok();
@@ -819,8 +1066,9 @@ fn replace_prepared_file(
 
     for (id, blob) in prepared {
         tx.execute(
-            "INSERT OR REPLACE INTO vec_code(id, embedding) VALUES (?1, ?2)",
-            params![id, blob],
+            "INSERT INTO vec_code(id, workspace_id, embedding)
+             VALUES (?1, ?2, ?3)",
+            params![id, workspace_id, blob],
         )
         .map_err(|e| format!("index_file insert chunk: {e}"))?;
     }
@@ -829,8 +1077,10 @@ fn replace_prepared_file(
     let new_ids_json =
         serde_json::to_string(&new_ids).map_err(|e| format!("serialize chunk ids: {e}"))?;
     tx.execute(
-        "INSERT OR REPLACE INTO vec_code_files(path, chunk_ids, indexed_at) VALUES (?1, ?2, ?3)",
-        params![rel, new_ids_json, indexed_at],
+        "INSERT OR REPLACE INTO vec_code_files
+             (workspace_id, path, chunk_ids, indexed_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![workspace_id, rel, new_ids_json, indexed_at],
     )
     .map_err(|e| format!("index_file upsert side table: {e}"))?;
     Ok(())
@@ -884,7 +1134,8 @@ pub(crate) fn index_files_internal(
         .iter()
         .flat_map(|(_, chunks)| chunks.iter().map(|(body, _, _)| body.clone()))
         .collect();
-    let mut embeddings = embed_many(&bodies)?.into_iter();
+    let mut embeddings = embed_many(app, &bodies)?.into_iter();
+    let workspace_id = workspace_id(root);
     let mut prepared_files: Vec<(String, Vec<(String, Vec<u8>)>)> =
         Vec::with_capacity(sources.len());
     let mut total = 0usize;
@@ -894,7 +1145,10 @@ pub(crate) fn index_files_internal(
             let vector = embeddings
                 .next()
                 .ok_or_else(|| "embedding batch ended before chunk metadata".to_string())?;
-            prepared.push((chunk_id(&rel, start, end), serialize_f32_vec(&vector)));
+            prepared.push((
+                scoped_chunk_id(&workspace_id, &rel, start, end),
+                serialize_f32_vec(&vector),
+            ));
         }
         total += prepared.len();
         prepared_files.push((rel, prepared));
@@ -909,7 +1163,7 @@ pub(crate) fn index_files_internal(
         .map_err(|e| format!("index batch begin: {e}"))?;
     let indexed_at = now_ms();
     for (rel, prepared) in &prepared_files {
-        replace_prepared_file(&tx, rel, prepared, indexed_at)?;
+        replace_prepared_file(&tx, &workspace_id, rel, prepared, indexed_at)?;
     }
 
     tx.commit()
@@ -920,7 +1174,12 @@ pub(crate) fn index_files_internal(
 /// Remove a file's index entirely: delete its tracked chunk ids from `vec_code`
 /// and drop its `vec_code_files` row, in one IMMEDIATE transaction. Used for
 /// filesystem Remove events. A file with no tracked row is a clean no-op (Ok).
-pub(crate) fn delete_file_index_internal(app: &tauri::AppHandle, rel: &str) -> Result<(), String> {
+pub(crate) fn delete_file_index_internal(
+    app: &tauri::AppHandle,
+    root: &Path,
+    rel: &str,
+) -> Result<(), String> {
+    let workspace_id = workspace_id(root);
     let mut guard = get_conn(app)?.lock().map_err(|e| format!("lock: {e}"))?;
     let tx = guard
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -928,8 +1187,9 @@ pub(crate) fn delete_file_index_internal(app: &tauri::AppHandle, rel: &str) -> R
 
     let prior_json: Option<String> = tx
         .query_row(
-            "SELECT chunk_ids FROM vec_code_files WHERE path = ?1",
-            params![rel],
+            "SELECT chunk_ids FROM vec_code_files
+              WHERE workspace_id = ?1 AND path = ?2",
+            params![workspace_id, rel],
             |r| r.get(0),
         )
         .ok();
@@ -941,8 +1201,11 @@ pub(crate) fn delete_file_index_internal(app: &tauri::AppHandle, rel: &str) -> R
                 .map_err(|e| format!("delete_file delete chunk: {e}"))?;
         }
     }
-    tx.execute("DELETE FROM vec_code_files WHERE path = ?1", params![rel])
-        .map_err(|e| format!("delete_file drop side row: {e}"))?;
+    tx.execute(
+        "DELETE FROM vec_code_files WHERE workspace_id = ?1 AND path = ?2",
+        params![workspace_id, rel],
+    )
+    .map_err(|e| format!("delete_file drop side row: {e}"))?;
 
     tx.commit()
         .map_err(|e| format!("delete_file commit: {e}"))?;
@@ -977,12 +1240,27 @@ pub fn vec_index(
     text: String,
 ) -> Result<(), String> {
     validate_collection(&collection)?;
-    let blob = serialize_f32_vec(&embed(&text)?);
-    let guard = get_conn(&app)?.lock().map_err(|e| format!("lock: {e}"))?;
-    let sql = format!("INSERT OR REPLACE INTO vec_{collection}(id, embedding) VALUES (?1, ?2)");
-    guard
-        .execute(&sql, params![id, blob])
-        .map_err(|e| format!("vec_index: {e}"))?;
+    if matches!(collection.as_str(), "code" | "memory") {
+        return Err(
+            "workspace-scoped collections must use their dedicated index commands".to_string(),
+        );
+    }
+    let blob = serialize_f32_vec(&embed(&app, &text)?);
+    let mut guard = get_conn(&app)?.lock().map_err(|e| format!("lock: {e}"))?;
+    // sqlite-vec virtual tables do not implement SQLite's REPLACE conflict
+    // algorithm reliably: a second index of the same message can raise
+    // `UNIQUE constraint failed` instead of replacing it. Delete + insert in
+    // one IMMEDIATE transaction is the documented, atomic upsert shape.
+    let tx = guard
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("vec_index begin: {e}"))?;
+    let delete_sql = format!("DELETE FROM vec_{collection} WHERE id = ?1");
+    tx.execute(&delete_sql, params![&id])
+        .map_err(|e| format!("vec_index delete prior: {e}"))?;
+    let insert_sql = format!("INSERT INTO vec_{collection}(id, embedding) VALUES (?1, ?2)");
+    tx.execute(&insert_sql, params![id, blob])
+        .map_err(|e| format!("vec_index insert: {e}"))?;
+    tx.commit().map_err(|e| format!("vec_index commit: {e}"))?;
     Ok(())
 }
 
@@ -997,7 +1275,10 @@ pub(crate) fn vec_search_internal(
     k: u32,
 ) -> Result<Vec<VecHit>, String> {
     validate_collection(collection)?;
-    let blob = serialize_f32_vec(&embed(query)?);
+    if matches!(collection, "code" | "memory") {
+        return Err("generic search is forbidden for workspace-scoped collections".to_string());
+    }
+    let blob = serialize_f32_vec(&embed(app, query)?);
     let guard = get_conn(app)?.lock().map_err(|e| format!("lock: {e}"))?;
     let sql = format!(
         "SELECT id, distance FROM vec_{collection} \
@@ -1020,23 +1301,69 @@ pub(crate) fn vec_search_internal(
     Ok(hits)
 }
 
+/// Workspace-isolated kNN search for source-code chunks. The partition
+/// predicate is handled by sqlite-vec during nearest-neighbour selection, then
+/// the private global-id prefix is removed before returning hits.
+pub(crate) fn code_search_internal(
+    app: &tauri::AppHandle,
+    root: &Path,
+    query: &str,
+    k: u32,
+) -> Result<Vec<VecHit>, String> {
+    let workspace_id = workspace_id(root);
+    let blob = serialize_f32_vec(&embed(app, query)?);
+    let guard = get_conn(app)?.lock().map_err(|e| format!("lock: {e}"))?;
+    let mut stmt = guard
+        .prepare(
+            "SELECT id, distance FROM vec_code
+              WHERE embedding MATCH ?1
+                AND k = ?2
+                AND workspace_id = ?3
+              ORDER BY distance",
+        )
+        .map_err(|e| format!("code_search prepare: {e}"))?;
+    let hits = stmt
+        .query_map(params![blob, k, workspace_id], |row| {
+            let scoped: String = row.get(0)?;
+            Ok(VecHit {
+                id: unscoped_chunk_id(&workspace_id, &scoped).to_string(),
+                distance: row.get(1)?,
+            })
+        })
+        .map_err(|e| format!("code_search query: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("code_search row: {e}"))?;
+    Ok(hits)
+}
+
 /// Return the `k` nearest vectors in `vec_<collection>` to `query`.
 ///
 /// Results are ordered by ascending distance (closest first).
 #[tauri::command(async)]
 pub fn vec_search(
     app: tauri::AppHandle,
+    root_state: tauri::State<'_, Mutex<Option<std::path::PathBuf>>>,
     collection: String,
     query: String,
     k: u32,
 ) -> Result<Vec<VecHit>, String> {
-    vec_search_internal(&app, &collection, &query, k)
+    if collection == "code" {
+        let root = lock_workspace_root(&root_state)?;
+        code_search_internal(&app, &root, &query, k)
+    } else {
+        vec_search_internal(&app, &collection, &query, k)
+    }
 }
 
 /// Delete the entry identified by `id` from `vec_<collection>`.
 #[tauri::command(async)]
 pub fn vec_delete(app: tauri::AppHandle, collection: String, id: String) -> Result<(), String> {
     validate_collection(&collection)?;
+    if collection == "code" {
+        return Err(
+            "vec_delete(code) is workspace-scoped; use vec_remove_file for code chunks".to_string(),
+        );
+    }
     let mut guard = get_conn(&app)?.lock().map_err(|e| format!("lock: {e}"))?;
     let sql = format!("DELETE FROM vec_{collection} WHERE id = ?1");
     // AM-5 — the embedding and its payload are deleted as one atomic unit (single
@@ -1064,18 +1391,36 @@ pub fn vec_delete(app: tauri::AppHandle, collection: String, id: String) -> Resu
 /// (Lot 4 suite) pour purger les ids whole-file stale avant un rebuild en
 /// chunks. Ne supprime pas la table, juste ses lignes.
 #[tauri::command(async)]
-pub fn vec_clear(app: tauri::AppHandle, collection: String) -> Result<(), String> {
+pub fn vec_clear(
+    app: tauri::AppHandle,
+    root_state: tauri::State<'_, Mutex<Option<std::path::PathBuf>>>,
+    collection: String,
+) -> Result<(), String> {
     validate_collection(&collection)?;
     let mut guard = get_conn(&app)?.lock().map_err(|e| format!("lock: {e}"))?;
-    let sql = format!("DELETE FROM vec_{collection}");
+    let code_workspace_id = if collection == "code" {
+        Some(workspace_id(&lock_workspace_root(&root_state)?))
+    } else {
+        None
+    };
+    let sql = if collection == "code" {
+        "DELETE FROM vec_code WHERE workspace_id = ?1".to_string()
+    } else {
+        format!("DELETE FROM vec_{collection}")
+    };
     // AM-5 — purge the vec0 table and (for `memory`) its payload side table in a
     // single atomic IMMEDIATE transaction, so a concurrent reindex/recall never
     // observes the embeddings cleared while the payload rows still linger.
     let tx = guard
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| format!("vec_clear begin: {e}"))?;
-    tx.execute(&sql, [])
-        .map_err(|e| format!("vec_clear: {e}"))?;
+    if let Some(workspace_id) = code_workspace_id.as_deref() {
+        tx.execute(&sql, params![workspace_id])
+            .map_err(|e| format!("vec_clear code: {e}"))?;
+    } else {
+        tx.execute(&sql, [])
+            .map_err(|e| format!("vec_clear: {e}"))?;
+    }
     // AM-2 — clearing the memory collection also wipes its payload side table.
     if collection == "memory" {
         tx.execute("DELETE FROM agent_memory", [])
@@ -1089,8 +1434,11 @@ pub fn vec_clear(app: tauri::AppHandle, collection: String) -> Result<(), String
     // and, worse, the side table would claim files are indexed that are no longer
     // present. Mirror of the memory→agent_memory special-case above.
     if collection == "code" {
-        tx.execute("DELETE FROM vec_code_files", [])
-            .map_err(|e| format!("vec_clear vec_code_files: {e}"))?;
+        tx.execute(
+            "DELETE FROM vec_code_files WHERE workspace_id = ?1",
+            params![code_workspace_id.as_deref().unwrap_or_default()],
+        )
+        .map_err(|e| format!("vec_clear vec_code_files: {e}"))?;
     }
     tx.commit().map_err(|e| format!("vec_clear commit: {e}"))?;
     Ok(())
@@ -1124,6 +1472,77 @@ pub struct MemoryHit {
     pub ts: i64,
 }
 
+const LEGACY_MEMORY_WORKSPACE: &str = "__legacy__";
+const GLOBAL_MEMORY_WORKSPACE: &str = "__global__";
+const MEMORY_REPAIR_BATCH: usize = 128;
+
+fn memory_partition(workspace: Option<&str>) -> &str {
+    workspace
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(GLOBAL_MEMORY_WORKSPACE)
+}
+
+/// Rebuild payloads whose legacy/unexpected vector row is missing. The read and
+/// ONNX work happen without the SQLite mutex; only the final bounded upsert is
+/// transactional. This is normally a one-time migration path.
+fn repair_missing_memory_vectors(app: &tauri::AppHandle) -> Result<usize, String> {
+    let missing: Vec<(String, String, String)> = {
+        let guard = get_conn(app)?.lock().map_err(|e| format!("lock: {e}"))?;
+        let existing: std::collections::HashSet<String> = {
+            let mut stmt = guard
+                .prepare("SELECT id FROM vec_memory")
+                .map_err(|e| format!("memory repair prepare vectors: {e}"))?;
+            let ids = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| format!("memory repair query vectors: {e}"))?
+                .filter_map(Result::ok)
+                .collect();
+            ids
+        };
+        let mut stmt = guard
+            .prepare(
+                "SELECT id, workspace_id, text FROM agent_memory
+                  ORDER BY ts DESC",
+            )
+            .map_err(|e| format!("memory repair prepare payloads: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| format!("memory repair query payloads: {e}"))?
+            .filter_map(Result::ok)
+            .filter(|(id, _, _)| !existing.contains(id))
+            .take(MEMORY_REPAIR_BATCH)
+            .collect();
+        rows
+    };
+    if missing.is_empty() {
+        return Ok(0);
+    }
+
+    let texts: Vec<String> = missing.iter().map(|(_, _, text)| text.clone()).collect();
+    let vectors = embed_many(app, &texts)?;
+    let mut guard = get_conn(app)?.lock().map_err(|e| format!("lock: {e}"))?;
+    let tx = guard
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("memory repair begin: {e}"))?;
+    for ((id, workspace_id, _), vector) in missing.iter().zip(vectors.iter()) {
+        tx.execute(
+            "INSERT OR IGNORE INTO vec_memory(id, workspace_id, embedding)
+             VALUES (?1, ?2, ?3)",
+            params![id, workspace_id, serialize_f32_vec(vector)],
+        )
+        .map_err(|e| format!("memory repair insert: {e}"))?;
+    }
+    tx.commit()
+        .map_err(|e| format!("memory repair commit: {e}"))?;
+    Ok(missing.len())
+}
+
 /// Persist one memory: embed `text`, upsert the vector under a fresh UUID, and
 /// store its payload + metadata in `agent_memory`. Returns the new id.
 ///
@@ -1134,6 +1553,7 @@ pub(crate) fn memory_remember(
     kind: &str,
     role: &str,
     conversation_id: Option<&str>,
+    workspace_id: Option<&str>,
     text: &str,
 ) -> Result<String, String> {
     let trimmed = text.trim();
@@ -1141,7 +1561,8 @@ pub(crate) fn memory_remember(
         return Err("memory_remember: empty text".to_string());
     }
     let id = uuid::Uuid::new_v4().to_string();
-    let blob = serialize_f32_vec(&embed(trimmed)?);
+    let blob = serialize_f32_vec(&embed(app, trimmed)?);
+    let workspace_id = memory_partition(workspace_id);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -1157,14 +1578,16 @@ pub(crate) fn memory_remember(
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| format!("memory_remember begin: {e}"))?;
     tx.execute(
-        "INSERT OR REPLACE INTO vec_memory(id, embedding) VALUES (?1, ?2)",
-        params![id, blob],
+        "INSERT INTO vec_memory(id, workspace_id, embedding)
+         VALUES (?1, ?2, ?3)",
+        params![id, workspace_id, blob],
     )
     .map_err(|e| format!("memory_remember vec: {e}"))?;
     tx.execute(
-        "INSERT OR REPLACE INTO agent_memory(id, kind, role, conversation_id, text, ts) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![id, kind, role, conversation_id, trimmed, now],
+        "INSERT OR REPLACE INTO agent_memory
+             (id, kind, role, conversation_id, workspace_id, text, ts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![id, kind, role, conversation_id, workspace_id, trimmed, now],
     )
     .map_err(|e| format!("memory_remember payload: {e}"))?;
     tx.commit()
@@ -1180,33 +1603,85 @@ pub(crate) fn memory_recall(
     app: &tauri::AppHandle,
     query: &str,
     k: u32,
+    workspace_id: Option<&str>,
+    conversation_id: Option<&str>,
+    role: Option<&str>,
 ) -> Result<Vec<MemoryHit>, String> {
     if query.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let hits = vec_search_internal(app, "memory", query, k)?;
-    if hits.is_empty() {
-        return Ok(Vec::new());
+    if let Err(e) = repair_missing_memory_vectors(app) {
+        eprintln!("[memory] legacy vector repair skipped: {e}");
     }
+    let current_partition = memory_partition(workspace_id);
+    let mut partitions = vec![current_partition];
+    // Legacy memories are safe to consider only inside the exact conversation
+    // they were created for. They never become project-global recalls.
+    if conversation_id.is_some() && current_partition != LEGACY_MEMORY_WORKSPACE {
+        partitions.push(LEGACY_MEMORY_WORKSPACE);
+    }
+    let blob = serialize_f32_vec(&embed(app, query)?);
     let guard = get_conn(app)?.lock().map_err(|e| format!("lock: {e}"))?;
-    let mut out: Vec<MemoryHit> = Vec::with_capacity(hits.len());
-    for h in hits {
-        let row: rusqlite::Result<(String, String, i64)> = guard.query_row(
-            "SELECT kind, text, ts FROM agent_memory WHERE id = ?1",
-            params![h.id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        );
-        if let Ok((kind, text, ts)) = row {
-            out.push(MemoryHit {
-                id: h.id,
-                kind,
-                text,
-                distance: h.distance,
-                ts,
-            });
+    let search_k = k.saturating_mul(4).clamp(k, 64);
+    let mut ranked: Vec<(u8, u8, MemoryHit)> = Vec::new();
+    for partition in partitions {
+        let mut stmt = guard
+            .prepare(
+                "SELECT id, distance FROM vec_memory
+                  WHERE embedding MATCH ?1
+                    AND k = ?2
+                    AND workspace_id = ?3
+                  ORDER BY distance",
+            )
+            .map_err(|e| format!("memory_recall prepare: {e}"))?;
+        let hits = stmt
+            .query_map(params![blob, search_k, partition], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?))
+            })
+            .map_err(|e| format!("memory_recall query: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("memory_recall row: {e}"))?;
+        for (id, distance) in hits {
+            let row: rusqlite::Result<(String, String, Option<String>, String, i64)> = guard
+                .query_row(
+                    "SELECT kind, role, conversation_id, text, ts
+                       FROM agent_memory WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                );
+            if let Ok((kind, memory_role, memory_conversation, text, ts)) = row {
+                if partition == LEGACY_MEMORY_WORKSPACE
+                    && memory_conversation.as_deref() != conversation_id
+                {
+                    continue;
+                }
+                let conversation_rank = u8::from(memory_conversation.as_deref() != conversation_id);
+                let role_rank = u8::from(role.is_some_and(|r| r != memory_role));
+                ranked.push((
+                    conversation_rank,
+                    role_rank,
+                    MemoryHit {
+                        id,
+                        kind,
+                        text,
+                        distance,
+                        ts,
+                    },
+                ));
+            }
         }
     }
-    Ok(out)
+    ranked.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.cmp(&b.1))
+            .then_with(|| a.2.distance.total_cmp(&b.2.distance))
+    });
+    let mut seen = std::collections::HashSet::new();
+    Ok(ranked
+        .into_iter()
+        .filter_map(|(_, _, hit)| seen.insert(hit.id.clone()).then_some(hit))
+        .take(k as usize)
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -1219,10 +1694,13 @@ pub(crate) fn memory_recall(
 #[tauri::command(async)]
 pub fn memory_search(
     app: tauri::AppHandle,
+    root_state: tauri::State<'_, Mutex<Option<std::path::PathBuf>>>,
     query: String,
     k: u32,
 ) -> Result<Vec<MemoryHit>, String> {
-    memory_recall(&app, &query, k.clamp(1, 50))
+    let root = lock_workspace_root(&root_state)?;
+    let workspace = workspace_id(&root);
+    memory_recall(&app, &query, k.clamp(1, 50), Some(&workspace), None, None)
 }
 
 // ---------------------------------------------------------------------------
@@ -1283,11 +1761,8 @@ pub fn vec_remove_file(
     root_state: tauri::State<'_, Mutex<Option<std::path::PathBuf>>>,
     path: String,
 ) -> Result<(), String> {
-    // root_state isn't strictly needed for a delete (ids are workspace-relative),
-    // but we take it for symmetry with `vec_index_file` and to fail fast with a
-    // clean "no workspace open" rather than silently no-op'ing when none is set.
-    let _root = lock_workspace_root(&root_state)?;
-    delete_file_index_internal(&app, &path)
+    let root = lock_workspace_root(&root_state)?;
+    delete_file_index_internal(&app, &root, &path)
 }
 
 // ---------------------------------------------------------------------------
@@ -1320,14 +1795,10 @@ pub struct StaleReport {
 /// so the decision table (untracked/modified/fresh/deleted/truncated) is unit-
 /// testable without an AppHandle or a real filesystem.
 ///
-/// DELIBERATE: `vec_code` is ONE global collection keyed by workspace-relative
-/// path, without a workspace id. Opening workspace B therefore reports every
-/// path of workspace A as `deleted` → A's chunks are purged, and switching
-/// back to A re-embeds it from scratch. This is the chosen trade-off: search
-/// results can never mix hits from another workspace (which the pre-diff
-/// full-walk allowed), at the cost of a full re-index on each workspace
-/// switch. Scoping the index per-workspace (path prefix or side column) is the
-/// follow-up if that cost ever matters.
+/// `tracked` contains only rows from the current workspace partition. Other
+/// workspaces remain persisted and reusable, so switching projects no longer
+/// causes a destructive full re-index and their paths can never be classified
+/// as deleted by this pass.
 fn partition_stale(
     candidates: &[String],
     tracked: &std::collections::HashMap<String, i64>,
@@ -1393,13 +1864,19 @@ pub fn vec_stale_paths(
     truncated: bool,
 ) -> Result<StaleReport, String> {
     let root = lock_workspace_root(&root_state)?;
+    let workspace_id = workspace_id(&root);
     let tracked: std::collections::HashMap<String, i64> = {
         let guard = get_conn(&app)?.lock().map_err(|e| format!("lock: {e}"))?;
         let mut stmt = guard
-            .prepare("SELECT path, indexed_at FROM vec_code_files")
+            .prepare(
+                "SELECT path, indexed_at FROM vec_code_files
+                  WHERE workspace_id = ?1",
+            )
             .map_err(|e| format!("vec_stale_paths prepare: {e}"))?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .query_map(params![workspace_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
             .map_err(|e| format!("vec_stale_paths query: {e}"))?
             .collect::<Result<_, _>>()
             .map_err(|e| format!("vec_stale_paths row: {e}"))?;
@@ -1809,10 +2286,15 @@ pub fn vec_maybe_vacuum(app: tauri::AppHandle) -> Result<VacuumOutcome, String> 
 #[tauri::command(async)]
 pub fn semantic_search(
     app: tauri::AppHandle,
+    root_state: tauri::State<'_, Mutex<Option<std::path::PathBuf>>>,
     query: String,
     k: u32,
 ) -> Result<Vec<VecHit>, String> {
-    match vec_search_internal(&app, "code", &query, k.clamp(1, 50)) {
+    let root = match lock_workspace_root(&root_state) {
+        Ok(root) => root,
+        Err(_) => return Ok(Vec::new()),
+    };
+    match code_search_internal(&app, &root, &query, k.clamp(1, 50)) {
         Ok(hits) => Ok(hits),
         // An empty/cold index or an unavailable embedding model must not error
         // the palette — degrade to no results (the full-walk indexer surfaces
@@ -1926,6 +2408,55 @@ mod tests {
         assert_eq!(sync, 1, "synchronous must be NORMAL (1) under WAL");
 
         let _ = std::fs::remove_dir_all(db.parent().unwrap());
+    }
+
+    #[test]
+    fn code_partition_filters_knn_before_results_are_returned() {
+        register_vec_extension();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE vec_code USING vec0(
+                id TEXT PRIMARY KEY,
+                workspace_id TEXT PARTITION KEY,
+                embedding FLOAT[{EMBED_DIM}]
+            );"
+        ))
+        .unwrap();
+
+        let near = serialize_f32_vec(&vec![0.0; EMBED_DIM]);
+        let far = serialize_f32_vec(&vec![10.0; EMBED_DIM]);
+        conn.execute(
+            "INSERT INTO vec_code(id, workspace_id, embedding) VALUES (?1, 'ws-a', ?2)",
+            params!["a::src/a.rs#L1-2", near],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO vec_code(id, workspace_id, embedding) VALUES (?1, 'ws-b', ?2)",
+            params!["b::src/b.rs#L1-2", far],
+        )
+        .unwrap();
+
+        let query = serialize_f32_vec(&vec![0.0; EMBED_DIM]);
+        let ids = conn
+            .prepare(
+                "SELECT id FROM vec_code
+                  WHERE embedding MATCH ?1 AND k = 5 AND workspace_id = ?2",
+            )
+            .unwrap()
+            .query_map(params![query, "ws-b"], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(ids, vec!["b::src/b.rs#L1-2"]);
+    }
+
+    #[test]
+    fn scoped_chunk_ids_are_unique_but_unwrap_to_frontend_format() {
+        let a = scoped_chunk_id("f:/dev/a", "src/main.rs", 1, 8);
+        let b = scoped_chunk_id("f:/dev/b", "src/main.rs", 1, 8);
+        assert_ne!(a, b);
+        assert_eq!(unscoped_chunk_id("f:/dev/a", &a), "src/main.rs#L1-8");
+        assert_eq!(unscoped_chunk_id("f:/dev/b", &b), "src/main.rs#L1-8");
     }
 
     /// The compound write is atomic: a forced failure mid-pair (here: a rollback

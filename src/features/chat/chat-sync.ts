@@ -32,6 +32,7 @@ import { db } from "@/lib/db";
 import { resolveCurrentProjectId } from "@/features/projects/projectsQueries";
 import { invoke } from "@/lib/tauri";
 import { resolveProvider, type Protocol } from "@/lib/providers";
+import { providerAvailability } from "@/lib/providerAvailability";
 import { loadProviderConfig, getConfig, getProviderEnabled } from "@/lib/credentials";
 import { parseAiReply } from "@/lib/markdown";
 import { parseMentions, resolveMentions, buildMentionContext } from "./mentions";
@@ -51,7 +52,9 @@ import { chatKeys } from "./keys";
 import { agentKeys } from "@/features/agents/keys";
 import type { ParsedAgentTranscript } from "@/features/agents/queries";
 import type { AgentRow } from "@/lib/agents";
+import type { GoalRow } from "@/lib/goals";
 import type { Message } from "@/lib/types";
+import { pushToast } from "@/components/toast";
 
 // ─── Event names + storage keys (centralized to prevent drift) ─────────
 const EVT_MESSAGES     = "chat://messages-changed";
@@ -349,11 +352,12 @@ export async function sendChatMessage(
     typeof window !== "undefined" &&
     typeof window.location !== "undefined" &&
     window.location.pathname.includes("mascot");
-  // ── Sélecteur de mode (cockpit) — Chat / Plan / Agent ─────────────────────
+  // ── Sélecteur de mode (cockpit) — Chat / Plan / Agent / Goal ──────────────
   // Le mode est l'override PRINCIPAL du routage sur le chemin cockpit unifié :
   //   • "chat"  → chat-direct SANS outils (conversation pure, rapide) ;
   //   • "plan"  → délègue à l'agent en LECTURE SEULE (read_only côté runner) ;
   //   • "agent" → délègue à l'agent complet (défaut, exec directe).
+  //   • "goal"  → même cycle complet, lié à un objectif durable et reprenable.
   // `agentMode` est passé à handleDelegate quel que soit le chemin (cockpit OU
   // mascotte) : ainsi « Plan » reste lecture-seule même quand la mascotte confie
   // une tâche. Les exceptions historiques (image vision / never-delegate /
@@ -772,25 +776,21 @@ export async function sendChatMessage(
  * own UX (chat message vs Studio banner).
  */
 export type OrchestratorResolution =
-  | { kind: "ok"; model: string; protocol: Protocol; baseUrl: string; apiKey?: string }
+  | {
+      kind: "ok";
+      model: string;
+      protocol: Protocol;
+      baseUrl: string;
+      apiKey?: string;
+      fallbackFrom?: { model: string; reason: string };
+    }
   | { kind: "no-orchestrator" }
-  | { kind: "disabled"; providerId: string };
+  | { kind: "disabled"; providerId: string }
+  | { kind: "unavailable"; providerId: string; reason: string };
 
-export async function resolveOrchestrator(fallbackModel?: string): Promise<OrchestratorResolution> {
-  const orchestratorModelRaw = await db.settings.get("routing.orchestratorModel");
-  let orchestratorModel = orchestratorModelRaw && orchestratorModelRaw.trim();
-  // Pas d'orchestrateur DÉDIÉ configuré → repli sur le modèle de chat actif
-  // (souvent déjà un modèle fort, ex. MiniMax M3). Ainsi la délégation marche
-  // « out of the box » : demander « crée un jeu » lance un vrai agent
-  // (plan + run_command + advisor) sans config préalable. L'utilisateur peut
-  // toujours épingler un orchestrateur dédié dans Réglages → Routing.
-  // Le Design Studio appelle resolveOrchestrator() SANS fallback → comportement
-  // inchangé là-bas (bannière « configure un orchestrateur » si absent).
-  if (!orchestratorModel && fallbackModel && fallbackModel.trim()) {
-    orchestratorModel = fallbackModel.trim();
-  }
-  if (!orchestratorModel) return { kind: "no-orchestrator" };
-
+async function resolveOrchestratorModel(
+  orchestratorModel: string,
+): Promise<OrchestratorResolution> {
   // Prefix the id with `openai/` if no slash so resolveProvider doesn't fall
   // through to "unknown provider".
   const fullId = orchestratorModel.includes("/") ? orchestratorModel : `openai/${orchestratorModel}`;
@@ -815,7 +815,48 @@ export async function resolveOrchestrator(fallbackModel?: string): Promise<Orche
   }
   const baseUrl: string = cfg.baseUrl && cfg.baseUrl !== "" ? cfg.baseUrl : defaultBaseUrl;
   const apiKey: string | undefined = cfg.apiKey && cfg.apiKey !== "" ? cfg.apiKey : undefined;
+  const availability = providerAvailability(protocol, baseUrl, apiKey);
+  if (!availability.ready) {
+    return {
+      kind: "unavailable",
+      providerId,
+      reason: availability.reason ?? "configuration incomplète",
+    };
+  }
   return { kind: "ok", model: realModel, protocol, baseUrl, apiKey };
+}
+
+export async function resolveOrchestrator(fallbackModel?: string): Promise<OrchestratorResolution> {
+  const configured = (await db.settings.get("routing.orchestratorModel"))?.trim() ?? "";
+  const fallback = fallbackModel?.trim() ?? "";
+
+  // Pas d'orchestrateur dédié : le modèle actif devient l'orchestrateur. Le
+  // Design Studio appelle sans fallback et conserve son garde explicite.
+  if (!configured) {
+    return fallback ? resolveOrchestratorModel(fallback) : { kind: "no-orchestrator" };
+  }
+
+  const primary = await resolveOrchestratorModel(configured);
+  if (primary.kind === "ok") return primary;
+
+  // Une ancienne case "enabled" ne prouve pas que la clé existe encore dans
+  // le coffre OS. Pour le Chat/Agent/Goal, ne bloque pas une tâche quand le
+  // modèle actif est, lui, utilisable : replie-toi dessus et expose ce choix.
+  if (fallback && fallback !== configured) {
+    const secondary = await resolveOrchestratorModel(fallback);
+    if (secondary.kind === "ok") {
+      const reason = primary.kind === "disabled"
+        ? `provider ${primary.providerId} désactivé`
+        : primary.kind === "unavailable"
+          ? `${primary.providerId} : ${primary.reason}`
+          : "orchestrateur indisponible";
+      return {
+        ...secondary,
+        fallbackFrom: { model: configured, reason },
+      };
+    }
+  }
+  return primary;
 }
 
 async function handleDelegate(
@@ -841,6 +882,9 @@ async function handleDelegate(
     executionProfile?: ExecutionProfile;
     isolate?: boolean;
   },
+  // Durable Goal resume outside a HITL card. The normal first Goal run omits
+  // this id; Rust creates the Goal atomically with the agent row.
+  goalId?: string,
 ): Promise<void> {
   const executionProfile = resume?.executionProfile
     ?? executionProfileForMode(mode, getAgentAccessProfile());
@@ -865,15 +909,29 @@ async function handleDelegate(
       } catch (err) {
         console.warn("[chat-sync] navigate emit failed", err);
       }
-    } else {
+    } else if (orch.kind === "disabled") {
       await appendMessage(convId, {
         id: newMessageId("e"),
         role: "ai",
         body: `⚠ Le provider orchestrator "${orch.providerId}" n'est pas activé. Ouvre Settings → Connections, configure-le et clique Save.`,
         ts: nowHHMM(),
       });
+    } else {
+      await appendMessage(convId, {
+        id: newMessageId("e"),
+        role: "ai",
+        body: `⚠ Le provider orchestrator "${orch.providerId}" est inutilisable : ${orch.reason}. Ouvre Settings → Connections et vérifie sa configuration.`,
+        ts: nowHHMM(),
+      });
     }
     return;
+  }
+  if (orch.fallbackFrom) {
+    pushToast(
+      `Orchestrateur ${orch.fallbackFrom.model} indisponible (${orch.fallbackFrom.reason}) — repli sur ${orch.model}.`,
+      "info",
+      7000,
+    );
   }
 
   // Résolution finale : protocol / baseUrl / apiKey / model.
@@ -1034,7 +1092,9 @@ async function handleDelegate(
           conversationId: convId,
           model: realModel,
           answer: execTask,
-          mode,
+          // HITL continuations keep their durable Goal through the source
+          // agent_id in Rust. The continuation API itself executes as Agent.
+          mode: mode === "goal" ? "agent" : mode,
           executionProfile,
           isolate,
           protocol,
@@ -1072,6 +1132,8 @@ async function handleDelegate(
           advisorProtocol: advisor?.protocol,
           advisorBaseUrl: advisor?.baseUrl,
           advisorApiKey: advisor?.apiKey,
+          goalId,
+          goalObjective: mode === "goal" ? userText : undefined,
           // Exécution DIRECTE par défaut (2026-07-02) : on NE passe PAS `isolate`
           // → le backend applique `unwrap_or(false)` et l'orchestrateur travaille
           // sur le VRAI checkout, comme Claude Code — les fichiers non commités du
@@ -1115,6 +1177,7 @@ async function handleDelegate(
     isolate,
     profileVerified: true,
     isolationStatus: isolate ? "pending" : "none",
+    goalId,
   };
   queryClient.setQueryData<ParsedAgentTranscript>(
     agentKeys.detail(agentId),
@@ -1253,6 +1316,38 @@ export async function continueAgent(
   },
 ): Promise<void> {
   await handleDelegate(convId, answer, undefined, getActiveModel(), mode, answer, resume);
+}
+
+/** Resume a durable Goal after a process restart or a recoverable run error.
+ * Provider credentials are intentionally resolved again through the normal
+ * keychain-backed path; they are never copied into the Goal row. */
+export async function resumeGoal(goal: GoalRow): Promise<void> {
+  const visibleMessage = `Reprendre le Goal « ${goal.title} »`;
+  await appendMessage(goal.conversationId, {
+    id: newMessageId("u"),
+    role: "user",
+    text: visibleMessage,
+    ts: nowHHMM(),
+  });
+  const task = [
+    "Reprends cet objectif durable jusqu'à sa complétion vérifiée.",
+    `OBJECTIF : ${goal.objective}`,
+    goal.lastError ? `INTERRUPTION PRÉCÉDENTE : ${goal.lastError}` : "",
+    goal.lastOutput ? `DERNIER RÉSULTAT CONNU : ${goal.lastOutput}` : "",
+    "Relis l'état réel du workspace et l'historique de la conversation avant d'agir. Ne suppose pas que l'exécution précédente a terminé ce qu'elle annonçait.",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  await handleDelegate(
+    goal.conversationId,
+    task,
+    undefined,
+    getActiveModel(),
+    "goal",
+    visibleMessage,
+    undefined,
+    goal.id,
+  );
 }
 
 /**
@@ -1503,11 +1598,13 @@ export function useActiveCodexEffort(): [string, (e: string) => void] {
 //   • "agent" — DÉFAUT : délègue à l'agent complet (exec directe, git = filet).
 // Persisté en localStorage + diffusé cross-fenêtre comme le modèle actif, pour
 // que le cockpit et la mascotte voient le même mode.
-export type ChatMode = "chat" | "plan" | "agent";
+export type ChatMode = "chat" | "plan" | "agent" | "goal";
 const DEFAULT_CHAT_MODE: ChatMode = "agent";
 
 function parseChatMode(raw: string | null | undefined): ChatMode {
-  return raw === "chat" || raw === "plan" || raw === "agent" ? raw : DEFAULT_CHAT_MODE;
+  return raw === "chat" || raw === "plan" || raw === "agent" || raw === "goal"
+    ? raw
+    : DEFAULT_CHAT_MODE;
 }
 
 /** Plain getter for the send path (localStorage-only, no React). */

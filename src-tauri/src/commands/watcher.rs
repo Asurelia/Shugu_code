@@ -321,7 +321,7 @@ fn flush_reindex(app: &tauri::AppHandle, pending: &mut HashMap<PathBuf, ChangeKi
                         crate::commands::vector::index_file_internal(app, &root, &rel).map(|_| ())
                     }
                     ChangeKind::Removed => {
-                        crate::commands::vector::delete_file_index_internal(app, &rel)
+                        crate::commands::vector::delete_file_index_internal(app, &root, &rel)
                     }
                 };
                 if let Err(e) = result {

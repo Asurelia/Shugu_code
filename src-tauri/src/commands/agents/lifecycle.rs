@@ -96,6 +96,18 @@ impl RunEvidence {
                 .filter(|result| !result.is_error)
         };
 
+        // Capture this BEFORE recording a plan from the current round. A tool
+        // refused by the plan-first gate is repaired by a successful retry of a
+        // guarded tool under a plan from a strictly earlier round. This matters
+        // for read-only shell commands such as `cd`: they are conservatively
+        // plan-guarded before dispatch, but correctly carry no mutation marker
+        // after execution and must not leave an impossible "missing execution"
+        // debt forever.
+        let guarded_retry_succeeded = self.latest_plan_round.is_some()
+            && calls
+                .iter()
+                .any(|call| is_plan_guarded_tool(&call.name) && succeeded(call).is_some());
+
         let plan_succeeded = calls
             .iter()
             .any(|call| call.name == "todo_write" && succeeded(call).is_some());
@@ -138,6 +150,9 @@ impl RunEvidence {
             if self.last_mutation_was_planned {
                 self.pending_plan_guarded_mutation = false;
             }
+        }
+        if guarded_retry_succeeded {
+            self.pending_plan_guarded_mutation = false;
         }
 
         // Record a plan only after classifying this round's mutations, so a
@@ -228,7 +243,16 @@ impl RunEvidence {
 const PLAN_REQUIRED_MARKER: &str = "[SHUGU_PLAN_REQUIRED]";
 
 fn task_requests_mutation(task: &str) -> bool {
-    let normalized: String = task
+    // Durable Goal resumes append prior errors and outputs after an explicit
+    // OBJECTIF block. Those diagnostics may mention words such as "modifier"
+    // or "delete" while describing something that must NOT be repeated. The
+    // user's objective remains the sole authority for mutation intent.
+    let intent_scope = ["OBJECTIF :", "OBJECTIVE:"]
+        .iter()
+        .find_map(|marker| task.split_once(marker).map(|(_, tail)| tail))
+        .and_then(|tail| tail.split("\n\n").next())
+        .unwrap_or(task);
+    let normalized: String = intent_scope
         .to_lowercase()
         .chars()
         .map(|c| match c {
@@ -242,54 +266,93 @@ fn task_requests_mutation(task: &str) -> bool {
             _ => c,
         })
         .collect();
-    normalized
+    let words: Vec<&str> = normalized
         .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .any(|word| {
+        .filter(|word| !word.is_empty())
+        .collect();
+
+    words.iter().enumerate().any(|(index, word)| {
+        let is_mutation = matches!(
+            *word,
+            "add"
+                | "ajoute"
+                | "ajouter"
+                | "change"
+                | "changer"
+                | "corrige"
+                | "corriger"
+                | "create"
+                | "cree"
+                | "creer"
+                | "delete"
+                | "deplace"
+                | "deplacer"
+                | "edit"
+                | "ecris"
+                | "ecrire"
+                | "efface"
+                | "effacer"
+                | "fix"
+                | "implement"
+                | "implemente"
+                | "implementer"
+                | "modifie"
+                | "modifier"
+                | "move"
+                | "refactor"
+                | "refactorise"
+                | "refactoriser"
+                | "remove"
+                | "rename"
+                | "renomme"
+                | "renommer"
+                | "repare"
+                | "reparer"
+                | "replace"
+                | "remplace"
+                | "remplacer"
+                | "supprime"
+                | "supprimer"
+                | "update"
+                | "write"
+        );
+        if !is_mutation {
+            return false;
+        }
+
+        // Intent is not a bag of keywords: "sans modifier", "ne modifie
+        // pas", and "do not edit" explicitly forbid the very mutation verb
+        // they contain. A short local window also carries "without" across
+        // coordinators ("without editing or writing"), while contrast/sequence
+        // words reset the scope so "ne modifie pas X, mais crée Y" stays
+        // positive for the second instruction.
+        let window = &words[index.saturating_sub(4)..index];
+        let scoped_window = window
+            .iter()
+            .rposition(|token| ["mais", "but", "puis", "then"].contains(token))
+            .map(|reset| &window[reset + 1..])
+            .unwrap_or(window);
+        let negated = scoped_window.iter().any(|token| {
             matches!(
-                word,
-                "add"
-                    | "ajoute"
-                    | "ajouter"
-                    | "change"
-                    | "changer"
-                    | "corrige"
-                    | "corriger"
-                    | "create"
-                    | "cree"
-                    | "creer"
-                    | "delete"
-                    | "deplace"
-                    | "deplacer"
-                    | "edit"
-                    | "ecris"
-                    | "ecrire"
-                    | "efface"
-                    | "effacer"
-                    | "fix"
-                    | "implement"
-                    | "implemente"
-                    | "implementer"
-                    | "modifie"
-                    | "modifier"
-                    | "move"
-                    | "refactor"
-                    | "refactorise"
-                    | "refactoriser"
-                    | "remove"
-                    | "rename"
-                    | "renomme"
-                    | "renommer"
-                    | "repare"
-                    | "reparer"
-                    | "replace"
-                    | "remplace"
-                    | "remplacer"
-                    | "supprime"
-                    | "supprimer"
-                    | "update"
-                    | "write"
+                *token,
+                "aucun"
+                    | "aucune"
+                    | "avoid"
+                    | "don"
+                    | "doesn"
+                    | "interdit"
+                    | "jamais"
+                    | "ne"
+                    | "never"
+                    | "no"
+                    | "not"
+                    | "pas"
+                    | "sans"
+                    | "without"
             )
-        })
+        });
+        !negated
+    })
 }
 
 pub(super) fn is_plan_guarded_tool(name: &str) -> bool {
@@ -427,6 +490,29 @@ mod tests {
     }
 
     #[test]
+    fn mutation_intent_classifier_respects_explicit_negation() {
+        assert!(!task_requests_mutation(
+            "Inspecte ce workspace sans modifier de fichier"
+        ));
+        assert!(!task_requests_mutation(
+            "Ne modifie pas les fichiers et ne crée rien"
+        ));
+        assert!(!task_requests_mutation(
+            "Inspect the repository without editing or writing files"
+        ));
+        assert!(!task_requests_mutation(
+            "Do not delete anything; only report what you find"
+        ));
+        assert!(task_requests_mutation(
+            "Ne modifie pas README.md, mais crée report.md"
+        ));
+        assert!(!task_requests_mutation(
+            "Reprends ce Goal.\n\nOBJECTIF : Inspecte sans modifier de fichier.\n\n\
+             INTERRUPTION PRÉCÉDENTE : la modification demandée n'a pas été exécutée"
+        ));
+    }
+
+    #[test]
     fn read_only_turn_is_never_forced_to_mutate() {
         let mut evidence = RunEvidence::default();
         observe(&mut evidence, "w1", "fs_write_file", "written");
@@ -497,6 +583,27 @@ mod tests {
         observe(&mut evidence, "p1", "todo_write", "plan saved");
         observe(&mut evidence, "w2", "fs_write_file", "written after plan");
         observe(&mut evidence, "t1", "run_command", "[exit 0]");
+
+        assert_eq!(
+            evidence.completion_decision(false),
+            CompletionDecision::Complete
+        );
+    }
+
+    #[test]
+    fn planned_read_only_command_retry_clears_guard_debt_without_fake_mutation() {
+        let mut evidence =
+            RunEvidence::for_task(true, "Inspecte le projet et vérifie le chemin courant");
+        let command = call("c1", "run_command");
+        let blocked = reject_unplanned_tool(&command, true).unwrap();
+        evidence.observe_round(&[command], &[blocked]);
+        observe(&mut evidence, "p1", "todo_write", "plan saved");
+        observe(
+            &mut evidence,
+            "c2",
+            "run_command",
+            "[EXECUTION: fullAccessDirect]\n[exit 0]\nF:\\Dev\\Comfyui",
+        );
 
         assert_eq!(
             evidence.completion_decision(false),

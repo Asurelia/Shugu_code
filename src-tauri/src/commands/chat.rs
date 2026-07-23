@@ -1675,8 +1675,13 @@ async fn run_chat_tool_loop(
                         "code_search: champ requis manquant : query".to_string(),
                         true,
                     )
-                } else {
-                    match crate::commands::vector::vec_search_internal(app, "code", query, k) {
+                } else if let Some(workspace_root) = root.as_deref() {
+                    match crate::commands::vector::code_search_internal(
+                        app,
+                        workspace_root,
+                        query,
+                        k,
+                    ) {
                         Ok(hits) if hits.is_empty() => (
                             "aucun résultat sémantique — l'index n'est peut-être pas encore construit. \
                              Utilise fs_search (littéral/regex) à la place."
@@ -1696,6 +1701,11 @@ async fn run_chat_tool_loop(
                         ),
                         Err(e) => (format!("code_search a échoué : {e}"), true),
                     }
+                } else {
+                    (
+                        "aucun workspace ouvert — recherche sémantique indisponible".to_string(),
+                        true,
+                    )
                 }
             } else if tc.name.starts_with("mcp__") {
                 let mgr = app.state::<crate::commands::mcp::McpManager>();

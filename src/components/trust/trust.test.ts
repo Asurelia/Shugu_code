@@ -16,10 +16,11 @@ import {
 } from "./trust";
 
 describe("toTrustMode", () => {
-  it("passes through the three known modes", () => {
+  it("passes through the known modes", () => {
     expect(toTrustMode("chat")).toBe("chat");
     expect(toTrustMode("plan")).toBe("plan");
     expect(toTrustMode("agent")).toBe("agent");
+    expect(toTrustMode("goal")).toBe("goal");
   });
 
   it("defaults unknown / nullish input to agent (matches chat-sync default)", () => {
@@ -39,6 +40,7 @@ describe("modeToRisk", () => {
 
   it("maps the full agent mode to the exec tier", () => {
     expect(modeToRisk("agent")).toBe("exec");
+    expect(modeToRisk("goal")).toBe("exec");
   });
 });
 
@@ -47,10 +49,11 @@ describe("MODE_META", () => {
     expect(MODE_META.chat.badge).toBe("Ask");
     expect(MODE_META.plan.badge).toBe("Plan");
     expect(MODE_META.agent.badge).toBe("Act");
+    expect(MODE_META.goal.badge).toBe("Goal");
   });
 
   it("every mode's risk points at a real RISK entry", () => {
-    const modes: TrustMode[] = ["chat", "plan", "agent"];
+    const modes: TrustMode[] = ["chat", "plan", "agent", "goal"];
     for (const m of modes) {
       const risk = MODE_META[m].risk;
       expect(RISK[risk]).toBeDefined();

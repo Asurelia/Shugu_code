@@ -49,6 +49,7 @@ import { useGitBranches } from "@/features/git/queries";
 import { fsGetWorkspaceRoot } from "@/lib/fs";
 import { fsKeys } from "@/features/fs/keys";
 import { CommentTray } from "@/features/cockpit/CommentTray";
+import { GoalCard } from "@/features/goals/GoalCard";
 import { getComments, clearComments } from "@/features/cockpit/commentStore";
 import "./composer-controls.css";
 import type { Generation, Message, MessageAction } from "@/lib/types";
@@ -426,6 +427,7 @@ export function ChatView({
 
   const composer = (
     <>
+      <GoalCard conversationId={activeConv} />
       {/* C2.4 — pending inline comments tray. Returns null when empty (no-comments
           path unchanged). Visible only when the user has queued notes from the
           Révision diff, independently of the cockpit flag. */}
@@ -610,17 +612,17 @@ export function ChatView({
           </span>
         )}
         {/* Trust-UX — fait de permission précis, dépendant du mode. */}
-        {chatMode === "agent" && agentAccess === "auto" ? (
+        {(chatMode === "agent" || chatMode === "goal") && agentAccess === "auto" ? (
           <PermissionBadge
             kind="scoped"
             label="Auto sandboxé"
-            title="Mode Agent Auto — écrit dans le workspace et n'exécute une commande que si le sandbox Windows a réellement démarré. Aucun fallback direct."
+            title={`${chatMode === "goal" ? "Goal" : "Mode Agent"} Auto — écrit dans le workspace et n'exécute une commande que si le sandbox Windows a réellement démarré. Aucun fallback direct.`}
           />
-        ) : chatMode === "agent" ? (
+        ) : chatMode === "agent" || chatMode === "goal" ? (
           <PermissionBadge
             kind="direct"
             label="Full Access direct"
-            title="Mode Full Access — exécution directe sur la machine, sans confirmation par commande. Ce choix expire à la fermeture de l'application."
+            title={`${chatMode === "goal" ? "Goal" : "Mode Agent"} Full Access — exécution directe sur la machine, sans confirmation par commande. Ce choix expire à la fermeture de l'application.`}
           />
         ) : (
           <PermissionBadge

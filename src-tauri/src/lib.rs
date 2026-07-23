@@ -552,6 +552,47 @@ ALTER TABLE generations ADD COLUMN kind TEXT NOT NULL DEFAULT 'image'
 CREATE INDEX IF NOT EXISTS idx_generations_kind_ts ON generations(kind, ts DESC);
 ";
 
+// V24 — Goal durable. Un Goal est l'objectif utilisateur de haut niveau ; les
+// rows `agents` restent ses tentatives/exécutions successives. Il survit donc à
+// un reload ou un crash, sait s'il attend une réponse, et peut être repris avec
+// un nouveau run sans perdre son objectif ni son historique d'agents.
+const MIGRATION_V24: &str = "
+CREATE TABLE IF NOT EXISTS agent_goals (
+    id                TEXT PRIMARY KEY,
+    conversation_id   TEXT NOT NULL,
+    workspace_id      TEXT,
+    title             TEXT NOT NULL,
+    objective         TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'active'
+      CHECK (status IN ('active', 'waiting', 'paused', 'completed', 'cancelled')),
+    role              TEXT NOT NULL DEFAULT 'orchestrator',
+    model             TEXT NOT NULL,
+    protocol          TEXT,
+    base_url          TEXT,
+    execution_profile TEXT NOT NULL DEFAULT 'auto'
+      CHECK (execution_profile IN ('chat', 'plan', 'auto', 'fullAccess')),
+    isolate           INTEGER NOT NULL DEFAULT 0 CHECK (isolate IN (0, 1)),
+    current_agent_id  TEXT,
+    last_output       TEXT,
+    last_error        TEXT,
+    resume_count      INTEGER NOT NULL DEFAULT 0,
+    archived          INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1)),
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL,
+    finished_at       INTEGER
+);
+ALTER TABLE agents ADD COLUMN goal_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_agent_goals_conv_updated
+  ON agent_goals(conversation_id, archived, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_goals_status
+  ON agent_goals(status, updated_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_goals_one_live_conversation
+  ON agent_goals(conversation_id)
+  WHERE status IN ('active', 'waiting');
+CREATE INDEX IF NOT EXISTS idx_agents_goal
+  ON agents(goal_id, created_at);
+";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = vec![
@@ -691,6 +732,12 @@ pub fn run() {
             version: 23,
             description: "unified_media_generations",
             sql: MIGRATION_V23,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 24,
+            description: "durable_agent_goals",
+            sql: MIGRATION_V24,
             kind: MigrationKind::Up,
         },
     ];
@@ -874,11 +921,7 @@ pub fn run() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "tray-show" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.unminimize();
-                            let _ = window.set_focus();
-                        }
+                        let _ = commands::app::show_main_window(app);
                     }
                     "tray-quit" => {
                         app.exit(0);
@@ -905,6 +948,8 @@ pub fn run() {
                                 }
                                 Err(_) => {}
                             }
+                        } else {
+                            let _ = commands::app::show_main_window(app);
                         }
                     }
                 })
@@ -913,6 +958,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::app::app_show_main,
             commands::chat::chat_send,
             commands::chat::chat_abort,
             commands::chat::fim_complete,
@@ -998,6 +1044,9 @@ pub fn run() {
             commands::agents::agent_list_active,
             commands::agents::agent_get_transcript,
             commands::agents::agent_list_by_conversation,
+            commands::agents::goals::goal_list_by_conversation,
+            commands::agents::goals::goal_get,
+            commands::agents::goals::goal_archive,
             commands::agents::agent_atelier_run,
             commands::agents::agent_exec_preflight,
             commands::agents::agent_grounded_run,
@@ -1156,4 +1205,44 @@ pub fn run() {
                 commands::lsp::kill_all(lsp_state.inner());
             }
         });
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::MIGRATION_V24;
+    use rusqlite::{params, Connection};
+
+    #[test]
+    fn v24_creates_durable_goals_and_one_live_goal_per_conversation() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agents (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL);",
+        )
+        .unwrap();
+        conn.execute_batch(MIGRATION_V24).unwrap();
+
+        let has_goal_id: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM pragma_table_info('agents') WHERE name='goal_id'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_goal_id);
+
+        let insert = |id: &str, status: &str| {
+            conn.execute(
+                "INSERT INTO agent_goals
+                    (id, conversation_id, title, objective, status, model,
+                     execution_profile, created_at, updated_at)
+                 VALUES (?1, 'conv', 'title', 'objective', ?2, 'model', 'auto', 1, 1)",
+                params![id, status],
+            )
+        };
+        insert("goal-1", "active").unwrap();
+        assert!(insert("goal-2", "waiting").is_err());
+        insert("goal-3", "paused").unwrap();
+    }
 }
