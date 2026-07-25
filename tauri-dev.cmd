@@ -22,6 +22,10 @@ REM Usage:
 REM   tauri-dev.cmd          runs pnpm tauri dev
 REM   tauri-dev.cmd build    runs pnpm tauri build
 REM   tauri-dev.cmd info     runs pnpm tauri info
+REM
+REM On main, every launch first fetches origin/main and applies a safe
+REM fast-forward. Local modifications are never overwritten. When the commit
+REM changes, dependencies are refreshed with pnpm's frozen lockfile.
 
 REM ─── Toujours s'exécuter depuis le dossier du script ─────────
 REM Sans ça, un raccourci Windows avec un « Démarrer dans » différent
@@ -29,6 +33,16 @@ REM (ou un lancement depuis un autre clone) compile UN AUTRE dossier
 REM que celui-ci — symptôme : « je viens de lancer et c'est l'ancienne
 REM version ». %~dp0 = dossier de CE fichier .cmd.
 cd /d "%~dp0"
+
+REM ─── Synchroniser main sans écraser le travail local ─────────
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\sync-main-before-launch.ps1"
+if errorlevel 1 (
+  echo.
+  echo [tauri-dev.cmd] ERROR: automatic update failed; launch cancelled.
+  echo Resolve the Git error above, then relaunch.
+  pause
+  exit /b 1
+)
 
 REM ─── Afficher le code réellement exécuté ─────────────────────
 REM Branche + commit imprimés à chaque lancement : plus jamais de doute

@@ -901,6 +901,8 @@ export function SideSettings({ section, setSection }: any) {
     { id: 'shortcuts', label: 'Keyboard shortcuts' },
     { id: 'privacy', label: 'Privacy' },
     { id: 'command-rules', label: 'Command Rules' },
+    { id: 'hooks', label: 'Hooks' },
+    { id: 'plugins', label: 'Plugins' },
     { id: 'ops', label: 'Storage & Backup' },
     { id: 'about', label: 'About' },
   ];

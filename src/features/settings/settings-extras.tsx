@@ -390,6 +390,9 @@ export function InterfaceSettings() {
           />
           <CockpitRow />
           <NativeSearchRow />
+          <FollowUpQueueModeRow />
+          <DetailModeRow />
+          <NativeNotificationRows />
         </div>
 
         <div className="setting-section">
@@ -534,6 +537,155 @@ function CockpitRow() {
       desc="Affiche la vue Chat comme un cockpit : chat à gauche, éditeur/révision en panneau droit redimensionnable. Désactiver ramène la vue chat simple."
     >
       <Switch on={on} onChange={change} />
+    </SettingRow>
+  );
+}
+
+/**
+ * P6.6 — mode de détail de la conversation (`chat.conversationDetailMode`,
+ * défaut "etapes"). Récit = prose seule (timeline d'outils masquée), Étapes =
+ * rendu actuel, Exécution = tout déplié. Consommé par views-chat et
+ * AgentsPanel via useQuery — l'invalidation de la clé re-rend immédiatement.
+ */
+function DetailModeRow() {
+  const [mode, setMode] = useState("etapes"); // défaut Étapes
+
+  useEffect(() => {
+    let alive = true;
+    void db.settings.get("chat.conversationDetailMode").then((v) => {
+      if (alive) setMode(v === "recit" || v === "execution" ? v : "etapes");
+    });
+    return () => { alive = false; };
+  }, []);
+
+  const change = (v: string) => {
+    setMode(v);
+    void (async () => {
+      await db.settings.set("chat.conversationDetailMode", v);
+      await queryClient.invalidateQueries({ queryKey: ["settings", "chat.conversationDetailMode"] });
+    })();
+  };
+
+  return (
+    <SettingRow
+      label="Niveau de détail de la conversation"
+      desc="Récit : prose seule (outils masqués). Étapes : rendu actuel. Exécution : tout déplié (commandes, sorties, reasoning). Appliqué immédiatement, sans recharger."
+    >
+      <SegRow value={mode} onChange={change} options={[
+        { v: "recit",     l: "📖 Récit" },
+        { v: "etapes",    l: "🪜 Étapes" },
+        { v: "execution", l: "⚙️ Exécution" },
+      ]}/>
+    </SettingRow>
+  );
+}
+
+/**
+ * P6.5 — un toggle de notification native (`notifications.*`, défaut ON).
+ * Même pattern lecture/écriture que NativeSearchRow ; le CONSOMMATEUR réel
+ * est le listener d'events agent (useAgentEvents → maybeNotifyAgentEvent).
+ */
+function NotificationToggleRow({
+  settingKey,
+  label,
+  desc,
+}: {
+  settingKey: string;
+  label: string;
+  desc: string;
+}) {
+  const [on, setOn] = useState(true); // défaut ON
+
+  useEffect(() => {
+    let alive = true;
+    void db.settings.get(settingKey).then((v) => {
+      if (alive) setOn(v !== "false");
+    });
+    return () => { alive = false; };
+  }, [settingKey]);
+
+  const change = (v: boolean) => {
+    setOn(v);
+    void (async () => {
+      await db.settings.set(settingKey, v ? "true" : "false");
+      await queryClient.invalidateQueries({ queryKey: ["settings", settingKey] });
+    })();
+  };
+
+  return (
+    <SettingRow label={label} desc={desc}>
+      <Switch on={on} onChange={change} />
+    </SettingRow>
+  );
+}
+
+/** P6.5 — section des 4 toggles de notifications OS natives. */
+function NativeNotificationRows() {
+  return (
+    <>
+      <NotificationToggleRow
+        settingKey="notifications.runComplete"
+        label="Notification à la fin d'un run"
+        desc="Toast natif Windows quand un run agent se termine avec succès."
+      />
+      <NotificationToggleRow
+        settingKey="notifications.runError"
+        label="Notification en cas d'échec"
+        desc="Toast natif quand un run agent échoue ou est arrêté."
+      />
+      <NotificationToggleRow
+        settingKey="notifications.hitlWaiting"
+        label="Notification quand l'agent attend une réponse"
+        desc="Toast natif quand une question (ask_user) ou un plan attend ton action dans le chat."
+      />
+      <NotificationToggleRow
+        settingKey="notifications.onlyWhenUnfocused"
+        label="Seulement si Shugu n'est pas au premier plan"
+        desc="Évite de doubler le toast in-app quand tu regardes déjà l'app. Désactiver pour être notifié même fenêtre focus."
+      />
+    </>
+  );
+}
+
+/**
+ * P6.1 — mode de la file d'attente des suivis (`agents.followUpQueueMode`,
+ * défaut "queue"). Que fait un message envoyé PENDANT un run agent ?
+ *   - File d'attente : traité automatiquement quand le run se termine ;
+ *   - Guidage : injecté entre deux étapes du run pour le réorienter ;
+ *   - Interruption : arrête le run et repart avec ce message.
+ * Ctrl+Shift+Enter dans le composer envoie avec le mode INVERSE (one-shot).
+ * Lu côté envoi par handleDelegate (chat-sync.ts) ; appliqué par le backend
+ * (`agent_run_or_queue`).
+ */
+function FollowUpQueueModeRow() {
+  const [mode, setMode] = useState("queue"); // défaut queue
+
+  useEffect(() => {
+    let alive = true;
+    void db.settings.get("agents.followUpQueueMode").then((v) => {
+      if (alive) setMode(v === "steer" || v === "interrupt" ? v : "queue");
+    });
+    return () => { alive = false; };
+  }, []);
+
+  const change = (v: string) => {
+    setMode(v);
+    void (async () => {
+      await db.settings.set("agents.followUpQueueMode", v);
+      await queryClient.invalidateQueries({ queryKey: ["settings", "agents.followUpQueueMode"] });
+    })();
+  };
+
+  return (
+    <SettingRow
+      label="Message envoyé pendant un run"
+      desc="File d'attente : traité à la fin du run. Guidage : injecté entre deux étapes pour réorienter l'agent. Interruption : arrête le run et repart avec ce message. Ctrl+Shift+Entrée envoie une fois avec le mode inverse."
+    >
+      <SegRow value={mode} onChange={change} options={[
+        { v: "queue",     l: "⏳ File d'attente" },
+        { v: "steer",     l: "🧭 Guidage" },
+        { v: "interrupt", l: "⚡ Interruption" },
+      ]}/>
     </SettingRow>
   );
 }

@@ -45,6 +45,7 @@ export default tseslint.config(
       "public/**",
       "_design_extracted/**",
       "docs/**",
+      "dev-logs/**",
       "evals/**",
       "scripts/**",
       "e2e/**", // e2e specs run under Playwright's own runtime, not the app build

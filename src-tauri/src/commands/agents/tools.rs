@@ -543,9 +543,55 @@ fn agent_tools() -> &'static [ToolDef] {
                         "timeoutSecs": {
                             "type": "integer",
                             "description": "Wall-clock cap in seconds (default 60, max 300)."
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": "Optional: run inside the PERSISTENT shell session with this id                                            (keeps cwd + env vars between commands, e.g. after `cd` or `set`).                                            Omit for a disposable one-shot process (the default).                                            Sessions die when this run ends."
                         }
                     },
                     "required": ["command"]
+                }),
+            },
+            ToolDef {
+                name: "run_background",
+                description: "Start a shell command as a BACKGROUND process (dev server, watcher, long                               build) and get its id IMMEDIATELY — it keeps running while you work. Same                               sandbox and risk classification as run_command. Poll its output with                               read_process_output(id); stop it with stop_process(id). Killed automatically                               if this run is stopped.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command to run detached, e.g. \"pnpm dev\"."
+                        }
+                    },
+                    "required": ["command"]
+                }),
+            },
+            ToolDef {
+                name: "read_process_output",
+                description: "Read the current status + bounded output tail of a background process                               started with run_background. Read-only. Returns status                               (running/exited/interrupted/killed), exit code when known, and the last                               ~8KB of combined stdout/stderr.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Process id returned by run_background (bg-...)."
+                        }
+                    },
+                    "required": ["id"]
+                }),
+            },
+            ToolDef {
+                name: "stop_process",
+                description: "Stop a background process started with run_background (kills the whole                               process tree). Returns whether something was actually killed — an                               already-finished process returns false.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Process id returned by run_background (bg-...)."
+                        }
+                    },
+                    "required": ["id"]
                 }),
             },
             ToolDef {
@@ -596,6 +642,60 @@ fn agent_tools() -> &'static [ToolDef] {
                         }
                     },
                     "required": ["name", "body"]
+                }),
+            },
+            ToolDef {
+                name: "skill_load",
+                description: "Load the FULL body of a file skill (SKILL.md) listed in your context                               (from .shugu/skills, ~/.claude/skills or plugins). Only the name +                               description of each skill is in your context — call this to read the                               complete procedure BEFORE applying a skill that looks relevant to the                               task. Read-only; errors list the available skill names if unknown.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Exact skill name as listed, e.g. \"pdf-processing\"."
+                        }
+                    },
+                    "required": ["name"]
+                }),
+            },
+            ToolDef {
+                name: "lsp_diagnostics",
+                description: "Get the language server's diagnostics (errors/warnings with line, column,                               message and source) for a workspace file — precise compiler-grade feedback                               without running a full build. Read-only. Returns an honest error when no                               LSP server exists for the file's language.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Workspace-relative file path, e.g. \"src/main.ts\"."
+                        }
+                    },
+                    "required": ["path"]
+                }),
+            },
+            ToolDef {
+                name: "lsp_definition",
+                description: "Find the definition location(s) of the symbol at (path, line, character)                               via the language server. Coordinates are 0-based LSP (line 0 = first line).                               Read-only.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Workspace-relative file path." },
+                        "line": { "type": "integer", "description": "0-based line number." },
+                        "character": { "type": "integer", "description": "0-based character offset." }
+                    },
+                    "required": ["path", "line", "character"]
+                }),
+            },
+            ToolDef {
+                name: "lsp_references",
+                description: "Find all reference locations of the symbol at (path, line, character) via                               the language server (declaration included). Coordinates are 0-based LSP.                               Read-only.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Workspace-relative file path." },
+                        "line": { "type": "integer", "description": "0-based line number." },
+                        "character": { "type": "integer", "description": "0-based character offset." }
+                    },
+                    "required": ["path", "line", "character"]
                 }),
             },
             ToolDef {
@@ -1016,7 +1116,7 @@ pub(super) fn execute_tool(
 /// d'un workspace. Le runner les route sur le chemin séquentiel AVANT le gate
 /// workspace (via `any_async`), sinon le mode Plan interactif serait cassé quand
 /// aucun dossier n'est ouvert (« planifie-moi un nouveau projet »).
-fn register_hitl_interaction(
+pub(super) fn register_hitl_interaction(
     app: &AppHandle,
     agent_id: &str,
     tool_call_id: &str,
@@ -1399,6 +1499,47 @@ fn dispatch_inner(
                 .lock()
                 .ok()
                 .and_then(|guard| guard.get(agent_id).map(|h| h.cancelled.clone()));
+            // P6.9 — `session_id` présent ⇒ commande dans la session shell
+            // persistante du run (cwd/env conservés, sentinel de complétion) ;
+            // absent ⇒ processus jetable (comportement historique inchangé).
+            if let Some(session_id) = args["session_id"].as_str().filter(|v| !v.trim().is_empty()) {
+                let res = super::processes::exec_in_session(
+                    app,
+                    root,
+                    agent_id,
+                    session_id,
+                    command,
+                    timeout_secs,
+                    execution_profile,
+                    &rules,
+                )?;
+                last_exec_exit.store(
+                    if res.timed_out {
+                        -2
+                    } else {
+                        res.exit_code as i64
+                    },
+                    Ordering::Relaxed,
+                );
+                let status = if res.timed_out {
+                    format!("TIMED OUT after {timeout_secs}s — session tuée, la prochaine commande respawn une session fraîche")
+                } else {
+                    format!("exit {}", res.exit_code)
+                };
+                let session_note = if res.session_alive {
+                    String::new()
+                } else {
+                    " (session morte — la prochaine commande respawn une session fraîche)"
+                        .to_string()
+                };
+                return Ok(format!(
+                    "[EXECUTION: session {session_id}{session_note}]
+[{status}]
+--- output ---
+{}",
+                    res.output
+                ));
+            }
             let res = super::exec::run_command_governed(
                 root,
                 command,
@@ -1511,6 +1652,65 @@ fn dispatch_inner(
             Ok(format!(
                 "skill '{name}' saved for role '{role}' — it will load automatically in future runs"
             ))
+        }
+        "run_background" => {
+            // P6.9 — processus détaché suivi en SQLite (id retourné immédiatement,
+            // watcher MAJ statut/exit/sortie). Même classification que run_command.
+            let command = args["command"]
+                .as_str()
+                .ok_or_else(|| "missing required field: command".to_string())?;
+            let rules = super::command_rules::load_for_classify(app)
+                .map_err(|e| format!("commande bloquée : règles indisponibles ({e})"))?;
+            let row = super::processes::run_background(
+                app,
+                root,
+                agent_id,
+                command,
+                execution_profile,
+                &rules,
+            )?;
+            Ok(format!(
+                "processus d'arrière-plan démarré — id: {} (pid {}, statut running). Poll avec read_process_output, stop avec stop_process.",
+                row.id, row.pid
+            ))
+        }
+        "read_process_output" => {
+            // P6.9 — lecture bornée (effet lecture, Auto-safe).
+            let id = args["id"]
+                .as_str()
+                .ok_or_else(|| "missing required field: id".to_string())?;
+            let view = super::processes::read_process_output(app, id)?;
+            Ok(format!(
+                "[{}]{}
+--- output (tail) ---
+{}",
+                view.status,
+                view.exit_code
+                    .map(|c| format!(" exit {c}"))
+                    .unwrap_or_default(),
+                view.tail
+            ))
+        }
+        "stop_process" => {
+            // P6.9 — kill de l'arbre d'un processus d'arrière-plan.
+            let id = args["id"]
+                .as_str()
+                .ok_or_else(|| "missing required field: id".to_string())?;
+            let stopped = super::processes::stop_process(app, id)?;
+            Ok(if stopped {
+                format!("processus {id} arrêté (arbre tué)")
+            } else {
+                format!("processus {id} déjà terminé ou introuvable — rien tué")
+            })
+        }
+        "skill_load" => {
+            // P6.8 — chargement paresseux d'une skill FICHIER (SKILL.md) : le
+            // listing (name+description) est dans le contexte, le corps arrive
+            // ici à la demande. Effet lecture, Auto-safe.
+            let name = args["name"]
+                .as_str()
+                .ok_or_else(|| "missing required field: name".to_string())?;
+            super::file_skills::load_body(app, Some(root), name)
         }
         // NB : `ask_user` / `submit_plan` NE sont PAS dispatchés ici — ils passent
         // par `execute_hitl_tool` (chemin séquentiel du runner, pré-gate workspace),

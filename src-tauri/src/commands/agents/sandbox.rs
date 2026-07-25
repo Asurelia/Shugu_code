@@ -260,11 +260,85 @@ pub fn run_confined_cancellable(
 }
 
 // ════════════════════════════════════════════════════════════════════════
+// P6.9 — surface publique des spawns persistants (sessions + background).
+// Sur Windows : le chemin confiné LOW (windows_impl). Ailleurs : None →
+// l'appelant utilise son chemin direct (Full Access) ou refuse (Auto,
+// fail-closed comme run_command).
+// ════════════════════════════════════════════════════════════════════════
+
+/// Un shell spawné sans attente (session persistante ou processus détaché) :
+/// pipes appartenant au parent + handle (terminate = kill de l'arbre).
+#[cfg(windows)]
+pub(super) struct SpawnedShell {
+    pub pid: u32,
+    pub stdin: std::fs::File,
+    pub stdout: std::fs::File,
+    pub stderr: std::fs::File,
+    handle: windows_impl::ConfinedShellHandle,
+}
+
+#[cfg(windows)]
+impl SpawnedShell {
+    /// Consomme le shell : (pid, stdin, stdout, stderr, handle). Évite les
+    /// moves partiels côté appelant (P6.9).
+    pub fn into_parts(
+        self,
+    ) -> (
+        u32,
+        std::fs::File,
+        std::fs::File,
+        std::fs::File,
+        windows_impl::ConfinedShellHandle,
+    ) {
+        (self.pid, self.stdin, self.stdout, self.stderr, self.handle)
+    }
+}
+
+/// Session shell persistante confinée (LOW integrity), `cmd /d /q /k`.
+/// `None` si le sandbox ne peut pas s'armer (Auto doit alors REFUSER —
+/// fail-closed, jamais de repli direct silencieux).
+#[cfg(windows)]
+pub(super) fn spawn_confined_shell(ws: &Path) -> Option<SpawnedShell> {
+    windows_impl::spawn_shell(ws).map(|sh| SpawnedShell {
+        pid: sh.handle.pid(),
+        stdin: sh.stdin,
+        stdout: sh.stdout,
+        stderr: sh.stderr,
+        handle: sh.handle,
+    })
+}
+
+/// Processus d'arrière-plan confiné (`cmd /d /s /c <command>`).
+#[cfg(windows)]
+pub(super) fn spawn_confined_detached(ws: &Path, command: &str) -> Option<SpawnedShell> {
+    windows_impl::spawn_detached(ws, command).map(|sh| SpawnedShell {
+        pid: sh.handle.pid(),
+        stdin: sh.stdin,
+        stdout: sh.stdout,
+        stderr: sh.stderr,
+        handle: sh.handle,
+    })
+}
+
+#[cfg(not(windows))]
+pub(super) struct SpawnedShell;
+
+#[cfg(not(windows))]
+pub(super) fn spawn_confined_shell(_ws: &Path) -> Option<SpawnedShell> {
+    None
+}
+
+#[cfg(not(windows))]
+pub(super) fn spawn_confined_detached(_ws: &Path, _command: &str) -> Option<SpawnedShell> {
+    None
+}
+
+// ════════════════════════════════════════════════════════════════════════
 // Windows implementation
 // ════════════════════════════════════════════════════════════════════════
 
 #[cfg(windows)]
-mod windows_impl {
+pub(crate) mod windows_impl {
     use super::*;
     use std::io::Read;
     use std::os::windows::ffi::OsStrExt;
@@ -1139,6 +1213,210 @@ mod windows_impl {
     /// joins the job at creation. Returns the backing buffer (kept alive by the
     /// caller until after CreateProcess). `None` on any failure → caller assigns
     /// the job post-spawn instead.
+
+    // ── P6.9 — spawn confiné PERSISTANT (sessions shell + processus d'arrière-
+    // plan). Même confinement que `run_confined` (token LOW, allowlist MIC,
+    // Job Object), mais SANS attente : le parent garde stdin/stdout/stderr et
+    // le handle. L'appelant (processes.rs) possède le cycle de vie.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Handle d'un shell confiné : possède le Job, le processus et les labels
+    /// MIC (nettoyés au drop). `terminate` tue tout l'arbre.
+    pub(crate) struct ConfinedShellHandle {
+        pid: u32,
+        job: Option<OwnedHandle>,
+        proc: Option<OwnedHandle>,
+        /// Labels MIC transitoires du workspace — restaurés à la mort du shell.
+        _workspace_labels: WorkspaceTreeLabels,
+        /// Labels MIC des dossiers runtime (provisionnés/transitoires).
+        _restores: Vec<LabelRestore>,
+        _token: OwnedHandle,
+    }
+
+    impl ConfinedShellHandle {
+        pub(crate) fn pid(&self) -> u32 {
+            self.pid
+        }
+        pub(crate) fn terminate(&self) {
+            use windows_sys::Win32::System::Threading::TerminateProcess;
+            if let Some(ref j) = self.job {
+                // SAFETY: live job handle — kill the whole tree.
+                unsafe { TerminateJobObject(j.raw(), 1) };
+            }
+            if let Some(ref p) = self.proc {
+                // SAFETY: live process handle — belt-and-braces.
+                unsafe { TerminateProcess(p.raw(), 1) };
+            }
+        }
+        pub(crate) fn exited(&self) -> Option<i32> {
+            use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+            let p = self.proc.as_ref()?;
+            // SAFETY: live process handle; 0 ms = poll.
+            let wait = unsafe { WaitForSingleObject(p.raw(), 0) };
+            if wait != WAIT_OBJECT_0 {
+                return None;
+            }
+            let mut code: u32 = 0;
+            // SAFETY: live handle; out-param valid.
+            unsafe {
+                GetExitCodeProcess(p.raw(), &mut code);
+            }
+            Some(code as i32)
+        }
+    }
+
+    /// Un shell confiné fraîchement spawné (pipes détenues par le parent).
+    pub(super) struct ConfinedShell {
+        pub handle: ConfinedShellHandle,
+        pub stdin: std::fs::File,
+        pub stdout: std::fs::File,
+        pub stderr: std::fs::File,
+    }
+
+    // Les HANDLEs Win32 sont des handles kernel valables process-wide : les
+    // déplacer vers le thread propriétaire de la session est sûr (lecture des
+    // pipes et TerminateJobObject/TerminateProcess sont thread-safe).
+    unsafe impl Send for ConfinedShellHandle {}
+    unsafe impl Sync for ConfinedShellHandle {}
+
+    /// Spawn confiné sans attente. `cmdline` est la ligne complète
+    /// (`cmd /d /q /k` pour une session, `cmd /d /s /c <command>` pour un
+    /// détaché). Retourne `None` si le sandbox ne peut pas s'armer (l'appelant
+    /// décide alors — fail-closed en Auto pour run_command, erreur propre
+    /// pour les sessions/background).
+    fn spawn_confined_noblock(ws: &Path, cmdline: &str) -> Option<ConfinedShell> {
+        let token = make_low_token()?;
+        let allow = prepare_runtime_dirs(ws)?;
+        let mut restores: Vec<LabelRestore> = Vec::new();
+        let workspace_labels = label_workspace_tree(ws, cmdline)?;
+        for dir in &allow {
+            if dir == ws {
+                continue;
+            }
+            let transient = dir == ws;
+            match ensure_label_low(dir, transient) {
+                LabelOutcome::Transient(r) => restores.push(r),
+                LabelOutcome::Provisioned => {}
+                LabelOutcome::Failed => {}
+            }
+        }
+        let job = create_job();
+
+        let mut sa: SECURITY_ATTRIBUTES = unsafe { std::mem::zeroed() };
+        sa.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
+        sa.bInheritHandle = 1;
+
+        // stdin : l'enfant LIT (hStdInput = read end), le parent ÉCRIT.
+        let (in_read, in_write) = make_pipe(&sa)?;
+        clear_inherit(in_write.raw());
+        let (out_read, out_write) = make_pipe(&sa)?;
+        let (err_read, err_write) = make_pipe(&sa)?;
+        clear_inherit(out_read.raw());
+        clear_inherit(err_read.raw());
+
+        let mut si: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+        si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput = in_read.raw();
+        si.StartupInfo.hStdOutput = out_write.raw();
+        si.StartupInfo.hStdError = err_write.raw();
+
+        let mut attr_buf: Vec<u8> = Vec::new();
+        let mut job_handles: [HANDLE; 1] = [ptr::null_mut()];
+        let mut have_attr_list = false;
+        if let Some(ref j) = job {
+            job_handles[0] = j.raw();
+            if let Some(buf) = build_job_attr_list(&job_handles) {
+                attr_buf = buf;
+                si.lpAttributeList = attr_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+                have_attr_list = true;
+            }
+        }
+
+        let mut cmdline_w = wide_str(cmdline);
+        let cwd_w = wide(ws);
+        let mut env_block = environment_block(ws);
+        let creation_flags = CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | 0x0000_0400; // UNICODE env
+        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+        // SAFETY: same contract as run_confined's CreateProcessAsUserW call.
+        let spawned = unsafe {
+            CreateProcessAsUserW(
+                token.raw(),
+                ptr::null(),
+                cmdline_w.as_mut_ptr(),
+                ptr::null(),
+                ptr::null(),
+                1,
+                creation_flags,
+                env_block.as_mut_ptr() as *mut core::ffi::c_void,
+                cwd_w.as_ptr(),
+                &si.StartupInfo,
+                &mut pi,
+            )
+        };
+        if have_attr_list {
+            // SAFETY: attr_buf was initialized by InitializeProcThreadAttributeList.
+            unsafe {
+                DeleteProcThreadAttributeList(attr_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST);
+            }
+        }
+        if spawned == 0 {
+            let err = std::io::Error::last_os_error();
+            eprintln!("[agent:sandbox] WARN confined no-block spawn failed ({err})");
+            return None;
+        }
+        let proc = OwnedHandle::new(pi.hProcess);
+        let _thread = OwnedHandle::new(pi.hThread);
+        if !have_attr_list {
+            if let (Some(ref j), Some(ref p)) = (&job, &proc) {
+                // SAFETY: both handles are live; assignment is idempotent.
+                unsafe {
+                    AssignProcessToJobObject(j.raw(), p.raw());
+                }
+            }
+        }
+        let pid = pi.dwProcessId;
+
+        // Le parent garde : write-end de stdin, read-ends de stdout/stderr.
+        // Les extrémités de l'enfant sont droppées (sinon jamais d'EOF).
+        drop(in_read);
+        drop(out_write);
+        drop(err_write);
+
+        let stdin_file = unsafe { std::fs::File::from_raw_handle(in_write.raw() as *mut _) };
+        let out_file = unsafe { std::fs::File::from_raw_handle(out_read.raw() as *mut _) };
+        let err_file = unsafe { std::fs::File::from_raw_handle(err_read.raw() as *mut _) };
+        std::mem::forget(in_write);
+        std::mem::forget(out_read);
+        std::mem::forget(err_read);
+
+        Some(ConfinedShell {
+            handle: ConfinedShellHandle {
+                pid,
+                job,
+                proc,
+                _workspace_labels: workspace_labels,
+                _restores: restores,
+                _token: token,
+            },
+            stdin: stdin_file,
+            stdout: out_file,
+            stderr: err_file,
+        })
+    }
+
+    /// Session shell persistante confinée (`cmd /d /q /k` — /d skip AutoRun,
+    /// /q pas d'écho, /k reste ouvert).
+    pub(super) fn spawn_shell(ws: &Path) -> Option<ConfinedShell> {
+        spawn_confined_noblock(ws, "cmd /d /q /k")
+    }
+
+    /// Processus d'arrière-plan confiné (`cmd /d /s /c <command>`).
+    pub(super) fn spawn_detached(ws: &Path, command: &str) -> Option<ConfinedShell> {
+        spawn_confined_noblock(ws, &format!("cmd /d /s /c {command}"))
+    }
+
     fn build_job_attr_list(jobs: &[HANDLE; 1]) -> Option<Vec<u8>> {
         unsafe {
             // Size the list for 1 attribute.

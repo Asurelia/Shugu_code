@@ -1,6 +1,6 @@
 # Shugu — plan de viabilisation complet
 
-État de référence : 23 juillet 2026. Ce document décrit le produit local Tauri,
+État de référence : 25 juillet 2026. Ce document décrit le produit local Tauri,
 pas la branche distante. SQLite reste la source de vérité et aucun écran ne doit
 annoncer une capacité que le backend n'applique pas.
 
@@ -41,6 +41,30 @@ annoncer une capacité que le backend n'applique pas.
 | P4.3 | Évaluations agents live multi-provider | Validé | Codex réel validé en chat/probe ; Qwen3 8B et Llama 3.1 8B validés séparément sur le même cycle Agent complet sous llama.cpp. |
 | P5.1 | Accessibilité clavier/ARIA | Validé | 534 contrôles visibles nommés et 827 échantillons de contraste sans violation sur 11 états au dernier passage ; navigation clavier et focus-trap/restauration des dialogs prouvés dans WebView2. |
 | P5.2 | Dépendances, lint et performances | Validé | Audit JS propre, exceptions Rust bornées, lint à 0/0, budgets dev/release/charge mesurés, indexation batchée et installateurs Windows produits. |
+| P6.1 | File de suivi run (queue/steer/interrupt) | Validé | Migration V25 `queued_followups` ; steer injecté entre deux tours (preuve provider scripté), queue drainée par le pipeline d'envoi normal sur succès seulement, interrupt = kill CAS + nouvelle instruction ; kill conserve la file ; 6 tests Rust + 8 Vitest verts. |
+| P6.2 | Comptabilité tokens + indicateur contexte | Validé | `usage` parsé sur Anthropic/OpenAI-compatible/Ollama sans zéro fabriqué, `tokenUsage` par tour et `tokens_used` du run persistés, jauge de contexte sourcée (provider/estimate) avec alerte 75 %, événement `memoryCompacted` enfin consommé dans l'UI ; 8 tests Rust + 9 Vitest verts. |
+| P6.3 | Rewind/checkpoints par tour | Validé | Migration V26 (provenance fork) ; rewind fichiers avec preview (restaurés/supprimés), checkpoint de secours `pre-revert-*` obligatoire avant mutation, double rewind idempotent, fork de conversation non-destructif, event `rewindApplied` persisté ; menu 3 choix (fichiers/conversation/les deux) ; 10 tests Rust + 8 Vitest verts. |
+| P6.4 | Hooks lifecycle utilisateur | Validé | hooks.json user+projet (merge concaténé, désactivation persistée hors JSON), 6 événements, permissions évaluées avant PreToolUse, PreToolUse fail-closed (refus = ToolResult), chemins stdin échappés par shell, PostToolUse/Stop avec contexte tracé (`hookFired` persisté), Stop borné à 3 blocs, exécution confinée (LOW en Auto, zéro hook en Chat/Plan) ; 12 tests Rust + 8 Vitest verts. |
+| P6.5 | Notifications OS natives | Fonctionnel | tauri-plugin-notification câblé (capability fenêtre principale seule), toasts natifs fin/erreur/HITL avec 4 toggles persistés à consommateurs réels, garde focus et anti-double-window ; 7 tests Vitest verts ; preuve native du toast Windows à confirmer au prochain `native:smoke` (étapes documentées). |
+| P6.6 | Modes de détail de conversation | Validé | Récit/Étapes/Exécution = 3 présentations des mêmes events persistés (filtré ≠ supprimé), bascule en direct sans reload sur chat + AgentsPanel, actions HITL/fichiers conservées en Récit ; 9 tests Vitest verts. |
+| P6.7 | Plugins par convention de répertoires | Validé | Découverte user/projet/cache Claude (lecture seule, dernière version semver, formats actuels `installed_plugins`/`enabledPlugins` + hérités), 5 contributions (commands namespacées, agents via le parseur existant, skills, hooks scopés plugin, `.mcp.json` en approbation explicite avec empreinte complète commande+arguments+env+URL revérifiée), enable/disable sans réécriture ; 9 tests Rust + 7 Vitest verts (couvrant aussi P6.8). |
+| P6.8 | Skills fichiers SKILL.md sémantiques | Validé | Découverte projet > shugu > claude > plugins, listing name+description seul injecté (borné, préambule anti-injection), outil `skill_load` paresseux Auto-safe tracé en ToolCall, dedup fichier-gagne sans suppression de l'apprise ; preuve loopback corps absent du prompt initial. |
+| P6.9 | Shell persistant agents + background | Validé | Migration V27 ; sessions `cmd` par `session_id` (cwd/env conservés, sentinel `__SHUGU_DONE_<nonce>_%ERRORLEVEL%`, timeout → kill + respawn), `run_background`/`read_process_output`/`stop_process` suivis en SQLite, confinement LOW réutilisé en Auto (fail-closed), aucun process laissé orphelin si la persistance/le registre échoue, kill en cascade au kill du run, recovery `interrupted` honnête ; 11 tests Rust + 11 Vitest verts. Écart assumé : pipes au lieu de ConPTY (incompatible token LOW), pas de TUI. |
+| P6.10 | Permissions allow/ask/deny par motifs | Validé | Migrations V28/V29 ; décision fail-closed calculée une fois avant hooks, deny = ToolResult de refus, ask = pause HITL durable par signature et continuation, `allow once` consommé atomiquement une seule fois, réponse inconnue refusée ; chemins normalisés avant matching ; précédence deny > ask > allow puis spécificité puis projet > global ; UI 3 listes + testeur live ; 6 tests Rust + 14 Vitest verts. |
+| P6.11 | Sub-agents en fan-out parallèle | Validé | Délégations multiples du même tour exécutées après gates permission/hook, en parallèle borné avec réservations atomiques multi-parents (cap global 4, délégation imbriquée sans deadlock), wall-time ≈ max(latences) prouvé, résultats dans l'ordre, erreurs honnêtes, cascade kill BFS sans zombie, arbre parent↔enfants dans AgentsPanel ; 5 tests Rust + 4 Vitest verts. |
+| P6.12 | Outils LSP pour agents | Validé | `lsp_diagnostics`/`definition`/`references` au manifest en effet `shared_read`, confinement workspace et résultats bornés ; session unique par langue, IDs agent négatifs sans collision éditeur, handshake partagé/serialisé, `didOpen` puis `didChange` versionné, diagnostics diffusés à tous les waiters ; mock LSP strict + fixture TS, 13 tests Rust verts. |
+| P6.13 | Auto-update | À faire | Vérification au boot + dialog natif ; sans certificat, mode notifier + télécharger seulement. |
+| P6.14 | Refonte UX/UI (analyse Claude/OpenCode/Cursor) | À faire | **Tranche 1 : confiance projet** avant activation des règles/hooks/plugins projet, avec choix lecture seule/faire confiance et état visible ; puis système de motion, tokens hairline/ring/opacités, sidebar groupée + non-lus, palette Ctrl+K, cartes d'outils + divider checkpoint, virtualisation, anti-flash ; périmètre : `docs/competitor-ux-2026-07-24.md`. |
+
+> Analyse comparative source : `docs/competitor-parity-2026-07-24.md`
+> (dissection Codex desktop 26.721 / Claude Code 2.1.193, réimplémentation
+> sans reprise de code propriétaire).
+
+> Limite de sûreté encore ouverte : jusqu'à la tranche « confiance projet » de
+> P6.14, l'ouverture volontaire d'un workspace vaut confiance implicite pour ses
+> règles, hooks, skills et plugins. Auto les confine, mais Full Access rend cette
+> hypothèse trop forte ; le gate explicite est donc prioritaire avant la finition
+> visuelle.
 
 ## Contrat produit non négociable
 
@@ -162,7 +186,25 @@ audité ne repose sur une donnée de démonstration ou un contrôle sans effet.
 L'accessibilité critique, le runtime release isolé, la charge
 indexation/streaming et les installateurs sont également prouvés.
 
-## Dernière preuve locale — 23 juillet 2026
+## Dernière preuve locale — 25 juillet 2026
+
+- Reprise du plan Kimi interrompu en P6.12 sur la branche
+  `codex/resume-kimi-parity-plan`, sans écraser le worktree existant.
+- Rust : `cargo check` vert et 548 tests `--lib` verts, dont les contrats
+  permissions/plugins/hooks/fan-out/LSP/rewind ajoutés pendant la revue
+  adversariale. Le loader Windows du harness de test porte désormais le
+  manifeste Common Controls v6 requis par Tauri.
+- Frontend : 63 fichiers / 632 tests Vitest, typecheck, ESLint, build Vite et
+  `ui:tour` verts. Le tour headless conserve les captures dans
+  `dev-logs/ui-tour/`.
+- Revue sécurité/logic : permissions fail-closed et single-use réellement
+  atomiques, fan-out après gates avec réservation globale, approbation MCP liée
+  à toute la configuration, background sans orphelin, rewind sans mutation si
+  son checkpoint de secours échoue, session LSP partagée sans collision d'ID.
+- Restent à prouver nativement : le toast Windows P6.5, l'auto-update P6.13 et
+  le gate de confiance projet priorisé en première tranche P6.14.
+
+## Preuve locale historique — 23 juillet 2026
 
 - Gates : 51 fichiers / 559 tests frontend et 455 tests Rust réussis ;
   typecheck, build Vite 8 (554 modules), ESLint 0/0, Playwright 1/1, tour UI et

@@ -11,9 +11,11 @@
 // `.lgb-primary`, plus the same inline-style pill idiom used by the llama-server
 // controls for the transport badge. No new design system is introduced.
 
-import { useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { Icon } from "@/components/components";
 import { ConfirmDialog } from "@/components/trust";
+import { pluginsMcpList, pluginsMcpApprove, pluginsMcpReject, type PluginMcpServerInfo } from "@/lib/plugins";
+import { pushToast } from "@/components/toast";
 import {
   useMcpServers,
   useMcpToggle,
@@ -103,6 +105,133 @@ const RECOMMENDED: Preset[] = [
     envNote: "Colle ton jeton GitHub (Settings → Developer settings → Personal access tokens) après le =.",
   },
 ];
+
+// P6.7 — serveurs MCP déclarés par des PLUGINS (.mcp.json dans le dossier du
+// plugin). Jamais démarrés sans approbation explicite ; l'approbation est
+// clée sur le hash de la commande (si la commande du plugin change, elle
+// redevient « en attente »). Miroir des enabledMcpjsonServers de Claude Code.
+function PluginMcpPending() {
+  const [servers, setServers] = useState<PluginMcpServerInfo[]>([]);
+  const [busy, setBusy] = useState(false);
+
+  const refresh = useCallback(async () => {
+    try {
+      setServers(await pluginsMcpList());
+    } catch (err) {
+      console.warn("[mcp] plugin pending list failed:", err);
+      setServers([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const act = async (kind: "approve" | "reject", s: PluginMcpServerInfo) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      if (kind === "approve") {
+        await pluginsMcpApprove(s.plugin, s.server);
+        pushToast(
+          `Serveur « ${s.server} » (plugin ${s.plugin}) approuvé — actif au prochain run.`,
+          "success",
+          5000,
+        );
+      } else {
+        await pluginsMcpReject(s.plugin, s.server);
+        pushToast(`Serveur « ${s.server} » (plugin ${s.plugin}) rejeté.`, "info", 4000);
+      }
+      await refresh();
+    } catch (err) {
+      pushToast(`Échec : ${String(err)}`, "error", 6000);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const pending = servers.filter((s) => s.status === "pending");
+  if (pending.length === 0) return null;
+
+  return (
+    <div
+      style={{
+        margin: "14px 0",
+        padding: "10px 12px",
+        borderRadius: 8,
+        background: "rgba(255, 207, 107, 0.06)",
+        border: "1px solid rgba(255, 207, 107, 0.25)",
+      }}
+    >
+      <div style={{ fontSize: 12, fontWeight: 700, color: "var(--warning, #ffcf6b)" }}>
+        ⚠ Serveurs MCP de plugins en attente d'approbation
+      </div>
+      <p className="sub" style={{ margin: "4px 0 8px" }}>
+        Déclarés par un plugin installé — ils ne démarrent JAMAIS sans ton
+        accord. Si la commande du plugin change après approbation, elle est
+        revérifiée et le serveur redevient en attente.
+      </p>
+      <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 6 }}>
+        {pending.map((s) => (
+          <li
+            key={`${s.plugin}/${s.server}`}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              flexWrap: "wrap",
+              padding: "6px 8px",
+              borderRadius: 6,
+              background: "var(--surface-container, #16162a)",
+              border: "1px solid rgba(150,150,150,0.16)",
+            }}
+          >
+            <strong style={{ fontSize: 12 }}>{s.server}</strong>
+            <span style={{ fontSize: 10.5, color: "var(--on-surface-muted)" }}>plugin {s.plugin}</span>
+            <code
+              style={{ fontSize: 10.5, color: "var(--on-surface-muted)", flex: 1, minWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+              title={s.commandPreview}
+            >
+              {s.transport} · {s.commandPreview}
+            </code>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => void act("approve", s)}
+              style={{
+                fontSize: 11,
+                padding: "3px 10px",
+                borderRadius: 6,
+                cursor: "pointer",
+                color: "var(--success, #8aefc7)",
+                background: "rgba(138,239,199,0.10)",
+                border: "1px solid rgba(138,239,199,0.35)",
+              }}
+            >
+              Approuver
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => void act("reject", s)}
+              style={{
+                fontSize: 11,
+                padding: "3px 10px",
+                borderRadius: 6,
+                cursor: "pointer",
+                color: "var(--danger, #ff6a8a)",
+                background: "rgba(255,106,138,0.08)",
+                border: "1px solid rgba(255,106,138,0.3)",
+              }}
+            >
+              Rejeter
+            </button>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
 
 export function McpServersSection() {
   const { data: servers, isLoading, error } = useMcpServers();
@@ -254,6 +383,8 @@ export function McpServersSection() {
             à la racine de ton projet.
           </div>
         )}
+
+        <PluginMcpPending />
 
         {!isLoading && servers && servers.map((s) => (
           <McpServerCard

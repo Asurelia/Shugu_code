@@ -23,11 +23,12 @@ import { listen } from "@/lib/tauri";
 import { diag, diagEveryN } from "@/lib/diag";
 import type { AgentEvent, AgentRow } from "@/lib/agents";
 import type { ParsedAgentTranscript } from "./queries";
-import { agentKeys } from "./keys";
+import { agentKeys, followupKeys } from "./keys";
 import { fireMoodReaction } from "@/features/mascot/moodReactionStore";
 import { sayMascot, truncateSpeech } from "@/features/mascot/speechStore";
 import { pushToast } from "@/components/toast";
 import { goalKeys } from "@/features/goals/queries";
+import { maybeNotifyAgentEvent } from "@/lib/nativeNotifications";
 
 export function useAgentEvents(): void {
   const qc = useQueryClient();
@@ -208,6 +209,24 @@ export function useAgentEvents(): void {
                 agentId: event.agentId,
               });
             }
+
+            // P6.5 — notification OS native (complète le toast in-app, ne le
+            // duplique pas : par défaut seulement fenêtre non focus, toggles
+            // Settings dédiés). Fenêtre principale uniquement (la mascotte
+            // monte ce même listener — sinon double notification).
+            if (event.kind === "complete") {
+              void maybeNotifyAgentEvent(
+                "runComplete",
+                "✅ Run terminé",
+                truncateSpeech(event.output || "L'agent a fini son travail.", 120),
+              );
+            } else if (event.kind === "error") {
+              void maybeNotifyAgentEvent(
+                "runError",
+                "❌ Run en échec",
+                truncateSpeech(event.error, 120),
+              );
+            }
           } else if (event.kind === "skillLearned") {
             // Elle apprend (skill vérifié par un test qui passe) → fierté.
             fireMoodReaction("skill-learned");
@@ -236,6 +255,18 @@ export function useAgentEvents(): void {
             );
           }
 
+          // P6.5 — HITL en attente : l'agent a posé une question ou soumis un
+          // plan et attend la réponse de l'utilisateur.
+          if (event.kind === "questionAsked" || event.kind === "planSubmitted") {
+            void maybeNotifyAgentEvent(
+              "hitlWaiting",
+              "❓ L'agent attend ta réponse",
+              event.kind === "questionAsked"
+                ? "Une question est en attente dans le chat."
+                : "Un plan attend ton approbation dans le chat.",
+            );
+          }
+
           // Goal rows transition from the same durable agent events. Invalidate
           // only on states that can change the compact Goal card.
           if (
@@ -246,6 +277,18 @@ export function useAgentEvents(): void {
             || event.kind === "error"
           ) {
             void qc.invalidateQueries({ queryKey: goalKeys.all });
+          }
+
+          // P6.1 — file de suivi : les chips du composer se rafraîchissent dès
+          // qu'une ligne est mise en file, injectée (steer / nouveau run) ou
+          // retirée. L'event est aussi appendé au transcript (setQueryData
+          // générique ci-dessus) pour la trace inline.
+          if (
+            event.kind === "followUpQueued"
+            || event.kind === "followUpInjected"
+            || event.kind === "followUpDropped"
+          ) {
+            void qc.invalidateQueries({ queryKey: followupKeys.all });
           }
         });
         diag("agent-events", `LISTEN ATTACHED cancelled=${cancelled}`);

@@ -170,8 +170,32 @@ fn select_skills(skills: &[SkillRow], task: &str) -> Vec<SkillRow> {
 /// Bounded, task-relevant skill section injected into the agent's system
 /// context. Saved skills are trusted procedures, but never authority: the
 /// runtime tool gates and the current user request remain higher priority.
-pub(super) fn skills_prompt_block(app: &AppHandle, role: &str, task: &str) -> String {
-    let selected = select_skills(&load_skills(app, role), task);
+///
+/// P6.8 — variante avec exclusion : une skill FICHIER (SKILL.md) de même nom
+/// qu'une skill apprise gagne dans le listing ; l'apprise reste en DB mais
+/// n'est pas double-injectée (dedup file-over-learned).
+/// Filtre pur du dedup file-over-learned (P6.8) : retire les skills apprises
+/// dont le nom existe en version FICHIER. Testable sans DB.
+pub(crate) fn filter_learned_by_file_names(
+    learned: Vec<SkillRow>,
+    exclude: &std::collections::HashSet<String>,
+) -> Vec<SkillRow> {
+    learned
+        .into_iter()
+        .filter(|s| !exclude.contains(&s.name))
+        .collect()
+}
+
+pub(super) fn skills_prompt_block_filtered(
+    app: &AppHandle,
+    role: &str,
+    task: &str,
+    exclude: &std::collections::HashSet<String>,
+) -> String {
+    let selected = select_skills(
+        &filter_learned_by_file_names(load_skills(app, role), exclude),
+        task,
+    );
     if selected.is_empty() {
         return String::new();
     }

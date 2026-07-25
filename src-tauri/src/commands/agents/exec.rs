@@ -88,9 +88,17 @@ impl ExecutionProvenance {
 ///   * normal exit / error → `Drop` closes the handle; with
 ///     `KILL_ON_JOB_CLOSE` set, Windows reaps any stragglers.
 #[cfg(windows)]
-struct ProcessTree {
+pub(crate) struct ProcessTree {
     job: windows_sys::Win32::Foundation::HANDLE,
 }
+
+// Un HANDLE de Job Object est un handle kernel valable process-wide :
+// l'assigner/terminer depuis un autre thread est sûr (P6.9 — sessions et
+// processus d'arrière-plan partagés via les registries).
+#[cfg(windows)]
+unsafe impl Send for ProcessTree {}
+#[cfg(windows)]
+unsafe impl Sync for ProcessTree {}
 
 #[cfg(windows)]
 impl ProcessTree {
@@ -98,7 +106,7 @@ impl ProcessTree {
     /// `None` on any FFI failure — the caller degrades to a plain `child.kill()`
     /// rather than refusing to run (containment is best-effort hardening, never
     /// a precondition for execution).
-    fn create() -> Option<Self> {
+    pub(super) fn create() -> Option<Self> {
         use std::ptr;
         use windows_sys::Win32::System::JobObjects::{
             CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
@@ -140,7 +148,7 @@ impl ProcessTree {
 
     /// Assign a freshly-spawned child to the job. Best-effort: a failure here
     /// just means the timeout kill falls back to killing the direct child only.
-    fn assign(&self, child: &Child) {
+    pub(super) fn assign(&self, child: &Child) {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
         let proc_handle = child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
@@ -153,7 +161,7 @@ impl ProcessTree {
 
     /// Terminate every process in the job (the whole tree) with the given exit
     /// code. Used on the timeout path.
-    fn terminate(&self) {
+    pub(super) fn terminate(&self) {
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
         // SAFETY: `self.job` is a valid job handle.
         unsafe {
@@ -296,9 +304,14 @@ pub(super) fn run_command_governed(
     #[cfg(windows)]
     let mut cmd = {
         let mut c = Command::new("cmd");
-        c.args(["/d", "/s", "/c", command]);
-        // CREATE_NO_WINDOW — no console flash from a GUI app.
+        c.args(["/d", "/s", "/c"]);
+        // raw_arg : la commande doit arriver VERBATIM à cmd — comme le chemin
+        // sandboxé, qui construit sa ligne brute (`cmd /d /s /c {command}`).
+        // `args([..., command])` échappe les guillemets façon MSVCRT (`"`),
+        // ce qui cassait toute commande contenant des quotes (hooks, echo JSON…).
         use std::os::windows::process::CommandExt;
+        c.raw_arg(command);
+        // CREATE_NO_WINDOW — no console flash from a GUI app.
         c.creation_flags(0x0800_0000);
         c
     };

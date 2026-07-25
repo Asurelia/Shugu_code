@@ -351,6 +351,103 @@ async fn revert_inner(root: &Path, turn_id: &str) -> Result<Snapshot, String> {
     })
 }
 
+/// P6.3 — ce qu'un rewind de `turn_id` changerait MAINTENANT : fichiers qui
+/// seraient restaurés à l'état du checkpoint (diff worktree vs snapshot) et
+/// fichiers créés APRÈS le checkpoint qui seraient SUPPRIMÉS (untracked —
+/// c'est exactement ce que `revert_inner` efface). Alimente la boîte de
+/// confirmation : l'utilisateur voit la liste AVANT de décider, y compris ses
+/// propres modifications post-checkpoint (garde-fou « warn + confirm »).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotPreview {
+    pub turn_id: String,
+    pub ref_name: String,
+    /// Fichiers suivis qui seraient restaurés à l'état du checkpoint.
+    pub restored: Vec<String>,
+    /// Fichiers non suivis (créés après le checkpoint) qui seraient supprimés.
+    pub removed: Vec<String>,
+}
+
+async fn resolve_snapshot(root: &Path, turn_id: &str) -> Result<(String, String), String> {
+    validate_turn_id(turn_id)?;
+    let ref_name = ref_for(turn_id);
+    let oid = run_git(
+        root,
+        &["rev-parse", "--verify", &format!("{ref_name}^{{commit}}")],
+    )
+    .await
+    .map_err(|_| format!("snapshot not found: {turn_id}"))?;
+    Ok((ref_name, oid))
+}
+
+pub(crate) async fn preview_inner(root: &Path, turn_id: &str) -> Result<SnapshotPreview, String> {
+    let (ref_name, oid) = resolve_snapshot(root, turn_id).await?;
+    // Diff worktree vs snapshot : chemins que `git restore --source=<oid>`
+    // toucherait (modifiés, supprimés à restaurer, ajoutés suivis).
+    let diff = run_git(root, &["diff", "--name-only", &oid, "--", ":/"]).await?;
+    let restored: Vec<String> = diff
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    // Untracked = créés après le checkpoint → `revert_inner` les supprime.
+    let leftovers = run_git(root, &["ls-files", "--others", "--exclude-standard"]).await?;
+    let removed: Vec<String> = leftovers
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok(SnapshotPreview {
+        turn_id: turn_id.to_string(),
+        ref_name,
+        restored,
+        removed,
+    })
+}
+
+/// Résultat du rewind gardé (P6.3).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RewindResult {
+    pub snapshot: Snapshot,
+    /// Checkpoint de SECOURS pris avant le revert (le rewind est lui-même
+    /// rewindable). Le rewind échoue avant toute mutation si sa capture est
+    /// impossible ; `None` n'est conservé que pour compatibilité de sérialisation.
+    pub safety_ref: Option<String>,
+    pub restored: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+pub(crate) async fn rewind_inner(root: &Path, turn_id: &str) -> Result<RewindResult, String> {
+    // 1. Ce qui va changer (échoue tôt si le checkpoint n'existe pas).
+    let preview = preview_inner(root, turn_id).await?;
+    // 2. Filet de sécurité : checkpoint de l'état COURANT avant de l'écraser —
+    //    les changements utilisateur post-checkpoint ne sont JAMAIS perdus.
+    //    Idempotent : un second rewind réécrit simplement la même ref (l'état
+    //    courant est alors déjà celui du checkpoint — revert idempotent-safe).
+    let safety_id = format!("pre-revert-{turn_id}");
+    let safety_ref = Some(
+        checkpoint_inner(root, &safety_id)
+            .await
+            .map_err(|e| {
+                format!(
+                    "rewind annulé : impossible de créer le checkpoint de sécurité courant : {e}"
+                )
+            })?
+            .ref_name,
+    );
+    // 3. Le revert lui-même (inchangé — mêmes garanties qu'avant).
+    let snapshot = revert_inner(root, turn_id).await?;
+    Ok(RewindResult {
+        snapshot,
+        safety_ref,
+        restored: preview.restored,
+        removed: preview.removed,
+    })
+}
+
 async fn delete_inner(root: &Path, turn_id: &str) -> Result<(), String> {
     validate_turn_id(turn_id)?;
     let ref_name = ref_for(turn_id);
@@ -398,6 +495,44 @@ pub async fn shugu_snapshot_list(app: AppHandle) -> Result<Vec<Snapshot>, String
 pub async fn shugu_snapshot_delete(app: AppHandle, turn_id: String) -> Result<(), String> {
     let root = workspace_root_required(&app)?;
     delete_inner(&root, &turn_id).await
+}
+
+/// P6.3 — ce qu'un rewind de `turnId` changerait (fichiers restaurés /
+/// supprimés). Alimente la boîte de confirmation native avant décision.
+#[command(rename_all = "camelCase")]
+pub async fn shugu_snapshot_preview(
+    app: AppHandle,
+    turn_id: String,
+) -> Result<SnapshotPreview, String> {
+    let root = workspace_root_required(&app)?;
+    preview_inner(&root, &turn_id).await
+}
+
+/// P6.3 — rewind fichiers GARDÉ : preview → checkpoint de secours (le rewind
+/// est lui-même rewindable) → revert. Double-rewind idempotent-safe : le
+/// second revert ramène au même état cible. Trace un event `rewindApplied`
+/// persisté sur le flux du run (agent_id == turn_id) pour l'historique.
+/// `kind` : "files" | "both" (la conversation seule ne passe pas par ici).
+#[command(rename_all = "camelCase")]
+pub async fn shugu_snapshot_rewind(
+    app: AppHandle,
+    turn_id: String,
+    kind: Option<String>,
+    forked_conversation_id: Option<String>,
+) -> Result<RewindResult, String> {
+    let root = workspace_root_required(&app)?;
+    let result = rewind_inner(&root, &turn_id).await?;
+    crate::commands::agents::record_rewind_event(
+        &app,
+        &turn_id,
+        kind.as_deref().unwrap_or("files"),
+        &result.snapshot.ref_name,
+        result.restored.clone(),
+        result.removed.clone(),
+        result.safety_ref.clone(),
+        forked_conversation_id,
+    );
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -570,6 +705,180 @@ mod tests {
         // Deleting a missing ref is a no-op success.
         delete_inner(&root, "ghost").await.expect("delete ghost ok");
 
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn preview_lists_restored_and_removed_before_any_change() {
+        if !which_git() {
+            return;
+        }
+        let root = make_temp_dir("preview");
+        init_repo(&root);
+
+        checkpoint_inner(&root, "t").await.expect("checkpoint");
+        // Mutations post-checkpoint : un fichier édité, un créé (untracked).
+        std::fs::write(
+            root.join("seed.txt"),
+            b"agent-edit
+",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("new.txt"),
+            b"created
+",
+        )
+        .unwrap();
+
+        let preview = preview_inner(&root, "t").await.expect("preview");
+        assert_eq!(preview.turn_id, "t");
+        assert!(preview.restored.contains(&"seed.txt".to_string()));
+        assert!(preview.removed.contains(&"new.txt".to_string()));
+
+        // Le preview est une LECTURE : rien n'a changé sur disque.
+        assert_eq!(
+            std::fs::read_to_string(root.join("seed.txt")).unwrap(),
+            "agent-edit
+"
+        );
+        assert!(root.join("new.txt").exists());
+
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn rewind_two_checkpoints_reverts_to_first_and_is_idempotent() {
+        if !which_git() {
+            return;
+        }
+        let root = make_temp_dir("rewind2");
+        init_repo(&root);
+
+        // Run simulé : checkpoint 1 → mutation 1 → checkpoint 2 → mutation 2.
+        checkpoint_inner(&root, "turn-1").await.expect("cp1");
+        std::fs::write(
+            root.join("seed.txt"),
+            b"mutation-1
+",
+        )
+        .unwrap();
+        checkpoint_inner(&root, "turn-2").await.expect("cp2");
+        std::fs::write(
+            root.join("seed.txt"),
+            b"mutation-2
+",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("agent.txt"),
+            b"agent output
+",
+        )
+        .unwrap();
+
+        // Rewind au checkpoint 1 : les deux mutations sont défaites.
+        let result = rewind_inner(&root, "turn-1").await.expect("rewind");
+        assert_eq!(
+            std::fs::read_to_string(root.join("seed.txt")).unwrap(),
+            "seed
+",
+            "fichier restauré à l'état du checkpoint 1"
+        );
+        assert!(
+            !root.join("agent.txt").exists(),
+            "fichier post-checkpoint supprimé"
+        );
+        assert!(result.restored.contains(&"seed.txt".to_string()));
+        assert!(result.removed.contains(&"agent.txt".to_string()));
+
+        // Filet de sécurité : le rewind a checkpointé l'état « mutation-2 »
+        // AVANT de l'écraser → le rewind est lui-même rewindable.
+        let safety = result.safety_ref.expect("safety checkpoint");
+        assert_eq!(safety, "refs/shugu/turn/pre-revert-turn-1");
+        let back = rewind_inner(&root, "pre-revert-turn-1")
+            .await
+            .expect("rewind of the rewind");
+        assert_eq!(
+            std::fs::read_to_string(root.join("seed.txt")).unwrap(),
+            "mutation-2
+",
+            "le filet de sécurité restaure l'état d'avant le premier rewind"
+        );
+        assert!(back.safety_ref.is_some());
+
+        // Double-rewind du MÊME checkpoint : idempotent-safe (même état cible,
+        // pas d'erreur, pas d'état zombie).
+        rewind_inner(&root, "turn-1").await.expect("re-rewind");
+        let again = rewind_inner(&root, "turn-1").await.expect("re-re-rewind");
+        assert_eq!(
+            std::fs::read_to_string(root.join("seed.txt")).unwrap(),
+            "seed
+",
+            "un second rewind du même checkpoint laisse le même état"
+        );
+        assert!(
+            again.restored.is_empty() && again.removed.is_empty(),
+            "déjà à l'état cible : plus rien à changer"
+        );
+
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn rewind_missing_checkpoint_refuses() {
+        if !which_git() {
+            return;
+        }
+        let root = make_temp_dir("rewmiss");
+        init_repo(&root);
+        std::fs::write(
+            root.join("seed.txt"),
+            b"user work
+",
+        )
+        .unwrap();
+        let err = rewind_inner(&root, "nope").await.unwrap_err();
+        assert!(err.contains("not found"), "got {err}");
+        // Refus net : le travail utilisateur n'a pas été touché.
+        assert_eq!(
+            std::fs::read_to_string(root.join("seed.txt")).unwrap(),
+            "user work
+"
+        );
+        cleanup(&root);
+    }
+
+    #[tokio::test]
+    async fn rewind_refuses_before_mutation_when_safety_checkpoint_fails() {
+        if !which_git() {
+            return;
+        }
+        let root = make_temp_dir("rewsafetyfail");
+        init_repo(&root);
+        checkpoint_inner(&root, "turn-1")
+            .await
+            .expect("target checkpoint");
+        std::fs::write(root.join("seed.txt"), b"user work\n").unwrap();
+
+        // Empêche Git de publier exactement la ref de sécurité, tout en
+        // laissant la ref cible et le preview lisibles.
+        let git_dir = git_dir(&root).await.expect("git dir");
+        let blocker = git_dir
+            .join("refs")
+            .join("shugu")
+            .join("turn")
+            .join("pre-revert-turn-1");
+        std::fs::create_dir_all(&blocker).unwrap();
+        std::fs::write(blocker.join("keep"), b"block ref replacement").unwrap();
+
+        let err = rewind_inner(&root, "turn-1").await.unwrap_err();
+        assert!(err.contains("rewind annulé"), "got {err}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("seed.txt")).unwrap(),
+            "user work\n",
+            "aucune mutation si le filet de sécurité ne peut pas être publié"
+        );
         cleanup(&root);
     }
 

@@ -8,32 +8,63 @@
 
 import { invoke } from "@/lib/tauri";
 
-/** Une règle telle que stockée/affichée. `verdict` est la forme string Rust. */
-export interface CommandRuleRow {
+// P6.10 — moteur de règles de permission allow / ask / deny (table
+// `agent_permission_rules`, V28). Les anciennes règles allow/deny sont
+// migrées ; le `ask` produit une question HITL en profil mutant.
+
+export type RuleDecision = "allow" | "ask" | "deny";
+
+/** Une règle telle que stockée/affichée (trois décisions + scope). */
+export interface PermissionRuleRow {
   pattern: string;
-  verdict: "allow" | "deny";
+  decision: RuleDecision;
+  /** "" = global, sinon chemin du workspace. */
+  scope: string;
   detail?: string;
+  createdAt: number;
 }
 
-/** Liste toutes les règles apprises, plus récentes d'abord. */
-export async function commandRuleList(): Promise<CommandRuleRow[]> {
-  return invoke<CommandRuleRow[]>("command_rule_list");
+/** Liste toutes les règles, plus récentes d'abord. */
+export async function permissionRuleList(): Promise<PermissionRuleRow[]> {
+  return invoke<PermissionRuleRow[]>("permission_rule_list");
 }
 
-/** Enregistre (ou raffine) une règle. Le backend rejette un motif vide ou `*`
- *  nu. `detail` est une note optionnelle affichée pour une règle `deny`. */
-export async function commandRuleSave(
+/** Enregistre (ou raffine) une règle. Le backend valide la forme du motif
+ *  (grammaire unique : `git push *`, `run_command(...)`, `web_fetch(domain:)`,
+ *  `mcp__<serveur>__<outil|*>`, `<outil>(path:...)`) et rejette un motif vide,
+ *  invalide ou `*` nu. `scope` vide = global. */
+export async function permissionRuleSave(
   pattern: string,
-  verdict: "allow" | "deny",
+  decision: RuleDecision,
+  scope?: string,
   detail?: string,
 ): Promise<void> {
-  await invoke("command_rule_save", { pattern, verdict, detail });
+  await invoke("permission_rule_save", { pattern, decision, scope, detail });
 }
 
-/** Supprime une règle par son motif exact. */
-export async function commandRuleDelete(pattern: string): Promise<void> {
-  await invoke("command_rule_delete", { pattern });
+/** Supprime une règle par (motif, scope) — la PK exacte. */
+export async function permissionRuleDelete(pattern: string, scope?: string): Promise<void> {
+  await invoke("permission_rule_delete", { pattern, scope });
 }
+
+/** Verdict du testeur live (Settings). */
+export interface PermissionEvaluation {
+  /** "allow" | "ask" | "deny" | "noRule". */
+  outcome: "allow" | "ask" | "deny" | "noRule";
+  matchedPattern: string | null;
+  reason: string | null;
+}
+
+/** Évalue un appel d'outil d'exemple contre les règles actuelles. */
+export async function permissionRuleEvaluate(
+  tool: string,
+  args: Record<string, unknown>,
+): Promise<PermissionEvaluation> {
+  return invoke<PermissionEvaluation>("permission_rule_evaluate", { tool, args });
+}
+
+/** @deprecated utilise PermissionRuleRow (P6.10). */
+export type CommandRuleRow = PermissionRuleRow;
 
 /** Un flag de risque extrait de la sortie d'une commande. */
 export interface RiskFlag {

@@ -35,6 +35,16 @@ export const agentKeys = {
 };
 
 // ─────────────────────────────────────────────────────────────────────
+// P6.1 — file d'attente des messages de suivi pendant un run.
+// Invalidée par useAgentEvents sur les events followUpQueued/Injected/Dropped.
+// ─────────────────────────────────────────────────────────────────────
+
+export const followupKeys = {
+  all: ["agent-followups"] as const,
+  list: (conversationId: string) => [...followupKeys.all, "list", conversationId] as const,
+};
+
+// ─────────────────────────────────────────────────────────────────────
 // Définitions d'agents portables (.md format Claude Code).
 //
 // Disjoint d'`agentKeys` qui traque les RUNS. Ces clés ciblent les

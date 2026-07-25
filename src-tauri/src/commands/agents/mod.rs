@@ -77,7 +77,7 @@ mod delta_buffer;
 // the `execute_tool` dispatcher that resolves a parsed ToolCall against
 // the workspace root. The runner imports the public-to-this-module symbols
 // (the `pub(super)` items) from here.
-mod tools;
+pub(crate) mod tools;
 
 /// Governed command execution. Auto is sandboxed and fail-closed; only a native
 /// session grant allows Full Access to use the direct process path.
@@ -125,6 +125,40 @@ mod profile_memory;
 /// Durable user objectives. A Goal owns successive agent runs and remains
 /// resumable across reloads/restarts.
 pub(crate) mod goals;
+
+/// File d'attente des messages de suivi pendant un run (P6.1) : queue (le
+/// message pilote le tour suivant), steer (injection entre deux tours
+/// d'outils), interrupt (kill + nouvelle instruction, atomique).
+pub(crate) mod followups;
+
+/// Hooks de cycle de vie utilisateur (P6.4 — modèle Claude Code) : hooks.json
+/// utilisateur + projet, confinés au profil (sandbox Auto / direct Full
+/// Access), PreToolUse fail-closed, Stop borné, traces hookFired persistées.
+pub(crate) mod hooks;
+
+/// Plugins par convention de répertoires (P6.7 — format compatible Claude
+/// Code) : découverte user/projet/cache-claude (read-only), contributions
+/// commands/agents/skills/hooks/.mcp.json (MCP en attente d'approbation).
+pub(crate) mod plugins;
+
+/// Skills fichiers SKILL.md à déclenchement sémantique (P6.8) : listing
+/// paresseux injecté au run, corps chargé à la demande via `skill_load`.
+pub(crate) mod file_skills;
+
+/// Sessions shell persistantes + processus d'arrière-plan (P6.9) : cwd/env
+/// conservés par session (sentinel de complétion), suivi SQLite des processus
+/// détachés, kill d'arbre à la mort du run, recovery honnête au boot.
+pub(crate) mod processes;
+
+/// Outils LSP pour les agents (P6.12) : lsp_diagnostics / lsp_definition /
+/// lsp_references — effet lecture, confinement workspace identique à
+/// fs_read_file, sessions partagées avec l'éditeur (bridge commands::lsp).
+pub(crate) mod lsp_tools;
+
+/// Moteur de règles de permission allow / ask / deny (P6.10) : grammaire de
+/// motifs unique (commandes, domaines, outils MCP), précédence
+/// deny > ask > allow > statique, spécificité + scope projet.
+pub(crate) mod permission;
 
 /// LOT 1 — Task-graph d'orchestration. Logique PURE (aucune I/O) qui transforme
 /// les args de `todo_write` en graphe de tâches dependency-aware : validation
@@ -485,12 +519,107 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         title: Option<String>,
     },
+    /// P6.1 — un message envoyé pendant ce run a été mis en file d'attente
+    /// (`queue` ou `steer`). Émis sur le flux du run ACTIF au moment de
+    /// l'envoi ; persisté → le chip/la trace se reconstruisent après reload.
+    FollowUpQueued {
+        agent_id: String,
+        followup_id: String,
+        conversation_id: String,
+        /// "queue" | "steer" ("interrupt" n'est jamais persisté).
+        mode: String,
+        content: String,
+    },
+    /// P6.1 — une ligne de la file a été consommée : soit injectée `steer`
+    /// entre deux tours d'outils (sur le flux du run en cours), soit consommée
+    /// `queue` au spawn du nouveau run (sur le flux du NOUVEAU run).
+    FollowUpInjected {
+        agent_id: String,
+        followup_id: String,
+        conversation_id: String,
+        mode: String,
+        content: String,
+    },
+    /// P6.1 — l'utilisateur a retiré explicitement une ligne `pending` (le ✕
+    /// d'un chip). Un kill ne produit JAMAIS cet event : la ligne reste pending.
+    FollowUpDropped {
+        agent_id: String,
+        followup_id: String,
+        conversation_id: String,
+        mode: String,
+        content: String,
+    },
+    /// P6.2 — consommation tokens d'UN tour LLM, telle que rapportée par le
+    /// provider. Chaque champ absent (`None`, non sérialisé) = non rapporté :
+    /// jamais de zéros fabriqués. Émis seulement quand AU MOINS un champ est
+    /// rapporté ; persisté → l'agrégat du run se reconstruit après reload.
+    TokenUsage {
+        agent_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input_tokens: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_tokens: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_creation_input_tokens: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_read_input_tokens: Option<u64>,
+    },
+    /// P6.2 — remplissage de la fenêtre de contexte après chaque tour.
+    /// `used` = entrée RÉELLE du dernier tour quand le provider l'a rapportée
+    /// (`source: "provider"`), sinon estimation locale (`source: "estimate"`) —
+    /// le frontend DOIT distinguer les deux (contrat d'honnêteté). Persisté
+    /// pour que la jauge survive au reload.
+    ContextWindowUsage {
+        agent_id: String,
+        used: u64,
+        window: u64,
+        /// "provider" | "estimate"
+        source: String,
+    },
+    /// P6.3 — un rewind a été APPLIQUÉ par l'utilisateur sur ce tour
+    /// (`refs/shugu/turn/<agent_id>`). `kind` : "files" | "conversation" |
+    /// "both". `safety_ref` = le checkpoint de secours pris AVANT le revert
+    /// (le rewind est lui-même rewindable) ; None si sa capture a échoué.
+    /// Persisté → le fait qu'un tour a été rembobiné survit au reload.
+    RewindApplied {
+        agent_id: String,
+        /// "files" | "conversation" | "both" (renommé : `kind` est le tag serde).
+        rewind_kind: String,
+        ref_name: String,
+        restored: Vec<String>,
+        removed: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        safety_ref: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        forked_conversation_id: Option<String>,
+    },
+    /// P6.4 — un hook utilisateur a été exécuté. Chaque exécution est tracée
+    /// (commande tronquée, outcome, durée, contexte injecté le cas échéant) —
+    /// un hook n'est JAMAIS invisible. Persisté → visible après reload.
+    HookFired {
+        agent_id: String,
+        /// "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse"
+        /// | "PreCompact" | "Stop".
+        hook_event: String,
+        command: String,
+        /// "user" | "project" — quel hooks.json a fourni ce hook.
+        source: String,
+        /// "ok" | "context" | "block" | "timeout" | "error" | "block-ignored".
+        outcome: String,
+        duration_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        injected_context: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
+    },
 }
 
 impl AgentEvent {
     /// Stable discriminator string used in the `agent_events.kind` column.
     /// Must match the `tag = "kind"` value serde emits on serialization.
-    fn kind_str(&self) -> &'static str {
+    pub(crate) fn kind_str(&self) -> &'static str {
         match self {
             AgentEvent::Spawn { .. } => "spawn",
             AgentEvent::Message { .. } => "message",
@@ -511,12 +640,19 @@ impl AgentEvent {
             AgentEvent::WorktreeSkipped { .. } => "worktreeSkipped",
             AgentEvent::QuestionAsked { .. } => "questionAsked",
             AgentEvent::PlanSubmitted { .. } => "planSubmitted",
+            AgentEvent::FollowUpQueued { .. } => "followUpQueued",
+            AgentEvent::FollowUpInjected { .. } => "followUpInjected",
+            AgentEvent::FollowUpDropped { .. } => "followUpDropped",
+            AgentEvent::TokenUsage { .. } => "tokenUsage",
+            AgentEvent::ContextWindowUsage { .. } => "contextWindowUsage",
+            AgentEvent::RewindApplied { .. } => "rewindApplied",
+            AgentEvent::HookFired { .. } => "hookFired",
         }
     }
 
     /// Agent id extractor — used to write the `agent_id` column without
     /// having to pattern-match every variant at the call site.
-    fn agent_id(&self) -> &str {
+    pub(crate) fn agent_id(&self) -> &str {
         match self {
             AgentEvent::Spawn { agent_id, .. }
             | AgentEvent::Message { agent_id, .. }
@@ -536,7 +672,14 @@ impl AgentEvent {
             | AgentEvent::WorktreeFinalized { agent_id, .. }
             | AgentEvent::WorktreeSkipped { agent_id, .. }
             | AgentEvent::QuestionAsked { agent_id, .. }
-            | AgentEvent::PlanSubmitted { agent_id, .. } => agent_id,
+            | AgentEvent::PlanSubmitted { agent_id, .. }
+            | AgentEvent::FollowUpQueued { agent_id, .. }
+            | AgentEvent::FollowUpInjected { agent_id, .. }
+            | AgentEvent::FollowUpDropped { agent_id, .. }
+            | AgentEvent::TokenUsage { agent_id, .. }
+            | AgentEvent::ContextWindowUsage { agent_id, .. }
+            | AgentEvent::RewindApplied { agent_id, .. }
+            | AgentEvent::HookFired { agent_id, .. } => agent_id,
         }
     }
 }
@@ -602,6 +745,11 @@ pub struct SpawnArgs {
     /// injected editor context and is therefore not a good durable objective.
     pub goal_title: Option<String>,
     pub goal_objective: Option<String>,
+    /// P6.1 — ligne `queued_followups` que ce spawn consomme (drain de la file
+    /// de suivi). La consommation est ATOMIQUE avec l'INSERT du run : CAS
+    /// `pending → injected` dans la même transaction ; si la ligne a déjà été
+    /// consommée ou retirée, le spawn échoue au lieu d'exécuter un doublon.
+    pub followup_id: Option<String>,
 }
 
 /// Arguments for `agent_continue` — human-in-the-loop resume after the user
@@ -716,6 +864,15 @@ fn recover_orphans(conn: &Connection, now: i64) -> Result<OrphanRecovery, String
         )
         .map_err(|e| format!("recover interaction claims: {e}"))?;
     let goals_paused = goals::pause_orphaned_on_conn(&tx, now)?;
+    // P6.9 — processus d'arrière-plan encore 'running' après un redémarrage :
+    // le suivi en mémoire est mort avec le process précédent → 'interrupted',
+    // honnêtement (jamais prétendus vivants).
+    let bg_interrupted = processes::recover_bg_on_conn(&tx, now)?;
+    if bg_interrupted > 0 {
+        eprintln!(
+            "[agents] recovery: {bg_interrupted} background process(es) reconciled to interrupted"
+        );
+    }
     tx.commit()
         .map_err(|e| format!("commit orphan recovery: {e}"))?;
     Ok(OrphanRecovery {
@@ -839,6 +996,35 @@ pub(crate) fn get_conn(app: &tauri::AppHandle) -> Result<&'static Mutex<Connecti
 // ────────────────────────────────────────────────────────────────────────
 // Small helpers
 // ────────────────────────────────────────────────────────────────────────
+
+/// P6.3 — trace durable d'un rewind appliqué par l'utilisateur. Enrobage
+/// pub(crate) de `persist_and_emit` (pub(super)) pour les modules frères
+/// (`snapshot.rs`, `conversations.rs`) : le fait qu'un tour a été rembobiné
+/// reste visible dans l'historique du run après reload (contrat d'honnêteté).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_rewind_event(
+    app: &tauri::AppHandle,
+    agent_id: &str,
+    kind: &str,
+    ref_name: &str,
+    restored: Vec<String>,
+    removed: Vec<String>,
+    safety_ref: Option<String>,
+    forked_conversation_id: Option<String>,
+) {
+    let _ = persist_and_emit(
+        app,
+        &AgentEvent::RewindApplied {
+            agent_id: agent_id.to_string(),
+            rewind_kind: kind.to_string(),
+            ref_name: ref_name.to_string(),
+            restored,
+            removed,
+            safety_ref,
+            forked_conversation_id,
+        },
+    );
+}
 
 pub(crate) fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1139,7 +1325,7 @@ pub async fn agent_spawn(
     let agent_id = Uuid::new_v4().to_string();
     {
         let mut guard = state.0.lock().map_err(|e| e.to_string())?;
-        if guard.len() >= MAX_CONCURRENT_AGENTS {
+        if runner::active_capacity_used(&guard) >= MAX_CONCURRENT_AGENTS {
             return Err(format!(
                 "agent capacity reached: {} active",
                 MAX_CONCURRENT_AGENTS
@@ -1157,70 +1343,105 @@ pub async fn agent_spawn(
 
     // INSERT the agent and its durable Goal attachment in one transaction. A
     // Goal-mode run without goal_id creates a new objective; a continuation
-    // passes the existing id and becomes its new current attempt.
+    // passes the existing id and becomes its new current attempt. The same
+    // transaction consumes the queued follow-up this spawn drives (P6.1).
     let created_at = now_ms();
-    let persist_spawn = (|| -> Result<Option<String>, String> {
-        let conn_mutex = get_conn(&app)?;
-        let mut conn = conn_mutex.lock().map_err(|e| e.to_string())?;
-        let tx = conn
-            .transaction()
-            .map_err(|e| format!("begin agent spawn transaction: {e}"))?;
-        let goal_requested = args.mode.as_deref() == Some("goal") || args.goal_id.is_some();
-        let attached_goal_id = if goal_requested {
-            let conversation_id = args
-                .conversation_id
+    let persist_spawn =
+        (|| -> Result<(Option<String>, Option<(String, String, String)>), String> {
+            let conn_mutex = get_conn(&app)?;
+            let mut conn = conn_mutex.lock().map_err(|e| e.to_string())?;
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("begin agent spawn transaction: {e}"))?;
+            // P6.1 — consommation atomique de la ligne de suivi qui pilote ce run.
+            // CAS `pending → injected` AVANT l'INSERT : une ligne déjà consommée ou
+            // retirée fait échouer TOUT le spawn (jamais de doublon d'exécution).
+            let consumed_followup: Option<(String, String, String)> = match args
+                .followup_id
                 .as_deref()
-                .ok_or_else(|| "le mode Goal exige une conversation".to_string())?;
-            let workspace_id = runner::get_workspace_root(&app)
-                .as_deref()
-                .map(crate::commands::vector::workspace_id);
-            Some(goals::attach_run_on_conn(
-                &tx,
-                goals::AttachGoal {
-                    existing_goal_id: args.goal_id.as_deref(),
-                    conversation_id,
-                    workspace_id: workspace_id.as_deref(),
-                    title: args.goal_title.as_deref(),
-                    objective: args.goal_objective.as_deref().unwrap_or(&args.task),
-                    role: &args.role,
-                    model: &args.model,
-                    protocol: args.protocol.as_deref(),
-                    base_url: args.base_url.as_deref(),
-                    execution_profile: execution_profile.as_str(),
-                    isolate: isolate_for_task,
-                    agent_id: &agent_id,
-                    now: created_at,
-                },
-            )?)
-        } else {
-            None
-        };
-        tx.execute(
-            "INSERT INTO agents
+            {
+                Some(fid) => {
+                    let data: Option<(String, String)> = tx
+                        .query_row(
+                            "SELECT mode, content FROM queued_followups WHERE id = ?1",
+                            params![fid],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .optional()
+                        .map_err(|e| format!("followup lookup: {e}"))?;
+                    let (fmode, fcontent) =
+                        data.ok_or_else(|| "message de suivi introuvable".to_string())?;
+                    let changed = tx
+                        .execute(
+                            "UPDATE queued_followups
+                            SET status = 'injected', injected_at = ?1
+                          WHERE id = ?2 AND status = 'pending'",
+                            params![created_at, fid],
+                        )
+                        .map_err(|e| format!("consume followup: {e}"))?;
+                    if changed != 1 {
+                        return Err("ce message de suivi a déjà été consommé ou retiré".to_string());
+                    }
+                    Some((fid.to_string(), fmode, fcontent))
+                }
+                None => None,
+            };
+            let goal_requested = args.mode.as_deref() == Some("goal") || args.goal_id.is_some();
+            let attached_goal_id = if goal_requested {
+                let conversation_id = args
+                    .conversation_id
+                    .as_deref()
+                    .ok_or_else(|| "le mode Goal exige une conversation".to_string())?;
+                let workspace_id = runner::get_workspace_root(&app)
+                    .as_deref()
+                    .map(crate::commands::vector::workspace_id);
+                Some(goals::attach_run_on_conn(
+                    &tx,
+                    goals::AttachGoal {
+                        existing_goal_id: args.goal_id.as_deref(),
+                        conversation_id,
+                        workspace_id: workspace_id.as_deref(),
+                        title: args.goal_title.as_deref(),
+                        objective: args.goal_objective.as_deref().unwrap_or(&args.task),
+                        role: &args.role,
+                        model: &args.model,
+                        protocol: args.protocol.as_deref(),
+                        base_url: args.base_url.as_deref(),
+                        execution_profile: execution_profile.as_str(),
+                        isolate: isolate_for_task,
+                        agent_id: &agent_id,
+                        now: created_at,
+                    },
+                )?)
+            } else {
+                None
+            };
+            tx.execute(
+                "INSERT INTO agents
                 (id, role, status, parent_id, model, task, conversation_id, created_at,
                  execution_profile, isolate, profile_verified, isolation_status, goal_id)
              VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11)",
-            params![
-                agent_id,
-                args.role,
-                args.parent_id,
-                args.model,
-                args.task,
-                args.conversation_id,
-                created_at,
-                execution_profile.as_str(),
-                isolate_for_task,
-                if isolate_for_task { "pending" } else { "none" },
-                attached_goal_id,
-            ],
-        )
-        .map_err(|e| format!("insert agents row: {e}"))?;
-        tx.commit()
-            .map_err(|e| format!("commit agent spawn transaction: {e}"))?;
-        Ok(attached_goal_id)
-    })();
-    let attached_goal_id = match persist_spawn {
-        Ok(goal_id) => goal_id,
+                params![
+                    agent_id,
+                    args.role,
+                    args.parent_id,
+                    args.model,
+                    args.task,
+                    args.conversation_id,
+                    created_at,
+                    execution_profile.as_str(),
+                    isolate_for_task,
+                    if isolate_for_task { "pending" } else { "none" },
+                    attached_goal_id,
+                ],
+            )
+            .map_err(|e| format!("insert agents row: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("commit agent spawn transaction: {e}"))?;
+            Ok((attached_goal_id, consumed_followup))
+        })();
+    let (attached_goal_id, consumed_followup) = match persist_spawn {
+        Ok(ok) => ok,
         Err(error) => {
             if let Ok(mut guard) = state.0.lock() {
                 guard.remove(&agent_id);
@@ -1244,6 +1465,22 @@ pub async fn agent_spawn(
             goal_id: attached_goal_id.clone(),
         },
     )?;
+
+    // P6.1 — le spawn a consommé une ligne de la file de suivi : trace
+    // `followUpInjected` sur le flux du NOUVEAU run (la ligne porte le run_id
+    // de l'ancien ; c'est ici qu'elle devient une instruction exécutée).
+    if let Some((followup_id, fmode, fcontent)) = consumed_followup {
+        persist_and_emit(
+            &app,
+            &AgentEvent::FollowUpInjected {
+                agent_id: agent_id.clone(),
+                followup_id,
+                conversation_id: args.conversation_id.clone().unwrap_or_default(),
+                mode: fmode,
+                content: fcontent,
+            },
+        )?;
+    }
 
     // Phase 1 — hand off to the runner submodule. `run_agent_task` resolves
     // the provider (protocol/baseUrl/apiKey from `args`), calls the real
@@ -1511,6 +1748,7 @@ pub async fn agent_continue(
         goal_id: source_goal_id,
         goal_title: None,
         goal_objective: None,
+        followup_id: None, // une reprise HITL ne consomme pas la file de suivi
     };
     let manager_after_spawn = state.0.clone();
     let spawn = agent_spawn(app.clone(), state, full_access, spawn_args).await;
@@ -1602,7 +1840,7 @@ pub async fn agent_atelier_run(
     let agent_id = Uuid::new_v4().to_string();
     {
         let mut guard = state.0.lock().map_err(|e| e.to_string())?;
-        if guard.len() >= MAX_CONCURRENT_AGENTS {
+        if runner::active_capacity_used(&guard) >= MAX_CONCURRENT_AGENTS {
             return Err(format!(
                 "agent capacity reached: {} active",
                 MAX_CONCURRENT_AGENTS
@@ -1760,7 +1998,7 @@ pub async fn agent_grounded_run(
     let agent_id = Uuid::new_v4().to_string();
     {
         let mut guard = state.0.lock().map_err(|e| e.to_string())?;
-        if guard.len() >= MAX_CONCURRENT_AGENTS {
+        if runner::active_capacity_used(&guard) >= MAX_CONCURRENT_AGENTS {
             return Err(format!(
                 "agent capacity reached: {} active",
                 MAX_CONCURRENT_AGENTS
@@ -1878,47 +2116,70 @@ pub async fn agent_kill(
     state: State<'_, AgentManagerState>,
     agent_id: String,
 ) -> Result<(), String> {
-    // Cascade : rassembler tous les descendants vivants (BFS via parent_id)
-    // AVANT de toucher au registre.
+    kill_agent_tree(&app, &state.0, &agent_id).await
+}
+
+/// Descendants VIVANTS (status running/pending) d'un agent, en BFS via
+/// `parent_id` — la cascade du kill (P6.11 : un kill du parent en fan-out
+/// retrouve TOUS ses enfants et petits-enfants). Extrait pour testabilité.
+pub(crate) fn live_descendants_on_conn(
+    conn: &Connection,
+    agent_id: &str,
+) -> Result<Vec<String>, String> {
     let mut descendants: Vec<String> = Vec::new();
-    {
-        let conn_mutex = get_conn(&app)?;
-        let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
-        let mut frontier = vec![agent_id.clone()];
-        while let Some(pid) = frontier.pop() {
-            let kids: Vec<String> = {
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT id FROM agents
-                          WHERE parent_id = ?1 AND status IN ('running', 'pending')",
-                    )
-                    .map_err(|e| e.to_string())?;
-                let rows = stmt
-                    .query_map(params![pid], |r| r.get::<_, String>(0))
-                    .map_err(|e| e.to_string())?;
-                rows.flatten().collect()
-            };
-            for k in kids {
-                if k != agent_id && !descendants.contains(&k) {
-                    descendants.push(k.clone());
-                    frontier.push(k);
-                }
+    let mut frontier = vec![agent_id.to_string()];
+    while let Some(pid) = frontier.pop() {
+        let kids: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM agents
+                      WHERE parent_id = ?1 AND status IN ('running', 'pending')",
+                )
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(params![pid], |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            rows.flatten().collect()
+        };
+        for k in kids {
+            if k != agent_id && !descendants.contains(&k) {
+                descendants.push(k.clone());
+                frontier.push(k);
             }
         }
     }
+    Ok(descendants)
+}
+
+/// Corps du kill (cible + cascade), partagé entre `agent_kill` et le mode
+/// `interrupt` de la file de suivi (P6.1, `agent_run_or_queue`). Ne touche
+/// JAMAIS les lignes `queued_followups` du run tué : elles restent `pending`,
+/// visibles dans l'UI, jusqu'à un retrait explicite de l'utilisateur.
+pub(crate) async fn kill_agent_tree(
+    app: &tauri::AppHandle,
+    state: &Arc<Mutex<HashMap<String, AgentHandle>>>,
+    agent_id: &str,
+) -> Result<(), String> {
+    // Cascade : rassembler tous les descendants vivants (BFS via parent_id)
+    // AVANT de toucher au registre.
+    let descendants = {
+        let conn_mutex = get_conn(app)?;
+        let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
+        live_descendants_on_conn(&conn, agent_id)?
+    };
 
     // Signal async + flag atomique pour les boucles bloquantes. Les handles
     // restent enregistrés jusqu'à ce que leurs runners aient effectivement
     // arrêté les processus enfants ; la capacité reflète ainsi le travail réel.
     let abort_token = {
-        let guard = state.0.lock().map_err(|e| e.to_string())?;
+        let guard = state.lock().map_err(|e| e.to_string())?;
         for d in &descendants {
             if let Some(h) = guard.get(d) {
                 h.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
                 h.abort.notify_one();
             }
         }
-        match guard.get(&agent_id) {
+        match guard.get(agent_id) {
             Some(handle) => {
                 handle
                     .cancelled
@@ -1936,9 +2197,9 @@ pub async fn agent_kill(
     let finished_at = now_ms();
     let mut killed_ids: Vec<String> = Vec::new();
     {
-        let conn_mutex = get_conn(&app)?;
+        let conn_mutex = get_conn(app)?;
         let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
-        for id in std::iter::once(&agent_id).chain(descendants.iter()) {
+        for id in std::iter::once(agent_id).chain(descendants.iter().map(String::as_str)) {
             let changed = conn
                 .execute(
                     "UPDATE agents
@@ -1950,7 +2211,7 @@ pub async fn agent_kill(
                 )
                 .map_err(|e| format!("update agents kill: {e}"))?;
             if changed == 1 {
-                killed_ids.push(id.clone());
+                killed_ids.push(id.to_string());
             }
         }
     }
@@ -1958,12 +2219,17 @@ pub async fn agent_kill(
     // Emit only for rows whose terminal-state CAS we actually won.
     for id in &killed_ids {
         persist_and_emit(
-            &app,
+            app,
             &AgentEvent::Error {
                 agent_id: id.clone(),
                 error: "killed by user".into(),
             },
         )?;
+    }
+    // P6.9 — kill du run ⇒ kill de ses sessions shell persistantes ET de ses
+    // processus d'arrière-plan (arbres, statut 'killed' — jamais de zombie).
+    for id in &killed_ids {
+        processes::kill_run_all(app, id);
     }
     Ok(())
 }
@@ -2193,6 +2459,13 @@ mod profile_tests {
              );
              CREATE TABLE agent_interactions (
                 interaction_id TEXT PRIMARY KEY, answered_at INTEGER, claim_token TEXT
+             );
+             CREATE TABLE agent_background_processes (
+                id TEXT PRIMARY KEY, run_id TEXT NOT NULL, command TEXT NOT NULL,
+                cwd TEXT NOT NULL, pid INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                exit_code INTEGER, created_at INTEGER NOT NULL, ended_at INTEGER,
+                output_tail TEXT NOT NULL DEFAULT ''
              );
              INSERT INTO agents VALUES ('a1','running',NULL,NULL,1,'active');
              INSERT INTO agents VALUES ('a2','complete',NULL,10,0,'none');

@@ -49,7 +49,15 @@ export type AgentEventKind =
   | "worktreeFinalized"
   | "worktreeSkipped"
   | "questionAsked"
-  | "planSubmitted";
+  | "planSubmitted"
+  | "followUpQueued"
+  | "followUpInjected"
+  | "followUpDropped"
+  | "tokenUsage"
+  | "contextWindowUsage"
+  | "rewindApplied"
+  | "hookFired";
+
 
 // ────────────────────────────────────────────────────────────────────
 // DB row shapes (mirror Rust AgentRow / AgentEventRow)
@@ -273,13 +281,10 @@ export type AgentEvent =
       kind: "questionAsked";
       agentId: string;
       toolCallId: string;
-      /** Le JSON brut de l'outil `ask_user` : 1 à 4 questions à choix. */
-      questions: {
-        id?: string;
-        question: string;
-        multiSelect?: boolean;
-        options: { label: string; description?: string }[];
-      }[];
+      /** Le JSON brut : tableau de questions (ask_user) OU objet marqueur
+       *  `permissionAsk` (P6.10 — carte de permission allow/ask/deny).
+       *  `useMessageDisplay` normalise les deux formes. */
+      questions: unknown;
     }
   | {
       // Human-in-the-loop — l'agent a appelé `submit_plan`. Rendu en carte avec
@@ -290,6 +295,87 @@ export type AgentEvent =
       /** Plan final en Markdown à présenter dans la carte d'approbation. */
       plan: string;
       title?: string;
+    }
+  | {
+      // P6.1 — un message envoyé pendant ce run a été mis en file d'attente
+      // (queue / steer). Persisté dans agent_events → survit au reload.
+      kind: "followUpQueued";
+      agentId: string;
+      followupId: string;
+      conversationId: string;
+      mode: "queue" | "steer" | "interrupt";
+      content: string;
+    }
+  | {
+      // P6.1 — ligne consommée : steer injecté entre deux tours d'outils
+      // (flux du run en cours) ou queue consommé au spawn du nouveau run.
+      kind: "followUpInjected";
+      agentId: string;
+      followupId: string;
+      conversationId: string;
+      mode: "queue" | "steer" | "interrupt";
+      content: string;
+    }
+  | {
+      // P6.1 — retrait explicite d'une ligne pending (✕ d'un chip). Un kill
+      // ne produit JAMAIS cet event : les lignes restent pending.
+      kind: "followUpDropped";
+      agentId: string;
+      followupId: string;
+      conversationId: string;
+      mode: "queue" | "steer" | "interrupt";
+      content: string;
+    }
+  | {
+      // P6.2 — consommation tokens d'UN tour, telle que rapportée par le
+      // provider. Champ ABSENT = non rapporté (jamais de zéros fabriqués) ;
+      // l'event lui-même n'est émis que si au moins un champ est rapporté.
+      kind: "tokenUsage";
+      agentId: string;
+      inputTokens?: number;
+      outputTokens?: number;
+      cacheCreationInputTokens?: number;
+      cacheReadInputTokens?: number;
+    }
+  | {
+      // P6.2 — remplissage de la fenêtre de contexte après chaque tour.
+      // `source` distingue mesure provider (entrée réelle du dernier tour)
+      // et estimation locale — l'UI doit afficher laquelle des deux.
+      kind: "contextWindowUsage";
+      agentId: string;
+      used: number;
+      window: number;
+      source: "provider" | "estimate";
+    }
+  | {
+      // P6.3 — un rewind a été appliqué par l'utilisateur sur ce tour.
+      // Persisté : le fait qu'un tour a été rembobiné survit au reload.
+      kind: "rewindApplied";
+      agentId: string;
+      /** "files" | "conversation" | "both" (champ rewindKind côté serde). */
+      rewindKind: string;
+      refName: string;
+      restored: string[];
+      removed: string[];
+      /** Checkpoint de secours pré-revert (rewind réversible) ; absent si échec. */
+      safetyRef?: string;
+      forkedConversationId?: string;
+    }
+  | {
+      // P6.4 — un hook utilisateur a été exécuté (tracé, jamais invisible).
+      kind: "hookFired";
+      agentId: string;
+      /** "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PreCompact" | "Stop". */
+      hookEvent: string;
+      command: string;
+      /** "user" | "project" — quel hooks.json a fourni ce hook. */
+      source: string;
+      /** "ok" | "context" | "block" | "timeout" | "error" | "block-ignored". */
+      outcome: string;
+      durationMs: number;
+      reason?: string;
+      injectedContext?: string;
+      tool?: string;
     };
 
 // ────────────────────────────────────────────────────────────────────
@@ -352,6 +438,11 @@ export interface SpawnArgs {
   goalId?: string;
   goalTitle?: string;
   goalObjective?: string;
+  /** P6.1 — ligne `queued_followups` que ce spawn consomme (drain de la file
+   *  de suivi). Consommation atomique côté Rust : si la ligne a déjà été
+   *  consommée ou retirée, le spawn échoue au lieu d'exécuter un doublon.
+   *  Sérialise vers le champ Rust `followup_id` (SpawnArgs). */
+  followupId?: string;
 }
 
 /** Spawn an agent. Returns the freshly minted agent id (UUID v4 string).
@@ -377,7 +468,7 @@ export interface ContinueArgs {
   isolate?: boolean;
   /** tool_call_id de l'interaction consommée — clé d'idempotence de la relance. */
   interactionId?: string;
-  kind?: "ask_user" | "submit_plan";
+  kind?: "ask_user" | "submit_plan" | "permission_ask" | (string & {});
   response?: string;
   verdict?: "approved" | "continue";
   // Provider routing — miroir de SpawnArgs (résolu côté TS avant l'appel).
@@ -612,4 +703,63 @@ export async function groundedRun(args: {
   testCommand?: string;
 }): Promise<string> {
   return invoke<string>("agent_grounded_run", { args });
+}
+
+// ── P6.1 — file d'attente des messages de suivi pendant un run ─────────────
+// Mirrors commands::agents::followups (Rust). Un message envoyé pendant un
+// run n'est plus un run concurrent : il est routé selon le mode effectif
+// (`agents.followUpQueueMode`, défaut "queue" ; Ctrl+Shift+Enter = inverse
+// one-shot queue ↔ steer).
+
+export type FollowUpMode = "queue" | "steer" | "interrupt";
+
+/** Une ligne `queued_followups` (mirror de QueuedFollowupRow côté Rust). */
+export interface QueuedFollowupRow {
+  id: string;
+  runId: string;
+  conversationId: string;
+  content: string;
+  mode: FollowUpMode;
+  status: "pending" | "injected" | "dropped";
+  createdAt: number;
+  injectedAt: number | null;
+}
+
+/** Résultat de `agent_run_or_queue` — soit un run démarré, soit une mise en file. */
+export type RunOrQueueResult =
+  | { kind: "spawned"; agentId: string }
+  | { kind: "queued"; followup: QueuedFollowupRow };
+
+/** Chemin d'envoi du chat pendant (ou hors) un run agent. Sans run actif sur
+ *  la conversation : spawn direct. Avec un run actif : `queue`/`steer`
+ *  persistent et rendent la main (pas de run concurrent) ; `interrupt` tue le
+ *  run actif (même kill coopératif que Stop) puis spawne la nouvelle
+ *  instruction — Stop + send atomique côté utilisateur. */
+export async function runOrQueueAgent(args: {
+  spawn: SpawnArgs;
+  /** Mode effectif résolu côté TS (réglage + inverse one-shot). */
+  followUpMode?: FollowUpMode;
+}): Promise<RunOrQueueResult> {
+  return invoke<RunOrQueueResult>("agent_run_or_queue", { args });
+}
+
+/** File `pending` d'une conversation (FIFO) — alimente les chips du composer.
+ *  Re-sert aussi les lignes orphelines d'un run mort (boot recovery). */
+export async function listFollowups(conversationId: string): Promise<QueuedFollowupRow[]> {
+  return invoke<QueuedFollowupRow[]>("agent_list_followups", { conversationId });
+}
+
+/** Prochaine ligne `pending` (lecture seule). `mode: "queue"` pour le drain
+ *  automatique de fin de run ; sans mode pour le « reprendre » manuel. */
+export async function nextFollowup(
+  conversationId: string,
+  mode?: FollowUpMode,
+): Promise<QueuedFollowupRow | null> {
+  return invoke<QueuedFollowupRow | null>("agent_next_followup", { conversationId, mode });
+}
+
+/** Retrait explicite d'une ligne `pending` (le ✕ d'un chip). false = la ligne
+ *  était déjà consommée/retirée (CAS). */
+export async function dequeueFollowup(id: string): Promise<boolean> {
+  return invoke<boolean>("agent_dequeue_followup", { id });
 }

@@ -19,6 +19,9 @@
     "sql:allow-select",
     "sql:allow-load",
     "sql:allow-close",
-    "dialog:allow-open"
+    "dialog:allow-open",
+    "notification:default",
+    "notification:allow-notify",
+    "notification:allow-request-permission"
   ]
 }

@@ -1,5 +1,14 @@
 mod commands;
 
+// The application binary receives Tauri's Windows resource automatically.
+// Unit-test harnesses do not, yet tauri-plugin-dialog imports
+// `TaskDialogIndirect`, which requires the Common Controls v6 manifest stored
+// in that resource. Whole-archive is required because a .res library exports
+// no symbol for the linker to pull lazily.
+#[cfg(all(test, target_os = "windows"))]
+#[link(name = "resource", kind = "static")]
+unsafe extern "C" {}
+
 use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -593,6 +602,99 @@ CREATE INDEX IF NOT EXISTS idx_agents_goal
   ON agents(goal_id, created_at);
 ";
 
+// V25 — file d'attente des messages de suivi pendant un run agent (P6.1).
+// Un message envoyé pendant un run n'est plus lancé en run CONCURRENT : il est
+// persisté ici (`pending`) puis consommé selon son mode —
+//   * 'steer' : injecté par la boucle entre deux tours d'outils du run visé
+//     (`run_id`), marqué `injected` au moment de l'injection ;
+//   * 'queue' : pilote le tour suivant quand le run se termine (consommé
+//     atomiquement au spawn du nouveau run, cf. agent_spawn `followup_id`) ;
+//   * 'interrupt' : jamais persisté en pratique (kill + spawn immédiat) — le
+//     CHECK le tolère pour garder la colonne honnête si un appelant le pose.
+// Un kill ne touche JAMAIS ces lignes : elles restent `pending`, visibles dans
+// l'UI, jusqu'à un retrait explicite (`dropped`) ou une consommation.
+const MIGRATION_V25: &str = "
+CREATE TABLE IF NOT EXISTS queued_followups (
+  id              TEXT    PRIMARY KEY,
+  run_id          TEXT    NOT NULL,
+  conversation_id TEXT    NOT NULL,
+  content         TEXT    NOT NULL CHECK (length(content) >= 1),
+  mode            TEXT    NOT NULL CHECK (mode IN ('queue', 'steer', 'interrupt')),
+  status          TEXT    NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'injected', 'dropped')),
+  created_at      INTEGER NOT NULL,
+  injected_at     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_queued_followups_run
+  ON queued_followups(run_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_queued_followups_conv
+  ON queued_followups(conversation_id, status, created_at);
+";
+
+// V26 — branche de conversation (fork, P6.3 rewind). Le fork COPIE les messages
+// jusqu'au point de branche dans une NOUVELLE conversation et garde la source
+// intacte ; ces deux colonnes enregistrent la provenance (conversation source +
+// message du point de branche) pour que l'UI puisse afficher « branché depuis… »
+// et qu'un audit retrouve la lignée après reload.
+const MIGRATION_V26: &str = "
+ALTER TABLE conversations ADD COLUMN forked_from_id TEXT;
+ALTER TABLE conversations ADD COLUMN fork_point_message_id TEXT;
+CREATE INDEX IF NOT EXISTS idx_conversations_forked_from ON conversations(forked_from_id);
+";
+
+// V27 — processus d'arrière-plan des agents (P6.9). Suivi durable des process
+// détachés lancés par `run_background` : statut honnête (running/exited/
+// interrupted/killed), code de sortie, snapshot borné de la sortie. Au boot,
+// les lignes encore 'running' sont réconciliées en 'interrupted' (jamais
+// prétendues vivantes — le suivi en mémoire est perdu avec le process).
+const MIGRATION_V27: &str = "
+CREATE TABLE IF NOT EXISTS agent_background_processes (
+  id          TEXT    PRIMARY KEY,
+  run_id      TEXT    NOT NULL,
+  command     TEXT    NOT NULL,
+  cwd         TEXT    NOT NULL,
+  pid         INTEGER NOT NULL,
+  status      TEXT    NOT NULL DEFAULT 'running'
+    CHECK (status IN ('running', 'exited', 'interrupted', 'killed')),
+  exit_code   INTEGER,
+  created_at  INTEGER NOT NULL,
+  ended_at    INTEGER,
+  output_tail TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_bg_processes_run
+  ON agent_background_processes(run_id, status, created_at);
+";
+
+// V28 — moteur de règles de permission allow / ask / deny (P6.10). Nouvelle
+// table `agent_permission_rules` : `decision` à trois valeurs (les anciennes
+// règles allow/deny sont migrées telles quelles) et `scope` ('' = GLOBAL,
+// sinon chemin du workspace — les règles projet gagnent à spécificité égale).
+// PK (pattern, scope) : un même motif peut exister en global ET en projet.
+// L'ancienne table est copiée puis supprimée (source unique).
+const MIGRATION_V28: &str = "
+CREATE TABLE IF NOT EXISTS agent_permission_rules (
+  pattern    TEXT    NOT NULL,
+  decision   TEXT    NOT NULL CHECK (decision IN ('allow', 'ask', 'deny')),
+  scope      TEXT    NOT NULL DEFAULT '',
+  detail     TEXT,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (pattern, scope)
+);
+INSERT OR REPLACE INTO agent_permission_rules (pattern, decision, scope, detail, created_at)
+  SELECT pattern, verdict, '', detail, created_at FROM agent_command_rules;
+DROP TABLE agent_command_rules;
+";
+
+// V29 — une réponse HITL « autoriser/refuser cette fois » ne vaut que pour le
+// run de continuation créé par agent_continue et ne peut être consommée qu'une
+// fois. Sans ce marqueur, une ancienne réponse de même signature était réutilisée
+// globalement dans d'autres conversations et projets.
+const MIGRATION_V29: &str = "
+ALTER TABLE agent_interactions ADD COLUMN permission_consumed_at INTEGER;
+CREATE INDEX IF NOT EXISTS idx_agent_interactions_permission_once
+  ON agent_interactions(continuation_agent_id, permission_consumed_at, answered_at);
+";
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = vec![
@@ -740,6 +842,36 @@ pub fn run() {
             sql: MIGRATION_V24,
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 25,
+            description: "queued_followups",
+            sql: MIGRATION_V25,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 26,
+            description: "conversation_fork_provenance",
+            sql: MIGRATION_V26,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 27,
+            description: "agent_background_processes",
+            sql: MIGRATION_V27,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 28,
+            description: "agent_permission_rules",
+            sql: MIGRATION_V28,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 29,
+            description: "permission_once_consumption",
+            sql: MIGRATION_V29,
+            kind: MigrationKind::Up,
+        },
     ];
 
     // Garde anti-dérive : le backup pré-migration (backup.rs) décide « une
@@ -754,6 +886,7 @@ pub fn run() {
     );
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
@@ -775,6 +908,9 @@ pub fn run() {
         .manage(commands::llama::LlamaServerState::default())
         .manage(commands::agents::AgentManagerState::default())
         .manage(commands::agents::FullAccessGrant::default())
+        // P6.9 — sessions shell persistantes + processus d'arrière-plan.
+        .manage(commands::agents::processes::SessionRegistry::default())
+        .manage(commands::agents::processes::BackgroundRegistry::default())
         // Lot C — registre des connexions MCP vives (un RunningService par serveur).
         .manage(commands::mcp::McpManager::default())
         .manage(commands::chat::ChatAbortRegistry::default())
@@ -1044,6 +1180,33 @@ pub fn run() {
             commands::agents::agent_list_active,
             commands::agents::agent_get_transcript,
             commands::agents::agent_list_by_conversation,
+            // P6.1 — file d'attente des messages de suivi pendant un run.
+            commands::agents::followups::agent_run_or_queue,
+            commands::agents::followups::agent_list_followups,
+            commands::agents::followups::agent_next_followup,
+            commands::agents::followups::agent_dequeue_followup,
+            // P6.3 — rewind par tour : fork de conversation + rewind fichiers gardé.
+            commands::conversations::conversation_fork_at,
+            commands::snapshot::shugu_snapshot_preview,
+            commands::snapshot::shugu_snapshot_rewind,
+            // P6.4 — hooks de cycle de vie utilisateur (Settings « Hooks »).
+            commands::agents::hooks::hooks_list,
+            commands::agents::hooks::hooks_set_disabled,
+            commands::agents::hooks::hooks_test,
+            // P6.7 — plugins par convention de répertoires (Settings « Plugins »).
+            commands::agents::plugins::plugins_list,
+            commands::agents::plugins::plugins_set_enabled,
+            commands::agents::plugins::plugins_commands,
+            commands::agents::plugins::plugins_mcp_list,
+            commands::agents::plugins::plugins_mcp_approve,
+            commands::agents::plugins::plugins_mcp_reject,
+            // P6.8 — skills fichiers SKILL.md (listing + prévisualisation).
+            commands::agents::file_skills::file_skills_list,
+            commands::agents::file_skills::file_skills_body,
+            // P6.9 — sessions + processus d'arrière-plan (panneau Terminaux).
+            commands::agents::processes::agent_process_list,
+            commands::agents::processes::agent_process_output,
+            commands::agents::processes::agent_process_stop,
             commands::agents::goals::goal_list_by_conversation,
             commands::agents::goals::goal_get,
             commands::agents::goals::goal_archive,
@@ -1057,9 +1220,10 @@ pub fn run() {
             commands::agents::skills::skills_clear,
             commands::agents::skills::skill_save_advisor,
             // Phase 2 — règles d'auto-allow apprises (« mode fluide »).
-            commands::agents::command_rules::command_rule_save,
-            commands::agents::command_rules::command_rule_list,
-            commands::agents::command_rules::command_rule_delete,
+            commands::agents::command_rules::permission_rule_save,
+            commands::agents::command_rules::permission_rule_list,
+            commands::agents::command_rules::permission_rule_delete,
+            commands::agents::command_rules::permission_rule_evaluate,
             // Codex CLI bridge — auth status + real usage tracking (ChatGPT subscription).
             commands::codex::codex_auth_status,
             commands::codex::codex_login,
@@ -1209,7 +1373,9 @@ pub fn run() {
 
 #[cfg(test)]
 mod migration_tests {
-    use super::MIGRATION_V24;
+    use super::{
+        MIGRATION_V24, MIGRATION_V25, MIGRATION_V26, MIGRATION_V27, MIGRATION_V28, MIGRATION_V29,
+    };
     use rusqlite::{params, Connection};
 
     #[test]
@@ -1244,5 +1410,240 @@ mod migration_tests {
         insert("goal-1", "active").unwrap();
         assert!(insert("goal-2", "waiting").is_err());
         insert("goal-3", "paused").unwrap();
+    }
+
+    #[test]
+    fn v25_creates_queued_followups_with_check_constraints() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATION_V25).unwrap();
+
+        let insert = |id: &str, mode: &str, status: &str| {
+            conn.execute(
+                "INSERT INTO queued_followups
+                    (id, run_id, conversation_id, content, mode, status, created_at)
+                 VALUES (?1, 'run', 'conv', 'contenu', ?2, ?3, 1)",
+                params![id, mode, status],
+            )
+        };
+        insert("f-1", "queue", "pending").unwrap();
+        insert("f-2", "steer", "injected").unwrap();
+        insert("f-3", "interrupt", "dropped").unwrap();
+        // CHECK mode / status : toute valeur hors ensemble est rejetée.
+        assert!(insert("f-4", "turbo", "pending").is_err());
+        assert!(insert("f-5", "queue", "archived").is_err());
+        // content vide rejeté (CHECK length >= 1).
+        assert!(conn
+            .execute(
+                "INSERT INTO queued_followups
+                    (id, run_id, conversation_id, content, mode, status, created_at)
+                 VALUES ('f-6', 'run', 'conv', '', 'queue', 'pending', 1)",
+                [],
+            )
+            .is_err());
+        // Défaut status = 'pending'.
+        let status: String = conn
+            .query_row(
+                "INSERT INTO queued_followups
+                    (id, run_id, conversation_id, content, mode, created_at)
+                 VALUES ('f-7', 'run', 'conv', 'x', 'queue', 1)
+                 RETURNING status",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "pending");
+    }
+
+    #[test]
+    fn v26_adds_fork_provenance_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversations (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                project_id TEXT,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                archived INTEGER NOT NULL DEFAULT 0,
+                unread INTEGER NOT NULL DEFAULT 0,
+                env TEXT,
+                parent_id TEXT,
+                updated_at INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute_batch(MIGRATION_V26).unwrap();
+
+        let has_col = |name: &str| -> bool {
+            conn.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM pragma_table_info('conversations') WHERE name=?1
+                 )",
+                params![name],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(has_col("forked_from_id"));
+        assert!(has_col("fork_point_message_id"));
+
+        // Les colonnes sont NULL par défaut : les conversations existantes ne
+        // sont pas des branches (provenance absente, pas fabriquée).
+        conn.execute(
+            "INSERT INTO conversations (id, title, updated_at) VALUES ('c1', 't', 1)",
+            [],
+        )
+        .unwrap();
+        let (from, point): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT forked_from_id, fork_point_message_id FROM conversations WHERE id='c1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(from, None);
+        assert_eq!(point, None);
+    }
+
+    #[test]
+    fn v27_creates_background_processes_with_status_check() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATION_V27).unwrap();
+
+        let insert = |id: &str, status: &str| {
+            conn.execute(
+                "INSERT INTO agent_background_processes
+                    (id, run_id, command, cwd, pid, status, created_at)
+                 VALUES (?1, 'run', 'cmd', 'C:/x', 1, ?2, 1)",
+                params![id, status],
+            )
+        };
+        insert("b-1", "running").unwrap();
+        insert("b-2", "exited").unwrap();
+        insert("b-3", "interrupted").unwrap();
+        insert("b-4", "killed").unwrap();
+        assert!(
+            insert("b-5", "zombie").is_err(),
+            "CHECK status : valeur hors ensemble refusée"
+        );
+
+        // Défaut status = 'running', output_tail = ''.
+        let (status, tail): (String, String) = conn
+            .query_row(
+                "INSERT INTO agent_background_processes
+                    (id, run_id, command, cwd, pid, created_at)
+                 VALUES ('b-6', 'run', 'cmd', 'C:/x', 1, 1)
+                 RETURNING status, output_tail",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "running");
+        assert_eq!(tail, "");
+    }
+
+    #[test]
+    fn v28_migrates_command_rules_to_permission_rules() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Ancienne table (pré-V28) avec des règles allow/deny existantes.
+        conn.execute_batch(
+            "CREATE TABLE agent_command_rules (
+                pattern TEXT PRIMARY KEY,
+                verdict TEXT NOT NULL,
+                detail TEXT,
+                created_at INTEGER NOT NULL
+            );
+            INSERT INTO agent_command_rules VALUES ('git push *', 'allow', NULL, 10);
+            INSERT INTO agent_command_rules VALUES ('rm -rf *', 'deny', 'dangereux', 20);",
+        )
+        .unwrap();
+        conn.execute_batch(MIGRATION_V28).unwrap();
+
+        // Les anciennes lignes atterrissent avec la bonne décision + scope global.
+        let rows: Vec<(String, String, String, Option<String>)> = {
+            let mut stmt = conn
+                .prepare("SELECT pattern, decision, scope, detail FROM agent_permission_rules ORDER BY pattern")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            (
+                "git push *".to_string(),
+                "allow".to_string(),
+                String::new(),
+                None
+            )
+        );
+        assert_eq!(
+            rows[1],
+            (
+                "rm -rf *".to_string(),
+                "deny".to_string(),
+                String::new(),
+                Some("dangereux".to_string())
+            )
+        );
+
+        // CHECK decision : hors ensemble refusé ; PK (pattern, scope) : un même
+        // motif peut exister en global ET en projet.
+        assert!(conn
+            .execute(
+                "INSERT INTO agent_permission_rules (pattern, decision, created_at)
+                 VALUES ('x', 'maybe', 1)",
+                [],
+            )
+            .is_err());
+        conn.execute(
+            "INSERT INTO agent_permission_rules (pattern, decision, scope, created_at)
+             VALUES ('git push *', 'ask', 'C:/proj', 30)",
+            [],
+        )
+        .unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent_permission_rules", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 3, "global + projet cohabitent pour le même motif");
+
+        // L'ancienne table est supprimée (source unique).
+        let old_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_command_rules')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!old_exists);
+    }
+
+    #[test]
+    fn v29_adds_single_use_permission_consumption() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agent_interactions (
+                interaction_id TEXT PRIMARY KEY,
+                answered_at INTEGER,
+                continuation_agent_id TEXT
+            );",
+        )
+        .unwrap();
+        conn.execute_batch(MIGRATION_V29).unwrap();
+
+        let has_column: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('agent_interactions')
+                    WHERE name='permission_consumed_at'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_column);
     }
 }

@@ -670,6 +670,8 @@ async fn maybe_compact<F, Fut>(
     conversation_id: Option<&str>,
     workspace_id: Option<&str>,
     window: usize,
+    execution_profile: ExecutionProfile,
+    workspace_root: Option<&std::path::Path>,
     summarise: F,
 ) -> bool
 where
@@ -688,6 +690,45 @@ where
         .iter()
         .take_while(|m| matches!(m, AgentMessage::Text { role, .. } if role == "system"))
         .count();
+
+    // P6.4 — PreCompact hooks : la compaction va réellement se produire (cut
+    // décidé). Fail-open ; leur additionalContext est joint à l'historique
+    // AVANT le résumé — il voyage donc dans l'excerpt résumé, pas seulement
+    // dans la queue conservée. Hooks rechargés ici (compaction rare — évite
+    // de threader hook_defs depuis la boucle).
+    if super::hooks::hooks_enabled_for_profile(execution_profile) {
+        if let Some(ws) = workspace_root {
+            let defs = super::hooks::load_hooks(app, Some(ws));
+            if !defs.is_empty() {
+                let payload = super::hooks::build_payload(
+                    super::hooks::HookEvent::PreCompact,
+                    agent_id,
+                    Some(ws),
+                    execution_profile,
+                    None,
+                    None,
+                    None,
+                );
+                let fire = super::hooks::fire(
+                    app,
+                    &defs,
+                    super::hooks::HookEvent::PreCompact,
+                    payload,
+                    ws,
+                    execution_profile,
+                    agent_id,
+                    None,
+                )
+                .await;
+                for ctx in fire.contexts {
+                    history.push(AgentMessage::Text {
+                        role: "user".to_string(),
+                        content: format!("[Shugu hook PreCompact] {ctx}"),
+                    });
+                }
+            }
+        }
+    }
 
     let excerpt = transcript_excerpt(&history[fold_start..cut]);
     if excerpt.trim().is_empty() {
@@ -1400,6 +1441,8 @@ pub(super) async fn run_agent_task(
         ) => r,
         _ = abort.notified() => {
             mark_killed(&app, &agent_id);
+            // P6.9 — une session shell meurt avec son run (jamais de fuite).
+            super::processes::kill_run_sessions(&app, &agent_id);
             // Phase 3 — killed mid-flight: DISCARD the isolated worktree (its
             // edits are abandoned with the run). No-op when not isolating.
             // Best-effort + non-panicking on the kill path.
@@ -1432,6 +1475,10 @@ pub(super) async fn run_agent_task(
         }
     };
 
+    // P6.9 — les sessions shell du run meurent avec lui (succès, erreur,
+    // budget épuisé — tous les chemins qui atteignent ce point).
+    super::processes::kill_run_sessions(&app, &agent_id);
+
     let ms = start.elapsed().as_millis() as u64;
 
     // Télémétrie par run (succès / blocage / itérations). Écrit pour succès ET
@@ -1439,7 +1486,7 @@ pub(super) async fn run_agent_task(
     record_outcome(&app, &agent_id, &role, loop_result.is_ok(), &loop_metrics);
 
     match loop_result {
-        Ok((output, reasoning)) => {
+        Ok((output, reasoning, run_usage)) => {
             let transitioned = if let Ok(conn_mutex) = get_conn(&app) {
                 if let Ok(conn) = conn_mutex.lock() {
                     conn.execute(
@@ -1492,7 +1539,9 @@ pub(super) async fn run_agent_task(
                 &AgentEvent::Complete {
                     agent_id: agent_id.clone(),
                     output,
-                    tokens_used: None,
+                    // P6.2 — agrégat réel du run (entrée cache incluse + sortie) ;
+                    // None si le provider n'a jamais rapporté d'usage.
+                    tokens_used: run_usage.total(),
                     reasoning: if reasoning.trim().is_empty() {
                         None
                     } else {
@@ -1676,6 +1725,241 @@ const DELEGATE_CHILD_PROMPT: &str = "Tu es un SOUS-AGENT à contexte ISOLÉ, lan
 /// vérifiée) + bloc FAITS capté de l'environnement (le delta du statut git —
 /// chemins touchés PENDANT le sous-run — est la vérité-terrain que la prose
 /// de l'enfant ne peut pas falsifier).
+// ────────────────────────────────────────────────────────────────────
+// P6.11 — fan-out parallèle borné des sous-agents délégués
+// ────────────────────────────────────────────────────────────────────
+
+/// Réservation globale des unités de travail pendant les fan-outs. Un parent
+/// enregistré ne consomme plus de slot pendant qu'il attend ses enfants ; les
+/// enfants réservés le remplacent. Le mutex rend le calcul atomique entre
+/// plusieurs parents concurrents.
+#[derive(Default, Debug)]
+struct FanoutCapacity {
+    /// parent_id → le parent est-il lui-même un delegate réservé ?
+    waiting_parents: std::collections::HashMap<String, bool>,
+    reserved_delegates: usize,
+}
+
+impl FanoutCapacity {
+    fn waiting_roots(&self) -> usize {
+        self.waiting_parents
+            .values()
+            .filter(|is_delegate| !**is_delegate)
+            .count()
+    }
+
+    fn active_units(&self, root_count: usize) -> usize {
+        root_count
+            .saturating_sub(self.waiting_roots())
+            .saturating_add(self.reserved_delegates)
+    }
+
+    fn reserve(
+        &mut self,
+        parent_id: &str,
+        root_count: usize,
+        parent_is_delegate: bool,
+        requested: usize,
+    ) -> Result<usize, String> {
+        if self.waiting_parents.contains_key(parent_id) {
+            return Err(format!("fan-out déjà actif pour le parent {parent_id}"));
+        }
+        if parent_is_delegate {
+            if self.reserved_delegates == 0 {
+                return Err("réservation du sous-agent parent introuvable".to_string());
+            }
+            // Son slot est temporairement libéré pendant qu'il attend.
+            self.reserved_delegates -= 1;
+        }
+        self.waiting_parents
+            .insert(parent_id.to_string(), parent_is_delegate);
+
+        let available = super::MAX_CONCURRENT_AGENTS.saturating_sub(self.active_units(root_count));
+        let slots = available.min(requested.max(1));
+        if slots == 0 {
+            self.waiting_parents.remove(parent_id);
+            if parent_is_delegate {
+                self.reserved_delegates += 1;
+            }
+            return Err("capacité globale des agents atteinte".to_string());
+        }
+        self.reserved_delegates += slots;
+        Ok(slots)
+    }
+
+    fn release(&mut self, parent_id: &str, slots: usize) {
+        self.reserved_delegates = self.reserved_delegates.saturating_sub(slots);
+        if self.waiting_parents.remove(parent_id) == Some(true) {
+            // Le delegate parent reprend son propre slot après ses enfants.
+            self.reserved_delegates += 1;
+        }
+    }
+}
+
+static FANOUT_CAPACITY: std::sync::LazyLock<std::sync::Mutex<FanoutCapacity>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(FanoutCapacity::default()));
+
+/// Nombre d'unités réellement actives, utilisé aussi par les chemins de spawn
+/// racine pendant qu'un fan-out a des réservations en vol.
+pub(super) fn active_capacity_used(
+    registry: &std::collections::HashMap<String, super::AgentHandle>,
+) -> usize {
+    let root_count = registry
+        .values()
+        .filter(|handle| handle.role != "delegate")
+        .count();
+    FANOUT_CAPACITY
+        .lock()
+        .map(|capacity| capacity.active_units(root_count))
+        .unwrap_or(super::MAX_CONCURRENT_AGENTS)
+}
+
+struct FanoutLease {
+    parent_id: String,
+    slots: usize,
+}
+
+impl Drop for FanoutLease {
+    fn drop(&mut self) {
+        if let Ok(mut capacity) = FANOUT_CAPACITY.lock() {
+            capacity.release(&self.parent_id, self.slots);
+        }
+    }
+}
+
+fn acquire_fanout_lease(
+    app: &AppHandle,
+    parent_id: &str,
+    requested: usize,
+) -> Result<FanoutLease, String> {
+    // Ordre de locks unique : registry puis coordinator. Les spawns racine
+    // tiennent aussi registry pendant leur lecture du coordinator.
+    let manager = app.state::<super::AgentManagerState>();
+    let registry = manager
+        .0
+        .lock()
+        .map_err(|e| format!("agent registry lock: {e}"))?;
+    let root_count = registry
+        .values()
+        .filter(|handle| handle.role != "delegate")
+        .count();
+    let parent_is_delegate = registry
+        .get(parent_id)
+        .is_some_and(|handle| handle.role == "delegate");
+    let mut capacity = FANOUT_CAPACITY
+        .lock()
+        .map_err(|e| format!("fan-out capacity lock: {e}"))?;
+    let slots = capacity.reserve(parent_id, root_count, parent_is_delegate, requested)?;
+    Ok(FanoutLease {
+        parent_id: parent_id.to_string(),
+        slots,
+    })
+}
+
+/// Exécute `tasks` en parallèle borné, résultats dans L'ORDRE d'entrée.
+/// Implémentation par LOTS de `slots` futures (`join_all` par lot, séquentiel
+/// entre lots) : les tâches sont I/O-bound (streams SSE), la concurrence sur
+/// une seule tâche tokio donne le même wall-time ≈ max(latences du lot) — et
+/// n'exige PAS que les futures soient `Send` (le futur de `run_delegated_child`
+/// ne l'est pas). `slots <= 0` est ramené à 1 ; au-delà des slots, les tâches
+/// attendent le lot suivant (fan-out borné, jamais au-delà du cap).
+pub(crate) async fn run_bounded_parallel<F, Fut, T>(slots: usize, tasks: Vec<F>) -> Vec<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let width = slots.max(1);
+    let mut out = Vec::with_capacity(tasks.len());
+    let mut iter = tasks.into_iter();
+    loop {
+        let chunk: Vec<F> = iter.by_ref().take(width).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        let results = futures_util::future::join_all(chunk.into_iter().map(|f| f())).await;
+        out.extend(results);
+    }
+    out
+}
+
+/// Exécute PLUSIEURS sous-agents délégués d'un même tour CONCURRENTLY (P6.11)
+/// — plafond [`fanout_slots`], résultats `(content, is_error)` dans l'ordre
+/// des appels. Un enfant tué/en échec produit un résultat d'erreur honnête à
+/// SA place, jamais un succès fabriqué.
+#[allow(clippy::too_many_arguments)]
+async fn run_delegated_children_parallel(
+    app: &AppHandle,
+    client: &reqwest::Client,
+    protocol: &str,
+    base_url: &str,
+    model: &str,
+    api_key: &str,
+    chat_template_kwargs: &Option<serde_json::Value>,
+    parent_id: &str,
+    depth: u32,
+    tasks: Vec<(String, String)>, // (tool_call_id, child_task)
+    execution_profile: ExecutionProfile,
+) -> Vec<(String, (String, bool))> {
+    let lease = match acquire_fanout_lease(app, parent_id, tasks.len()) {
+        Ok(lease) => lease,
+        Err(error) => {
+            return tasks
+                .into_iter()
+                .map(|(tool_call_id, _)| (tool_call_id, (format!("delegate: {error}"), true)))
+                .collect();
+        }
+    };
+    let slots = lease.slots;
+    let parent_id = parent_id.to_string();
+    let protocol = protocol.to_string();
+    let base_url = base_url.to_string();
+    let model = model.to_string();
+    let api_key = api_key.to_string();
+    let kwargs = chat_template_kwargs.clone();
+    let closures: Vec<_> = tasks
+        .into_iter()
+        .map(|(tc_id, task)| {
+            let app_c = app.clone();
+            let client_c = client.clone();
+            let (protocol_c, base_url_c, model_c, api_key_c) = (
+                protocol.clone(),
+                base_url.clone(),
+                model.clone(),
+                api_key.clone(),
+            );
+            let kwargs_c = kwargs.clone();
+            let parent_c = parent_id.clone();
+            move || {
+                let tc_id = tc_id.clone();
+                async move {
+                    let res = run_delegated_child(
+                        &app_c,
+                        &client_c,
+                        &protocol_c,
+                        &base_url_c,
+                        &model_c,
+                        &api_key_c,
+                        &kwargs_c,
+                        &parent_c,
+                        depth,
+                        task,
+                        execution_profile,
+                    )
+                    .await;
+                    let outcome = match res {
+                        Ok(handoff) => (handoff, false),
+                        Err(e) => (format!("delegate: {e}"), true),
+                    };
+                    (tc_id, outcome)
+                }
+            }
+        })
+        .collect();
+    let results = run_bounded_parallel(slots, closures).await;
+    drop(lease);
+    results
+}
+
 fn format_delegate_handoff(
     output: &str,
     diff_stat: Option<&str>,
@@ -1741,7 +2025,8 @@ fn registry_remove(app: &AppHandle, id: &str) {
 /// (le cœur awaitable) — ne touche PAS `run_agent_task` (zéro régression du
 /// chemin agent principal). L'enfant : conversation_id=None (contexte vierge),
 /// worktree frais (jamais auto-mergé → keep-for-review), provider/modèle hérités.
-/// Hors du cap `MAX_CONCURRENT_AGENTS` (continuation du parent, bornée par depth).
+/// Le slot est réservé par le coordinateur de fan-out global ; le parent cède
+/// le sien pendant l'attente, y compris pour les délégations imbriquées.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_delegated_child(
     app: &AppHandle,
@@ -1760,10 +2045,9 @@ pub(super) async fn run_delegated_child(
     let child_id = uuid::Uuid::new_v4().to_string();
     let child_abort = std::sync::Arc::new(tokio::sync::Notify::new());
 
-    // Registre : insérer le handle enfant SANS le check de capacité
-    // (MAX_CONCURRENT_AGENTS). L'enfant est une CONTINUATION du parent (qui
-    // occupe déjà un slot et attend) — la profondeur le borne. Permet aussi au
-    // cascade kill (agent_kill) de le retrouver et l'abort.
+    // Registre : le slot a déjà été réservé atomiquement par
+    // `acquire_fanout_lease`. On insère le handle pour la cascade kill
+    // (agent_kill) sans refaire un second comptage.
     registry_insert(
         app,
         &child_id,
@@ -1850,7 +2134,7 @@ pub(super) async fn run_delegated_child(
     // Boucle enfant en course contre le timeout ET l'abort en cascade. Le bloc
     // borne l'emprunt mutable de `history`/`metrics` par le future ; après, on
     // lit `metrics` librement.
-    let outcome: Result<(String, String), String> = {
+    let outcome: Result<(String, String, RunUsageTotals), String> = {
         let loop_fut = tool_use_loop(
             app,
             client,
@@ -1905,7 +2189,7 @@ pub(super) async fn run_delegated_child(
     // MAJ DB + event terminal + handoff.
     let ms = start.elapsed().as_millis() as u64;
     let handoff = match &outcome {
-        Ok((output, _reasoning)) => {
+        Ok((output, _reasoning, child_usage)) => {
             let mut transitioned = false;
             if let Ok(conn_mutex) = get_conn(app) {
                 if let Ok(conn) = conn_mutex.lock() {
@@ -1925,7 +2209,8 @@ pub(super) async fn run_delegated_child(
                     &AgentEvent::Complete {
                         agent_id: child_id.clone(),
                         output: output.clone(),
-                        tokens_used: None,
+                        // P6.2 — agrégat réel du sous-run (None si non rapporté).
+                        tokens_used: child_usage.total(),
                         reasoning: None,
                         ms,
                     },
@@ -2036,7 +2321,65 @@ fn definition_allows_tool(selectors: Option<&[String]>, tool: &str) -> bool {
         }))
 }
 
+fn permission_allows_hooks(decision: Option<&super::permission::ToolPermission>) -> bool {
+    matches!(decision, Some(super::permission::ToolPermission::Proceed))
+}
+
 /// Multi-turn loop body. Returns the final answer text when the LLM
+/// P6.2 — `used` + `source` de la jauge de contexte pour UN tour : l'entrée
+/// RÉELLE rapportée par le provider quand elle existe, sinon l'estimation
+/// locale de l'historique. Helper pur (la boucle ne fait que l'émettre) pour
+/// garder la distinction mesuré/estimé sous test unitaire.
+pub(crate) fn context_window_source(
+    usage: &chat::TurnUsage,
+    history: &[AgentMessage],
+) -> (u64, &'static str) {
+    match usage.total_input() {
+        Some(n) => (n, "provider"),
+        None => (estimate_tokens(history) as u64, "estimate"),
+    }
+}
+
+/// P6.2 — agrégat de consommation tokens d'un run entier. Somme champ par
+/// champ, Option-aware : un champ reste `None` si AUCUN tour ne l'a rapporté
+/// (jamais de zéros fabriqués — la distinction mesuré/estimé doit survivre).
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct RunUsageTotals {
+    pub input: Option<u64>,
+    pub output: Option<u64>,
+    pub cache_creation: Option<u64>,
+    pub cache_read: Option<u64>,
+}
+
+impl RunUsageTotals {
+    fn add(&mut self, u: &chat::TurnUsage) {
+        fn acc(total: &mut Option<u64>, v: Option<u64>) {
+            if let Some(v) = v {
+                *total = Some(total.unwrap_or(0) + v);
+            }
+        }
+        acc(&mut self.input, u.input_tokens);
+        acc(&mut self.output, u.output_tokens);
+        acc(&mut self.cache_creation, u.cache_creation_input_tokens);
+        acc(&mut self.cache_read, u.cache_read_input_tokens);
+    }
+
+    /// Total tous canaux confondus pour le `tokens_used` du Complete event :
+    /// entrée (cache inclus — Anthropic la rapporte hors `input_tokens`) +
+    /// sortie. `None` si le provider n'a rien rapporté du run entier.
+    pub(crate) fn total(&self) -> Option<u32> {
+        let sum = self.input.unwrap_or(0)
+            + self.output.unwrap_or(0)
+            + self.cache_creation.unwrap_or(0)
+            + self.cache_read.unwrap_or(0);
+        if sum > 0 {
+            Some(u32::try_from(sum).unwrap_or(u32::MAX))
+        } else {
+            None
+        }
+    }
+}
+
 /// produces a turn without tool_calls. Returns Err when the iteration
 /// budget is exhausted or any underlying call fails.
 #[allow(clippy::too_many_arguments)]
@@ -2068,7 +2411,7 @@ pub(super) async fn tool_use_loop(
     // `delegate` (cf. MAX_DELEGATION_DEPTH) et conditionne sa présence au manifest.
     depth: u32,
     definition_tools: Option<&[String]>,
-) -> Result<(String, String), String> {
+) -> Result<(String, String, RunUsageTotals), String> {
     let read_only = execution_profile.is_read_only();
     let memory_workspace_root = workspace_override
         .clone()
@@ -2089,6 +2432,8 @@ pub(super) async fn tool_use_loop(
     // write→run-test→fix cycle costs one iteration).
     let budget = MAX_ITERATIONS;
     let mut iteration: u32 = 0;
+    // P6.2 — agrégat tokens du run (rempli tour par tour depuis turn.usage).
+    let mut run_usage = RunUsageTotals::default();
 
     // Capture the actual request before inserting any learned system blocks.
     // Relevance selection, lessons, memory recall and completion evidence must
@@ -2108,7 +2453,18 @@ pub(super) async fn tool_use_loop(
     // the system prompt — so the agent applies what it has already figured out
     // instead of re-deriving it. No-op when the role has no skills yet. This is
     // the reuse half of skill-learning; `skill_save` is the capture half.
-    let skills_block = super::skills::skills_prompt_block(app, role, &task_text);
+    //
+    // P6.8 — skills FICHIERS (SKILL.md) : on découvre d'abord, puis on exclut
+    // leurs noms du bloc des skills apprises (dedup file-over-learned — la
+    // fichier gagne, l'apprise reste en DB sans être double-injectée). Le
+    // listing fichier (name + description SEULEMENT) est injecté ensuite : le
+    // corps se charge paresseusement via l'outil `skill_load`.
+    let file_skills =
+        super::file_skills::discover_file_skills(app, memory_workspace_root.as_deref());
+    let file_skill_names: std::collections::HashSet<String> =
+        file_skills.iter().map(|s| s.name.clone()).collect();
+    let skills_block =
+        super::skills::skills_prompt_block_filtered(app, role, &task_text, &file_skill_names);
     if !skills_block.is_empty() {
         let pos = history.len().min(1);
         history.insert(
@@ -2116,6 +2472,17 @@ pub(super) async fn tool_use_loop(
             AgentMessage::Text {
                 role: "system".to_string(),
                 content: skills_block,
+            },
+        );
+    }
+    let file_skills_block = super::file_skills::listing_block(&file_skills);
+    if !file_skills_block.is_empty() {
+        let pos = history.len().min(1);
+        history.insert(
+            pos,
+            AgentMessage::Text {
+                role: "system".to_string(),
+                content: file_skills_block,
             },
         );
     }
@@ -2412,6 +2779,54 @@ pub(super) async fn tool_use_loop(
         agent_tools.as_ref(),
     );
 
+    // P6.4 — hooks de cycle de vie utilisateur. Chargés UNE fois par run,
+    // UNIQUEMENT en profil mutant (Chat/Plan ⇒ zéro processus hook) et avec un
+    // workspace ouvert (le hook a besoin d'un cwd + d'un dossier payload).
+    let hook_defs: Vec<super::hooks::HookDef> =
+        if super::hooks::hooks_enabled_for_profile(execution_profile) {
+            super::hooks::load_hooks(app, context_root.as_deref())
+        } else {
+            Vec::new()
+        };
+    if !hook_defs.is_empty() {
+        if let Some(ws) = context_root.as_deref() {
+            for event in [
+                super::hooks::HookEvent::SessionStart,
+                super::hooks::HookEvent::UserPromptSubmit,
+            ] {
+                let payload = super::hooks::build_payload(
+                    event,
+                    agent_id,
+                    Some(ws),
+                    execution_profile,
+                    None,
+                    None,
+                    None,
+                );
+                let fire = super::hooks::fire(
+                    app,
+                    &hook_defs,
+                    event,
+                    payload,
+                    ws,
+                    execution_profile,
+                    agent_id,
+                    None,
+                )
+                .await;
+                for ctx in fire.contexts {
+                    history.push(AgentMessage::Text {
+                        role: "user".to_string(),
+                        content: format!("[Shugu hook {}] {ctx}", event.as_str()),
+                    });
+                }
+            }
+        }
+    }
+    // Blocs Stop consécutifs honorés (borne MAX_STOP_BLOCKS — jamais de boucle
+    // infinie imposée par un hook). Réinitialisé dès qu'un tour d'outils tourne.
+    let mut stop_blocks: u32 = 0;
+
     // LOT 1 — plan vivant : le dernier `todo_write` parsé en task-graph. Quand il
     // change, on le ré-injecte au tour suivant (step 0a) pour ANCRER la boucle sur
     // le graphe — c'est ce qui rend le plan « exécutable » plutôt qu'advisory : le
@@ -2425,6 +2840,14 @@ pub(super) async fn tool_use_loop(
 
     while iteration < budget {
         metrics.iterations = iteration + 1;
+
+        // ── 0b. Follow-ups « steer » (P6.1) — messages de l'utilisateur envoyés
+        //        PENDANT le run, drainés ICI, au point sûr entre deux tours
+        //        d'outils (là où la boucle reprend la main avant le prochain
+        //        appel LLM). Chaque ligne devient un vrai message user dans
+        //        l'historique + des events persistés : l'agent corrige sa
+        //        trajectoire sans kill, et la trace survit au reload.
+        super::followups::drain_steer_into_history(app, agent_id, history);
 
         // ── 0a. Ancrage du plan — après une mise à jour `todo_write`, on ré-énonce
         //        le graphe (compact : checklist + tâches bloquées + prochaine
@@ -2486,6 +2909,8 @@ pub(super) async fn tool_use_loop(
             conversation_id,
             memory_workspace_id.as_deref(),
             context_window,
+            execution_profile,
+            context_root.as_deref(),
             |excerpt| {
                 summarise_turns(
                     client,
@@ -2543,13 +2968,97 @@ pub(super) async fn tool_use_loop(
             },
         );
 
+        // ── 2b. P6.2 — usage tokens du tour + jauge de fenêtre de contexte ──
+        // TokenUsage : UNIQUEMENT si le provider a rapporté quelque chose
+        // (sinon l'event prétendrait une mesure qui n'existe pas).
+        // ContextWindowUsage : à chaque tour ; `source` dit honnêtement si le
+        // `used` vient du provider (entrée réelle du tour) ou de l'estimateur.
+        run_usage.add(&turn.usage);
+        if turn.usage.any() {
+            let _ = persist_and_emit(
+                app,
+                &AgentEvent::TokenUsage {
+                    agent_id: agent_id.to_string(),
+                    input_tokens: turn.usage.input_tokens,
+                    output_tokens: turn.usage.output_tokens,
+                    cache_creation_input_tokens: turn.usage.cache_creation_input_tokens,
+                    cache_read_input_tokens: turn.usage.cache_read_input_tokens,
+                },
+            );
+        }
+        let (ctx_used, ctx_source) = context_window_source(&turn.usage, history);
+        let _ = persist_and_emit(
+            app,
+            &AgentEvent::ContextWindowUsage {
+                agent_id: agent_id.to_string(),
+                used: ctx_used,
+                window: context_window as u64,
+                source: ctx_source.to_string(),
+            },
+        );
+
         // ── 3. No tool_calls = tentative de réponse finale ─────────────
         //    Elle n'est acceptée que si le contrat runtime confirme qu'une
         //    éventuelle mutation possède un plan et une vérification verte.
         if turn.tool_calls.is_empty() {
             match run_evidence.completion_decision(read_only) {
                 super::lifecycle::CompletionDecision::Complete => {
-                    return Ok((turn.content, reasoning));
+                    // P6.4 — Stop hooks : peuvent BLOQUER la fin du run (le run
+                    // continue avec la raison du hook comme contexte), borné à
+                    // MAX_STOP_BLOCKS blocs consécutifs — ensuite la fin est
+                    // laissée passer et le dépassement est tracé. Pas de bloc
+                    // honoré sur la dernière itération (budget épuisé de toute
+                    // façon : le hook ne peut pas réclamer l'infini).
+                    if !hook_defs.is_empty() && !last_iteration {
+                        if let Some(ws) = context_root.as_deref() {
+                            let payload = super::hooks::build_payload(
+                                super::hooks::HookEvent::Stop,
+                                agent_id,
+                                Some(ws),
+                                execution_profile,
+                                None,
+                                None,
+                                None,
+                            );
+                            let fire = super::hooks::fire(
+                                app,
+                                &hook_defs,
+                                super::hooks::HookEvent::Stop,
+                                payload,
+                                ws,
+                                execution_profile,
+                                agent_id,
+                                None,
+                            )
+                            .await;
+                            if let Some(reason) = fire.blocked_reason {
+                                if super::hooks::should_honor_stop_block(stop_blocks) {
+                                    stop_blocks += 1;
+                                    history.push(AgentMessage::Text {
+                                        role: "assistant".to_string(),
+                                        content: turn.content,
+                                    });
+                                    history.push(AgentMessage::Text {
+                                        role: "user".to_string(),
+                                        content: format!(
+                                            "[Shugu hook Stop] Un hook refuse la fin du run : {reason}. Continue le travail ou explique ce qu'il manque."
+                                        ),
+                                    });
+                                    iteration += 1;
+                                    continue;
+                                }
+                                super::hooks::emit_stop_block_ignored(
+                                    app,
+                                    agent_id,
+                                    &format!(
+                                        "borne de {} blocs Stop consécutifs atteinte — fin autorisée malgré : {reason}",
+                                        super::hooks::MAX_STOP_BLOCKS
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    return Ok((turn.content, reasoning, run_usage));
                 }
                 super::lifecycle::CompletionDecision::Continue { reason, nudge } => {
                     if last_iteration {
@@ -2600,6 +3109,9 @@ pub(super) async fn tool_use_loop(
             ));
         }
 
+        // Un tour d'outils interrompt toute série de blocs Stop.
+        stop_blocks = 0;
+
         // Stall signal #1 — same tool-call signature repeated across rounds.
         let sig = turn
             .tool_calls
@@ -2637,6 +3149,111 @@ pub(super) async fn tool_use_loop(
             );
         }
 
+        // ── 4.4. P6.10 — moteur de permissions allow/ask/deny, chargé une
+        //        fois par itération. Les règles s'appliquent aussi aux outils
+        //        de lecture (web_fetch, LSP, MCP read) en Chat/Plan.
+        let (permission_rules, permission_rules_error) =
+            match super::command_rules::load_permission_rules(app) {
+                Ok(rules) => (rules, None),
+                Err(e) => {
+                    eprintln!("[agents] permission rules load failed (fail-closed): {e}");
+                    (Vec::new(), Some(e))
+                }
+            };
+        let permission_scope: String = context_root
+            .as_deref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let enforce_plan_first = !read_only && !run_evidence.has_recorded_plan();
+
+        // Préflight AVANT hooks : une règle deny/ask ne doit jamais déclencher
+        // un script utilisateur/projet. La décision est calculée UNE fois puis
+        // réutilisée au dispatch. Le verdict « une fois » est donc réservé
+        // atomiquement avant les hooks : deux appels identiques concurrents ne
+        // peuvent ni l'exécuter deux fois ni lancer un hook pour le second.
+        let mut permission_preflight: std::collections::HashMap<
+            String,
+            super::permission::ToolPermission,
+        > = std::collections::HashMap::new();
+        for tc in &turn.tool_calls {
+            if !definition_allows_tool(definition_tools, &tc.name)
+                || !super::execution_profile_authorized(app, execution_profile)
+                || !execution_profile.allows_tool(&tc.name)
+                || super::lifecycle::reject_unplanned_tool(tc, enforce_plan_first).is_some()
+            {
+                continue;
+            }
+            let args_value: serde_json::Value =
+                serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
+            let decision = if let Some(error) = permission_rules_error.as_deref() {
+                super::permission::ToolPermission::Blocked(format!(
+                    "moteur de permissions indisponible : {error}"
+                ))
+            } else {
+                super::permission::evaluate_tool_call(
+                    app,
+                    agent_id,
+                    &tc.name,
+                    &args_value,
+                    &permission_rules,
+                    &permission_scope,
+                    true,
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("[agents] permission preflight failed (fail-closed): {e}");
+                    super::permission::ToolPermission::Blocked(format!(
+                        "évaluation de permission impossible : {e}"
+                    ))
+                })
+            };
+            permission_preflight.insert(tc.id.clone(), decision);
+        }
+
+        // ── 4.5. P6.4 — PreToolUse hooks (fail-CLOSED), uniquement après les
+        //        gates de définition/profil/plan et le préflight permission.
+        let mut pre_tool_blocked: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        if !hook_defs.is_empty() {
+            if let Some(ws) = workspace_override
+                .as_ref()
+                .cloned()
+                .or_else(|| get_workspace_root(app))
+                .as_deref()
+            {
+                let ws = ws.to_path_buf();
+                for tc in &turn.tool_calls {
+                    if !permission_allows_hooks(permission_preflight.get(&tc.id)) {
+                        continue;
+                    }
+                    let args_value: serde_json::Value =
+                        serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
+                    let payload = super::hooks::build_payload(
+                        super::hooks::HookEvent::PreToolUse,
+                        agent_id,
+                        Some(&ws),
+                        execution_profile,
+                        Some(&tc.name),
+                        Some(&args_value),
+                        None,
+                    );
+                    let fire = super::hooks::fire(
+                        app,
+                        &hook_defs,
+                        super::hooks::HookEvent::PreToolUse,
+                        payload,
+                        &ws,
+                        execution_profile,
+                        agent_id,
+                        Some(&tc.name),
+                    )
+                    .await;
+                    if let Some(reason) = fire.blocked_reason {
+                        pre_tool_blocked.insert(tc.id.clone(), reason);
+                    }
+                }
+            }
+        }
+
         // ── 5. Resolve workspace + execute tools ───────────────────────
         let workspace_root = workspace_override
             .as_ref()
@@ -2647,8 +3264,6 @@ pub(super) async fn tool_use_loop(
         // round, every mutation-capable tool is refused before touching disk or
         // spawning a process. Calls from the same assistant turn are treated as
         // concurrent, so `todo_write` beside an edit cannot authorize it.
-        let enforce_plan_first = !read_only && !run_evidence.has_recorded_plan();
-
         // Lot C — MCP routing. MCP tools (`mcp__server__tool`) are executed via
         // `mcp::mcp_execute`, which is ASYNC and CANNOT run inside the sync
         // `spawn_blocking` closure used for the native fs tools. So when at least
@@ -2672,6 +3287,11 @@ pub(super) async fn tool_use_loop(
                     || tc.name == "advisor"
                     || tc.name == "browser_test"
                     || tc.name == "delegate"
+                    // P6.12 — outils LSP : requêtes async vers le serveur de
+                    // langage (bridge commands::lsp), comme web_search/advisor.
+                    || tc.name == "lsp_diagnostics"
+                    || tc.name == "lsp_definition"
+                    || tc.name == "lsp_references"
                     // HITL : ask_user / submit_plan n'écrivent qu'un event + sentinel
                     // et n'ont PAS besoin d'un workspace → routés sur le chemin
                     // séquentiel (traité AVANT le gate workspace), sinon un tour ne
@@ -2680,6 +3300,78 @@ pub(super) async fn tool_use_loop(
                     || tc.name == "ask_user"
                     || tc.name == "submit_plan"
         });
+
+        // P6.11 — fan-out parallèle borné : quand le modèle émet PLUSIEURS
+        // appels `delegate` dans le même tour, ils sont exécutés CONCURRENTLY
+        // (sémaphore de slots, cap global partagé) au lieu d'un à la fois.
+        // Les résultats sont pré-calculés ICI et consommés dans l'ordre par le
+        // dispatch ci-dessous — l'ordre des appels est toujours préservé.
+        let mut fanout_results: std::collections::HashMap<String, (String, bool)> =
+            std::collections::HashMap::new();
+        if any_async && depth < MAX_DELEGATION_DEPTH {
+            let mut prepared: Vec<(String, String)> = Vec::new();
+            for tc in turn.tool_calls.iter().filter(|tc| tc.name == "delegate") {
+                // Ne pré-exécuter que les appels qui ont franchi EXACTEMENT
+                // les mêmes gates que le dispatch. Sinon un fan-out pouvait
+                // partir avant qu'une règle ask/deny ou un hook le bloque.
+                if !definition_allows_tool(definition_tools, &tc.name)
+                    || !super::execution_profile_authorized(app, execution_profile)
+                    || !execution_profile.allows_tool(&tc.name)
+                    || super::lifecycle::reject_unplanned_tool(tc, enforce_plan_first).is_some()
+                    || !permission_allows_hooks(permission_preflight.get(&tc.id))
+                    || pre_tool_blocked.contains_key(&tc.id)
+                {
+                    continue;
+                }
+                let args: serde_json::Value =
+                    serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
+                let task = args["task"].as_str().unwrap_or("").trim().to_string();
+                if task.is_empty() {
+                    fanout_results.insert(
+                        tc.id.clone(),
+                        ("delegate: missing required field: task".to_string(), true),
+                    );
+                    continue;
+                }
+                let mut child_task = task;
+                let focus = args["focus_hint"].as_str().unwrap_or("").trim();
+                let expected = args["expected_artifacts"].as_str().unwrap_or("").trim();
+                if !focus.is_empty() {
+                    child_task.push_str(&format!(
+                        "
+
+Point de départ : {focus}"
+                    ));
+                }
+                if !expected.is_empty() {
+                    child_task.push_str(&format!(
+                        "
+
+Livrable attendu : {expected}"
+                    ));
+                }
+                prepared.push((tc.id.clone(), child_task));
+            }
+            if prepared.len() >= 2 {
+                let outcomes = run_delegated_children_parallel(
+                    app,
+                    client,
+                    protocol,
+                    base_url,
+                    model,
+                    api_key,
+                    chat_template_kwargs,
+                    agent_id,
+                    depth + 1,
+                    prepared,
+                    execution_profile,
+                )
+                .await;
+                for (tc_id, outcome) in outcomes {
+                    fanout_results.insert(tc_id, outcome);
+                }
+            }
+        }
 
         let results: Vec<ToolResult> = if any_async {
             let mgr = app.state::<crate::commands::mcp::McpManager>();
@@ -2724,6 +3416,57 @@ pub(super) async fn tool_use_loop(
                     super::lifecycle::reject_unplanned_tool(tc, enforce_plan_first)
                 {
                     acc.push(blocked);
+                    continue;
+                }
+                // P6.10 — décision du préflight déjà évaluée AVANT hooks.
+                // On la réutilise sans seconde lecture/consommation : un verdict
+                // « une fois » ne peut pas être pris deux fois sous concurrence.
+                let args_value: serde_json::Value =
+                    serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
+                match permission_preflight
+                    .get(&tc.id)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        super::permission::ToolPermission::Blocked(
+                            "préflight de permission absent".to_string(),
+                        )
+                    }) {
+                    super::permission::ToolPermission::Blocked(reason) => {
+                        acc.push(ToolResult {
+                            id: tc.id.clone(),
+                            name: tc.name.clone(),
+                            is_error: true,
+                            content: format!(
+                                "outil `{}` refusé par une règle de permission : {reason}",
+                                tc.name
+                            ),
+                        });
+                        continue;
+                    }
+                    super::permission::ToolPermission::Ask { pattern } => {
+                        acc.push(super::permission::pause_for_permission_ask(
+                            app,
+                            agent_id,
+                            tc,
+                            &args_value,
+                            &pattern,
+                        ));
+                        continue;
+                    }
+                    super::permission::ToolPermission::Proceed => {}
+                }
+                // P6.4 — refus PreToolUse (fail-closed) : le modèle voit la
+                // raison du hook comme résultat d'outil, rien n'est exécuté.
+                if let Some(reason) = pre_tool_blocked.get(&tc.id) {
+                    acc.push(ToolResult {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        is_error: true,
+                        content: format!(
+                            "outil `{}` refusé par un hook PreToolUse : {reason}",
+                            tc.name
+                        ),
+                    });
                     continue;
                 }
                 if tc.name == "web_search" {
@@ -2867,6 +3610,19 @@ pub(super) async fn tool_use_loop(
                         content,
                     });
                 } else if tc.name == "delegate" {
+                    // P6.11 — résultat du fan-out parallèle déjà calculé pour
+                    // cet appel ? (les tours multi-delegate sont exécutés
+                    // concurrently plus haut ; ce bras reste le chemin
+                    // séquentiel historique pour un delegate unique.)
+                    if let Some((content, is_error)) = fanout_results.get(&tc.id) {
+                        acc.push(ToolResult {
+                            id: tc.id.clone(),
+                            name: tc.name.clone(),
+                            is_error: *is_error,
+                            content: content.clone(),
+                        });
+                        continue;
+                    }
                     // Offload vers un SOUS-AGENT à contexte isolé. Le parent attend
                     // (await) et reçoit un handoff machine-vérifiable (diff réel +
                     // itérations), pas une simple prose. Box::pin casse la récursion
@@ -2892,24 +3648,84 @@ pub(super) async fn tool_use_loop(
                         if !expected.is_empty() {
                             child_task.push_str(&format!("\n\nLivrable attendu : {expected}"));
                         }
-                        match Box::pin(run_delegated_child(
-                            app,
-                            client,
-                            protocol,
-                            base_url,
-                            model,
-                            api_key,
-                            chat_template_kwargs,
-                            agent_id,
-                            depth + 1,
-                            child_task,
-                            execution_profile,
-                        ))
-                        .await
-                        {
-                            Ok(handoff) => (handoff, false),
+                        match acquire_fanout_lease(app, agent_id, 1) {
                             Err(e) => (format!("delegate: {e}"), true),
+                            Ok(lease) => {
+                                let result = Box::pin(run_delegated_child(
+                                    app,
+                                    client,
+                                    protocol,
+                                    base_url,
+                                    model,
+                                    api_key,
+                                    chat_template_kwargs,
+                                    agent_id,
+                                    depth + 1,
+                                    child_task,
+                                    execution_profile,
+                                ))
+                                .await;
+                                drop(lease);
+                                match result {
+                                    Ok(handoff) => (handoff, false),
+                                    Err(e) => (format!("delegate: {e}"), true),
+                                }
+                            }
                         }
+                    };
+                    acc.push(ToolResult {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        is_error,
+                        content,
+                    });
+                } else if tc.name == "lsp_diagnostics"
+                    || tc.name == "lsp_definition"
+                    || tc.name == "lsp_references"
+                {
+                    // P6.12 — outils LSP (effet lecture). Confinement identique
+                    // à fs_read_file ; serveur absent/crash/timeout = erreur
+                    // honnête, la boucle continue.
+                    let args: serde_json::Value =
+                        serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
+                    let path = args["path"].as_str().unwrap_or("").to_string();
+                    let Some(root) = workspace_root.as_ref() else {
+                        acc.push(ToolResult {
+                            id: tc.id.clone(),
+                            name: tc.name.clone(),
+                            is_error: true,
+                            content: "no workspace open".to_string(),
+                        });
+                        continue;
+                    };
+                    let outcome: Result<String, String> = match tc.name.as_str() {
+                        "lsp_diagnostics" => {
+                            super::lsp_tools::lsp_diagnostics_tool(app, root, &path).await
+                        }
+                        "lsp_definition" => {
+                            super::lsp_tools::lsp_definition_tool(
+                                app,
+                                root,
+                                &path,
+                                args["line"].as_u64().unwrap_or(0),
+                                args["character"].as_u64().unwrap_or(0),
+                            )
+                            .await
+                        }
+                        _ => {
+                            super::lsp_tools::lsp_references_tool(
+                                app,
+                                root,
+                                &path,
+                                args["line"].as_u64().unwrap_or(0),
+                                args["character"].as_u64().unwrap_or(0),
+                            )
+                            .await
+                        }
+                    };
+                    let (content, is_error) = match outcome {
+                        Ok(text) => (text, false),
+                        Err(e) => (e, true),
                     };
                     acc.push(ToolResult {
                         id: tc.id.clone(),
@@ -2995,6 +3811,15 @@ pub(super) async fn tool_use_loop(
                 let definition_blocked = !definition_allows_tool(definition_tools, &tc_clone.name);
                 let plan_blocked =
                     super::lifecycle::reject_unplanned_tool(&tc_clone, enforce_plan_first);
+                let hook_block_reason = pre_tool_blocked.get(&tc_clone.id).cloned();
+                let permission_decision = permission_preflight
+                    .get(&tc_clone.id)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        super::permission::ToolPermission::Blocked(
+                            "préflight de permission absent".to_string(),
+                        )
+                    });
                 let root_clone = root_arc.clone();
                 let app_clone = app.clone();
                 let role_clone = role.to_string();
@@ -3023,6 +3848,43 @@ pub(super) async fn tool_use_loop(
                     }
                     if let Some(blocked) = plan_blocked {
                         return blocked;
+                    }
+                    // P6.10 — réutilise la décision atomique du préflight
+                    // exécuté avant hooks (aucune double consommation).
+                    let args_value: serde_json::Value =
+                        serde_json::from_str(&tc_clone.arguments)
+                            .unwrap_or(serde_json::json!({}));
+                    match permission_decision {
+                        super::permission::ToolPermission::Blocked(reason) => {
+                            return ToolResult {
+                                id: fallback_id,
+                                name: fallback_name.clone(),
+                                is_error: true,
+                                content: format!(
+                                    "outil `{fallback_name}` refusé par une règle de permission : {reason}"
+                                ),
+                            };
+                        }
+                        super::permission::ToolPermission::Ask { pattern } => {
+                            return super::permission::pause_for_permission_ask(
+                                &app_clone,
+                                &agent_id_clone,
+                                &tc_clone,
+                                &args_value,
+                                &pattern,
+                            );
+                        }
+                        super::permission::ToolPermission::Proceed => {}
+                    }
+                    if let Some(reason) = hook_block_reason {
+                        return ToolResult {
+                            id: fallback_id,
+                            name: fallback_name.clone(),
+                            is_error: true,
+                            content: format!(
+                                "outil `{fallback_name}` refusé par un hook PreToolUse : {reason}"
+                            ),
+                        };
                     }
                     // `spawn_blocking` because the fs ops are synchronous —
                     // running them on the async runtime thread would starve
@@ -3098,6 +3960,46 @@ pub(super) async fn tool_use_loop(
             return Err(message);
         }
 
+        // ── 6.5. P6.4 — PostToolUse hooks (fail-OPEN) : chaque résultat d'outil
+        //        est notifié aux hooks matchés (nom + résumé borné) ; leur
+        //        `additionalContext` est injecté comme contexte du tour suivant.
+        if !hook_defs.is_empty() {
+            // `workspace_root` (step 5) a été consommé par le dispatch ; on
+            // réutilise `context_root`, vivant pour toute la boucle.
+            if let Some(ws) = context_root.as_deref() {
+                let ws = ws.to_path_buf();
+                for (tc, r) in turn.tool_calls.iter().zip(results.iter()) {
+                    let summary: String = r.content.chars().take(500).collect();
+                    let payload = super::hooks::build_payload(
+                        super::hooks::HookEvent::PostToolUse,
+                        agent_id,
+                        Some(&ws),
+                        execution_profile,
+                        Some(&tc.name),
+                        None,
+                        Some(&summary),
+                    );
+                    let fire = super::hooks::fire(
+                        app,
+                        &hook_defs,
+                        super::hooks::HookEvent::PostToolUse,
+                        payload,
+                        &ws,
+                        execution_profile,
+                        agent_id,
+                        Some(&tc.name),
+                    )
+                    .await;
+                    for ctx in fire.contexts {
+                        history.push(AgentMessage::Text {
+                            role: "user".to_string(),
+                            content: format!("[Shugu hook PostToolUse] {ctx}"),
+                        });
+                    }
+                }
+            }
+        }
+
         // Human-in-the-loop par FIN DE TOUR : `ask_user` / `submit_plan` ont émis
         // leur event au dispatch et renvoyé le sentinel. On termine le tour
         // proprement (pas de pause in-process) — l'utilisateur répond via
@@ -3107,7 +4009,7 @@ pub(super) async fn tool_use_loop(
             .iter()
             .any(|r| !r.is_error && r.content.starts_with(super::tools::AGENT_PAUSE_SENTINEL))
         {
-            return Ok((String::new(), reasoning));
+            return Ok((String::new(), reasoning, run_usage));
         }
 
         // Stall signal #2 — consecutive rounds where at least one tool errored.
@@ -4479,8 +5381,280 @@ mod tests {
         assert!(definition_allows_tool(Some(&mutating), "delegate"));
         assert!(!definition_allows_tool(Some(&mutating), "fs_write_file"));
     }
+
+    #[test]
+    fn hooks_run_only_after_a_successful_permission_preflight() {
+        use super::super::permission::ToolPermission;
+
+        assert!(permission_allows_hooks(Some(&ToolPermission::Proceed)));
+        assert!(!permission_allows_hooks(Some(&ToolPermission::Ask {
+            pattern: "run_command(git push *)".to_string(),
+        })));
+        assert!(!permission_allows_hooks(Some(&ToolPermission::Blocked(
+            "denied".to_string(),
+        ))));
+        assert!(!permission_allows_hooks(None));
+    }
 }
 
 #[cfg(test)]
 #[path = "runner_provider_contract_tests.rs"]
 mod provider_contract_tests;
+
+// ────────────────────────────────────────────────────────────────────
+// P6.2 — tests de l'agrégat tokens (Option-aware) et de la décision
+// provider/estimate de la jauge de contexte.
+// ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    fn turn_usage(
+        input: Option<u64>,
+        output: Option<u64>,
+        cc: Option<u64>,
+        cr: Option<u64>,
+    ) -> chat::TurnUsage {
+        chat::TurnUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_creation_input_tokens: cc,
+            cache_read_input_tokens: cr,
+        }
+    }
+
+    #[test]
+    fn run_usage_totals_sum_option_aware() {
+        let mut totals = RunUsageTotals::default();
+        totals.add(&turn_usage(Some(100), Some(10), None, None));
+        // Un tour sans sortie rapportée n'efface ni ne fabrique la sortie.
+        totals.add(&turn_usage(Some(50), None, Some(20), Some(30)));
+        assert_eq!(totals.input, Some(150));
+        assert_eq!(totals.output, Some(10));
+        assert_eq!(totals.cache_creation, Some(20));
+        assert_eq!(totals.cache_read, Some(30));
+        // Total = entrée cache incluse + sortie (Anthropic rapporte le cache
+        // hors input_tokens → pas de double compte).
+        assert_eq!(totals.total(), Some(210));
+    }
+
+    #[test]
+    fn run_usage_totals_fabricates_nothing_without_reports() {
+        let mut totals = RunUsageTotals::default();
+        totals.add(&turn_usage(None, None, None, None));
+        assert_eq!(totals.total(), None);
+        assert_eq!(totals.input, None);
+        assert_eq!(totals.output, None);
+    }
+
+    #[test]
+    fn context_window_source_prefers_provider_measurement() {
+        let history = vec![AgentMessage::Text {
+            role: "user".to_string(),
+            content: "bonjour".to_string(),
+        }];
+        let (used, source) =
+            context_window_source(&turn_usage(Some(120), None, Some(30), Some(40)), &history);
+        assert_eq!(used, 190, "entrée réelle cache incluse");
+        assert_eq!(source, "provider");
+    }
+
+    #[test]
+    fn context_window_source_falls_back_to_estimate_honestly() {
+        let history = vec![
+            AgentMessage::Text {
+                role: "system".to_string(),
+                content: "tu es un agent".to_string(),
+            },
+            AgentMessage::Text {
+                role: "user".to_string(),
+                content: "fais ceci".to_string(),
+            },
+        ];
+        let (used, source) = context_window_source(&turn_usage(None, None, None, None), &history);
+        assert_eq!(used, estimate_tokens(&history) as u64);
+        assert_eq!(
+            source, "estimate",
+            "sans mesure provider, la source est honnêtement « estimate »"
+        );
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// P6.11 — tests du fan-out parallèle borné (latence ≈ max, ordre préservé,
+// cap respecté, slots) et de la cascade de kill (BFS, pas de zombie).
+// ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod fanout_tests {
+    use super::super::live_descendants_on_conn;
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn fanout_capacity_is_atomic_across_multiple_parents() {
+        let mut capacity = FanoutCapacity::default();
+
+        // Deux parents racine actifs. Le premier réserve 3 enfants et attend :
+        // 1 autre racine + 3 enfants = cap 4.
+        let first = capacity
+            .reserve("parent-1", 2, false, 3)
+            .expect("first lease");
+        assert_eq!(first, 3);
+        assert_eq!(capacity.active_units(2), 4);
+
+        // Le second parent entre ensuite en attente : il ne récupère qu'un
+        // slot, jamais 3 supplémentaires.
+        let second = capacity
+            .reserve("parent-2", 2, false, 3)
+            .expect("second lease");
+        assert_eq!(second, 1);
+        assert_eq!(capacity.active_units(2), 4);
+
+        capacity.release("parent-2", second);
+        capacity.release("parent-1", first);
+        assert_eq!(capacity.active_units(2), 2);
+    }
+
+    #[test]
+    fn nested_delegate_temporarily_yields_its_reserved_slot() {
+        let mut capacity = FanoutCapacity::default();
+        let outer = capacity
+            .reserve("root", 1, false, 1)
+            .expect("outer delegate");
+        assert_eq!(capacity.active_units(1), 1);
+
+        let nested = capacity
+            .reserve("delegate", 1, true, 3)
+            .expect("nested fan-out");
+        assert_eq!(nested, 3);
+        assert_eq!(capacity.active_units(1), 3);
+
+        capacity.release("delegate", nested);
+        assert_eq!(capacity.active_units(1), 1);
+        capacity.release("root", outer);
+        assert_eq!(capacity.active_units(1), 1);
+    }
+
+    #[tokio::test]
+    async fn parallel_wall_time_is_max_not_sum_and_order_preserved() {
+        // 3 « enfants » à latences contrôlées 120/300/180 ms.
+        let latencies = [120u64, 300, 180];
+        let t0 = Instant::now();
+        let results = run_bounded_parallel(
+            3,
+            latencies
+                .map(|ms| {
+                    move || async move {
+                        tokio::time::sleep(Duration::from_millis(ms)).await;
+                        ms
+                    }
+                })
+                .into_iter()
+                .collect(),
+        )
+        .await;
+        let wall = t0.elapsed();
+        let max = *latencies.iter().max().unwrap() as f64;
+        let sum: f64 = latencies.iter().sum::<u64>() as f64;
+        assert!(
+            (wall.as_millis() as f64) < max * 1.5,
+            "wall ({:.0} ms) ≈ max ({max} ms), pas somme ({sum} ms)",
+            wall.as_millis() as f64
+        );
+        // L'ordre des résultats suit l'ordre des appels, pas l'ordre de fin.
+        assert_eq!(results, vec![120, 300, 180]);
+    }
+
+    #[tokio::test]
+    async fn bounded_parallel_never_exceeds_slots() {
+        let current = std::sync::Arc::new(AtomicUsize::new(0));
+        let max_seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let tasks: Vec<_> = (0..5)
+            .map(|i| {
+                let cur = current.clone();
+                let max = max_seen.clone();
+                move || async move {
+                    let now = cur.fetch_add(1, Ordering::SeqCst) + 1;
+                    max.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    cur.fetch_sub(1, Ordering::SeqCst);
+                    i
+                }
+            })
+            .collect();
+        let t0 = Instant::now();
+        let results = run_bounded_parallel(2, tasks).await;
+        assert_eq!(results, vec![0, 1, 2, 3, 4], "ordre préservé même en lots");
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            2,
+            "jamais plus de 2 tâches actives à la fois"
+        );
+        // 5 tâches × 120 ms en lots de 2 → ~3 lots ≈ 360 ms (marge généreuse).
+        assert!(
+            t0.elapsed() < Duration::from_millis(520),
+            "le plafond de slots borne bien le parallélisme"
+        );
+    }
+
+    #[test]
+    fn kill_cascade_finds_all_live_descendants_and_leaves_no_zombie() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE agents (
+                id TEXT PRIMARY KEY, status TEXT, parent_id TEXT, created_at INTEGER NOT NULL,
+                finished_at INTEGER
+            );
+            INSERT INTO agents VALUES ('parent','running',NULL,1,NULL);
+            INSERT INTO agents VALUES ('child-1','running','parent',2,NULL);
+            INSERT INTO agents VALUES ('child-2','running','parent',3,NULL);
+            INSERT INTO agents VALUES ('child-3','running','parent',4,NULL);
+            INSERT INTO agents VALUES ('grandchild','running','child-1',5,NULL);
+            INSERT INTO agents VALUES ('done-child','complete','parent',6,50);",
+        )
+        .unwrap();
+
+        // BFS : 3 enfants vivants + le petit-enfant (pas l'enfant terminé).
+        let mut desc = live_descendants_on_conn(&conn, "parent").unwrap();
+        desc.sort();
+        assert_eq!(desc, vec!["child-1", "child-2", "child-3", "grandchild"]);
+
+        // CAS de kill (même SQL que kill_agent_tree) sur parent + descendants :
+        // tout passe 'killed', aucune ligne 'running' ne reste (pas de zombie).
+        let finished = 999i64;
+        for id in std::iter::once("parent").chain(desc.iter().map(String::as_str)) {
+            conn.execute(
+                "UPDATE agents SET status = 'killed', finished_at = ?1
+                  WHERE id = ?2 AND status IN ('running', 'pending')",
+                rusqlite::params![finished, id],
+            )
+            .unwrap();
+        }
+        let zombies: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agents WHERE status IN ('running', 'pending')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(zombies, 0, "aucun run zombie après le kill en cascade");
+        // L'enfant terminé avant le kill n'est PAS re-tué (CAS honnête).
+        let done_status: String = conn
+            .query_row("SELECT status FROM agents WHERE id='done-child'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(done_status, "complete");
+        // Un second kill ne change rien (CAS perdu, honnêtement).
+        let changed = conn
+            .execute(
+                "UPDATE agents SET status = 'killed' WHERE id = 'parent' AND status IN ('running', 'pending')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(changed, 0);
+    }
+}

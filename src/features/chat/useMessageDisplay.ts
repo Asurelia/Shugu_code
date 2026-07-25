@@ -74,6 +74,13 @@ export interface AgentPlanStep {
   doneWhen?: string;
 }
 
+/** P6.10 — marqueur d'une carte de permission « ask » (règle allow/ask/deny). */
+export interface PermissionAskData {
+  tool: string;
+  pattern: string;
+  argsSummary: string;
+}
+
 /** Human-in-the-loop — données d'une carte de question (`ask_user`). */
 export interface QuestionData {
   toolCallId: string;
@@ -87,6 +94,10 @@ export interface QuestionData {
     multiSelect?: boolean;
     options: { label: string; description?: string }[];
   }[];
+  /** Présent UNIQUEMENT pour une pause « ask » du moteur de permissions
+   *  (P6.10) — le payload `questions` de l'event est alors un objet marqueur,
+   *  pas le tableau ask_user classique. */
+  permissionAsk?: PermissionAskData;
 }
 
 /** Human-in-the-loop — données d'une carte de plan (`submit_plan`). */
@@ -96,6 +107,17 @@ export interface PlanApprovalData {
   agentId: string;
   plan: string;
   title?: string;
+}
+
+/** P6.1 — trace d'un message de suivi (queue/steer) dans le transcript d'un run. */
+export interface FollowUpNote {
+  /** followupId — stable, sert de clé React. */
+  key: string;
+  mode: "queue" | "steer" | "interrupt";
+  /** queued = mis en file · injected = consommé (steer entre deux tours, ou
+   *  queue devenu le tour suivant) · dropped = retiré explicitement. */
+  status: "queued" | "injected" | "dropped";
+  content: string;
 }
 
 export interface MessageDisplay {
@@ -118,6 +140,10 @@ export interface MessageDisplay {
   finishedAt?: number | null;
   /** Journal d'activité ordonné (appels d'outils + issue). Vide hors run agent. */
   activity: AgentActivityItem[];
+  /** P6.1 — suivis de l'utilisateur liés à ce run, dans l'ordre des events :
+   *  queued (mis en file pendant le run), injected (steer entre deux tours,
+   *  ou queue devenu le tour suivant), dropped (retiré explicitement). */
+  followUps: FollowUpNote[];
   /** Plan vivant de l'orchestrateur (dernier `todo_write`), undefined s'il n'en
    *  a pas posé. La checklist se met à jour à chaque nouvel appel todo_write. */
   plan?: AgentPlanStep[];
@@ -280,6 +306,7 @@ export function useMessageDisplay(m: Message): MessageDisplay {
   let liveContent = "";
   let liveReasoning = "";
   const activity: AgentActivityItem[] = [];
+  const followUpMap = new Map<string, FollowUpNote>();
   let plan: AgentPlanStep[] | undefined;
   let questionData: QuestionData | undefined;
   let planApprovalData: PlanApprovalData | undefined;
@@ -351,10 +378,27 @@ export function useMessageDisplay(m: Message): MessageDisplay {
         }
       } else if (ev.kind === "questionAsked") {
         // Human-in-the-loop — dernier `ask_user` gagne (carte de question courante).
+        // P6.10 : le payload peut être le marqueur objet `permissionAsk`
+        // (moteur de permissions) plutôt que le tableau de questions ask_user.
+        const raw: unknown = ev.questions;
+        const marker =
+          raw != null && typeof raw === "object" && !Array.isArray(raw)
+            ? (raw as Record<string, unknown>)
+            : undefined;
         questionData = {
           toolCallId: ev.toolCallId,
           agentId: ev.agentId,
-          questions: ev.questions,
+          questions: Array.isArray(raw)
+            ? raw
+            : ((marker?.questions as QuestionData["questions"]) ?? []),
+          permissionAsk:
+            marker?.permissionAsk === true
+              ? {
+                  tool: String(marker.tool ?? ""),
+                  pattern: String(marker.pattern ?? ""),
+                  argsSummary: String(marker.argsSummary ?? ""),
+                }
+              : undefined,
         };
       } else if (ev.kind === "planSubmitted") {
         // Human-in-the-loop — dernier `submit_plan` gagne (carte de plan courante).
@@ -364,6 +408,24 @@ export function useMessageDisplay(m: Message): MessageDisplay {
           plan: ev.plan,
           title: ev.title,
         };
+      } else if (
+        ev.kind === "followUpQueued" ||
+        ev.kind === "followUpInjected" ||
+        ev.kind === "followUpDropped"
+      ) {
+        // P6.1 — dernier statut gagne pour une même ligne (queued → injected
+        // ou dropped), l'ordre d'insertion de la Map garde la chronologie.
+        followUpMap.set(ev.followupId, {
+          key: ev.followupId,
+          mode: ev.mode,
+          status:
+            ev.kind === "followUpQueued"
+              ? "queued"
+              : ev.kind === "followUpInjected"
+                ? "injected"
+                : "dropped",
+          content: ev.content,
+        });
       }
     }
   }
@@ -398,6 +460,7 @@ export function useMessageDisplay(m: Message): MessageDisplay {
     planApprovalData,
     imageDataUrl,
     worktree,
+    followUps: [...followUpMap.values()],
   };
 }
 

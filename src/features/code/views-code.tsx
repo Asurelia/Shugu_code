@@ -15,6 +15,8 @@ import { ShellStatusExtras } from "@/components/StatusBar";
 import { ShortcutsSettings, InterfaceSettings } from "@/features/settings/settings-extras";
 import { ShuguProfileView } from "@/features/settings/ShuguProfileView";
 import { CommandRulesSection } from "@/features/settings/CommandRulesSection";
+import { HooksSection } from "@/features/settings/HooksSection";
+import { PluginsSection } from "@/features/settings/PluginsSection";
 import {
   AboutSettings,
   GeneralSettings,
@@ -496,6 +498,8 @@ export function SettingsView({ section }: { section: string }) {
   if (section === 'mascot') return <ShuguProfileView/>;
   if (section === 'privacy') return <PrivacySettings/>;
   if (section === 'command-rules') return <CommandRulesSection/>;
+  if (section === 'hooks') return <HooksSection/>;
+  if (section === 'plugins') return <PluginsSection/>;
   if (section === 'ops') return <OpsView/>;
   if (section === 'about') return <AboutSettings/>;
   // Connections + Profile previously fell through to <SettingsGeneral/> here,

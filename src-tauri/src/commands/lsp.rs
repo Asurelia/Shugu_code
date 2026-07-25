@@ -43,8 +43,9 @@
 //!   prend JAMAIS un chemin user comme entrée — pas de path injection.
 //! - Le workspace URI est passé par le frontend mais transite uniquement
 //!   vers le LSP server (qui le valide lui-même via son rootUri).
-//! - Les messages JSON-RPC sont transparents : on ne les parse pas côté
-//!   Rust (juste le framing). Aucune surface d'injection JSON à ce niveau.
+//! - Le bridge parse seulement les champs structurants nécessaires au partage
+//!   éditeur/agent (`id`, `method`, URI/version) ; le payload reste opaque et
+//!   est transmis au serveur avec un framing borné.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -71,6 +72,140 @@ pub struct LspSession {
     /// arbitraire (e.g. RunEvent::Exit). On utilise std::sync::Mutex (sync)
     /// car `Child::start_kill()` est synchrone.
     child: Mutex<Option<Child>>,
+    /// P6.12 — routeur des réponses en cours (requêtes request/response des
+    /// outils agent, attentes publishDiagnostics). Partagé avec la reader task.
+    router: std::sync::Arc<ResponseRouter>,
+    /// Handshake `initialize`/`initialized` déjà fait pour cette session
+    /// (une seule fois — le chemin agent le déclenche paresseusement au
+    /// premier besoin, le frontend le fait de son côté via LSPClient).
+    initialized: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Un handshake a déjà été envoyé (par l'éditeur ou par un outil agent).
+    /// Distinct de `initialized` pour que les deux clients partagent la même
+    /// session sans envoyer deux requêtes `initialize`.
+    initializing: std::sync::atomic::AtomicBool,
+    initialized_notify: tokio::sync::Notify,
+    /// Sérialise le handshake paresseux : un AtomicBool seul permettait à deux
+    /// outils LSP parallèles d'envoyer deux requêtes `initialize`.
+    initialize_lock: tokio::sync::Mutex<()>,
+    /// Version des documents ouverts par le frontend ou les outils agent.
+    /// Le premier envoi est `didOpen`, les suivants sont `didChange`.
+    documents: Mutex<HashMap<String, i32>>,
+}
+
+/// P6.12 — corrélation request/response EN COURS (le chemin éditeur est
+/// événementiel : le LSPClient frontend fait sa corrélation lui-même).
+/// Les réponses avec un `id` en attente sont routées vers le oneshot de
+/// l'appelant ; `publishDiagnostics` nourrit les attentes par URI ET continue
+/// d'être émis vers le frontend (notification partagée).
+pub(crate) struct ResponseRouter {
+    pending_requests:
+        std::sync::Mutex<HashMap<i64, tokio::sync::oneshot::Sender<serde_json::Value>>>,
+    pending_diagnostics:
+        std::sync::Mutex<HashMap<String, Vec<tokio::sync::oneshot::Sender<serde_json::Value>>>>,
+    next_id: std::sync::atomic::AtomicI64,
+}
+
+impl ResponseRouter {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending_requests: std::sync::Mutex::new(HashMap::new()),
+            pending_diagnostics: std::sync::Mutex::new(HashMap::new()),
+            // Les clients frontend utilisent habituellement des ids positifs.
+            // Le bridge agent réserve les négatifs pour éviter toute collision
+            // dans une session JSON-RPC partagée.
+            next_id: std::sync::atomic::AtomicI64::new(-1),
+        }
+    }
+
+    pub(crate) fn alloc_id(&self) -> i64 {
+        self.next_id
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn register_request(
+        &self,
+        id: i64,
+    ) -> tokio::sync::oneshot::Receiver<serde_json::Value> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if let Ok(mut g) = self.pending_requests.lock() {
+            g.insert(id, tx);
+        }
+        rx
+    }
+
+    pub(crate) fn unregister_request(&self, id: i64) {
+        if let Ok(mut g) = self.pending_requests.lock() {
+            g.remove(&id);
+        }
+    }
+
+    pub(crate) fn register_diagnostics(
+        &self,
+        uri: &str,
+    ) -> tokio::sync::oneshot::Receiver<serde_json::Value> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if let Ok(mut g) = self.pending_diagnostics.lock() {
+            g.entry(uri.to_string()).or_default().push(tx);
+        }
+        rx
+    }
+
+    pub(crate) fn unregister_diagnostics(&self, uri: &str) {
+        if let Ok(mut g) = self.pending_diagnostics.lock() {
+            if let Some(waiters) = g.get_mut(uri) {
+                waiters.retain(|tx| !tx.is_closed());
+                if waiters.is_empty() {
+                    g.remove(uri);
+                }
+            }
+        }
+    }
+
+    /// Route un message sortant du serveur. Retourne `true` quand le message
+    /// était une RÉPONSE à une requête agent en attente (consommée — ne pas
+    /// l'émettre vers le frontend). Les notifications (diagnostics) nourrissent
+    /// leurs attentes mais retournent `false` (l'event part quand même).
+    pub(crate) fn route(&self, message: &str) -> bool {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(message) else {
+            return false;
+        };
+        if let Some(id) = v["id"].as_i64() {
+            let tx = self
+                .pending_requests
+                .lock()
+                .ok()
+                .and_then(|mut g| g.remove(&id));
+            if let Some(tx) = tx {
+                let _ = tx.send(v);
+                return true;
+            }
+        }
+        if v["method"].as_str() == Some("textDocument/publishDiagnostics") {
+            let uri = v["params"]["uri"].as_str().unwrap_or("");
+            let waiters = self
+                .pending_diagnostics
+                .lock()
+                .ok()
+                .and_then(|mut g| g.remove(uri));
+            if let Some(waiters) = waiters {
+                for tx in waiters {
+                    let _ = tx.send(v["params"].clone());
+                }
+            }
+        }
+        false
+    }
+
+    /// EOF / crash du serveur : TOUTES les attentes échouent honnêtement
+    /// (drop des senders → RecvError côté appelant, jamais de hang infini).
+    pub(crate) fn fail_all(&self) {
+        if let Ok(mut g) = self.pending_requests.lock() {
+            g.clear();
+        }
+        if let Ok(mut g) = self.pending_diagnostics.lock() {
+            g.clear();
+        }
+    }
 }
 
 impl LspSession {
@@ -86,6 +221,11 @@ impl LspSession {
 
 /// Registry app-wide des sessions LSP, une par langage.
 pub struct LspServerRegistry(pub Mutex<HashMap<String, Arc<LspSession>>>);
+
+/// Évite le check-then-spawn concurrent entre l'éditeur et plusieurs outils
+/// agents. La création d'une session est rare ; sérialiser aussi les langages
+/// différents garde le registry simple et ne touche pas le chemin des requêtes.
+static LSP_START_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 impl Default for LspServerRegistry {
     fn default() -> Self {
@@ -355,6 +495,18 @@ async fn spawn_session(
     lang_id: String,
     app: AppHandle,
 ) -> Result<LspSession, String> {
+    spawn_session_opt(binary, args, lang_id, Some(app)).await
+}
+
+/// Variante testable : `app` optionnelle — sans elle, la reader task route
+/// uniquement vers le `ResponseRouter` (pas d'events Tauri). Le chemin
+/// production passe toujours `Some(app)`.
+async fn spawn_session_opt(
+    binary: PathBuf,
+    args: Vec<String>,
+    lang_id: String,
+    app: Option<AppHandle>,
+) -> Result<LspSession, String> {
     let mut cmd = build_command(binary, args);
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -382,48 +534,72 @@ async fn spawn_session(
         }
     });
 
-    // ── Reader task : lit les messages framés depuis stdout et les emit
-    //    sur "lsp://msg". Termine sur EOF (child exited) ou erreur framing.
+    // ── Reader task : route d'abord les réponses en cours (P6.12, outils
+    //    agent), puis emit "lsp://msg" pour le frontend. EOF/crash ⇒ toutes
+    //    les attentes échouent honnêtement + session retirée du registry
+    //    (un serveur mort ne reste pas « vivant » en cache).
+    let router = std::sync::Arc::new(ResponseRouter::new());
+    let initialized = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let app_for_reader = app.clone();
     let lang_for_reader = lang_id.clone();
+    let router_for_reader = router.clone();
     tauri::async_runtime::spawn(async move {
         let mut reader = BufReader::new(stdout);
         loop {
             match read_one_lsp_message(&mut reader).await {
                 Ok(Some(message)) => {
-                    let _ = app_for_reader.emit(
-                        "lsp://msg",
-                        LspIncomingMessage {
-                            lang_id: lang_for_reader.clone(),
-                            message,
-                        },
-                    );
+                    // Réponse à une requête agent ? Consommée, pas d'event.
+                    if router_for_reader.route(&message) {
+                        continue;
+                    }
+                    if let Some(ref app) = app_for_reader {
+                        let _ = app.emit(
+                            "lsp://msg",
+                            LspIncomingMessage {
+                                lang_id: lang_for_reader.clone(),
+                                message,
+                            },
+                        );
+                    }
                 }
                 Ok(None) => {
                     // EOF — LSP child closed stdout (crash or graceful exit).
-                    // Emit `lsp://exited` pour que le frontend puisse dispose
-                    // son LSPClient et clear le cache (autoriser un retry).
-                    // Sans ça, le user voit autocomplete/diagnostics se figer
-                    // silencieusement sans aucun signal côté UI.
                     eprintln!("[lsp:{lang_for_reader}] reader EOF (child exited)");
-                    let _ = app_for_reader.emit(
-                        "lsp://exited",
-                        LspErrorEvent {
-                            lang_id: lang_for_reader.clone(),
-                            message: "LSP server exited (EOF on stdout)".to_string(),
-                        },
-                    );
+                    router_for_reader.fail_all();
+                    if let Some(ref app) = app_for_reader {
+                        if let Some(registry) = app.try_state::<LspServerRegistry>() {
+                            if let Ok(mut g) = registry.0.lock() {
+                                if g.get(&lang_for_reader).is_some_and(|s| {
+                                    std::sync::Arc::ptr_eq(&s.router, &router_for_reader)
+                                }) {
+                                    g.remove(&lang_for_reader);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(ref app) = app_for_reader {
+                        let _ = app.emit(
+                            "lsp://exited",
+                            LspErrorEvent {
+                                lang_id: lang_for_reader.clone(),
+                                message: "LSP server exited (EOF on stdout)".to_string(),
+                            },
+                        );
+                    }
                     break;
                 }
                 Err(e) => {
                     eprintln!("[lsp:{lang_for_reader}] reader error: {e}");
-                    let _ = app_for_reader.emit(
-                        "lsp://error",
-                        LspErrorEvent {
-                            lang_id: lang_for_reader.clone(),
-                            message: e.to_string(),
-                        },
-                    );
+                    router_for_reader.fail_all();
+                    if let Some(ref app) = app_for_reader {
+                        let _ = app.emit(
+                            "lsp://error",
+                            LspErrorEvent {
+                                lang_id: lang_for_reader.clone(),
+                                message: e.to_string(),
+                            },
+                        );
+                    }
                     break;
                 }
             }
@@ -449,6 +625,12 @@ async fn spawn_session(
     Ok(LspSession {
         stdin_tx,
         child: Mutex::new(Some(child)),
+        router,
+        initialized,
+        initializing: std::sync::atomic::AtomicBool::new(false),
+        initialized_notify: tokio::sync::Notify::new(),
+        initialize_lock: tokio::sync::Mutex::new(()),
+        documents: Mutex::new(HashMap::new()),
     })
 }
 
@@ -484,6 +666,13 @@ pub async fn lsp_init(
             return Ok(LspInitResult { workspace_uri });
         }
     }
+    let _start_guard = LSP_START_LOCK.lock().await;
+    {
+        let guard = state.0.lock().map_err(|e| format!("registry lock: {e}"))?;
+        if guard.contains_key(&args.lang_id) {
+            return Ok(LspInitResult { workspace_uri });
+        }
+    }
 
     // Resolve binary (hybride : which-first ; sidecar fallback à wirer
     // plus tard, retourne Err pour MVP).
@@ -498,16 +687,69 @@ pub async fn lsp_init(
 
     let session = spawn_session(path, bin_args, args.lang_id.clone(), app).await?;
 
-    // Insert atomically (last-writer-wins if a race spawned a second one ;
-    // the loser's session will be dropped, kill_on_drop kicks in).
+    // Le verrou de création couvre le second check + spawn + insertion :
+    // aucune session concurrente n'est créée puis écrasée.
     let mut guard = state.0.lock().map_err(|e| format!("registry lock: {e}"))?;
     guard.insert(args.lang_id, Arc::new(session));
     Ok(LspInitResult { workspace_uri })
 }
 
 /// Envoie un message JSON-RPC au LSP server du langage donné. Le message
-/// est une string JSON déjà sérialisée par @codemirror/lsp-client côté JS ;
-/// le Rust ne fait que framing + write.
+/// est sérialisé par @codemirror/lsp-client côté JS ; le bridge observe les
+/// notifications de cycle de vie/document pour partager proprement la session
+/// avec les outils agent, puis la writer task assure le framing.
+fn observe_outgoing_message(session: &LspSession, message: &str) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(message) else {
+        return;
+    };
+    match value["method"].as_str() {
+        Some("initialize") => {
+            session
+                .initializing
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        Some("initialized") => {
+            session
+                .initialized
+                .store(true, std::sync::atomic::Ordering::Release);
+            session
+                .initializing
+                .store(false, std::sync::atomic::Ordering::Release);
+            session.initialized_notify.notify_waiters();
+        }
+        Some("textDocument/didOpen") => {
+            if let Some(uri) = value["params"]["textDocument"]["uri"].as_str() {
+                let version = value["params"]["textDocument"]["version"]
+                    .as_i64()
+                    .and_then(|v| i32::try_from(v).ok())
+                    .unwrap_or(1);
+                if let Ok(mut docs) = session.documents.lock() {
+                    docs.insert(uri.to_string(), version);
+                }
+            }
+        }
+        Some("textDocument/didChange") => {
+            if let Some(uri) = value["params"]["textDocument"]["uri"].as_str() {
+                let version = value["params"]["textDocument"]["version"]
+                    .as_i64()
+                    .and_then(|v| i32::try_from(v).ok())
+                    .unwrap_or(1);
+                if let Ok(mut docs) = session.documents.lock() {
+                    docs.insert(uri.to_string(), version);
+                }
+            }
+        }
+        Some("textDocument/didClose") => {
+            if let Some(uri) = value["params"]["textDocument"]["uri"].as_str() {
+                if let Ok(mut docs) = session.documents.lock() {
+                    docs.remove(uri);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 #[tauri::command]
 pub fn lsp_send(
     state: State<'_, LspServerRegistry>,
@@ -520,8 +762,9 @@ pub fn lsp_send(
         .ok_or_else(|| format!("no LSP session for '{lang_id}' (call lsp_init first)"))?;
     session
         .stdin_tx
-        .send(message)
+        .send(message.clone())
         .map_err(|e| format!("lsp_send channel: {e}"))?;
+    observe_outgoing_message(session, &message);
     Ok(())
 }
 
@@ -560,6 +803,302 @@ pub async fn lsp_shutdown(
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     session.force_kill();
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// P6.12 — chemin de requête EN COURS pour les outils agent (lsp_*). Le chemin
+// éditeur est événementiel ; les outils agent ont besoin d'une réponse
+// synchronisée : request/response avec timeout via le `ResponseRouter` de la
+// session PARTAGÉE (même registry que l'éditeur — un kill du run ne tue
+// JAMAIS les serveurs, ils sont app-level).
+// ---------------------------------------------------------------------------
+
+const AGENT_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Résout (ou crée) la session du langage dans le registry partagé — même
+/// idempotence que `lsp_init` (une seule session par langue par workspace).
+async fn ensure_session(
+    app: &AppHandle,
+    lang_id: &str,
+) -> Result<std::sync::Arc<LspSession>, String> {
+    {
+        let state = app.state::<LspServerRegistry>();
+        let guard = state.0.lock().map_err(|e| format!("registry lock: {e}"))?;
+        if let Some(session) = guard.get(lang_id) {
+            return Ok(session.clone());
+        }
+    }
+    let _start_guard = LSP_START_LOCK.lock().await;
+    {
+        let state = app.state::<LspServerRegistry>();
+        let guard = state.0.lock().map_err(|e| format!("registry lock: {e}"))?;
+        if let Some(session) = guard.get(lang_id) {
+            return Ok(session.clone());
+        }
+    }
+    let workspace_root: std::path::PathBuf = {
+        let ws_state = app.state::<std::sync::Mutex<Option<std::path::PathBuf>>>();
+        let guard = ws_state
+            .lock()
+            .map_err(|e| format!("workspace lock: {e}"))?;
+        guard.clone().ok_or("no workspace open")?
+    };
+    let (path, bin_args) = resolve_lsp_binary(lang_id, &workspace_root).ok_or_else(|| {
+        format!(
+            "pas de serveur LSP pour « {lang_id} » (binaire non installé —              typescript-language-server via npm, rust-analyzer via rustup, pylsp via pip)"
+        )
+    })?;
+    let session = spawn_session(path, bin_args, lang_id.to_string(), app.clone()).await?;
+    let session = std::sync::Arc::new(session);
+    let state = app.state::<LspServerRegistry>();
+    let mut guard = state.0.lock().map_err(|e| format!("registry lock: {e}"))?;
+    guard.insert(lang_id.to_string(), session.clone());
+    Ok(session)
+}
+
+fn workspace_root_required(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let ws_state = app.state::<std::sync::Mutex<Option<std::path::PathBuf>>>();
+    let guard = ws_state
+        .lock()
+        .map_err(|e| format!("workspace lock: {e}"))?;
+    guard.clone().ok_or("no workspace open".to_string())
+}
+
+/// Handshake LSP une fois par session (lazy, au premier besoin agent).
+async fn ensure_initialized(
+    workspace_uri: &str,
+    session: &std::sync::Arc<LspSession>,
+) -> Result<(), String> {
+    if session
+        .initialized
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Ok(());
+    }
+    let _initialize_guard = session.initialize_lock.lock().await;
+    if session
+        .initialized
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Ok(());
+    }
+
+    // L'éditeur peut avoir envoyé `initialize` via `lsp_send` juste avant
+    // l'outil agent. On attend alors son `initialized` au lieu d'envoyer une
+    // deuxième requête avec un autre id.
+    if session
+        .initializing
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        let notified = session.initialized_notify.notified();
+        if session
+            .initialized
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        tokio::time::timeout(AGENT_INIT_TIMEOUT, notified)
+            .await
+            .map_err(|_| {
+                "timeout en attendant la fin de l'initialisation LSP de l'éditeur".to_string()
+            })?;
+        return session
+            .initialized
+            .load(std::sync::atomic::Ordering::Acquire)
+            .then_some(())
+            .ok_or_else(|| "initialisation LSP de l'éditeur interrompue".to_string());
+    }
+
+    session
+        .initializing
+        .store(true, std::sync::atomic::Ordering::Release);
+    let result = async {
+        let resp = agent_lsp_request_inner(
+            session,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": workspace_uri,
+                "capabilities": {},
+            }),
+            AGENT_INIT_TIMEOUT,
+        )
+        .await?;
+        if resp["error"].is_object() {
+            return Err(format!(
+                "initialize LSP refusé : {}",
+                resp["error"]["message"]
+            ));
+        }
+        session
+            .stdin_tx
+            .send(
+                serde_json::json!({"jsonrpc":"2.0","method":"initialized","params":{}}).to_string(),
+            )
+            .map_err(|e| format!("lsp initialized send: {e}"))?;
+        session
+            .initialized
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+    .await;
+    session
+        .initializing
+        .store(false, std::sync::atomic::Ordering::Release);
+    session.initialized_notify.notify_waiters();
+    result
+}
+
+/// Requête request/response avec timeout sur une session donnée (cœur pur —
+/// testable sans AppHandle avec une session mock).
+async fn agent_lsp_request_inner(
+    session: &LspSession,
+    method: &str,
+    params: serde_json::Value,
+    timeout: std::time::Duration,
+) -> Result<serde_json::Value, String> {
+    let id = session.router.alloc_id();
+    let rx = session.router.register_request(id);
+    let msg = serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
+    session
+        .stdin_tx
+        .send(msg.to_string())
+        .map_err(|e| format!("lsp send: {e}"))?;
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) => Err("serveur LSP mort pendant la requête".to_string()),
+        Err(_) => {
+            session.router.unregister_request(id);
+            Err(format!("timeout LSP ({timeout:?}) pour `{method}`"))
+        }
+    }
+}
+
+/// URI file:// d'un chemin (réutilisé par les outils agent — même encodage
+/// que le workspaceUri du handshake).
+pub(crate) fn file_uri_for(path: &std::path::Path) -> String {
+    path_to_file_uri(path)
+}
+
+/// Ouvre un document dans la session (didOpen, fire-and-forget) — requis par
+/// la plupart des serveurs avant definition/references.
+pub(crate) async fn agent_lsp_open_document(
+    app: &AppHandle,
+    lang_id: &str,
+    uri: &str,
+    text: &str,
+    language: &str,
+) -> Result<(), String> {
+    let session = ensure_session(app, lang_id).await?;
+    let ws_uri = path_to_file_uri(&workspace_root_required(app)?);
+    ensure_initialized(&ws_uri, &session).await?;
+    agent_lsp_open_document_on_session(&session, uri, text, language).await
+}
+
+/// Requête request/response complète (session partagée + handshake garanti).
+pub(crate) async fn agent_lsp_request(
+    app: &AppHandle,
+    lang_id: &str,
+    method: &str,
+    params: serde_json::Value,
+    timeout: std::time::Duration,
+) -> Result<serde_json::Value, String> {
+    let session = ensure_session(app, lang_id).await?;
+    let uri = path_to_file_uri(&workspace_root_required(app)?);
+    ensure_initialized(&uri, &session).await?;
+    agent_lsp_request_inner(&session, method, params, timeout).await
+}
+
+/// Ouvre ou synchronise un document sur une session donnée. LSP interdit de
+/// répéter `didOpen` pour une URI déjà ouverte : les appels suivants utilisent
+/// `didChange` avec une version strictement croissante et le texte complet.
+pub(crate) async fn agent_lsp_open_document_on_session(
+    session: &LspSession,
+    uri: &str,
+    text: &str,
+    language: &str,
+) -> Result<(), String> {
+    let (method, params) = {
+        let mut documents = session
+            .documents
+            .lock()
+            .map_err(|e| format!("lsp documents lock: {e}"))?;
+        if let Some(version) = documents.get_mut(uri) {
+            *version = version.saturating_add(1);
+            (
+                "textDocument/didChange",
+                serde_json::json!({
+                    "textDocument": { "uri": uri, "version": *version },
+                    "contentChanges": [{ "text": text }],
+                }),
+            )
+        } else {
+            documents.insert(uri.to_string(), 1);
+            (
+                "textDocument/didOpen",
+                serde_json::json!({
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": language,
+                        "version": 1,
+                        "text": text,
+                    }
+                }),
+            )
+        }
+    };
+    let msg = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+    });
+    session
+        .stdin_tx
+        .send(msg.to_string())
+        .map_err(|e| format!("lsp document sync send: {e}"))?;
+    Ok(())
+}
+
+/// Ouvre un document et attend son `publishDiagnostics` (notification) — le
+/// serveur publie quand il veut, on attend borné (timeout honnête, jamais de
+/// liste vide fabriquée).
+pub(crate) async fn agent_lsp_diagnostics(
+    app: &AppHandle,
+    lang_id: &str,
+    uri: &str,
+    text: &str,
+    language: &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<serde_json::Value>, String> {
+    let session = ensure_session(app, lang_id).await?;
+    let ws_uri = path_to_file_uri(&workspace_root_required(app)?);
+    ensure_initialized(&ws_uri, &session).await?;
+    agent_lsp_diagnostics_on_session(&session, uri, text, language, timeout).await
+}
+
+/// Attente bornée de publishDiagnostics sur une session donnée (cœur testable).
+pub(crate) async fn agent_lsp_diagnostics_on_session(
+    session: &LspSession,
+    uri: &str,
+    text: &str,
+    language: &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<serde_json::Value>, String> {
+    let rx = session.router.register_diagnostics(uri);
+    agent_lsp_open_document_on_session(session, uri, text, language).await?;
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(params)) => Ok(params["diagnostics"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()),
+        Ok(Err(_)) => Err("serveur LSP mort pendant l'attente des diagnostics".to_string()),
+        Err(_) => {
+            session.router.unregister_diagnostics(uri);
+            Err(format!(
+                "timeout ({timeout:?}) en attendant publishDiagnostics pour {uri}"
+            ))
+        }
+    }
 }
 
 /// Tue toutes les sessions LSP — appelé depuis RunEvent::Exit (lib.rs).
@@ -610,4 +1149,319 @@ mod tests {
 
     // NB : les tests de strip_extended_prefix (formes `\\?\` et `//?/`) vivent
     // désormais dans `pathutil.rs` (helper centralisé).
+}
+
+// ---------------------------------------------------------------------------
+// P6.12 — tests du chemin de requête agent (mock LSP Content-Length sur node)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod agent_query_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn which_node() -> Option<PathBuf> {
+        which::which("node").ok()
+    }
+
+    fn mock_server_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests-mock-lsp")
+            .join("mock-lsp.mjs")
+    }
+
+    async fn mock_session() -> Option<LspSession> {
+        let node = which_node()?;
+        spawn_session_opt(
+            node,
+            vec![mock_server_path().to_string_lossy().to_string()],
+            "typescript".to_string(),
+            None,
+        )
+        .await
+        .ok()
+    }
+
+    #[tokio::test]
+    async fn request_response_roundtrip_with_mock_server() {
+        let Some(session) = mock_session().await else {
+            eprintln!("node absent — skip mock LSP test");
+            return;
+        };
+        let resp = agent_lsp_request_inner(
+            &session,
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": "file:///tmp/mock-ws",
+                "capabilities": {},
+            }),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("initialize response");
+        assert!(
+            resp["result"]["capabilities"].is_object(),
+            "result attendu : {resp}"
+        );
+        session.force_kill();
+    }
+
+    #[tokio::test]
+    async fn concurrent_initialization_performs_one_handshake() {
+        let Some(session) = mock_session().await.map(std::sync::Arc::new) else {
+            eprintln!("node absent — skip mock LSP test");
+            return;
+        };
+        let (first, second) = tokio::join!(
+            ensure_initialized("file:///tmp/mock-ws", &session),
+            ensure_initialized("file:///tmp/mock-ws", &session)
+        );
+        first.expect("first initialize");
+        second.expect("second caller reuses initialization");
+        assert!(session
+            .initialized
+            .load(std::sync::atomic::Ordering::Acquire));
+        session.force_kill();
+    }
+
+    #[tokio::test]
+    async fn agent_waits_for_frontend_initialization_instead_of_duplicating_it() {
+        let Some(session) = mock_session().await.map(std::sync::Arc::new) else {
+            eprintln!("node absent — skip mock LSP test");
+            return;
+        };
+        let initialize = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "initialize",
+            "params": {
+                "processId": std::process::id(),
+                "rootUri": "file:///tmp/mock-ws",
+                "capabilities": {},
+            }
+        })
+        .to_string();
+        session.stdin_tx.send(initialize.clone()).unwrap();
+        observe_outgoing_message(&session, &initialize);
+
+        let frontend_finishes = async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let initialized = r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#.to_string();
+            session.stdin_tx.send(initialized.clone()).unwrap();
+            observe_outgoing_message(&session, &initialized);
+        };
+        let (agent_result, _) = tokio::join!(
+            ensure_initialized("file:///tmp/mock-ws", &session),
+            frontend_finishes
+        );
+        agent_result.expect("l'agent réutilise le handshake frontend");
+        assert!(session
+            .initialized
+            .load(std::sync::atomic::Ordering::Acquire));
+        session.force_kill();
+    }
+
+    #[tokio::test]
+    async fn diagnostics_from_mock_server_contain_the_error() {
+        let Some(session) = mock_session().await else {
+            eprintln!("node absent — skip mock LSP test");
+            return;
+        };
+        let diags = agent_lsp_diagnostics_on_session(
+            &session,
+            "file:///tmp/mock-ws/broken.ts",
+            "const x: number = fooBar + 1;\n",
+            "typescript",
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("diagnostics response");
+        assert_eq!(diags.len(), 1);
+        let d = &diags[0];
+        assert_eq!(d["severity"].as_u64(), Some(1), "une ERREUR");
+        assert_eq!(d["range"]["start"]["line"].as_u64(), Some(2));
+        assert_eq!(d["range"]["start"]["character"].as_u64(), Some(4));
+        assert!(d["message"].as_str().unwrap_or("").contains("fooBar"));
+        assert_eq!(d["code"].as_str(), Some("ts2304"));
+        session.force_kill();
+    }
+
+    #[tokio::test]
+    async fn diagnostics_are_bounded_with_truncation_flag_source() {
+        let Some(session) = mock_session().await else {
+            eprintln!("node absent — skip mock LSP test");
+            return;
+        };
+        let diags = agent_lsp_diagnostics_on_session(
+            &session,
+            "file:///tmp/mock-ws/many.ts",
+            "let a = 1;\n",
+            "typescript",
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("diagnostics response");
+        // Le mock renvoie 60 diagnostics — le bridge les reçoit TOUS ; la
+        // borne de sortie (MAX_DIAGNOSTICS) est appliquée au formatage dans
+        // lsp_tools (assert ci-dessous sur le helper de borne).
+        assert_eq!(diags.len(), 60, "le mock émet bien 60 diagnostics");
+        session.force_kill();
+    }
+
+    #[tokio::test]
+    async fn concurrent_diagnostics_share_notification_and_document_versions() {
+        let Some(session) = mock_session().await else {
+            eprintln!("node absent — skip mock LSP test");
+            return;
+        };
+        let uri = "file:///tmp/mock-ws/shared.ts";
+        let (first, second) = tokio::join!(
+            agent_lsp_diagnostics_on_session(
+                &session,
+                uri,
+                "const first = fooBar;\n",
+                "typescript",
+                Duration::from_secs(10),
+            ),
+            agent_lsp_diagnostics_on_session(
+                &session,
+                uri,
+                "const second = fooBar;\n",
+                "typescript",
+                Duration::from_secs(10),
+            )
+        );
+        assert_eq!(first.expect("first diagnostics").len(), 1);
+        assert_eq!(second.expect("second diagnostics").len(), 1);
+        assert_eq!(
+            session.documents.lock().unwrap().get(uri).copied(),
+            Some(2),
+            "didOpen puis didChange version 2"
+        );
+        session.force_kill();
+    }
+
+    #[tokio::test]
+    async fn definition_and_references_return_expected_locations() {
+        let Some(session) = mock_session().await else {
+            eprintln!("node absent — skip mock LSP test");
+            return;
+        };
+        let uri = "file:///tmp/mock-ws/broken.ts";
+        agent_lsp_open_document_on_session(&session, uri, "const x = 1;\n", "typescript")
+            .await
+            .expect("didOpen");
+
+        let resp = agent_lsp_request_inner(
+            &session,
+            "textDocument/definition",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 0, "character": 6 },
+            }),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("definition response");
+        let locs = resp["result"].as_array().expect("definition array");
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0]["range"]["start"]["line"].as_u64(), Some(2));
+        assert_eq!(locs[0]["range"]["start"]["character"].as_u64(), Some(4));
+
+        let resp = agent_lsp_request_inner(
+            &session,
+            "textDocument/references",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 0, "character": 6 },
+                "context": { "includeDeclaration": true },
+            }),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("references response");
+        let locs = resp["result"].as_array().expect("references array");
+        assert_eq!(locs.len(), 2);
+        session.force_kill();
+    }
+
+    #[test]
+    fn router_fails_all_waiters_on_server_death() {
+        let router = std::sync::Arc::new(ResponseRouter::new());
+        let rx = router.register_request(router.alloc_id());
+        let rx2 = router.register_diagnostics("file:///x");
+        router.fail_all();
+        assert!(
+            rx.blocking_recv().is_err(),
+            "requête en attente échoue honnêtement"
+        );
+        assert!(
+            rx2.blocking_recv().is_err(),
+            "attente diagnostics échoue honnêtement"
+        );
+    }
+
+    #[test]
+    fn router_consumes_only_pending_responses() {
+        let router = ResponseRouter::new();
+        let id = router.alloc_id();
+        assert!(
+            id < 0,
+            "les ids agent ne collisionnent pas avec le frontend"
+        );
+        let rx = router.register_request(id);
+        // Une réponse avec un AUTRE id n'est pas consommée.
+        assert!(!router
+            .route(&serde_json::json!({"jsonrpc":"2.0","id":id + 1,"result":{}}).to_string()));
+        // La réponse attendue est consommée et livrée.
+        assert!(router
+            .route(&serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"ok":true}}).to_string()));
+        let v = rx.blocking_recv().expect("response delivered");
+        assert_eq!(v["result"]["ok"], serde_json::json!(true));
+        // publishDiagnostics n'est JAMAIS consommé (notification partagée avec l'éditeur).
+        let _rx2 = router.register_diagnostics("file:///x");
+        assert!(!router.route(
+            &serde_json::json!({"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file:///x","diagnostics":[]}}).to_string()
+        ));
+    }
+
+    #[test]
+    fn router_broadcasts_diagnostics_to_same_uri_waiters() {
+        let router = ResponseRouter::new();
+        let first = router.register_diagnostics("file:///shared.ts");
+        let second = router.register_diagnostics("file:///shared.ts");
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": "file:///shared.ts",
+                "diagnostics": [{"message": "shared"}]
+            }
+        })
+        .to_string();
+        assert!(!router.route(&message));
+        assert_eq!(
+            first.blocking_recv().unwrap()["diagnostics"][0]["message"],
+            "shared"
+        );
+        assert_eq!(
+            second.blocking_recv().unwrap()["diagnostics"][0]["message"],
+            "shared"
+        );
+    }
+
+    #[test]
+    fn manifest_exposes_the_three_lsp_tools() {
+        let tools = crate::commands::agents::tools::tools_json_openai();
+        let names: Vec<&str> = tools
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        for name in ["lsp_diagnostics", "lsp_definition", "lsp_references"] {
+            assert!(names.contains(&name), "outil manquant au manifest : {name}");
+        }
+    }
 }

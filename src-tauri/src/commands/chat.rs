@@ -34,10 +34,54 @@ pub struct ChatAbortRegistry(pub Mutex<HashMap<String, Arc<AtomicBool>>>);
 // chat surface never sets `with_tools: true`).
 // ────────────────────────────────────────────────────────────────────────
 
+/// P6.2 — consommation tokens d'UN tour, telle que rapportée par le provider.
+/// Chaque champ est `None` quand le provider ne l'a pas rapporté — on ne
+/// fabrique JAMAIS de zéro dans une donnée persistée (contrat d'honnêteté :
+/// le frontend affiche « mesuré » vs « estimé » selon la présence réelle).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TurnUsage {
+    /// Anthropic `usage.input_tokens` · OpenAI `usage.prompt_tokens` ·
+    /// Ollama `prompt_eval_count`. Anthropic : hors tokens de cache.
+    pub input_tokens: Option<u64>,
+    /// Anthropic `usage.output_tokens` (message_delta final) · OpenAI
+    /// `usage.completion_tokens` · Ollama `eval_count`.
+    pub output_tokens: Option<u64>,
+    /// Anthropic `usage.cache_creation_input_tokens` (message_start).
+    pub cache_creation_input_tokens: Option<u64>,
+    /// Anthropic `usage.cache_read_input_tokens` (message_start).
+    pub cache_read_input_tokens: Option<u64>,
+}
+
+impl TurnUsage {
+    /// Au moins UN champ rapporté par le provider ?
+    pub(crate) fn any(&self) -> bool {
+        self.input_tokens.is_some()
+            || self.output_tokens.is_some()
+            || self.cache_creation_input_tokens.is_some()
+            || self.cache_read_input_tokens.is_some()
+    }
+
+    /// Entrée totale de CE tour (cache inclus quand rapporté) — la meilleure
+    /// mesure RÉELLE du remplissage de la fenêtre de contexte pour ce tour.
+    pub(crate) fn total_input(&self) -> Option<u64> {
+        let sum = self.input_tokens.unwrap_or(0)
+            + self.cache_creation_input_tokens.unwrap_or(0)
+            + self.cache_read_input_tokens.unwrap_or(0);
+        if sum > 0 {
+            Some(sum)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AssistantTurn {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
+    /// Usage rapporté par le provider pour CE tour (P6.2). Tous champs `None`
+    /// quand le provider n'en fournit pas (jamais de zéros fabriqués).
+    pub usage: TurnUsage,
 }
 
 /// One message in a chat conversation history, mirroring the OpenAI/Anthropic
@@ -695,6 +739,9 @@ pub(crate) async fn call_anthropic_structured(
     }
     let mut blocks: std::collections::HashMap<usize, BlockState> = std::collections::HashMap::new();
     let mut text_acc = String::new();
+    // P6.2 — usage tokens. `message_start` porte l'entrée (+ cache) ;
+    // `message_delta` cumule la sortie finale. Absent du flux ⇒ champs None.
+    let mut usage = TurnUsage::default();
 
     collect_lines(response, abort, |line| {
         let Some(payload) = line.strip_prefix("data: ") else {
@@ -705,6 +752,24 @@ pub(crate) async fn call_anthropic_structured(
         };
 
         match v["type"].as_str() {
+            Some("message_start") => {
+                let u = &v["message"]["usage"];
+                usage.input_tokens = u["input_tokens"].as_u64().or(usage.input_tokens);
+                usage.output_tokens = u["output_tokens"].as_u64().or(usage.output_tokens);
+                usage.cache_creation_input_tokens = u["cache_creation_input_tokens"]
+                    .as_u64()
+                    .or(usage.cache_creation_input_tokens);
+                usage.cache_read_input_tokens = u["cache_read_input_tokens"]
+                    .as_u64()
+                    .or(usage.cache_read_input_tokens);
+            }
+            Some("message_delta") => {
+                // Cumul final de sortie (l'événement message_delta ne porte
+                // que output_tokens — l'entrée reste celle de message_start).
+                if let Some(out) = v["usage"]["output_tokens"].as_u64() {
+                    usage.output_tokens = Some(out);
+                }
+            }
             Some("content_block_start") => {
                 let idx = v["index"].as_u64().unwrap_or(0) as usize;
                 let cb = &v["content_block"];
@@ -774,6 +839,7 @@ pub(crate) async fn call_anthropic_structured(
     Ok(AssistantTurn {
         content: text_acc,
         tool_calls,
+        usage,
     })
 }
 
@@ -888,6 +954,11 @@ pub(crate) async fn call_openai_compat_structured(
         "stream": true,
         "messages": messages,
     });
+    // P6.2 — demande le chunk `usage` final (OpenAI : `stream_options.
+    // include_usage`). Ignoré par les serveurs qui ne le connaissent pas
+    // (llama.cpp / LM Studio / vLLM le tolèrent ou l'ignorent) ; quand le
+    // provider ne rapporte rien, les champs restent None (jamais de zéros).
+    body["stream_options"] = serde_json::json!({ "include_usage": true });
     if let Some(kwargs) = chat_template_kwargs {
         body["chat_template_kwargs"] = kwargs.clone();
     }
@@ -955,6 +1026,8 @@ pub(crate) async fn call_openai_compat_structured(
     let mut content_chunks = 0u32;
     let mut reasoning_chunks = 0u32;
     let mut tool_chunks = 0u32;
+    // P6.2 — chunk `usage` final (include_usage) : prompt/completion tokens.
+    let mut usage = TurnUsage::default();
 
     eprintln!("[chat:{protocol}] streaming model={model} url={url} with_tools={with_tools}");
 
@@ -969,6 +1042,14 @@ pub(crate) async fn call_openai_compat_structured(
         let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
             return;
         };
+        // P6.2 — le chunk d'usage final a `choices: []` et un objet `usage`
+        // (certains serveurs le répètent : on garde le dernier rapporté).
+        if v["usage"].is_object() {
+            usage.input_tokens = v["usage"]["prompt_tokens"].as_u64().or(usage.input_tokens);
+            usage.output_tokens = v["usage"]["completion_tokens"]
+                .as_u64()
+                .or(usage.output_tokens);
+        }
         // Visible answer chunk (the standard OpenAI field). Routé via le filtre
         // MiniMax : le `<think>` part en reasoning, les blocs d'outils XML sont
         // mis de côté, et SEULE la prose visible nettoyée nourrit `acc` +
@@ -1052,6 +1133,7 @@ pub(crate) async fn call_openai_compat_structured(
     Ok(AssistantTurn {
         content: acc,
         tool_calls,
+        usage,
     })
 }
 
@@ -1273,6 +1355,8 @@ pub(crate) async fn call_ollama_structured(
 
     let mut acc = String::new();
     let mut tool_calls = Vec::new();
+    // P6.2 — le chunk final (`done: true`) porte prompt_eval_count / eval_count.
+    let mut usage = TurnUsage::default();
 
     collect_lines(response, abort, |line| {
         if line.is_empty() {
@@ -1281,6 +1365,10 @@ pub(crate) async fn call_ollama_structured(
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             return;
         };
+        if v["done"].as_bool() == Some(true) {
+            usage.input_tokens = v["prompt_eval_count"].as_u64().or(usage.input_tokens);
+            usage.output_tokens = v["eval_count"].as_u64().or(usage.output_tokens);
+        }
         if let Some(text) = v["message"]["content"].as_str() {
             if !text.is_empty() {
                 acc.push_str(text);
@@ -1299,6 +1387,7 @@ pub(crate) async fn call_ollama_structured(
     Ok(AssistantTurn {
         content: acc,
         tool_calls,
+        usage,
     })
 }
 
@@ -1839,6 +1928,9 @@ async fn dispatch_single_call(
             .map(|content| AssistantTurn {
                 content,
                 tool_calls: Vec::new(),
+                // Le pont Codex ne rapporte pas d'usage par tour ici (P6.2) —
+                // champs None, jamais de zéros fabriqués.
+                usage: TurnUsage::default(),
             })
         }
         other => Err(format!("unsupported protocol: {}", other)),
@@ -3112,5 +3204,196 @@ mod fim_tests {
                 "{proto}: expected 'not supported' error, got: {err}"
             );
         }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// P6.2 — tests du parsing d'usage tokens (provider scripté loopback, même
+// harnais que runner_provider_contract_tests.rs). Vérifie pour chaque
+// protocole : les champs rapportés arrivent intacts dans AssistantTurn.usage,
+// et SANS usage rapporté : rien n'est fabriqué (tous champs None).
+// ────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod usage_parse_tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn read_request(socket: &mut tokio::net::TcpStream) -> Value {
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 8192];
+        let header_end = loop {
+            let read = socket.read(&mut buffer).await.expect("read request");
+            assert!(read > 0, "connection closed before HTTP headers");
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length: usize = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().ok())
+                    .flatten()
+            })
+            .expect("content-length");
+        while request.len() < header_end + content_length {
+            let read = socket.read(&mut buffer).await.expect("read request body");
+            assert!(read > 0, "connection closed before HTTP body");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        serde_json::from_slice(&request[header_end..header_end + content_length])
+            .expect("provider request JSON")
+    }
+
+    /// Serveur one-shot : capture la requête, répond `payload` (content-type
+    /// SSE par défaut), renvoie la requête capturée au join.
+    async fn scripted_server(
+        payload: String,
+        content_type: &'static str,
+    ) -> (String, tokio::task::JoinHandle<Value>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake provider");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let body = read_request(&mut socket).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+            body
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_reports_usage_with_cache_fields() {
+        let payload = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":120,\"output_tokens\":1,\"cache_creation_input_tokens\":30,\"cache_read_input_tokens\":40}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"bonjour\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":15}}\n\n",
+        )
+        .to_string();
+        let (base_url, server) = scripted_server(payload, "text/event-stream").await;
+        let client = reqwest::Client::new();
+        let turn = call_anthropic_structured(
+            &client,
+            &base_url,
+            "fake-claude",
+            vec![json!({"role":"user","content":"hi"})],
+            None,
+            "test-key",
+            false,
+            None,
+            None,
+            &mut |_, _| {},
+        )
+        .await
+        .expect("anthropic call");
+        server.await.expect("server join");
+        assert_eq!(turn.usage.input_tokens, Some(120));
+        // output : le cumul final de message_delta gagne sur le 1 initial.
+        assert_eq!(turn.usage.output_tokens, Some(15));
+        assert_eq!(turn.usage.cache_creation_input_tokens, Some(30));
+        assert_eq!(turn.usage.cache_read_input_tokens, Some(40));
+        assert_eq!(turn.usage.total_input(), Some(190));
+    }
+
+    #[tokio::test]
+    async fn openai_stream_reports_usage_and_requests_include_usage() {
+        let payload = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"salut\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":200,\"completion_tokens\":42}}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string();
+        let (base_url, server) = scripted_server(payload, "text/event-stream").await;
+        let client = reqwest::Client::new();
+        let turn = call_openai_compat_structured(
+            &client,
+            &base_url,
+            "fake-gpt",
+            vec![json!({"role":"user","content":"hi"})],
+            "test-key",
+            "openai",
+            &None,
+            false,
+            None,
+            None,
+            None,
+            &mut |_, _| {},
+        )
+        .await
+        .expect("openai call");
+        let body = server.await.expect("server join");
+        assert_eq!(turn.usage.input_tokens, Some(200));
+        assert_eq!(turn.usage.output_tokens, Some(42));
+        // P6.2 — on DEMANDE bien le chunk usage final au provider.
+        assert_eq!(body["stream_options"]["include_usage"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn ollama_ndjson_reports_eval_counts() {
+        let payload = concat!(
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"done\":false}\n",
+            "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"prompt_eval_count\":77,\"eval_count\":33}\n",
+        )
+        .to_string();
+        let (base_url, server) = scripted_server(payload, "application/x-ndjson").await;
+        let client = reqwest::Client::new();
+        let turn = call_ollama_structured(
+            &client,
+            &base_url,
+            "fake-qwen",
+            vec![json!({"role":"user","content":"hi"})],
+            None,
+            None,
+            &mut |_, _| {},
+        )
+        .await
+        .expect("ollama call");
+        server.await.expect("server join");
+        assert_eq!(turn.usage.input_tokens, Some(77));
+        assert_eq!(turn.usage.output_tokens, Some(33));
+    }
+
+    #[tokio::test]
+    async fn provider_without_usage_fabricates_nothing() {
+        let payload =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"salut\"}}]}\n\ndata: [DONE]\n\n"
+                .to_string();
+        let (base_url, server) = scripted_server(payload, "text/event-stream").await;
+        let client = reqwest::Client::new();
+        let turn = call_openai_compat_structured(
+            &client,
+            &base_url,
+            "fake-gpt",
+            vec![json!({"role":"user","content":"hi"})],
+            "test-key",
+            "openai",
+            &None,
+            false,
+            None,
+            None,
+            None,
+            &mut |_, _| {},
+        )
+        .await
+        .expect("openai call");
+        server.await.expect("server join");
+        assert!(!turn.usage.any(), "aucun champ ne doit être fabriqué");
+        assert_eq!(turn.usage.input_tokens, None);
+        assert_eq!(turn.usage.output_tokens, None);
+        assert_eq!(turn.usage.total_input(), None);
     }
 }

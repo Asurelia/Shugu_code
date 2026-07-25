@@ -25,7 +25,7 @@ import { ModeSelector } from "./ModeSelector";
 import { ChatWritesCard } from "./ChatWritesCard";
 import { db } from "@/lib/db";
 import { ModelPicker } from "@/features/panels/panels";
-import { revealAgent, killAgent, type AgentStatus } from "@/lib/agents";
+import { revealAgent, killAgent, type AgentStatus, type AgentEvent } from "@/lib/agents";
 import { extractWorktreeStatus, isWorktreeRunActive, type WorktreeStatus } from "@/lib/worktree";
 import { useAgentDefs } from "@/features/agents/agentDefsQueries";
 import { useMessageDisplay, type AgentActivityItem } from "./useMessageDisplay";
@@ -51,6 +51,19 @@ import { fsKeys } from "@/features/fs/keys";
 import { CommentTray } from "@/features/cockpit/CommentTray";
 import { GoalCard } from "@/features/goals/GoalCard";
 import { getComments, clearComments } from "@/features/cockpit/commentStore";
+import { FollowUpChips } from "./FollowUpChips";
+import { RewindControl } from "./RewindControl";
+import { PermissionAskCard } from "./PermissionAskCard";
+import { FOLLOWUP_MODE_SETTING_KEY, inverseFollowUpMode, parseFollowUpMode } from "./followUpQueue";
+import {
+  latestContextUsage, compactionInfo, contextFill, formatTokens, usageSourceLabel,
+} from "@/features/agents/tokenUsage";
+import {
+  DETAIL_MODE_SETTING_KEY, parseDetailMode, showToolTimeline, expandToolDetails,
+  showReasoning, expandReasoning, type DetailMode,
+} from "./detailMode";
+import { pluginsCommands } from "@/lib/plugins";
+import { buildTakenNames, effectiveSlashName } from "@/features/settings/pluginsUtils";
 import "./composer-controls.css";
 import type { Generation, Message, MessageAction } from "@/lib/types";
 import { IMAGE_MODEL_PRESETS, resolveImageProvider } from "@/lib/imageProviders";
@@ -157,6 +170,20 @@ export function ChatView({
     queryFn: async () => (await db.settings.get("chat.autoEditorContext")) !== "false",
     staleTime: 30_000,
   });
+  // P6.1 — mode de suivi configuré (file d'attente pendant un run). Sert au
+  // one-shot Ctrl+Shift+Enter qui envoie avec le mode INVERSE pour CE message.
+  const { data: followUpModeSetting } = useQuery({
+    queryKey: ["settings", FOLLOWUP_MODE_SETTING_KEY],
+    queryFn: async () => db.settings.get(FOLLOWUP_MODE_SETTING_KEY),
+    staleTime: 30_000,
+  });
+  // P6.6 — mode de détail de la conversation (Récit / Étapes / Exécution).
+  // La Settings row invalide cette clé → re-rendu immédiat, sans reload.
+  const { data: detailMode = "etapes" } = useQuery<DetailMode>({
+    queryKey: ["settings", DETAIL_MODE_SETTING_KEY],
+    queryFn: async () => parseDetailMode(await db.settings.get(DETAIL_MODE_SETTING_KEY)),
+    staleTime: 30_000,
+  });
 
   // Real context chips: current git branch + workspace folder name.
   const { data: branches } = useGitBranches();
@@ -230,6 +257,38 @@ export function ChatView({
     [agentDefs],
   );
 
+  // P6.7 — slash commands des PLUGINS actifs (`commands/*.md`). Fusionnées
+  // avec les agents dans la palette ; namespacées `plugin:command` en cas de
+  // collision (même règle que le backend).
+  const { data: pluginCmds = [] } = useQuery({
+    queryKey: ["plugins", "commands"],
+    queryFn: pluginsCommands,
+    staleTime: 30_000,
+  });
+  const slashEntries = useMemo(() => {
+    const agentEntries = enabledAgents.map((d) => ({
+      key: `agent:${d.path}`,
+      kind: "agent" as const,
+      name: d.name,
+      description: d.description,
+      path: d.path,
+      body: "",
+    }));
+    const cmdEntries = pluginCmds.map((c) => ({
+      key: `cmd:${c.plugin}:${c.name}`,
+      kind: "command" as const,
+      name: effectiveSlashName(c, buildTakenNames(
+        enabledAgents.map((d) => d.name),
+        pluginCmds,
+        c.plugin,
+      )),
+      description: c.description || `commande du plugin ${c.plugin}`,
+      path: "",
+      body: c.body,
+    }));
+    return [...agentEntries, ...cmdEntries];
+  }, [enabledAgents, pluginCmds]);
+
   // Palette de slash commands : ouverte dès que l'input commence par `/`. On
   // peut soit continuer à taper pour filtrer + Tab/↵ pour compléter, soit
   // taper directement `/<nom> texte` et le parser au send. Esc vide l'input.
@@ -242,8 +301,8 @@ export function ChatView({
   const slashMatches = useMemo(() => {
     if (slashFilter === null) return [];
     const f = slashFilter.toLowerCase();
-    return enabledAgents.filter((d) => d.name.toLowerCase().startsWith(f));
-  }, [enabledAgents, slashFilter]);
+    return slashEntries.filter((d) => d.name.toLowerCase().startsWith(f));
+  }, [slashEntries, slashFilter]);
   const slashOpen = slashFilter !== null && slashMatches.length > 0;
   useEffect(() => {
     if (slashIndex >= slashMatches.length) setSlashIndex(0);
@@ -263,7 +322,7 @@ export function ChatView({
     [input],
   );
 
-  const send = useCallback(async () => {
+  const send = useCallback(async (opts?: { inverseFollowUp?: boolean }) => {
     const raw = input.trim();
     if (!raw && !pendingImage) return;
     // Parse une éventuelle slash command : `/<nom> reste du message`. Si le
@@ -279,6 +338,16 @@ export function ChatView({
         if (hit) {
           agentDefPath = hit.path;
           text = rest.trim();
+        } else {
+          // P6.7 — commande de plugin : le corps du .md devient le message
+          // (avec substitution $ARGUMENTS, convention Claude Code).
+          const cmd = slashEntries.find((d) => d.kind === "command" && d.name === name);
+          if (cmd) {
+            const args = rest.trim();
+            text = cmd.body.includes("$ARGUMENTS")
+              ? cmd.body.split("$ARGUMENTS").join(args)
+              : `${cmd.body}\n\n${args}`.trim();
+          }
         }
       }
     }
@@ -321,6 +390,11 @@ export function ChatView({
         agentDefPath,
         editorCtx,
         commentsArg,
+        // P6.1 — Ctrl+Shift+Enter : mode INVERSE du réglage pour CE message
+        // (queue ↔ steer ; interrupt reste interrupt). Ignoré hors run actif.
+        opts?.inverseFollowUp
+          ? inverseFollowUpMode(parseFollowUpMode(followUpModeSetting))
+          : undefined,
       );
       // Clear ONLY after dispatch succeeds.
       if (commentsArg) clearComments();
@@ -336,11 +410,13 @@ export function ChatView({
     activeConv,
     chatStream,
     enabledAgents,
+    slashEntries,
     autoCtxOn,
     ctxDropped,
     activeFile,
     fileContents,
     selection,
+    followUpModeSetting,
   ]);
 
   const onKey = (e: React.KeyboardEvent) => {
@@ -369,6 +445,13 @@ export function ChatView({
         setInput("");
         return;
       }
+    }
+    // P6.1 — Ctrl+Shift+Enter (ou Cmd) : envoie avec le mode de suivi INVERSE
+    // du réglage, pour ce message uniquement. Sans run actif : sans effet.
+    if (e.key === "Enter" && e.shiftKey && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      void send({ inverseFollowUp: true });
+      return;
     }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -432,6 +515,8 @@ export function ChatView({
           path unchanged). Visible only when the user has queued notes from the
           Révision diff, independently of the cockpit flag. */}
       <CommentTray />
+      {/* P6.1 — file d'attente des suivis pendant un run (chips retirables) */}
+      <FollowUpChips conversationId={activeConv} />
       <div className="cx-composer" style={{ position: "relative" }}>
         {slashOpen && (
           <div
@@ -465,7 +550,7 @@ export function ChatView({
             </div>
             {slashMatches.map((d, i) => (
               <button
-                key={d.path}
+                key={d.key}
                 type="button"
                 onClick={() => applySlash(d.name)}
                 onMouseEnter={() => setSlashIndex(i)}
@@ -488,6 +573,11 @@ export function ChatView({
               >
                 <span style={{ fontWeight: 600, fontSize: 13 }}>
                   /{d.name}
+                  {d.kind === "command" && (
+                    <span style={{ marginLeft: 6, fontSize: 9, color: "var(--on-surface-muted)", fontWeight: 400 }}>
+                      cmd
+                    </span>
+                  )}
                 </span>
                 <span
                   style={{
@@ -640,7 +730,7 @@ export function ChatView({
             <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2" /></svg>
           </button>
         ) : (
-          <button className="cx-send" onClick={() => void send()} disabled={!input.trim() && !pendingImage} title="Envoyer (↵)">
+          <button className="cx-send" onClick={() => void send()} disabled={!input.trim() && !pendingImage} title="Envoyer (↵ · pendant un run : mis en file/guidage selon le réglage · Ctrl+Shift+↵ = mode inverse)">
             <Icon name="send" size={14} />
           </button>
         )}
@@ -656,6 +746,11 @@ export function ChatView({
           <span className="title">{cwd}</span>
           <span style={{ opacity: 0.4 }}>·</span>
           <span>{messages.length} message{messages.length > 1 ? "s" : ""}</span>
+          {/* P6.2 — jauge de fenêtre de contexte du DERNIER run agent (events
+              persistés → visible aussi après reload) + indicateur de compaction. */}
+          {latestAgentTranscript && (
+            <ContextUsageBar events={latestAgentTranscript.events} />
+          )}
         </div>
       )}
 
@@ -677,6 +772,7 @@ export function ChatView({
                   m={m}
                   convId={activeConv}
                   model={model}
+                  detailMode={detailMode}
                   onOpenFile={handleOpenFile}
                   onOpenSnippet={onOpenSnippet}
                   activeFile={activeFile}
@@ -920,7 +1016,7 @@ function fmtElapsed(ms: number): string {
 // Une ligne de la timeline. Quand l'outil a renvoyé une sortie (`result`), la
 // ligne devient dépliable (clic → <pre> de la sortie : stdout/exit d'une
 // commande, contenu lu, message d'erreur). Sinon c'est une ligne simple.
-function ActivityRow({ it }: { it: AgentActivityItem }) {
+function ActivityRow({ it, expandAll = false }: { it: AgentActivityItem; expandAll?: boolean }) {
   const head = (
     <>
       <span className="ic">{it.icon}</span>
@@ -948,7 +1044,7 @@ function ActivityRow({ it }: { it: AgentActivityItem }) {
   }
   return (
     <li className={"act has-out " + it.status}>
-      <details>
+      <details open={expandAll || undefined}>
         <summary>{head}</summary>
         {it.tool === "browser_test" ? (
           // Viewer dédié : verdict réussite/échec + capture + assertions.
@@ -978,6 +1074,7 @@ function AgentActivity({
   startedAt,
   finishedAt,
   agentId,
+  expandAll = false,
 }: {
   items: AgentActivityItem[];
   status?: AgentStatus;
@@ -985,6 +1082,8 @@ function AgentActivity({
   finishedAt?: number | null;
   /** Pour le bouton Stop (kill l'agent en cours). */
   agentId?: string;
+  /** P6.6 — mode Exécution : bloc + sorties dépliés par défaut. */
+  expandAll?: boolean;
 }) {
   const running = status === "running" || status === "pending";
 
@@ -1012,7 +1111,7 @@ function AgentActivity({
     : "Terminé";
 
   return (
-    <details className={"cx-agent-activity" + (running ? " running" : "")} open={running}>
+    <details className={"cx-agent-activity" + (running ? " running" : "")} open={running || expandAll}>
       <summary>
         <span className={"dot" + (running ? " live" : "")} />
         <span className="hl">{headLabel}</span>
@@ -1041,7 +1140,7 @@ function AgentActivity({
       {items.length > 0 && (
         <ul>
           {items.map((it) => (
-            <ActivityRow key={it.key} it={it} />
+            <ActivityRow key={it.key} it={it} expandAll={expandAll} />
           ))}
         </ul>
       )}
@@ -1196,6 +1295,7 @@ function CxMessage({
   m,
   convId,
   model,
+  detailMode = "etapes",
   onOpenFile,
   onOpenSnippet,
   activeFile,
@@ -1205,6 +1305,9 @@ function CxMessage({
   /** Conversation active — nécessaire aux cartes human-in-the-loop (relance). */
   convId: string;
   model: string;
+  /** P6.6 — mode de détail (Récit / Étapes / Exécution). Défaut Étapes =
+   *  rendu historique quand le parent ne le fournit pas. */
+  detailMode?: DetailMode;
   onOpenFile: (path: string) => void;
   onOpenSnippet?: (code: string, lang: string) => void;
   /** Lot A (Task 8) — active editor file: the Apply fallback target. */
@@ -1228,6 +1331,7 @@ function CxMessage({
     startedAt,
     finishedAt,
     worktree,
+    followUps,
   } = useMessageDisplay(m);
 
   // Le journal d'activité ne s'affiche que pour le travail de l'ORCHESTRATEUR,
@@ -1296,24 +1400,70 @@ function CxMessage({
         )}
       </div>
 
-      {isStreamingAgent && liveReasoning && !m.reasoning && <ThinkBlock open text={liveReasoning} />}
-      {m.reasoning && <ThinkBlock text={m.reasoning} label={`Thinking (${m.reasoning.length} chars)`} />}
+      {showReasoning(detailMode) && isStreamingAgent && liveReasoning && !m.reasoning && (
+        <ThinkBlock open={expandReasoning(detailMode)} text={liveReasoning} />
+      )}
+      {showReasoning(detailMode) && m.reasoning && (
+        <ThinkBlock
+          open={expandReasoning(detailMode)}
+          text={m.reasoning}
+          label={`Thinking (${m.reasoning.length} chars)`}
+        />
+      )}
 
-      {showActivity && plan && plan.length > 0 && <AgentPlan steps={plan} />}
-      {showActivity && (
+      {showActivity && showToolTimeline(detailMode) && plan && plan.length > 0 && (
+        <AgentPlan steps={plan} />
+      )}
+      {showActivity && showToolTimeline(detailMode) && (
         <AgentActivity
           items={activity}
           status={agentStatus}
           startedAt={startedAt}
           finishedAt={finishedAt}
           agentId={m.agentId}
+          expandAll={expandToolDetails(detailMode)}
         />
+      )}
+
+      {/* P6.1 — suivis de l'utilisateur (file / guidage) tracés dans le
+          transcript : styling discret, honnête (queued ≠ injected ≠ dropped). */}
+      {showActivity && followUps.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 3, margin: "4px 0" }}>
+          {followUps.map((f) => (
+            <div
+              key={f.key}
+              style={{
+                fontSize: 11,
+                fontStyle: "italic",
+                color: "var(--on-surface-muted)",
+                borderLeft: "2px solid var(--primary, #7c3aed)",
+                paddingLeft: 8,
+                opacity: f.status === "dropped" ? 0.5 : 0.85,
+                textDecoration: f.status === "dropped" ? "line-through" : "none",
+                whiteSpace: "pre-wrap",
+              }}
+            >
+              {f.status === "injected"
+                ? f.mode === "steer"
+                  ? "🧭 guidage injecté pendant le run : "
+                  : "⏳ message de la file devenu ce tour : "
+                : f.status === "queued"
+                  ? "⏳ en file d'attente : "
+                  : "✕ suivi retiré : "}
+              {f.content.length > 140 ? f.content.slice(0, 139) + "…" : f.content}
+            </div>
+          ))}
+        </div>
       )}
 
       {/* Human-in-the-loop — cartes interactives (ask_user / submit_plan). Rendues
           dès que le transcript porte l'event ; le clic relance l'agent via
           continueAgent (réponse aux questions ou approbation/refus du plan). */}
-      {questionData && <QuestionCard data={questionData} convId={convId} />}
+      {questionData?.permissionAsk ? (
+        <PermissionAskCard data={questionData} convId={convId} />
+      ) : (
+        questionData && <QuestionCard data={questionData} convId={convId} />
+      )}
       {planApprovalData && (
         <PlanApprovalCard data={planApprovalData} convId={convId} />
       )}
@@ -1354,6 +1504,9 @@ function CxMessage({
           records={showActivity && writeRecords.length > 0 ? writeRecords : undefined}
         />
         <div className="cx-react">
+          {/* P6.3 — « Revenir ici » : rewind fichiers (checkpoint du tour) et/ou
+              branche de conversation à partir de ce message. */}
+          <RewindControl m={m} convId={convId} />
           <button title="Copier" onClick={() => copyText(displayBody || m.body || m.text || "")}>
             <Icon name="copy" size={12} />
           </button>
@@ -1366,6 +1519,76 @@ function CxMessage({
   );
 }
 
+
+/**
+ * P6.2 — jauge de remplissage de la fenêtre de contexte (header du chat).
+ * Lue du transcript du DERNIER run agent (events `contextWindowUsage` persistés
+ * → rendue aussi après reload). Le libellé dit honnêtement si la valeur est
+ * MESURÉE (usage réel rapporté par le provider au dernier tour) ou ESTIMÉE
+ * (estimateur local). Teinte d'alerte dès 75 % = fraction du budget où la
+ * compaction token-aware peut se déclencher. L'indicateur « 🗜 compacté »
+ * consomme les events `memoryCompacted` (jusqu'ici sans aucun consommateur UI).
+ */
+function ContextUsageBar({ events }: { events: AgentEvent[] }) {
+  const ctx = latestContextUsage(events);
+  const comp = compactionInfo(events);
+  if (!ctx && !comp) return null;
+  const fill = ctx ? contextFill(ctx.used, ctx.window) : null;
+  return (
+    <span
+      style={{ display: "inline-flex", alignItems: "center", gap: 6, marginLeft: "auto" }}
+      title={
+        ctx
+          ? `Fenêtre de contexte du dernier run — ${usageSourceLabel(ctx.source)}` +
+            (fill?.over ? " · dépassement : compaction imminente" : "") +
+            " · alerte à 75 % (budget de compaction)"
+          : "Le contexte du run a été compacté (voir 🗜)"
+      }
+    >
+      {ctx && fill && (
+        <>
+          <span
+            style={{
+              width: 56,
+              height: 4,
+              borderRadius: 99,
+              background: "rgba(150,150,150,0.25)",
+              overflow: "hidden",
+              display: "inline-block",
+            }}
+          >
+            <span
+              style={{
+                display: "block",
+                width: `${fill.pct}%`,
+                height: "100%",
+                background: fill.warn ? "var(--warning, #f59e0b)" : "var(--primary, #7c3aed)",
+                transition: "width 0.3s ease",
+              }}
+            />
+          </span>
+          <span
+            style={{
+              fontSize: 10,
+              fontFamily: "var(--font-mono)",
+              color: fill.warn ? "var(--warning, #f59e0b)" : "var(--on-surface-muted)",
+            }}
+          >
+            {formatTokens(ctx.used)}/{formatTokens(ctx.window)} · {usageSourceLabel(ctx.source)}
+          </span>
+        </>
+      )}
+      {comp && (
+        <span
+          style={{ fontSize: 10, color: "var(--on-surface-muted)" }}
+          title={`Le contexte de ce run a été compacté ${comp.count} fois (${comp.folded} tours repliés en résumés) pour rester dans la fenêtre.`}
+        >
+          🗜 compacté ×{comp.count}
+        </span>
+      )}
+    </span>
+  );
+}
 
 function copyText(text: string) {
   if (text && typeof navigator !== "undefined" && navigator.clipboard) {

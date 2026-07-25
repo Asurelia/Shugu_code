@@ -23,9 +23,22 @@ REM Usage:
 REM   tauri-dev-log.cmd          runs `pnpm tauri dev`, logged
 REM   tauri-dev-log.cmd build    runs `pnpm tauri build`, logged
 REM   tauri-dev-log.cmd info     runs `pnpm tauri info`, logged
+REM
+REM On main, the shared pre-launch helper safely fast-forwards origin/main and
+REM refreshes pnpm dependencies only when the checked-out commit changes.
 
 REM ─── Toujours s'exécuter depuis le dossier du script (cf. tauri-dev.cmd) ──
 cd /d "%~dp0"
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\sync-main-before-launch.ps1"
+if errorlevel 1 (
+  echo.
+  echo [tauri-dev-log.cmd] ERROR: automatic update failed; launch cancelled.
+  echo Resolve the Git error above, then relaunch.
+  pause
+  exit /b 1
+)
+
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Write-Host ('[tauri-dev-log.cmd] Dossier : ' + (Get-Location)); Write-Host ('[tauri-dev-log.cmd] Code    : ' + (git rev-parse --abbrev-ref HEAD) + ' @ ' + (git log -1 --format='%%h %%s'))"
 
 set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"

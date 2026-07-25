@@ -46,6 +46,17 @@ import {
   worktreeDiscard,
   extractWorktreeStatus,
 } from "@/lib/worktree";
+import { aggregateTokenUsage, formatTokens } from "./tokenUsage";
+import { useQuery } from "@tanstack/react-query";
+import { db } from "@/lib/db";
+import {
+  DETAIL_MODE_SETTING_KEY, parseDetailMode, showToolTimeline,
+} from "@/features/chat/detailMode";
+import { fileSkillsList, fileSkillsBody, type FileSkill } from "@/lib/plugins";
+import { agentProcessList, agentProcessOutput, agentProcessStop, type BackgroundRow } from "@/lib/processes";
+import { processStatusLabel, processStatusTone, sessionStatusLabel, formatTail } from "./processesUtils";
+import { fileSkillSourceLabel } from "@/features/settings/pluginsUtils";
+import { buildAgentTree } from "./fanout";
 import "./agents-knowledge.css";
 
 // Resolve the active model → provider routing (protocol / baseUrl / key), exactly
@@ -196,10 +207,13 @@ function AgentRowItem({
   row,
   isSelected,
   onSelect,
+  depth = 0,
 }: {
   row: AgentRow;
   isSelected: boolean;
   onSelect: (id: string | null) => void;
+  /** P6.11 — profondeur dans l'arbre de fan-out (0 = racine). */
+  depth?: number;
 }) {
   return (
     // Trust-UX (Lane 5) — vrai <button> sémantique (était un div onClick) : la
@@ -226,6 +240,14 @@ function AgentRowItem({
       }}
     >
       <StatusBadge status={row.status} />
+      {depth > 0 && (
+        <span
+          title={`Sous-agent délégué (fan-out, parent ${row.parentId})`}
+          style={{ fontSize: 10, color: "var(--secondary, #a78bfa)", marginLeft: depth * 14 }}
+        >
+          ↳
+        </span>
+      )}
       <span style={{ fontSize: 11, fontWeight: 600 }}>{row.role}</span>
       <span
         title={`${profileSummary(row)} · ${isolationSummary(row)}`}
@@ -274,6 +296,15 @@ export function TranscriptDrawer({
 }) {
   const { data, isLoading } = useAgentTranscript(agentId);
   const [previewNonce, setPreviewNonce] = useState(0);
+  // P6.6 — mode de détail (Récit masque la timeline d'activité/exécution) ;
+  // invalidé par la Settings row → re-rendu immédiat. Zéro changement de
+  // données : les events affichés ou non restent les mêmes. Hoisté au-dessus
+  // de l'early return (règle des hooks).
+  const { data: detailMode = "etapes" } = useQuery({
+    queryKey: ["settings", DETAIL_MODE_SETTING_KEY],
+    queryFn: async () => parseDetailMode(await db.settings.get(DETAIL_MODE_SETTING_KEY)),
+    staleTime: 30_000,
+  });
 
   if (isLoading || !data) {
     return (
@@ -301,6 +332,10 @@ export function TranscriptDrawer({
   const completeEvent = events.find((e) => e.kind === "complete");
   const errorEvent = events.find((e) => e.kind === "error");
   const toolCallCount = events.filter((e) => e.kind === "toolCall").length;
+  // P6.2 — agrégat tokens du run depuis les events `tokenUsage` persistés :
+  // fonctionne live ET après reload. Champ undefined = jamais rapporté.
+  const usageAgg = aggregateTokenUsage(events);
+  const timelineVisible = showToolTimeline(detailMode);
   const isActive = row.status === "running" || row.status === "pending";
 
   // Exec views: the real test runs (run_command) + the skills the env-verified
@@ -309,6 +344,17 @@ export function TranscriptDrawer({
   // iframe stays Atelier-ONLY (keyed on the agent's role).
   const skillEvents = events.filter((e) => e.kind === "skillLearned");
   const lessonEvents = events.filter((e) => e.kind === "lessonsInjected");
+  // P6.1 — suivis de l'utilisateur tracés pendant ce run (file / guidage).
+  const followUpEvents = events.filter(
+    (e) =>
+      e.kind === "followUpQueued" ||
+      e.kind === "followUpInjected" ||
+      e.kind === "followUpDropped",
+  );
+  // P6.3 — rewinds appliqués sur ce run (fichiers / conversation / les deux).
+  const rewindEvents = events.filter((e) => e.kind === "rewindApplied");
+  // P6.4 — hooks utilisateur exécutés pendant ce run (tracés, jamais invisibles).
+  const hookEvents = events.filter((e) => e.kind === "hookFired");
   const runCalls = events.filter((e) => e.kind === "toolCall" && e.tool === "run_command");
   const hasExecRuns = runCalls.length > 0;
   const isAtelierRun = row.role === "atelier";
@@ -440,8 +486,9 @@ export function TranscriptDrawer({
         </div>
       </div>
 
-      {/* Section 2: activity sign + live stream while running */}
-      {isActive && (
+      {/* Section 2: activity sign + live stream while running (P6.6 : masquée
+          en mode Récit — la trace reste persistée, seule la présentation change) */}
+      {isActive && timelineVisible && (
         <div style={sectionStyle}>
           <span style={labelStyle}>Activité</span>
           <div
@@ -497,6 +544,40 @@ export function TranscriptDrawer({
           )}
         </div>
       )}
+
+      {/* P6.2 — consommation tokens du run (mesurée par le provider, sinon
+          aucune section : un estimateur local n'est JAMAIS présenté comme une
+          mesure — la jauge de contexte du chat porte, elle, la mention « estimé ») */}
+      {usageAgg.turns > 0 && (
+        <div style={sectionStyle}>
+          <span style={labelStyle}>
+            Tokens · {usageAgg.turns} tour{usageAgg.turns > 1 ? "s" : ""} mesuré{usageAgg.turns > 1 ? "s" : ""}
+          </span>
+          <div
+            style={{
+              ...bodyStyle,
+              fontFamily: "var(--font-mono)",
+              fontSize: 11,
+              color: "var(--on-surface-muted)",
+            }}
+          >
+            {usageAgg.input != null && `↑ ${formatTokens(usageAgg.input)} entrée`}
+            {usageAgg.input != null && usageAgg.output != null && " · "}
+            {usageAgg.output != null && `↓ ${formatTokens(usageAgg.output)} sortie`}
+            {(usageAgg.cacheRead != null || usageAgg.cacheCreation != null) && (
+              <>
+                {" · ⛁ cache "}
+                {usageAgg.cacheRead != null && `${formatTokens(usageAgg.cacheRead)} lus`}
+                {usageAgg.cacheRead != null && usageAgg.cacheCreation != null && " / "}
+                {usageAgg.cacheCreation != null && `${formatTokens(usageAgg.cacheCreation)} écrits`}
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* P6.9 — sessions shell persistantes + processus d'arrière-plan du run. */}
+      <RunTerminalsSection runId={row.id} isActive={isActive} sectionStyle={sectionStyle} labelStyle={labelStyle} bodyStyle={bodyStyle} />
 
       {/* Section 3: final response */}
       {completeEvent && completeEvent.kind === "complete" && (
@@ -600,8 +681,131 @@ export function TranscriptDrawer({
         </div>
       )}
 
+      {/* P6.1 — suivis de l'utilisateur (file d'attente / guidage steer)
+          tracés pendant ce run. Persistés → visibles aussi après reload. */}
+      {followUpEvents.length > 0 && (
+        <div style={{ marginTop: 10, display: "flex", flexWrap: "wrap", gap: 6 }}>
+          {followUpEvents.map((e, i) =>
+            e.kind === "followUpQueued" ||
+            e.kind === "followUpInjected" ||
+            e.kind === "followUpDropped" ? (
+              <span
+                key={i}
+                title={e.content}
+                style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  padding: "3px 8px",
+                  borderRadius: 99,
+                  background:
+                    e.kind === "followUpDropped"
+                      ? "rgba(148, 163, 184, 0.12)"
+                      : "rgba(95, 212, 240, 0.12)",
+                  color:
+                    e.kind === "followUpDropped"
+                      ? "var(--on-surface-muted)"
+                      : "var(--info, #5fd4f0)",
+                  border: `1px solid ${
+                    e.kind === "followUpDropped"
+                      ? "rgba(148, 163, 184, 0.3)"
+                      : "rgba(95, 212, 240, 0.3)"
+                  }`,
+                }}
+              >
+                {e.kind === "followUpQueued"
+                  ? `⏳ suivi en file (${e.mode})`
+                  : e.kind === "followUpInjected"
+                    ? e.mode === "steer"
+                      ? "🧭 guidage injecté pendant le run"
+                      : "⏳ suivi de la file injecté"
+                    : "✕ suivi retiré"}
+              </span>
+            ) : null,
+          )}
+        </div>
+      )}
+
+      {/* P6.3 — rewinds appliqués sur ce run. Persistés → visibles après
+          reload ; le filet de sécurité (checkpoint pré-revert) est affiché. */}
+      {rewindEvents.length > 0 && (
+        <div style={{ marginTop: 10, display: "flex", flexWrap: "wrap", gap: 6 }}>
+          {rewindEvents.map((e, i) =>
+            e.kind === "rewindApplied" ? (
+              <span
+                key={i}
+                title={
+                  `${e.restored.length} restauré(s), ${e.removed.length} supprimé(s)` +
+                  (e.safetyRef ? ` — réversible via ${e.safetyRef}` : " — NON réversible (filet de sécurité non capturé)") +
+                  (e.forkedConversationId ? ` — branche : ${e.forkedConversationId}` : "")
+                }
+                style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  padding: "3px 8px",
+                  borderRadius: 99,
+                  background: "rgba(255, 207, 107, 0.12)",
+                  color: "var(--warning, #ffcf6b)",
+                  border: "1px solid rgba(255, 207, 107, 0.3)",
+                }}
+              >
+                ↩ rewind {e.rewindKind === "files" ? "fichiers" : e.rewindKind === "both" ? "fichiers + conversation" : "conversation"}
+                {e.safetyRef ? "" : " ⚠"}
+              </span>
+            ) : null,
+          )}
+        </div>
+      )}
+
+      {/* P6.4 — hooks exécutés pendant ce run (outcome honnête : block,
+          timeout, erreur fail-open — jamais maquillés). */}
+      {hookEvents.length > 0 && (
+        <div style={{ marginTop: 10, display: "flex", flexWrap: "wrap", gap: 6 }}>
+          {hookEvents.map((e, i) =>
+            e.kind === "hookFired" ? (
+              <span
+                key={i}
+                title={
+                  `${e.command}` +
+                  (e.tool ? ` · outil ${e.tool}` : "") +
+                  (e.reason ? ` — ${e.reason}` : "") +
+                  (e.injectedContext ? ` — contexte : ${e.injectedContext}` : "")
+                }
+                style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  padding: "3px 8px",
+                  borderRadius: 99,
+                  background:
+                    e.outcome === "block"
+                      ? "rgba(255, 106, 138, 0.12)"
+                      : e.outcome === "timeout" || e.outcome === "error" || e.outcome === "block-ignored"
+                        ? "rgba(255, 207, 107, 0.12)"
+                        : "rgba(138, 239, 199, 0.10)",
+                  color:
+                    e.outcome === "block"
+                      ? "var(--danger, #ff6a8a)"
+                      : e.outcome === "timeout" || e.outcome === "error" || e.outcome === "block-ignored"
+                        ? "var(--warning, #ffcf6b)"
+                        : "var(--success, #8aefc7)",
+                  border: `1px solid ${
+                    e.outcome === "block"
+                      ? "rgba(255, 106, 138, 0.3)"
+                      : e.outcome === "timeout" || e.outcome === "error" || e.outcome === "block-ignored"
+                        ? "rgba(255, 207, 107, 0.3)"
+                        : "rgba(138, 239, 199, 0.3)"
+                  }`,
+                }}
+              >
+                🪝 {e.hookEvent} · {e.outcome}
+                {e.source ? ` (${e.source})` : ""} · {e.durationMs}ms
+              </span>
+            ) : null,
+          )}
+        </div>
+      )}
+
       {/* Real-env command runs (the test→fix loop) — Atelier or Grounded */}
-      {hasExecRuns && (
+      {hasExecRuns && timelineVisible && (
         <div style={sectionStyle}>
           <span style={labelStyle}>Tests exécutés (environnement réel)</span>
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -1123,10 +1327,11 @@ export function AgentsPanel() {
     void doLaunchGrounded();
   };
 
-  // Top-level filtering: only show ROOT agents (no parent). Sub-agents
-  // (Phase 1+) would appear nested under their parent in a future drawer
-  // variant; flat for now.
-  const rootAgents = agents.filter((a) => !a.parentId);
+  // P6.11 — arbre parent↔enfants (fan-out de délégations) : chaque parent est
+  // suivi de ses sous-agents, indentés avec badge ↳. Les orphelins (parent
+  // hors liste) remontent en racine — jamais masqués. Reconstruit après
+  // reload via parent_id (persisté avec l'event Spawn).
+  const agentTree = buildAgentTree(agents);
 
   return (
     <div style={{ padding: 8, fontSize: 12 }}>
@@ -1380,7 +1585,7 @@ export function AgentsPanel() {
         >
           Chargement…
         </div>
-      ) : rootAgents.length === 0 ? (
+      ) : agentTree.length === 0 ? (
         <div
           style={{
             padding: 16,
@@ -1394,12 +1599,13 @@ export function AgentsPanel() {
         </div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-          {rootAgents.map((row) => (
+          {agentTree.map((node) => (
             <AgentRowItem
-              key={row.id}
-              row={row}
-              isSelected={selectedId === row.id}
+              key={node.row.id}
+              row={node.row}
+              isSelected={selectedId === node.row.id}
               onSelect={setSelectedId}
+              depth={node.depth}
             />
           ))}
         </div>
@@ -1415,6 +1621,11 @@ export function AgentsPanel() {
       {(["atelier", "orchestrator", "coder"] as const).map((r) => (
         <SkillsSection key={r} role={r} />
       ))}
+
+      {/* P6.8 — skills FICHIERS (SKILL.md) : projet / shugu / claude
+          (lecture seule) / plugins, avec badge de source. Listing paresseux :
+          le corps est lu à la demande au dépliage. */}
+      <FileSkillsSection />
     </div>
   );
 }
@@ -1424,6 +1635,231 @@ export function AgentsPanel() {
 // woven into the main panel (no separate window). Refetched when a
 // `skillLearned` event invalidates the query (see the listener above).
 // ────────────────────────────────────────────────────────────────────
+
+// ────────────────────────────────────────────────────────────────────
+// P6.9 — « Terminaux » : sessions shell persistantes + processus
+// d'arrière-plan d'un run, statuts honnêtes (SQLite après reload), tail bornée,
+// stop avec confirmation (même idiom que les autres actions destructrices).
+// ────────────────────────────────────────────────────────────────────
+
+function ProcessRow({ proc, isActive, onStopped }: { proc: BackgroundRow; isActive: boolean; onStopped: () => void }) {
+  const [expanded, setExpanded] = useState(false);
+  const [tail, setTail] = useState<string | null>(null);
+  const [confirmStop, setConfirmStop] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const tone = processStatusTone(proc.status);
+  const toneColor =
+    tone === "success" ? "var(--success, #8aefc7)"
+    : tone === "warn" ? "var(--warning, #ffcf6b)"
+    : tone === "danger" ? "var(--danger, #ff6a8a)"
+    : "var(--on-surface-muted)";
+
+  const loadTail = () => {
+    if (expanded) { setExpanded(false); return; }
+    setExpanded(true);
+    if (tail === null) {
+      agentProcessOutput(proc.id)
+        .then((v) => setTail(v.tail))
+        .catch((err) => setTail(`(lecture impossible : ${String(err)})`));
+    }
+  };
+
+  return (
+    <div style={{ borderTop: "1px solid rgba(255,255,255,0.05)", padding: "5px 0" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+        <span style={{ fontSize: 10, fontWeight: 700, color: toneColor }}>
+          {processStatusLabel(proc.status)}
+        </span>
+        <code
+          style={{ fontSize: 11, color: "var(--on-surface)", flex: 1, minWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+          title={proc.command}
+        >
+          {proc.command}
+        </code>
+        {proc.exitCode != null && (
+          <span style={{ fontSize: 10, fontFamily: "var(--font-mono)", color: "var(--on-surface-muted)" }}>
+            exit {proc.exitCode}
+          </span>
+        )}
+        <button
+          type="button"
+          onClick={loadTail}
+          style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: "transparent", color: "var(--on-surface-muted)", border: "1px solid rgba(150,150,150,0.25)", cursor: "pointer" }}
+        >
+          {expanded ? "Masquer" : "Sortie"}
+        </button>
+        {isActive && proc.status === "running" && (
+          <button
+            type="button"
+            onClick={() => setConfirmStop(true)}
+            style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, background: "transparent", color: "var(--danger, #ff6a8a)", border: "1px solid rgba(255,106,138,0.35)", cursor: "pointer" }}
+          >
+            Stop
+          </button>
+        )}
+      </div>
+      {expanded && (
+        <pre
+          style={{
+            margin: "6px 0 0",
+            padding: 8,
+            fontSize: 10,
+            fontFamily: "var(--font-mono)",
+            maxHeight: 180,
+            overflow: "auto",
+            background: "rgba(0,0,0,0.25)",
+            borderRadius: 6,
+            whiteSpace: "pre-wrap",
+            color: "var(--on-surface-muted)",
+          }}
+        >
+          {tail === null ? "Chargement…" : formatTail(tail)}
+        </pre>
+      )}
+      <ConfirmDialog
+        open={confirmStop}
+        title="Arrêter ce processus d'arrière-plan ?"
+        body={<>Tout l'arbre de processus de <code>{proc.command}</code> sera tué (irréversible pour ce processus).</>}
+        confirmLabel={busy ? "Arrêt…" : "Arrêter le processus"}
+        tone="danger"
+        onCancel={() => setConfirmStop(false)}
+        onConfirm={() => {
+          setBusy(true);
+          void agentProcessStop(proc.id)
+            .then(() => { setConfirmStop(false); onStopped(); })
+            .catch((err) => pushToast(`Stop échoué : ${String(err)}`, "error", 5000))
+            .finally(() => setBusy(false));
+        }}
+      />
+    </div>
+  );
+}
+
+function RunTerminalsSection({
+  runId,
+  isActive,
+  sectionStyle,
+  labelStyle,
+  bodyStyle,
+}: {
+  runId: string;
+  isActive: boolean;
+  sectionStyle: React.CSSProperties;
+  labelStyle: React.CSSProperties;
+  bodyStyle: React.CSSProperties;
+}) {
+  const { data, refetch } = useQuery({
+    queryKey: ["agent-processes", runId],
+    queryFn: () => agentProcessList(runId),
+    refetchInterval: isActive ? 3000 : false,
+    staleTime: 0,
+  });
+  const sessions = data?.sessions ?? [];
+  const processes = data?.processes ?? [];
+  if (sessions.length === 0 && processes.length === 0) return null;
+  return (
+    <div style={sectionStyle}>
+      <span style={labelStyle}>Terminaux</span>
+      {sessions.length > 0 && (
+        <div style={{ ...bodyStyle, display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
+          {sessions.map((s) => (
+            <span
+              key={s.id}
+              title={`Session shell persistante « ${s.id} » (cwd/env conservés entre commandes)`}
+              style={{
+                fontSize: 10,
+                fontWeight: 700,
+                padding: "3px 8px",
+                borderRadius: 99,
+                background: s.alive ? "rgba(95, 212, 240, 0.12)" : "rgba(148,163,184,0.10)",
+                color: s.alive ? "var(--info, #5fd4f0)" : "var(--on-surface-muted)",
+                border: `1px solid ${s.alive ? "rgba(95, 212, 240, 0.3)" : "rgba(148,163,184,0.3)"}`,
+              }}
+            >
+              ⌁ session {s.id} · {sessionStatusLabel(s.alive)}
+            </span>
+          ))}
+        </div>
+      )}
+      {processes.length > 0 && (
+        <div style={bodyStyle}>
+          {processes.map((p) => (
+            <ProcessRow key={p.id} proc={p} isActive={isActive} onStopped={() => void refetch()} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// P6.8 — skills fichiers SKILL.md (listing + prévisualisation lecture seule).
+// ────────────────────────────────────────────────────────────────────
+
+function FileSkillRow({ skill }: { skill: FileSkill }) {
+  const [body, setBody] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  return (
+    <details
+      className="agent-skill"
+      onToggle={(e) => {
+        // Lecture paresseuse du corps au premier dépliage (jamais avant).
+        if ((e.target as HTMLDetailsElement).open && body === null && !error) {
+          fileSkillsBody(skill.name).then(setBody).catch((err) => setError(String(err)));
+        }
+      }}
+    >
+      <summary>
+        <span className="agent-skill-copy">
+          <strong>{skill.name}</strong>
+          <small>{skill.description || "Skill fichier (sans description)"}</small>
+        </span>
+        <span className="agent-skill-source">{fileSkillSourceLabel(skill.source)}</span>
+      </summary>
+      <div className="agent-skill-body">
+        <div className="agent-skill-note">
+          Skill fichier (SKILL.md) — chargée dans le contexte des agents via `skill_load`, lecture seule ici.
+        </div>
+        {error ? <pre>{error}</pre> : body === null ? <pre>Chargement…</pre> : <pre>{body}</pre>}
+      </div>
+    </details>
+  );
+}
+
+function FileSkillsSection() {
+  const [open, setOpen] = useState(false);
+  const { data: skills = [] } = useQuery<FileSkill[]>({
+    queryKey: ["file-skills", "list"],
+    queryFn: fileSkillsList,
+    staleTime: 30_000,
+  });
+  if (skills.length === 0) return null;
+  return (
+    <section className="agent-skills">
+      <button
+        type="button"
+        className="agent-skills-head"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+      >
+        <span className="agent-skills-icon"><Icon name="sparkle" size={13} /></span>
+        <span className="agent-skills-title">
+          <span>Skills fichiers (SKILL.md)</span>
+          <small>projet · shugu · claude (lecture seule) · plugins</small>
+        </span>
+        <span className="agent-skills-count">{skills.length}</span>
+        <Icon name="down" size={10} className={open ? "agent-skills-chevron open" : "agent-skills-chevron"} />
+      </button>
+      {open && (
+        <div className="agent-skills-list">
+          {skills.map((s) => (
+            <FileSkillRow key={`${s.source}:${s.name}`} skill={s} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
 
 function SkillsSection({ role }: { role: string }) {
   const { data: skills = [] } = useSkillsList(role);

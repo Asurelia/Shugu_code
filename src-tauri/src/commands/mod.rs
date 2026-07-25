@@ -9,6 +9,7 @@ pub mod chat_minimax;
 pub mod chat_tools;
 pub mod codex;
 pub mod codex_app_server;
+pub mod conversations;
 pub mod credentials;
 pub mod diag;
 pub mod diagnostics;

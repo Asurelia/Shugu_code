@@ -9,13 +9,14 @@
 import React, { useRef, useState } from "react";
 import { ConfirmDialog } from "@/components/trust/ConfirmDialog";
 import {
-  commandRuleSave,
+  permissionRuleSave,
   deriveCommandPattern,
   type RiskFlag,
+  type RuleDecision,
 } from "@/lib/commandRules";
 import { pushToast } from "@/components/toast";
 
-type Pending = { verdict: "allow" | "deny"; pattern: string };
+type Pending = { decision: RuleDecision; pattern: string };
 
 export function CommandRiskCard({
   risk,
@@ -29,20 +30,22 @@ export function CommandRiskCard({
   // Entrée immédiat enregistrerait le motif PROPOSÉ non édité (ex. « rm * »).
   const patternRef = useRef<HTMLInputElement | null>(null);
 
-  const openFor = (verdict: "allow" | "deny") =>
-    setPending({ verdict, pattern: deriveCommandPattern(command) });
+  const openFor = (decision: RuleDecision) =>
+    setPending({ decision, pattern: deriveCommandPattern(command) });
 
   const confirm = async () => {
     if (!pending) return;
     const pattern = pending.pattern.trim();
-    const { verdict } = pending;
+    const { decision } = pending;
     setPending(null);
     try {
-      await commandRuleSave(pattern, verdict);
+      await permissionRuleSave(pattern, decision);
       pushToast(
-        verdict === "allow"
+        decision === "allow"
           ? `Règle ajoutée : « ${pattern} » sera autorisé sans badge au prochain run.`
-          : `Règle ajoutée : « ${pattern} » sera bloqué avant exécution.`,
+          : decision === "ask"
+            ? `Règle ajoutée : « ${pattern} » demandera une confirmation à chaque fois.`
+            : `Règle ajoutée : « ${pattern} » sera bloqué avant exécution.`,
         "success",
         6000,
       );
@@ -107,6 +110,17 @@ export function CommandRiskCard({
       </button>
       <button
         type="button"
+        onClick={() => openFor("ask")}
+        style={{
+          ...btn,
+          color: "var(--warning, #ffcf6b)",
+          border: "1px solid rgba(255, 207, 107, 0.32)",
+        }}
+      >
+        Toujours demander
+      </button>
+      <button
+        type="button"
         onClick={() => openFor("deny")}
         style={{
           ...btn,
@@ -119,19 +133,23 @@ export function CommandRiskCard({
 
       <ConfirmDialog
         open={pending !== null}
-        tone={pending?.verdict === "deny" ? "danger" : "default"}
+        tone={pending?.decision === "deny" ? "danger" : "default"}
         title={
-          pending?.verdict === "deny"
+          pending?.decision === "deny"
             ? "Toujours refuser ce motif de commande"
-            : "Toujours autoriser ce motif de commande"
+            : pending?.decision === "ask"
+              ? "Toujours demander confirmation pour ce motif"
+              : "Toujours autoriser ce motif de commande"
         }
         body={
           pending && (
             <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
               <p style={{ margin: 0 }}>
-                {pending.verdict === "allow"
+                {pending.decision === "allow"
                   ? "Toute commande correspondant à ce motif s'exécutera SANS badge de risque."
-                  : "Toute commande correspondant à ce motif sera refusée avant de démarrer."}{" "}
+                  : pending.decision === "ask"
+                    ? "Toute commande correspondant à ce motif PAUSERA le run pour te demander confirmation."
+                    : "Toute commande correspondant à ce motif sera refusée avant de démarrer."}{" "}
                 Le motif est un glob de tokens (se termine éventuellement par{" "}
                 <code>*</code>) — restreins-le si besoin.
               </p>
@@ -167,7 +185,11 @@ export function CommandRiskCard({
           )
         }
         confirmLabel={
-          pending?.verdict === "deny" ? "Toujours refuser" : "Toujours autoriser"
+          pending?.decision === "deny"
+            ? "Toujours refuser"
+            : pending?.decision === "ask"
+              ? "Toujours demander"
+              : "Toujours autoriser"
         }
         initialFocusRef={patternRef}
         onConfirm={confirm}

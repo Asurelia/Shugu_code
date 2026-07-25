@@ -121,6 +121,15 @@ fn tools_to_csv(tools: &[String]) -> Option<String> {
 }
 
 fn parse_md(content: &str, path: &Path, scope: &str) -> Result<AgentDef, String> {
+    parse_agent_md(content, path, scope)
+}
+
+/// P6.7 — exposition crate-interne du parseur pour le module plugins : les
+/// `agents/*.md` d'un plugin passent par le MÊME pipeline de parsing (format
+/// Claude Code) sans réécriture ni fork. Le garde-chemin
+/// (`resolve_allowed_agent_path`) reste réservé aux dossiers d'agents
+/// canoniques ; les plugins fournissent leurs chemins eux-mêmes (découverte).
+pub(crate) fn parse_agent_md(content: &str, path: &Path, scope: &str) -> Result<AgentDef, String> {
     // Essai 1 : gray_matter (YAML strict). Marche pour les `.md` écrits par
     // Shugu (frontmatter propre) ou par des éditeurs qui quotent les valeurs.
     let matter: Matter<YAML> = Matter::new();
@@ -428,6 +437,14 @@ pub async fn agent_def_list(app: AppHandle, scope: String) -> Result<Vec<AgentDe
             }
         }
     }
+    // P6.7 — agents des plugins ACTIFS (`<plugin>/agents/*.md`), MÊME parseur,
+    // scope "plugin:<name>". Un plugin désactivé contribue zéro agent.
+    if scope == "all" {
+        let ws = workspace_root(&app);
+        for plugin in crate::commands::agents::plugins::enabled_plugins(&app, ws.as_deref()) {
+            out.extend(crate::commands::agents::plugins::plugin_agents(&plugin));
+        }
+    }
     Ok(out)
 }
 
@@ -438,6 +455,7 @@ fn resolve_allowed_agent_path(
     app: &AppHandle,
     p: &Path,
     must_exist: bool,
+    for_write: bool,
 ) -> Result<(PathBuf, &'static str), String> {
     if p.extension().and_then(|x| x.to_str()) != Some("md") {
         return Err("refus : extension `.md` requise".into());
@@ -474,6 +492,28 @@ fn resolve_allowed_agent_path(
             ));
         }
     }
+    // P6.7 — les `agents/` des plugins DÉCOUVERTS (user / projet / cache
+    // claude) sont des racines autorisées EN LECTURE SEULEMENT : le composer
+    // peut spawner un agent de plugin via `agent_def_path`. L'ÉCRITURE et la
+    // SUPPRESSION restent refusées — Shugu n'écrit jamais dans un plugin (et
+    // JAMAIS dans ~/.claude). Le périmètre reste borné aux dossiers `agents/`
+    // des plugins découverts (la désactivation filtre à la LISTE, pas à la
+    // lecture du fichier).
+    if for_write {
+        return Err(
+            "refus : les agents d'un plugin sont en lecture seule (éditez les fichiers du plugin directement)".into(),
+        );
+    }
+    let ws = workspace_root(app);
+    for plugin in crate::commands::agents::plugins::discover_plugins(ws.as_deref()) {
+        let dir = plugin.root.join("agents");
+        let Ok(dir) = std::fs::canonicalize(dir) else {
+            continue;
+        };
+        if resolved.parent() == Some(dir.as_path()) {
+            return Ok((resolved, "plugin"));
+        }
+    }
     Err("refus : le fichier doit être directement dans un dossier d'agents Shugu autorisé".into())
 }
 
@@ -481,7 +521,7 @@ fn resolve_allowed_agent_path(
 /// par `agent_def_list`, mais le backend revalide toujours la racine canonique.
 #[tauri::command]
 pub async fn agent_def_read(app: AppHandle, path: String) -> Result<AgentDef, String> {
-    let (p, scope) = resolve_allowed_agent_path(&app, Path::new(&path), true)?;
+    let (p, scope) = resolve_allowed_agent_path(&app, Path::new(&path), true, false)?;
     let content = std::fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
     parse_md(&content, &p, scope)
 }
@@ -507,7 +547,7 @@ pub async fn agent_def_write(app: AppHandle, def: AgentDef) -> Result<String, St
     } else {
         PathBuf::from(&def.path)
     };
-    let (final_path, _) = resolve_allowed_agent_path(&app, &final_path, false)?;
+    let (final_path, _) = resolve_allowed_agent_path(&app, &final_path, false, true)?;
     let mut def_to_write = def.clone();
     def_to_write.path = final_path.to_string_lossy().into_owned();
     let content = serialize_md(&def_to_write)?;
@@ -521,7 +561,7 @@ pub async fn agent_def_write(app: AppHandle, def: AgentDef) -> Result<String, St
 /// Supprime un agent après validation canonique de son scope.
 #[tauri::command]
 pub async fn agent_def_delete(app: AppHandle, path: String) -> Result<(), String> {
-    let (p, _) = resolve_allowed_agent_path(&app, Path::new(&path), true)?;
+    let (p, _) = resolve_allowed_agent_path(&app, Path::new(&path), true, true)?;
     std::fs::remove_file(&p).map_err(|e| format!("remove {}: {e}", p.display()))
 }
 
@@ -536,7 +576,7 @@ pub async fn agent_def_delete(app: AppHandle, path: String) -> Result<(), String
 /// pour l'onglet "Source `.md`" qui expose l'édition raw aux devs.
 #[tauri::command]
 pub async fn agent_def_read_raw(app: AppHandle, path: String) -> Result<String, String> {
-    let (p, _) = resolve_allowed_agent_path(&app, Path::new(&path), true)?;
+    let (p, _) = resolve_allowed_agent_path(&app, Path::new(&path), true, false)?;
     std::fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display()))
 }
 
@@ -550,7 +590,7 @@ pub async fn agent_def_write_raw(
     path: String,
     content: String,
 ) -> Result<(), String> {
-    let (p, _) = resolve_allowed_agent_path(&app, Path::new(&path), true)?;
+    let (p, _) = resolve_allowed_agent_path(&app, Path::new(&path), true, true)?;
     let tmp = p.with_extension("md.tmp");
     std::fs::write(&tmp, &content).map_err(|e| format!("write tmp: {e}"))?;
     std::fs::rename(&tmp, &p).map_err(|e| format!("rename {}: {e}", p.display()))?;
@@ -561,7 +601,7 @@ pub async fn agent_def_write_raw(
 /// par `agent_spawn` quand `agent_def_path` est fourni. Pas `#[tauri::command]`
 /// (pas exposé directement à JS — `agent_def_read` joue ce rôle côté UI).
 pub(crate) fn load_def(app: &AppHandle, path: &str) -> Result<AgentDef, String> {
-    let (p, scope) = resolve_allowed_agent_path(app, Path::new(path), true)?;
+    let (p, scope) = resolve_allowed_agent_path(app, Path::new(path), true, false)?;
     let content = std::fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
     parse_md(&content, &p, scope)
 }

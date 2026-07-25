@@ -122,6 +122,11 @@ impl ExecutionProfile {
                 | "advisor"
                 | "capture_screen"
                 | "ask_user"
+                | "skill_load"
+                | "read_process_output"
+                | "lsp_diagnostics"
+                | "lsp_definition"
+                | "lsp_references"
         );
         shared_read || (matches!(self, Self::Plan) && matches!(name, "todo_write" | "submit_plan"))
     }

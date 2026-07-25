@@ -90,16 +90,28 @@ pub fn global_config_path(app: &AppHandle) -> Option<PathBuf> {
 /// Charge global + projet, mergés (projet prioritaire). Fichiers absents ou
 /// illisibles ⇒ config vide (jamais d'erreur : un `.mcp.json` cassé ne doit pas
 /// empêcher l'app de tourner — il sera simplement ignoré).
+///
+/// P6.7 — y sont fusionnés les serveurs MCP des plugins APPROUVÉS (nom
+/// `<plugin>-<server>`, hash de commande revérifié à chaque chargement : si la
+/// commande du plugin change, l'approbation est caduque et le serveur disparaît
+/// d'ici). Jamais de démarrage sans approbation explicite.
 pub fn load_merged_config(app: &AppHandle) -> McpConfigFile {
     let read = |p: Option<PathBuf>| -> McpConfigFile {
         p.and_then(|p| std::fs::read_to_string(&p).ok())
             .and_then(|t| parse_mcp_config(&t).ok())
             .unwrap_or_default()
     };
-    merge_configs(
+    let mut merged = merge_configs(
         read(global_config_path(app)),
         read(project_config_path(app)),
-    )
+    );
+    let ws = crate::commands::fs::restore_workspace_root(app);
+    for (name, cfg) in
+        crate::commands::agents::plugins::approved_plugin_mcp_servers(app, ws.as_deref())
+    {
+        merged.mcp_servers.entry(name).or_insert(cfg);
+    }
+    merged
 }
 
 /// Écrit (upsert) un serveur dans un `.mcp.json` — projet par défaut, global si

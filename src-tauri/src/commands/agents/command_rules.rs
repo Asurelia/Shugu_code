@@ -1,81 +1,102 @@
-//! Learned command rules — persistence + Tauri surface for the « mode fluide ».
+//! Règles de permission allow / ask / deny (P6.10) — persistance + surface
+//! Tauri. La logique pure (grammaire, matching, précédence) vit dans
+//! [`super::permission`] ; ce module fait l'I/O SQLite (table
+//! `agent_permission_rules`, V28) et expose les commandes UI.
 //!
-//! The pure matching/override logic lives in [`super::policy`] (`CommandRule`,
-//! `command_matches`, `classify_with_rules`). This module owns the DB I/O
-//! (table `agent_command_rules`, created in `super::get_conn`) and the Tauri
-//! commands the UI uses to add / list / remove rules.
-//!
-//! A rule is GLOBAL (not per-role): the user blesses a command pattern once
-//! (e.g. `git push *` to their own fork) and it silences the risk badge for
-//! every run. `verdict = "allow"` ⇒ matching commands become `Safe`;
-//! `verdict = "deny"` ⇒ `Danger` (flag a pattern the static classifier misses).
-//! Persistence mirrors `skills.rs` (same `get_conn` handle, `INSERT OR REPLACE`).
+//! Compatibilité : [`load_for_classify`] alimente encore le classifieur de
+//! risque de `run_command` (règles allow/deny de la NOUVELLE table, scope
+//! global + scope du workspace courant) — le `ask` n'est pas du ressort du
+//! classifieur statique (il est résolu par `permission::resolve` au dispatch).
 
 use rusqlite::params;
 use serde::Serialize;
 use tauri::AppHandle;
 
+use super::permission::{Decision, PermissionRule};
 use super::policy::CommandRule;
 use super::{get_conn, now_ms};
 
-/// A rule as shown in the management UI (Phase 7). `verdict` is the stored
-/// string form (`"allow"` / `"deny"`); the classifier consumes the typed
-/// [`CommandRule`] via [`load_for_classify`].
+/// Une règle telle qu'exposée à l'UI de gestion (trois listes + scope).
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct CommandRuleRow {
+pub struct PermissionRuleRow {
     pub pattern: String,
-    pub verdict: String,
+    pub decision: String,
+    /// "" = global, sinon chemin du workspace.
+    pub scope: String,
     pub detail: Option<String>,
     pub created_at: i64,
 }
 
-/// Load every rule as a typed [`CommandRule`] for the execution gate. Because a
-/// persisted `deny` is an authorization decision, storage, lock and row errors
-/// are returned and the caller blocks the command.
-pub(super) fn load_for_classify(app: &AppHandle) -> Result<Vec<CommandRule>, String> {
+fn row_to_rule(r: &rusqlite::Row) -> rusqlite::Result<PermissionRule> {
+    let decision: String = r.get(1)?;
+    Ok(PermissionRule {
+        pattern: r.get(0)?,
+        decision: Decision::from_str(&decision).unwrap_or(Decision::Allow),
+        scope: r.get(2)?,
+        detail: r.get(3)?,
+        created_at: r.get(4)?,
+    })
+}
+
+const RULE_SELECT: &str =
+    "SELECT pattern, decision, scope, detail, created_at FROM agent_permission_rules";
+
+/// Toutes les règles (allow / ask / deny, tous scopes) pour le moteur pur.
+pub(crate) fn load_permission_rules(app: &AppHandle) -> Result<Vec<PermissionRule>, String> {
     let conn_mutex = get_conn(app)?;
     let conn = conn_mutex
         .lock()
-        .map_err(|e| format!("command rules lock: {e}"))?;
+        .map_err(|e| format!("permission rules lock: {e}"))?;
     let mut stmt = conn
-        .prepare(
-            "SELECT pattern, verdict, detail FROM agent_command_rules
-             ORDER BY length(pattern) DESC, pattern ASC",
-        )
-        .map_err(|e| format!("command rules prepare: {e}"))?;
-    let rows = stmt.query_map([], |r| {
-        let verdict: String = r.get(1)?;
-        Ok(CommandRule {
-            pattern: r.get(0)?,
-            allow: verdict == "allow",
-            detail: r.get::<_, Option<String>>(2)?,
-        })
-    });
-    let rows = rows.map_err(|e| format!("command rules query: {e}"))?;
+        .prepare(&format!(
+            "{RULE_SELECT} ORDER BY length(pattern) DESC, pattern ASC"
+        ))
+        .map_err(|e| format!("permission rules prepare: {e}"))?;
+    let rows = stmt
+        .query_map([], row_to_rule)
+        .map_err(|e| format!("permission rules query: {e}"))?;
     rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("command rules row: {e}"))
+        .map_err(|e| format!("permission rules row: {e}"))
 }
 
-fn list_inner(app: &AppHandle) -> Vec<CommandRuleRow> {
+/// Compatibilité classifieur : règles allow/deny de la nouvelle table, scope
+/// global + scope du workspace courant (le `ask` vit dans `permission::resolve`).
+pub(super) fn load_for_classify(app: &AppHandle) -> Result<Vec<CommandRule>, String> {
+    let scope = super::runner::get_workspace_root(app)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    Ok(load_permission_rules(app)?
+        .into_iter()
+        .filter(|r| {
+            (r.scope.is_empty() || r.scope == scope)
+                && matches!(r.decision, Decision::Allow | Decision::Deny)
+        })
+        .map(|r| CommandRule {
+            allow: r.decision == Decision::Allow,
+            pattern: r.pattern,
+            detail: r.detail,
+        })
+        .collect())
+}
+
+fn list_inner(app: &AppHandle) -> Vec<PermissionRuleRow> {
     let Ok(conn_mutex) = get_conn(app) else {
         return Vec::new();
     };
     let Ok(conn) = conn_mutex.lock() else {
         return Vec::new();
     };
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT pattern, verdict, detail, created_at FROM agent_command_rules
-         ORDER BY created_at DESC",
-    ) else {
+    let Ok(mut stmt) = conn.prepare(&format!("{RULE_SELECT} ORDER BY created_at DESC")) else {
         return Vec::new();
     };
     let rows = stmt.query_map([], |r| {
-        Ok(CommandRuleRow {
+        Ok(PermissionRuleRow {
             pattern: r.get(0)?,
-            verdict: r.get(1)?,
-            detail: r.get::<_, Option<String>>(2)?,
-            created_at: r.get(3)?,
+            decision: r.get(1)?,
+            scope: r.get(2)?,
+            detail: r.get(3)?,
+            created_at: r.get(4)?,
         })
     });
     match rows {
@@ -84,65 +105,121 @@ fn list_inner(app: &AppHandle) -> Vec<CommandRuleRow> {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────
-// Tauri commands (UI) — "Toujours autoriser" button + rules manager (Phase 7)
-// ────────────────────────────────────────────────────────────────────
+// ────────────────────────────────────────────────────────────────────────
+// Tauri commands (UI)
+// ────────────────────────────────────────────────────────────────────────
 
-/// Save (or refine) a learned rule. `verdict` must be `"allow"` or `"deny"`.
-/// A pattern is a whitespace-token glob, optionally ending in `*`
-/// (e.g. `git push *`, `npm run build`). `detail` is an optional note shown on
-/// the risk card for a `deny` rule.
+/// Enregistre (ou raffine) une règle de permission. `decision` ∈
+/// {"allow","ask","deny"} ; `scope` vide = global. La forme du motif est
+/// validée par le parseur unique (permission::parse_pattern) : un motif
+/// invalide ou trop large (« * » nu) est refusé.
 #[tauri::command]
-pub async fn command_rule_save(
+pub async fn permission_rule_save(
     app: AppHandle,
     pattern: String,
-    verdict: String,
+    decision: String,
+    scope: Option<String>,
     detail: Option<String>,
 ) -> Result<(), String> {
     let pattern = pattern.trim().to_string();
     if pattern.is_empty() {
         return Err("le motif (pattern) ne peut pas être vide".to_string());
     }
-    if verdict != "allow" && verdict != "deny" {
-        return Err("verdict doit être \"allow\" ou \"deny\"".to_string());
+    let Some(decision) = Decision::from_str(&decision) else {
+        return Err("decision doit être \"allow\", \"ask\" ou \"deny\"".to_string());
+    };
+    // Forme valide selon la grammaire unique (sinon le motif ne matcherait
+    // jamais rien — un motif mort est un bug silencieux).
+    if super::permission::parse_pattern(&pattern).is_none() {
+        return Err(format!(
+            "motif invalide : attendu `git push *`, `run_command(...)` (glob), \
+             `web_fetch(domain:...)` ou `mcp__<serveur>__<outil|*>` — reçu « {pattern} »"
+        ));
     }
-    // SÉCURITÉ : un motif sans token fixe (« * » seul) matcherait TOUTES les
-    // commandes — un `allow` ainsi posé ferait taire le drapeau de rm -rf & co.
-    // Refusé (cohérent avec policy::command_matches qui le rend inerte).
-    if !pattern.split_whitespace().any(|t| t != "*") {
+    // SÉCURITÉ : un glob sans token fixe (« * » seul) matcherait TOUT.
+    if !pattern.split_whitespace().any(|t| t != "*") && !pattern.contains('(') {
         return Err(
             "motif trop large : il doit contenir au moins un token fixe (pas seulement « * »)"
                 .to_string(),
         );
     }
-    // Borne la taille du detail (affiché verbatim dans la risk card).
+    let scope = scope.unwrap_or_default().trim().to_string();
     let detail = detail.map(|d| d.trim().chars().take(200).collect::<String>());
     let conn_mutex = get_conn(&app)?;
     let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
     conn.execute(
-        "INSERT OR REPLACE INTO agent_command_rules (pattern, verdict, detail, created_at)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![pattern, verdict, detail, now_ms()],
+        "INSERT OR REPLACE INTO agent_permission_rules (pattern, decision, scope, detail, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![pattern, decision.as_str(), scope, detail, now_ms()],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
 }
 
-/// List all learned rules, newest first (for the rules-manager UI).
+/// Liste toutes les règles (trois décisions + scopes), les plus récentes d'abord.
 #[tauri::command]
-pub async fn command_rule_list(app: AppHandle) -> Result<Vec<CommandRuleRow>, String> {
+pub async fn permission_rule_list(app: AppHandle) -> Result<Vec<PermissionRuleRow>, String> {
     Ok(list_inner(&app))
 }
 
-/// Delete a learned rule by its exact pattern.
+/// Supprime une règle par (pattern, scope) — la PK exacte.
 #[tauri::command]
-pub async fn command_rule_delete(app: AppHandle, pattern: String) -> Result<(), String> {
+pub async fn permission_rule_delete(
+    app: AppHandle,
+    pattern: String,
+    scope: Option<String>,
+) -> Result<(), String> {
     let conn_mutex = get_conn(&app)?;
     let conn = conn_mutex.lock().map_err(|e| e.to_string())?;
     conn.execute(
-        "DELETE FROM agent_command_rules WHERE pattern = ?1",
-        params![pattern.trim()],
+        "DELETE FROM agent_permission_rules WHERE pattern = ?1 AND scope = ?2",
+        params![pattern.trim(), scope.unwrap_or_default().trim()],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionEvaluation {
+    /// "allow" | "ask" | "deny" | "noRule".
+    pub outcome: String,
+    pub matched_pattern: Option<String>,
+    pub reason: Option<String>,
+}
+
+/// Testeur live (Settings) : évalue un appel d'outil contre les règles
+/// actuelles — montre QUELLE règle matche et la décision résultante.
+#[tauri::command]
+pub async fn permission_rule_evaluate(
+    app: AppHandle,
+    tool: String,
+    args: serde_json::Value,
+) -> Result<PermissionEvaluation, String> {
+    let rules = load_permission_rules(&app)?;
+    let scope = super::runner::get_workspace_root(&app)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    match super::permission::resolve(&tool, &args, &rules, &scope) {
+        super::permission::Outcome::Allow { pattern } => Ok(PermissionEvaluation {
+            outcome: "allow".to_string(),
+            matched_pattern: Some(pattern),
+            reason: None,
+        }),
+        super::permission::Outcome::Ask { pattern } => Ok(PermissionEvaluation {
+            outcome: "ask".to_string(),
+            matched_pattern: Some(pattern),
+            reason: None,
+        }),
+        super::permission::Outcome::Deny { pattern, reason } => Ok(PermissionEvaluation {
+            outcome: "deny".to_string(),
+            matched_pattern: Some(pattern),
+            reason: Some(reason),
+        }),
+        super::permission::Outcome::NoRule => Ok(PermissionEvaluation {
+            outcome: "noRule".to_string(),
+            matched_pattern: None,
+            reason: Some("aucune règle ne matche — classifieur statique".to_string()),
+        }),
+    }
 }

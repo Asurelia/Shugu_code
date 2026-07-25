@@ -41,7 +41,9 @@ import { fireMoodReaction } from "@/features/mascot/moodReactionStore";
 import { SHUGU_PERSONA_PROMPT, personaEnabled } from "@/features/chat/persona";
 import { parseThinkingMode, resolveThinking } from "@/lib/thinkingHeuristic";
 import { resolveRoute, parseDelegateOverride, type Route } from "@/lib/routingHeuristic";
-import { spawnAgent, agentContinue, awaitAgentComplete, type ExecutionProfile } from "@/lib/agents";
+import { agentContinue, awaitAgentComplete, runOrQueueAgent, nextFollowup, type ExecutionProfile,
+  type FollowUpMode, type QueuedFollowupRow } from "@/lib/agents";
+import { resolveEffectiveFollowUpMode, FOLLOWUP_MODE_SETTING_KEY } from "./followUpQueue";
 import { modelCapabilities } from "@/lib/modelCapabilities";
 import { readAgentDef } from "@/lib/agentDefs";
 import { superviseDeliverable, resolveReviewerArgs, resolveAdvisorArgs } from "@/lib/supervisors";
@@ -308,6 +310,9 @@ export async function sendChatMessage(
   agentDefPath?: string,
   editorCtx?: { path: string; content: string; selection?: { text: string; startLine: number; endLine: number } },
   inlineComments?: InlineCommentForSend[],
+  // P6.1 — override one-shot du mode de suivi (Ctrl+Shift+Enter = inverse du
+  // réglage). N'a d'effet QUE si un run est déjà actif sur la conversation.
+  followUpModeOverride?: FollowUpMode,
 ): Promise<void> {
   const trimmed = text.trim();
   // Allow empty text when an image is provided (image-only messages are valid).
@@ -419,7 +424,9 @@ export async function sendChatMessage(
     // Le modèle de chat actif sert d'orchestrateur de REPLI (cf. resolveOrchestrator).
     // `agentMode` propage le mode Plan (lecture seule) jusqu'au runner ; `trimmed`
     // (texte original) sert à juger la trivialité pour l'advisor.
-    await handleDelegate(convId, delegateTask, agentDefPath, modelId, agentMode, trimmed);
+    await handleDelegate(convId, delegateTask, agentDefPath, modelId, agentMode, trimmed, undefined, undefined, {
+      modeOverride: followUpModeOverride,
+    });
     return;
   }
   // Below: chat-direct + chat-think continue the existing chat flow.
@@ -876,7 +883,7 @@ async function handleDelegate(
   // (placeholder, await, relay, review S1) est identique au chemin délégué normal.
   resume?: {
     interactionId?: string;
-    kind?: "ask_user" | "submit_plan";
+    kind?: "ask_user" | "submit_plan" | "permission_ask" | (string & {});
     verdict?: "approved" | "continue";
     response?: string;
     executionProfile?: ExecutionProfile;
@@ -885,6 +892,11 @@ async function handleDelegate(
   // Durable Goal resume outside a HITL card. The normal first Goal run omits
   // this id; Rust creates the Goal atomically with the agent row.
   goalId?: string,
+  // P6.1 — file d'attente des suivis. `id` : ligne queued_followups que ce
+  // spawn consomme (drain ou « reprendre » manuel — CAS atomique côté Rust).
+  // `modeOverride` : inverse one-shot Ctrl+Shift+Enter (sinon le réglage
+  // `agents.followUpQueueMode` s'applique, défaut "queue").
+  followup?: { id?: string; modeOverride?: FollowUpMode },
 ): Promise<void> {
   const executionProfile = resume?.executionProfile
     ?? executionProfileForMode(mode, getAgentAccessProfile());
@@ -1082,13 +1094,61 @@ async function handleDelegate(
   // its (possibly already-completed) agent. Without this link, an orphan
   // "Orchestrateur au travail…" message stays forever even though its
   // output is sitting in the agents table.
+  // P6.1 — mode de suivi effectif : override one-shot (Ctrl+Shift+Enter) sinon
+  // le réglage persisté `agents.followUpQueueMode` (défaut "queue"). N'a d'effet
+  // QUE si un run est déjà actif sur la conversation (sinon spawn direct).
+  const followUpMode = resolveEffectiveFollowUpMode(
+    await db.settings.get(FOLLOWUP_MODE_SETTING_KEY),
+    followup?.modeOverride,
+  );
   let agentId: string;
   try {
-    agentId = resume
-      ? // Human-in-the-loop : relance idempotente (l'interaction consommée ne
-        // relance pas deux fois). Pas d'agentDefPath ni d'isolate — une relance
-        // reprend l'orchestrateur sur le vrai checkout.
-        await agentContinue({
+    if (!resume) {
+      // Chemin normal : run_or_queue — si un run est déjà actif sur CETTE
+      // conversation, le backend route selon le mode (queue/steer : mise en
+      // file sans run concurrent ; interrupt : kill + nouvelle instruction).
+      const outcome = await runOrQueueAgent({
+        spawn: {
+          role: "orchestrator",
+          task: execTask,
+          model: realModel,
+          conversationId: convId,
+          protocol,
+          baseUrl,
+          apiKey,
+          agentDefPath,
+          mode,
+          executionProfile,
+          isolate,
+          advisorModel: advisor?.model,
+          advisorProtocol: advisor?.protocol,
+          advisorBaseUrl: advisor?.baseUrl,
+          advisorApiKey: advisor?.apiKey,
+          goalId,
+          goalObjective: mode === "goal" ? userText : undefined,
+          followupId: followup?.id,
+        },
+        followUpMode,
+      });
+      if (outcome.kind === "queued") {
+        // Pas de placeholder, pas d'attente : le chip au-dessus du composer
+        // montre la ligne pending ; le run actif la consommera (steer entre
+        // deux tours) ou elle pilotera le tour suivant (queue).
+        pushToast(
+          outcome.followup.mode === "steer"
+            ? "Message envoyé en guidage — il sera injecté entre deux étapes du run."
+            : "Message mis en file d'attente — il sera traité à la fin du run.",
+          "info",
+          4000,
+        );
+        return;
+      }
+      agentId = outcome.agentId;
+    } else {
+      // Human-in-the-loop : relance idempotente (l'interaction consommée ne
+      // relance pas deux fois). Pas d'agentDefPath ni d'isolate — une relance
+      // reprend l'orchestrateur sur le vrai checkout.
+      agentId = await agentContinue({
           conversationId: convId,
           model: realModel,
           answer: execTask,
@@ -1108,40 +1168,8 @@ async function handleDelegate(
           kind: resume.kind,
           verdict: resume.verdict,
           response: resume.response,
-        })
-      : await spawnAgent({
-          role: "orchestrator",
-          task: execTask,
-          model: realModel,
-          conversationId: convId,
-          protocol,
-          baseUrl,
-          apiKey,
-          // Si l'utilisateur a choisi un agent custom dans le sélecteur du chat,
-          // le backend charge ce `.md` et remplace role/model/system_prompt par
-          // ses valeurs (cf. agent_spawn + agent_defs::load_def).
-          agentDefPath,
-          // Mode Plan → read_only côté runner (outils mutants retirés). Le défaut
-          // "agent" laisse l'exécution directe complète.
-          mode,
-          executionProfile,
-          isolate,
-          // v2 : modèle conseiller distinct pour l'outil `advisor` (sinon
-          // auto-consultation côté runner). Les 4 champs vont ensemble.
-          advisorModel: advisor?.model,
-          advisorProtocol: advisor?.protocol,
-          advisorBaseUrl: advisor?.baseUrl,
-          advisorApiKey: advisor?.apiKey,
-          goalId,
-          goalObjective: mode === "goal" ? userText : undefined,
-          // Exécution DIRECTE par défaut (2026-07-02) : on NE passe PAS `isolate`
-          // → le backend applique `unwrap_or(false)` et l'orchestrateur travaille
-          // sur le VRAI checkout, comme Claude Code — les fichiers non commités du
-          // user restent visibles pour l'agent, et son résultat atterrit
-          // directement dans les fichiers (pas de branche parquée à merger).
-          // Pour ISOLER un flux précis (worktree + revue/merge via panneau
-          // Agents), passer `isolate: true` explicitement.
         });
+    }
   } catch (err) {
     await appendMessage(convId, {
       id: newMessageId("e"),
@@ -1257,6 +1285,28 @@ async function handleDelegate(
     if (wantSupervise && supervisorAvailable) {
       void superviseDeliverable({ convId, agentId, task });
     }
+
+    // P6.1 — drain de la file de suivi : un message « queue » en attente pilote
+    // le tour suivant, via CE pipeline (mêmes gates qu'un message frais :
+    // résolution orchestrateur, preflight capacités, verrous profil backend).
+    // Décision (documentée dans followups.rs) : drain UNIQUEMENT sur succès —
+    // sur erreur/kill, les lignes restent « pending », visibles en chips, et
+    // l'utilisateur les déclenche à la main (un kill est une intention d'arrêt,
+    // pas un feu vert pour enchaîner). On ne draine pas non plus quand une
+    // carte HITL (ask_user / submit_plan) attend une réponse : c'est elle la
+    // suite attendue du run.
+    try {
+      const transcript = queryClient.getQueryData<ParsedAgentTranscript>(agentKeys.detail(agentId));
+      const hitlPending = transcript?.events.some(
+        (e) => e.kind === "questionAsked" || e.kind === "planSubmitted",
+      );
+      if (!hitlPending) {
+        const next = await nextFollowup(convId, "queue");
+        if (next) await driveQueuedFollowUp(convId, next);
+      }
+    } catch (drainErr) {
+      console.warn("[chat-sync] follow-up drain failed:", drainErr);
+    }
   } catch (err) {
     // The JS listener gave up (timeout, window thrash, etc.) — but the
     // Rust agent may have completed anyway. Do ONE last SQLite check
@@ -1292,6 +1342,32 @@ async function handleDelegate(
   }
 }
 
+/**
+ * P6.1 — conduit une ligne de la file de suivi comme nouveau tour agent.
+ * Passage OBLIGATOIRE par handleDelegate : le spawn reprend tous les gates
+ * d'un message frais (résolution provider, preflight capacités, verrous de
+ * profil côté Rust) — jamais d'auto-continuation en profil mutant sans eux.
+ * La ligne est consommée ATOMIQUEMENT au spawn (CAS `pending → injected` via
+ * `followupId`) : un échec de spawn la laisse `pending`, relançable.
+ */
+export async function driveQueuedFollowUp(convId: string, row: QueuedFollowupRow): Promise<void> {
+  const chatMode = getActiveChatMode();
+  await handleDelegate(
+    convId,
+    row.content,
+    undefined,
+    getActiveModel(),
+    // Un suivi en file implique un contexte agentique : si le sélecteur est
+    // repassé en Chat entre-temps, on conduit quand même en Agent (sinon le
+    // message partirait en chat direct sans outils, trahissant l'intention).
+    chatMode === "chat" ? "agent" : chatMode,
+    row.content,
+    undefined, // resume — n/a
+    undefined, // goalId — la ligne ne porte pas de Goal (limitation documentée)
+    { id: row.id },
+  );
+}
+
 /** Human-in-the-loop — relance l'agent après une réponse de l'utilisateur à un
  *  `ask_user`, ou une décision sur un `submit_plan`. Réutilise TOUT le pipeline de
  *  délégation (résolution provider, placeholder, await, relay verbatim, review S1)
@@ -1308,7 +1384,7 @@ export async function continueAgent(
   mode: "plan" | "agent",
   resume: {
     interactionId?: string;
-    kind?: "ask_user" | "submit_plan";
+    kind?: "ask_user" | "submit_plan" | "permission_ask" | (string & {});
     verdict?: "approved" | "continue";
     response?: string;
     executionProfile?: ExecutionProfile;
