@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 
@@ -68,16 +68,24 @@ pub fn merge_configs(global: McpConfigFile, project: McpConfigFile) -> McpConfig
     out
 }
 
+fn merge_configs_with_project_trust(
+    global: McpConfigFile,
+    project: McpConfigFile,
+    allow_project: bool,
+) -> McpConfigFile {
+    if allow_project {
+        merge_configs(global, project)
+    } else {
+        global
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Task 2 — localisation + lecture/écriture des fichiers `.mcp.json`
 // ---------------------------------------------------------------------------
 
-/// Chemin du `.mcp.json` projet (`<workspace>/.mcp.json`). `None` si aucun
-/// workspace n'est ouvert. On NE vérifie PAS l'existence du fichier ici : la
-/// lecture tolère l'absence, l'écriture le crée.
-pub fn project_config_path(app: &AppHandle) -> Option<PathBuf> {
-    let root = crate::commands::fs::restore_workspace_root(app)?;
-    Some(root.join(".mcp.json"))
+fn project_config_path_for(workspace: Option<&Path>) -> Option<PathBuf> {
+    workspace.map(|root| root.join(".mcp.json"))
 }
 
 /// Chemin du `.mcp.json` global (`~/.mcp.json`). `None` si le home dir est
@@ -96,18 +104,36 @@ pub fn global_config_path(app: &AppHandle) -> Option<PathBuf> {
 /// commande du plugin change, l'approbation est caduque et le serveur disparaît
 /// d'ici). Jamais de démarrage sans approbation explicite.
 pub fn load_merged_config(app: &AppHandle) -> McpConfigFile {
+    let workspace = crate::commands::agents::runner::get_workspace_root(app);
+    let allow_project = workspace
+        .as_deref()
+        .is_some_and(|root| crate::commands::project_trust::is_trusted(app, root));
+    load_merged_config_for_workspace(app, workspace.as_deref(), allow_project)
+}
+
+pub(crate) fn load_merged_config_for_workspace(
+    app: &AppHandle,
+    workspace: Option<&Path>,
+    allow_project: bool,
+) -> McpConfigFile {
     let read = |p: Option<PathBuf>| -> McpConfigFile {
         p.and_then(|p| std::fs::read_to_string(&p).ok())
             .and_then(|t| parse_mcp_config(&t).ok())
             .unwrap_or_default()
     };
-    let mut merged = merge_configs(
-        read(global_config_path(app)),
-        read(project_config_path(app)),
-    );
-    let ws = crate::commands::fs::restore_workspace_root(app);
+    let project = if allow_project {
+        read(project_config_path_for(workspace))
+    } else {
+        McpConfigFile::default()
+    };
+    let mut merged =
+        merge_configs_with_project_trust(read(global_config_path(app)), project, allow_project);
     for (name, cfg) in
-        crate::commands::agents::plugins::approved_plugin_mcp_servers(app, ws.as_deref())
+        crate::commands::agents::plugins::approved_plugin_mcp_servers_with_project_trust(
+            app,
+            workspace,
+            allow_project,
+        )
     {
         merged.mcp_servers.entry(name).or_insert(cfg);
     }
@@ -124,10 +150,17 @@ pub fn write_server(
     cfg: &McpServerConfig,
     global: bool,
 ) -> Result<(), String> {
+    let trusted_root = if global {
+        None
+    } else {
+        Some(crate::commands::project_trust::require_trusted_workspace(
+            app,
+        )?)
+    };
     let path = if global {
         global_config_path(app)
     } else {
-        project_config_path(app)
+        trusted_root.as_deref().map(|root| root.join(".mcp.json"))
     }
     .ok_or_else(|| "aucun emplacement de config (workspace fermé ?)".to_string())?;
 
@@ -138,6 +171,9 @@ pub fn write_server(
     file.mcp_servers.insert(name.to_string(), cfg.clone());
 
     let text = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
+    if let Some(root) = trusted_root.as_deref() {
+        crate::commands::project_trust::require_current_trusted_root(app, root)?;
+    }
     std::fs::write(&path, text).map_err(|e| format!("écriture {}: {e}", path.display()))
 }
 
@@ -145,7 +181,12 @@ pub fn write_server(
 /// fichier : un fichier absent/illisible est ignoré, et seul un fichier qui
 /// contenait réellement le serveur est réécrit.
 pub fn remove_server(app: &AppHandle, name: &str) -> Result<(), String> {
-    for path in [project_config_path(app), global_config_path(app)]
+    let workspace = crate::commands::agents::runner::get_workspace_root(app);
+    let trusted_project_path = workspace
+        .as_deref()
+        .filter(|root| crate::commands::project_trust::is_trusted(app, root))
+        .map(|root| root.join(".mcp.json"));
+    for path in [trusted_project_path.clone(), global_config_path(app)]
         .into_iter()
         .flatten()
     {
@@ -153,6 +194,12 @@ pub fn remove_server(app: &AppHandle, name: &str) -> Result<(), String> {
             if let Ok(mut file) = parse_mcp_config(&t) {
                 if file.mcp_servers.remove(name).is_some() {
                     let text = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
+                    if trusted_project_path.as_deref() == Some(path.as_path()) {
+                        let root = workspace
+                            .as_deref()
+                            .ok_or_else(|| "workspace fermé pendant la suppression".to_string())?;
+                        crate::commands::project_trust::require_current_trusted_root(app, root)?;
+                    }
                     std::fs::write(&path, text)
                         .map_err(|e| format!("écriture {}: {e}", path.display()))?;
                 }
@@ -254,6 +301,7 @@ pub fn set_enabled_setting(app: &AppHandle, name: &str, enabled: bool) -> Result
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::ServiceExt;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Type concret du client rmcp obtenu après `().serve(transport)`.
@@ -267,13 +315,31 @@ pub struct McpConn {
     pub client: McpClient,
     /// Outils bruts (rmcp `Tool`) du serveur, capturés au connect.
     pub tools: Vec<rmcp::model::Tool>,
+    /// Configuration exacte ayant produit cette connexion. Un cache-hit n'est
+    /// valide que si la config effective autorisée est toujours identique.
+    config: McpServerConfig,
+    /// CWD exact du handshake stdio. Une même configuration globale utilisée
+    /// depuis deux workspaces ne doit pas réutiliser le mauvais répertoire.
+    workspace_root: Option<PathBuf>,
 }
 
 /// Singleton de connexions MCP, une par serveur (calqué sur le pattern Codex
 /// app-server). `tokio::sync::Mutex` car `connect` est async et tient le lock
 /// au-dessus d'`await`.
 #[derive(Default)]
-pub struct McpManager(pub Arc<tokio::sync::Mutex<HashMap<String, Arc<McpConn>>>>);
+pub struct McpManager {
+    connections: Arc<tokio::sync::Mutex<HashMap<String, Arc<McpConn>>>>,
+    generation: AtomicU64,
+}
+
+pub(crate) fn invalidate_connections(app: &AppHandle) {
+    let manager = app.state::<McpManager>();
+    manager.generation.fetch_add(1, Ordering::SeqCst);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        app.state::<McpManager>().connections.lock().await.clear();
+    });
+}
 
 /// Ouvre (ou renvoie depuis le cache) la connexion à `name`. Erreur si le
 /// serveur n'est pas dans la config fusionnée. NE vérifie PAS `enabled` ici —
@@ -283,19 +349,38 @@ pub async fn connect(
     mgr: &McpManager,
     name: &str,
 ) -> Result<Arc<McpConn>, String> {
-    // Cache-hit : connexion déjà ouverte.
-    {
-        let map = mgr.0.lock().await;
-        if let Some(c) = map.get(name) {
-            return Ok(c.clone());
-        }
-    }
+    let workspace = crate::commands::agents::runner::get_workspace_root(app);
+    let allow_project = workspace
+        .as_deref()
+        .is_some_and(|root| crate::commands::project_trust::is_trusted(app, root));
+    connect_for_workspace(app, mgr, name, workspace.as_deref(), allow_project).await
+}
 
-    // Résout la config du serveur (projet > global).
-    let cfg = load_merged_config(app)
+pub(crate) async fn connect_for_workspace(
+    app: &AppHandle,
+    mgr: &McpManager,
+    name: &str,
+    workspace: Option<&Path>,
+    allow_project: bool,
+) -> Result<Arc<McpConn>, String> {
+    // Résout TOUJOURS la config effective avant un cache-hit. Une révocation,
+    // un changement de workspace ou une collision de nom invalide ainsi une
+    // connexion issue d'une ancienne configuration projet.
+    let cfg = load_merged_config_for_workspace(app, workspace, allow_project)
         .mcp_servers
         .remove(name)
         .ok_or_else(|| format!("serveur MCP inconnu : {name}"))?;
+    let generation = mgr.generation.load(Ordering::SeqCst);
+
+    {
+        let mut map = mgr.connections.lock().await;
+        if let Some(c) = map.get(name).filter(|conn| {
+            conn.config == cfg && conn.workspace_root.as_deref() == workspace
+        }) {
+            return Ok(c.clone());
+        }
+        map.remove(name);
+    }
 
     // BLOCKER 2 — timeout sur tout le handshake (serve + tools/list). Un serveur
     // qui spawn mais ne répond jamais au handshake gèlerait le run sinon. On borne
@@ -313,6 +398,9 @@ pub async fn connect(
                 // par `tokio::process::Command`.
                 let mut tcmd = tokio::process::Command::new(&command);
                 tcmd.args(&cfg.args);
+                if let Some(workspace) = workspace {
+                    tcmd.current_dir(workspace);
+                }
                 for (k, v) in &cfg.env {
                     // Ré-hydratation des secrets migrés au keychain : une valeur
                     // `${cred:<account>}` est lue depuis le keychain OS au moment
@@ -362,8 +450,27 @@ pub async fn connect(
             Err(_) => return Err(format!("timeout handshake MCP {name} (30s)")),
         };
 
-    let conn = Arc::new(McpConn { client, tools });
-    mgr.0.lock().await.insert(name.to_string(), conn.clone());
+    let conn = Arc::new(McpConn {
+        client,
+        tools,
+        config: cfg,
+        workspace_root: workspace.map(Path::to_path_buf),
+    });
+    if mgr.generation.load(Ordering::SeqCst) != generation {
+        return Err(format!(
+            "connexion MCP {name} annulée : workspace ou confiance modifié pendant le handshake"
+        ));
+    }
+    mgr.connections
+        .lock()
+        .await
+        .insert(name.to_string(), conn.clone());
+    if mgr.generation.load(Ordering::SeqCst) != generation {
+        mgr.connections.lock().await.remove(name);
+        return Err(format!(
+            "connexion MCP {name} annulée : configuration invalidée"
+        ));
+    }
     Ok(conn)
 }
 
@@ -651,13 +758,15 @@ fn keychain_set(account: &str, secret: &str) -> Result<(), String> {
 /// provider. `protocol == "anthropic"` → `{name, description, input_schema}` ;
 /// sinon (OpenAI/compatibles) → `{type:"function", function:{name, description,
 /// parameters}}`. Un serveur en erreur de connexion est IGNORÉ (pas de crash).
-pub async fn enabled_tools_json(
+pub(crate) async fn enabled_tools_json_for_workspace(
     app: &AppHandle,
     mgr: &McpManager,
     protocol: &str,
+    workspace: Option<&Path>,
+    allow_project: bool,
 ) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
-    let cfg = load_merged_config(app);
+    let cfg = load_merged_config_for_workspace(app, workspace, allow_project);
     for server in cfg.mcp_servers.keys() {
         if !is_enabled(app, server) {
             continue;
@@ -669,13 +778,13 @@ pub async fn enabled_tools_json(
             eprintln!("[mcp] serveur « {server} » ignoré : nom contenant « __ »");
             continue;
         }
-        let conn = match connect(app, mgr, server).await {
+        let conn = match connect_for_workspace(app, mgr, server, workspace, allow_project).await {
             Ok(c) => c,
             Err(_) => {
                 // BLOCKER 3 (complément) — serveur indisponible : on l'ignore
                 // proprement ET on évince toute connexion morte éventuellement
                 // restée en cache, pour ne pas la réutiliser au prochain appel.
-                mgr.0.lock().await.remove(server);
+                mgr.connections.lock().await.remove(server);
                 continue;
             }
         };
@@ -724,13 +833,36 @@ pub async fn mcp_execute(
     full_name: &str,
     args: &serde_json::Value,
 ) -> (String, bool) {
+    let workspace = crate::commands::agents::runner::get_workspace_root(app);
+    let allow_project = workspace
+        .as_deref()
+        .is_some_and(|root| crate::commands::project_trust::is_trusted(app, root));
+    mcp_execute_for_workspace(
+        app,
+        mgr,
+        full_name,
+        args,
+        workspace.as_deref(),
+        allow_project,
+    )
+    .await
+}
+
+pub(crate) async fn mcp_execute_for_workspace(
+    app: &AppHandle,
+    mgr: &McpManager,
+    full_name: &str,
+    args: &serde_json::Value,
+    workspace: Option<&Path>,
+    allow_project: bool,
+) -> (String, bool) {
     let Some((server, tool)) = split_namespaced(full_name) else {
         return (format!("nom d'outil MCP invalide : {full_name}"), true);
     };
     if !is_enabled(app, &server) {
         return (format!("serveur MCP « {server} » désactivé"), true);
     }
-    let conn = match connect(app, mgr, &server).await {
+    let conn = match connect_for_workspace(app, mgr, &server, workspace, allow_project).await {
         Ok(c) => c,
         Err(e) => return (e, true),
     };
@@ -767,11 +899,11 @@ pub async fn mcp_execute(
         // réutiliseraient. On l'évince du HashMap avant de renvoyer l'erreur pour
         // forcer une reconnexion propre au prochain appel.
         Ok(Err(e)) => {
-            mgr.0.lock().await.remove(&server);
+            mgr.connections.lock().await.remove(&server);
             (format!("appel MCP {full_name} : {e}"), true)
         }
         Err(_) => {
-            mgr.0.lock().await.remove(&server);
+            mgr.connections.lock().await.remove(&server);
             (format!("appel MCP {full_name} : délai dépassé (60s)"), true)
         }
     }
@@ -855,7 +987,7 @@ pub async fn mcp_list_servers(
         let enabled = is_enabled(&app, name);
         // Un seul lock pour connected + tool_count.
         let (connected, tool_count) = {
-            let map = mgr.0.lock().await;
+            let map = mgr.connections.lock().await;
             match map.get(name) {
                 Some(conn) => (true, conn.tools.len()),
                 None => (false, 0),
@@ -908,7 +1040,7 @@ pub async fn mcp_set_enabled(
 ) -> Result<(), String> {
     set_enabled_setting(&app, &name, enabled)?;
     if !enabled {
-        mgr.0.lock().await.remove(&name);
+        mgr.connections.lock().await.remove(&name);
     }
     Ok(())
 }
@@ -943,7 +1075,7 @@ pub async fn mcp_remove_server(
     name: String,
 ) -> Result<(), String> {
     remove_server(&app, &name)?;
-    mgr.0.lock().await.remove(&name);
+    mgr.connections.lock().await.remove(&name);
     Ok(())
 }
 
@@ -1066,6 +1198,27 @@ mod tests {
         assert_eq!(m.mcp_servers.len(), 2);
         assert_eq!(m.mcp_servers["a"].command.as_deref(), Some("new"));
         assert_eq!(m.mcp_servers["b"].command.as_deref(), Some("keep"));
+    }
+
+    #[test]
+    fn untrusted_project_cannot_override_an_enabled_global_server_name() {
+        let global =
+            parse_mcp_config(r#"{"mcpServers":{"filesystem":{"command":"safe-global"}}}"#).unwrap();
+        let project =
+            parse_mcp_config(r#"{"mcpServers":{"filesystem":{"command":"malicious-project"}}}"#)
+                .unwrap();
+
+        let restricted = merge_configs_with_project_trust(global.clone(), project.clone(), false);
+        assert_eq!(
+            restricted.mcp_servers["filesystem"].command.as_deref(),
+            Some("safe-global")
+        );
+
+        let trusted = merge_configs_with_project_trust(global, project, true);
+        assert_eq!(
+            trusted.mcp_servers["filesystem"].command.as_deref(),
+            Some("malicious-project")
+        );
     }
 
     #[test]

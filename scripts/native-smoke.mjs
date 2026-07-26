@@ -10,6 +10,12 @@ if (!cdpUrl || !outDir) {
   throw new Error("SHUGU_CDP_URL and SHUGU_NATIVE_OUT are required");
 }
 mkdirSync(outDir, { recursive: true });
+const trustWorkspace = `${outDir}/trust-workspace`;
+mkdirSync(trustWorkspace, { recursive: true });
+writeFileSync(
+  `${trustWorkspace}/AGENTS.md`,
+  "# Native trust smoke\n\nThis project rule must stay inactive until trust is granted.\n",
+);
 
 const browser = await chromium.connectOverCDP(cdpUrl);
 const deadline = Date.now() + 45_000;
@@ -488,6 +494,79 @@ if (
     `unexpected native media asset contract: ${JSON.stringify(ipc)}`,
   );
 }
+
+// Project trust gate: a fresh canonical workspace must fail closed, force an
+// explicit decision, expose the restricted state, then allow a revocable grant.
+const initialProjectTrust = await page.evaluate(async (path) => {
+  const bridge = globalThis.__TAURI_INTERNALS__;
+  await bridge.invoke("fs_set_workspace_root", { path });
+  return bridge.invoke("project_trust_status");
+}, trustWorkspace);
+if (
+  initialProjectTrust?.state !== "unknown" ||
+  initialProjectTrust?.projectFeaturesEnabled !== false ||
+  initialProjectTrust?.mutationsAllowed !== false
+) {
+  throw new Error(
+    `fresh workspace trust did not fail closed: ${JSON.stringify(initialProjectTrust)}`,
+  );
+}
+
+const trustDialog = page.getByRole("dialog", {
+  name: /Fais-tu confiance à/i,
+});
+await trustDialog.waitFor({ state: "visible", timeout: 10_000 });
+await page.waitForFunction(
+  () =>
+    document.activeElement?.textContent
+      ?.trim()
+      .startsWith("Ouvrir en lecture seule") === true,
+);
+await auditVisibleControls("project-trust-unknown");
+await auditTextContrast("project-trust-unknown");
+await page.screenshot({ path: `${outDir}/00a-project-trust-unknown.png` });
+
+await page
+  .getByRole("button", { name: /Ouvrir en lecture seule/i })
+  .click();
+await trustDialog.waitFor({ state: "detached" });
+const readOnlyProjectTrust = await page.evaluate(() =>
+  globalThis.__TAURI_INTERNALS__.invoke("project_trust_status"),
+);
+if (
+  readOnlyProjectTrust?.state !== "readOnly" ||
+  readOnlyProjectTrust?.projectFeaturesEnabled !== false ||
+  readOnlyProjectTrust?.mutationsAllowed !== false
+) {
+  throw new Error(
+    `read-only workspace trust is inconsistent: ${JSON.stringify(readOnlyProjectTrust)}`,
+  );
+}
+
+const readOnlyBadge = page.getByRole("button", { name: /Lecture seule/i }).first();
+await readOnlyBadge.waitFor({ state: "visible" });
+await readOnlyBadge.click();
+await page
+  .getByRole("dialog", { name: /Faire confiance à ce projet/i })
+  .getByRole("button", { name: /^Faire confiance$/i })
+  .click();
+await page
+  .getByRole("button", { name: /Projet approuvé/i })
+  .first()
+  .waitFor({ state: "visible" });
+const trustedProject = await page.evaluate(() =>
+  globalThis.__TAURI_INTERNALS__.invoke("project_trust_status"),
+);
+if (
+  trustedProject?.state !== "trusted" ||
+  trustedProject?.projectFeaturesEnabled !== true ||
+  trustedProject?.mutationsAllowed !== true
+) {
+  throw new Error(
+    `trusted workspace state is inconsistent: ${JSON.stringify(trustedProject)}`,
+  );
+}
+await page.screenshot({ path: `${outDir}/00b-project-trust-approved.png` });
 
 // Exercise real navigation and the profile selector. Full Access itself stays
 // outside automation because its OS-native confirmation must remain human-only.

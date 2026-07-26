@@ -134,6 +134,7 @@ pub struct PluginSummary {
     pub author: Option<String>,
     pub source: String,
     pub enabled: bool,
+    pub blocked_by_trust: bool,
     pub commands: usize,
     pub agents: usize,
     pub skills: usize,
@@ -395,9 +396,31 @@ pub(crate) fn filter_disabled(plugins: Vec<Plugin>, disabled: &[String]) -> Vec<
         .collect()
 }
 
+/// Retire les contributions appartenant au workspace tant que son chemin
+/// canonique n'a pas été approuvé. Les plugins utilisateur/cache restent actifs.
+pub(crate) fn filter_project_trust(plugins: Vec<Plugin>, allow_project: bool) -> Vec<Plugin> {
+    plugins
+        .into_iter()
+        .filter(|plugin| allow_project || plugin.source != PluginSource::Project)
+        .collect()
+}
+
+pub(crate) fn enabled_plugins_with_project_trust(
+    app: &AppHandle,
+    workspace: Option<&Path>,
+    allow_project: bool,
+) -> Vec<Plugin> {
+    filter_disabled(
+        filter_project_trust(discover_plugins(workspace), allow_project),
+        &disabled_plugin_ids(app),
+    )
+}
+
 /// Plugins ACTIFS (pour les contributions en boucle).
 pub(crate) fn enabled_plugins(app: &AppHandle, workspace: Option<&Path>) -> Vec<Plugin> {
-    filter_disabled(discover_plugins(workspace), &disabled_plugin_ids(app))
+    let allow_project =
+        workspace.is_some_and(|root| crate::commands::project_trust::is_trusted(app, root));
+    enabled_plugins_with_project_trust(app, workspace, allow_project)
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -534,9 +557,12 @@ pub(crate) fn plugin_hooks(plugin: &Plugin) -> Vec<HookDef> {
     )
 }
 
-/// Hooks de TOUS les plugins actifs (pour le merge dans `load_all_hooks`).
-pub(crate) fn enabled_plugins_hooks(app: &AppHandle, workspace: Option<&Path>) -> Vec<HookDef> {
-    enabled_plugins(app, workspace)
+pub(crate) fn enabled_plugins_hooks_with_project_trust(
+    app: &AppHandle,
+    workspace: Option<&Path>,
+    allow_project: bool,
+) -> Vec<HookDef> {
+    enabled_plugins_with_project_trust(app, workspace, allow_project)
         .iter()
         .flat_map(plugin_hooks)
         .collect()
@@ -590,8 +616,18 @@ pub(crate) fn enabled_plugins_mcp_servers(
     app: &AppHandle,
     workspace: Option<&Path>,
 ) -> Vec<(String, String, McpServerConfig)> {
+    let allow_project =
+        workspace.is_some_and(|root| crate::commands::project_trust::is_trusted(app, root));
+    enabled_plugins_mcp_servers_with_project_trust(app, workspace, allow_project)
+}
+
+pub(crate) fn enabled_plugins_mcp_servers_with_project_trust(
+    app: &AppHandle,
+    workspace: Option<&Path>,
+    allow_project: bool,
+) -> Vec<(String, String, McpServerConfig)> {
     let mut out = Vec::new();
-    for plugin in enabled_plugins(app, workspace) {
+    for plugin in enabled_plugins_with_project_trust(app, workspace, allow_project) {
         let path = plugin.root.join(".mcp.json");
         let Ok(raw) = std::fs::read_to_string(&path) else {
             continue;
@@ -643,16 +679,13 @@ pub(crate) fn select_approved(
         .collect()
 }
 
-/// Serveurs MCP de plugins APPROUVÉS (et dont la commande n'a pas changé),
-/// prêts à être fusionnés dans la config MCP effective sous le nom
-/// `<plugin>-<server>`. Appelé par `mcp::load_merged_config` — jamais avant
-/// l'approbation explicite.
-pub(crate) fn approved_plugin_mcp_servers(
+pub(crate) fn approved_plugin_mcp_servers_with_project_trust(
     app: &AppHandle,
     workspace: Option<&Path>,
+    allow_project: bool,
 ) -> Vec<(String, McpServerConfig)> {
     select_approved(
-        enabled_plugins_mcp_servers(app, workspace),
+        enabled_plugins_mcp_servers_with_project_trust(app, workspace, allow_project),
         &approved_mcp_keys(app),
     )
 }
@@ -692,7 +725,11 @@ pub async fn plugins_list(app: AppHandle) -> Result<Vec<PluginSummary>, String> 
     Ok(plugins
         .into_iter()
         .map(|p| {
-            let enabled = !disabled.contains(&p.id());
+            let blocked_by_trust = p.source == PluginSource::Project
+                && ws
+                    .as_deref()
+                    .is_none_or(|root| !crate::commands::project_trust::is_trusted(&app, root));
+            let enabled = !disabled.contains(&p.id()) && !blocked_by_trust;
             let (commands, agents, skills, hooks_n, mcp_pending) = if enabled {
                 let cmds = plugin_commands(&p).len();
                 let agts = plugin_agents(&p).len();
@@ -729,6 +766,7 @@ pub async fn plugins_list(app: AppHandle) -> Result<Vec<PluginSummary>, String> 
                 author: p.author,
                 source: p.source.as_str().to_string(),
                 enabled,
+                blocked_by_trust,
                 commands,
                 agents,
                 skills,
@@ -985,6 +1023,33 @@ mod tests {
         let active = filter_disabled(all, &["project:super-plugin".to_string()]);
         assert!(active.is_empty(), "plugin désactivé = zéro contribution");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn project_trust_filter_keeps_non_project_plugins() {
+        let plugin = |name: &str, source: PluginSource| Plugin {
+            name: name.to_string(),
+            version: None,
+            description: None,
+            author: None,
+            source,
+            root: PathBuf::from(name),
+        };
+        let filtered = filter_project_trust(
+            vec![
+                plugin("user", PluginSource::User),
+                plugin("project", PluginSource::Project),
+                plugin("claude", PluginSource::ClaudeCache),
+            ],
+            false,
+        );
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|plugin| plugin.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user", "claude"]
+        );
     }
 
     #[test]

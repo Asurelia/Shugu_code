@@ -974,6 +974,20 @@ button.studio-file-row:hover { background: rgba(224, 142, 254, 0.1); color: var(
 .studio-tweaks-bd { min-height: 0; flex: 1; }
 .studio-tweaks-empty { margin: 4px 2px; font-size: 12px; color: rgba(41, 38, 27, 0.6); }
 .studio-tweaks-empty code { font-family: var(--font-mono); color: rgba(41, 38, 27, 0.82); }
+
+.studio-preview-trust {
+  align-items: center;
+  color: rgba(41, 38, 27, 0.62);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  justify-content: center;
+  min-height: 280px;
+  padding: 32px;
+  text-align: center;
+}
+.studio-preview-trust strong { color: rgba(41, 38, 27, 0.86); font-size: 13px; }
+.studio-preview-trust span { font-size: 12px; line-height: 1.45; max-width: 300px; }
 .studio-tweak-crow { display: flex; align-items: center; gap: 8px; }
 .studio-tweak-cname {
   flex: 0 0 36%;

@@ -23,6 +23,7 @@ import {
 } from "./chat-sync";
 import { RiskBadge, modeToRisk, toTrustMode } from "@/components/trust";
 import { pushToast } from "@/components/toast";
+import { useProjectTrust } from "@/features/projects/projectTrustQueries";
 
 interface ModeDef {
   id: ChatMode;
@@ -59,8 +60,17 @@ export function ModeSelector({ className = "" }: { className?: string }) {
   const [accessBusy, setAccessBusy] = useState(false);
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLSpanElement | null>(null);
+  const { data: projectTrust } = useProjectTrust();
+  const projectTrustResolved = projectTrust !== undefined;
+  const projectRestricted = projectTrust?.state !== "trusted";
 
   const active = MODES.find((m) => m.id === mode) ?? MODES[2];
+
+  useEffect(() => {
+    if (projectTrustResolved && projectRestricted && (mode === "agent" || mode === "goal")) {
+      setMode("plan");
+    }
+  }, [mode, projectRestricted, projectTrustResolved, setMode]);
 
   // Fermeture au clic-extérieur + Échap (mêmes garanties que ModelPicker).
   useEffect(() => {
@@ -81,10 +91,18 @@ export function ModeSelector({ className = "" }: { className?: string }) {
 
   const pick = useCallback(
     (id: ChatMode) => {
+      if (projectRestricted && (id === "agent" || id === "goal")) {
+        pushToast(
+          "Ce projet est en lecture seule. Approuve-le depuis le badge de confiance pour activer les mutations.",
+          "error",
+          5500,
+        );
+        return;
+      }
       setMode(id);
       setOpen(false);
     },
-    [setMode],
+    [projectRestricted, setMode],
   );
 
   const pickAccess = useCallback(async (profile: AgentAccessProfile) => {
@@ -126,7 +144,14 @@ export function ModeSelector({ className = "" }: { className?: string }) {
               type="button"
               role="menuitemradio"
               aria-checked={m.id === mode}
+              aria-disabled={projectRestricted && (m.id === "agent" || m.id === "goal")}
+              disabled={projectRestricted && (m.id === "agent" || m.id === "goal")}
               className={`model-pop-item mode-item mode-${m.id}` + (m.id === mode ? " on" : "")}
+              title={
+                projectRestricted && (m.id === "agent" || m.id === "goal")
+                  ? "Projet en lecture seule — confiance requise"
+                  : undefined
+              }
               onClick={() => pick(m.id)}
             >
               <Icon name={m.icon} size={15} />
@@ -155,7 +180,7 @@ export function ModeSelector({ className = "" }: { className?: string }) {
                   type="button"
                   role="menuitemradio"
                   aria-checked={profile.id === access}
-                  disabled={accessBusy}
+                  disabled={accessBusy || projectRestricted}
                   className={`model-pop-item mode-item mode-agent${profile.id === access ? " on" : ""}`}
                   onClick={() => { void pickAccess(profile.id); }}
                 >

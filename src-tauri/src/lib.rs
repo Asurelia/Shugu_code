@@ -672,6 +672,12 @@ CREATE INDEX IF NOT EXISTS idx_bg_processes_run
 // PK (pattern, scope) : un même motif peut exister en global ET en projet.
 // L'ancienne table est copiée puis supprimée (source unique).
 const MIGRATION_V28: &str = "
+CREATE TABLE IF NOT EXISTS agent_command_rules (
+  pattern    TEXT PRIMARY KEY,
+  verdict    TEXT NOT NULL,
+  detail     TEXT,
+  created_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS agent_permission_rules (
   pattern    TEXT    NOT NULL,
   decision   TEXT    NOT NULL CHECK (decision IN ('allow', 'ask', 'deny')),
@@ -693,6 +699,17 @@ const MIGRATION_V29: &str = "
 ALTER TABLE agent_interactions ADD COLUMN permission_consumed_at INTEGER;
 CREATE INDEX IF NOT EXISTS idx_agent_interactions_permission_once
   ON agent_interactions(continuation_agent_id, permission_consumed_at, answered_at);
+";
+
+// V30 — confiance explicite par workspace canonique. L'absence de ligne vaut
+// `unknown` et échoue fermé : règles, hooks, skills, plugins et définitions
+// d'agents appartenant au projet ne sont actifs qu'après décision `trusted`.
+const MIGRATION_V30: &str = "
+CREATE TABLE IF NOT EXISTS project_trust (
+  root_path  TEXT PRIMARY KEY,
+  state      TEXT    NOT NULL CHECK (state IN ('read_only', 'trusted')),
+  updated_at INTEGER NOT NULL
+);
 ";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -870,6 +887,12 @@ pub fn run() {
             version: 29,
             description: "permission_once_consumption",
             sql: MIGRATION_V29,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 30,
+            description: "project_trust",
+            sql: MIGRATION_V30,
             kind: MigrationKind::Up,
         },
     ];
@@ -1189,6 +1212,9 @@ pub fn run() {
             commands::conversations::conversation_fork_at,
             commands::snapshot::shugu_snapshot_preview,
             commands::snapshot::shugu_snapshot_rewind,
+            // P6.14 — confiance explicite du workspace courant.
+            commands::project_trust::project_trust_status,
+            commands::project_trust::project_trust_set,
             // P6.4 — hooks de cycle de vie utilisateur (Settings « Hooks »).
             commands::agents::hooks::hooks_list,
             commands::agents::hooks::hooks_set_disabled,
@@ -1375,6 +1401,7 @@ pub fn run() {
 mod migration_tests {
     use super::{
         MIGRATION_V24, MIGRATION_V25, MIGRATION_V26, MIGRATION_V27, MIGRATION_V28, MIGRATION_V29,
+        MIGRATION_V30,
     };
     use rusqlite::{params, Connection};
 
@@ -1622,6 +1649,36 @@ mod migration_tests {
     }
 
     #[test]
+    fn v28_succeeds_on_a_fresh_database_without_legacy_rules() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATION_V28).unwrap();
+
+        let permission_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type='table' AND name='agent_permission_rules'
+                )",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let legacy_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type='table' AND name='agent_command_rules'
+                )",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        assert!(permission_exists);
+        assert!(!legacy_exists);
+    }
+
+    #[test]
     fn v29_adds_single_use_permission_consumption() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -1645,5 +1702,30 @@ mod migration_tests {
             )
             .unwrap();
         assert!(has_column);
+    }
+
+    #[test]
+    fn v30_creates_project_trust_with_fail_closed_states() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATION_V30).unwrap();
+        conn.execute(
+            "INSERT INTO project_trust (root_path, state, updated_at)
+             VALUES ('C:/Dev/project', 'trusted', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE project_trust SET state='read_only', updated_at=2
+             WHERE root_path='C:/Dev/project'",
+            [],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "INSERT INTO project_trust (root_path, state, updated_at)
+                 VALUES ('C:/Dev/other', 'unknown', 1)",
+                [],
+            )
+            .is_err());
     }
 }

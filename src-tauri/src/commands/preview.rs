@@ -205,6 +205,13 @@ pub fn serve(app: &AppHandle, raw_path: &str) -> Response<Cow<'static, [u8]>> {
             None => return not_found(),
         }
     };
+    if !crate::commands::project_trust::is_trusted(app, &root) {
+        return if is_index_request {
+            empty_preview()
+        } else {
+            not_found()
+        };
+    }
 
     let mut base = root;
     for part in PREVIEW_SUBDIR.split('/') {
@@ -224,11 +231,20 @@ pub fn serve(app: &AppHandle, raw_path: &str) -> Response<Cow<'static, [u8]>> {
         }
     }
 
-    if is_index_request && !target.is_file() {
-        empty_preview()
-    } else {
-        read_and_respond(&target)
+    let canonical_base = match std::fs::canonicalize(&base) {
+        Ok(path) => path,
+        Err(_) if is_index_request => return empty_preview(),
+        Err(_) => return not_found(),
+    };
+    let canonical_target = match std::fs::canonicalize(&target) {
+        Ok(path) => path,
+        Err(_) if is_index_request => return empty_preview(),
+        Err(_) => return not_found(),
+    };
+    if !canonical_target.starts_with(&canonical_base) || !canonical_target.is_file() {
+        return not_found();
     }
+    read_and_respond(&canonical_target)
 }
 
 /// Serve a file from an Atelier run's throwaway creation dir: `rest` is
@@ -248,8 +264,9 @@ fn serve_atelier(rest: &str) -> Response<Cow<'static, [u8]>> {
     let sub = it.next().unwrap_or("");
     let sub = if sub.is_empty() { "index.html" } else { sub };
 
-    let mut target = std::env::temp_dir();
-    target.push(format!("shugu-atelier-{agent_id}"));
+    let mut base = std::env::temp_dir();
+    base.push(format!("shugu-atelier-{agent_id}"));
+    let mut target = base.clone();
     for comp in std::path::Path::new(sub).components() {
         match comp {
             Component::Normal(c) => target.push(c),
@@ -258,7 +275,16 @@ fn serve_atelier(rest: &str) -> Response<Cow<'static, [u8]>> {
         }
     }
 
-    read_and_respond(&target)
+    let Ok(canonical_base) = std::fs::canonicalize(&base) else {
+        return not_found();
+    };
+    let Ok(canonical_target) = std::fs::canonicalize(&target) else {
+        return not_found();
+    };
+    if !canonical_target.starts_with(&canonical_base) || !canonical_target.is_file() {
+        return not_found();
+    }
+    read_and_respond(&canonical_target)
 }
 
 /// Read `target` and build the HTTP response: HTML gets the Studio controller

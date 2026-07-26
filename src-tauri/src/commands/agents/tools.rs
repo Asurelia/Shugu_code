@@ -1064,6 +1064,7 @@ pub(super) fn execute_tool(
     last_exec_exit: &AtomicI64,
     agent_id: &str,
     execution_profile: super::policy::ExecutionProfile,
+    allow_project_config: bool,
 ) -> ToolResult {
     if !super::execution_profile_authorized(app, execution_profile) {
         return ToolResult {
@@ -1094,6 +1095,7 @@ pub(super) fn execute_tool(
         last_exec_exit,
         agent_id,
         execution_profile,
+        allow_project_config,
     ) {
         Ok(content) => ToolResult {
             id: call.id.clone(),
@@ -1248,6 +1250,7 @@ fn dispatch_inner(
     last_exec_exit: &AtomicI64,
     agent_id: &str,
     execution_profile: super::policy::ExecutionProfile,
+    allow_project_config: bool,
 ) -> Result<String, String> {
     let args: serde_json::Value =
         serde_json::from_str(&call.arguments).map_err(|e| format!("argument parse error: {e}"))?;
@@ -1710,7 +1713,12 @@ fn dispatch_inner(
             let name = args["name"]
                 .as_str()
                 .ok_or_else(|| "missing required field: name".to_string())?;
-            super::file_skills::load_body(app, Some(root), name)
+            super::file_skills::load_body_with_project_trust(
+                app,
+                Some(root),
+                name,
+                allow_project_config,
+            )
         }
         // NB : `ask_user` / `submit_plan` NE sont PAS dispatchés ici — ils passent
         // par `execute_hitl_tool` (chemin séquentiel du runner, pré-gate workspace),

@@ -64,6 +64,10 @@ use tokio::sync::mpsc;
 
 /// Une session LSP active : process + canal d'écriture stdin + handle de kill.
 pub struct LspSession {
+    /// Racine canonique à laquelle ce processus est définitivement lié.
+    /// Une session ne doit jamais survivre à un changement/révocation de
+    /// workspace, y compris si son spawn termine après l'invalidation.
+    workspace_root: PathBuf,
     /// Canal vers la task qui sérialise les messages sur stdin.
     /// Drop ce sender → la task termine, stdin se ferme, le LSP server voit
     /// EOF (mécanisme de fin propre alternatif à `shutdown` JSON-RPC).
@@ -494,8 +498,11 @@ async fn spawn_session(
     args: Vec<String>,
     lang_id: String,
     app: AppHandle,
+    workspace_root: PathBuf,
 ) -> Result<LspSession, String> {
-    spawn_session_opt(binary, args, lang_id, Some(app)).await
+    let mut session = spawn_session_opt(binary, args, lang_id, Some(app)).await?;
+    session.workspace_root = workspace_root;
+    Ok(session)
 }
 
 /// Variante testable : `app` optionnelle — sans elle, la reader task route
@@ -623,6 +630,7 @@ async fn spawn_session_opt(
     });
 
     Ok(LspSession {
+        workspace_root: PathBuf::new(),
         stdin_tx,
         child: Mutex::new(Some(child)),
         router,
@@ -632,6 +640,29 @@ async fn spawn_session_opt(
         initialize_lock: tokio::sync::Mutex::new(()),
         documents: Mutex::new(HashMap::new()),
     })
+}
+
+fn session_for_workspace(
+    registry: &LspServerRegistry,
+    lang_id: &str,
+    workspace_root: &std::path::Path,
+) -> Result<Option<Arc<LspSession>>, String> {
+    let stale = {
+        let mut guard = registry
+            .0
+            .lock()
+            .map_err(|e| format!("registry lock: {e}"))?;
+        if let Some(session) = guard.get(lang_id) {
+            if session.workspace_root == workspace_root {
+                return Ok(Some(session.clone()));
+            }
+        }
+        guard.remove(lang_id)
+    };
+    if let Some(session) = stale {
+        session.force_kill();
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -650,26 +681,20 @@ pub async fn lsp_init(
 ) -> Result<LspInitResult, String> {
     // Récupère le workspace_uri d'abord — il est requis dans tous les cas
     // (renvoyé même si la session existe déjà).
-    let workspace_root: std::path::PathBuf = {
-        let ws_state = app.state::<std::sync::Mutex<Option<std::path::PathBuf>>>();
-        let guard = ws_state
-            .lock()
-            .map_err(|e| format!("workspace lock: {e}"))?;
-        guard.clone().ok_or("no workspace open")?
-    };
+    let workspace_root = crate::commands::project_trust::require_trusted_workspace(&app)?;
     let workspace_uri = path_to_file_uri(&workspace_root);
 
     // Check existing session (lock + early return).
     {
-        let guard = state.0.lock().map_err(|e| format!("registry lock: {e}"))?;
-        if guard.contains_key(&args.lang_id) {
+        crate::commands::project_trust::require_current_trusted_root(&app, &workspace_root)?;
+        if session_for_workspace(&state, &args.lang_id, &workspace_root)?.is_some() {
             return Ok(LspInitResult { workspace_uri });
         }
     }
     let _start_guard = LSP_START_LOCK.lock().await;
     {
-        let guard = state.0.lock().map_err(|e| format!("registry lock: {e}"))?;
-        if guard.contains_key(&args.lang_id) {
+        crate::commands::project_trust::require_current_trusted_root(&app, &workspace_root)?;
+        if session_for_workspace(&state, &args.lang_id, &workspace_root)?.is_some() {
             return Ok(LspInitResult { workspace_uri });
         }
     }
@@ -685,12 +710,43 @@ pub async fn lsp_init(
         )
     })?;
 
-    let session = spawn_session(path, bin_args, args.lang_id.clone(), app).await?;
+    crate::commands::project_trust::require_current_trusted_root(&app, &workspace_root)?;
+    let session = spawn_session(
+        path,
+        bin_args,
+        args.lang_id.clone(),
+        app.clone(),
+        workspace_root.clone(),
+    )
+    .await?;
+    if let Err(error) =
+        crate::commands::project_trust::require_current_trusted_root(&app, &workspace_root)
+    {
+        session.force_kill();
+        return Err(error);
+    }
 
     // Le verrou de création couvre le second check + spawn + insertion :
     // aucune session concurrente n'est créée puis écrasée.
-    let mut guard = state.0.lock().map_err(|e| format!("registry lock: {e}"))?;
-    guard.insert(args.lang_id, Arc::new(session));
+    let session = Arc::new(session);
+    {
+        let mut guard = state.0.lock().map_err(|e| format!("registry lock: {e}"))?;
+        guard.insert(args.lang_id.clone(), session.clone());
+    }
+    if let Err(error) =
+        crate::commands::project_trust::require_current_trusted_root(&app, &workspace_root)
+    {
+        if let Ok(mut guard) = state.0.lock() {
+            if guard
+                .get(&args.lang_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &session))
+            {
+                guard.remove(&args.lang_id);
+            }
+        }
+        session.force_kill();
+        return Err(error);
+    }
     Ok(LspInitResult { workspace_uri })
 }
 
@@ -752,14 +808,20 @@ fn observe_outgoing_message(session: &LspSession, message: &str) {
 
 #[tauri::command]
 pub fn lsp_send(
+    app: AppHandle,
     state: State<'_, LspServerRegistry>,
     lang_id: String,
     message: String,
 ) -> Result<(), String> {
+    let workspace_root = crate::commands::project_trust::require_trusted_workspace(&app)?;
+    crate::commands::project_trust::require_current_trusted_root(&app, &workspace_root)?;
     let guard = state.0.lock().map_err(|e| format!("registry lock: {e}"))?;
     let session = guard
         .get(&lang_id)
         .ok_or_else(|| format!("no LSP session for '{lang_id}' (call lsp_init first)"))?;
+    if session.workspace_root != workspace_root {
+        return Err("LSP session belongs to a different workspace".to_string());
+    }
     session
         .stdin_tx
         .send(message.clone())
@@ -821,47 +883,63 @@ async fn ensure_session(
     app: &AppHandle,
     lang_id: &str,
 ) -> Result<std::sync::Arc<LspSession>, String> {
+    let workspace_root = crate::commands::project_trust::require_trusted_workspace(app)?;
     {
+        crate::commands::project_trust::require_current_trusted_root(app, &workspace_root)?;
         let state = app.state::<LspServerRegistry>();
-        let guard = state.0.lock().map_err(|e| format!("registry lock: {e}"))?;
-        if let Some(session) = guard.get(lang_id) {
-            return Ok(session.clone());
+        if let Some(session) = session_for_workspace(&state, lang_id, &workspace_root)? {
+            return Ok(session);
         }
     }
     let _start_guard = LSP_START_LOCK.lock().await;
     {
+        crate::commands::project_trust::require_current_trusted_root(app, &workspace_root)?;
         let state = app.state::<LspServerRegistry>();
-        let guard = state.0.lock().map_err(|e| format!("registry lock: {e}"))?;
-        if let Some(session) = guard.get(lang_id) {
-            return Ok(session.clone());
+        if let Some(session) = session_for_workspace(&state, lang_id, &workspace_root)? {
+            return Ok(session);
         }
     }
-    let workspace_root: std::path::PathBuf = {
-        let ws_state = app.state::<std::sync::Mutex<Option<std::path::PathBuf>>>();
-        let guard = ws_state
-            .lock()
-            .map_err(|e| format!("workspace lock: {e}"))?;
-        guard.clone().ok_or("no workspace open")?
-    };
     let (path, bin_args) = resolve_lsp_binary(lang_id, &workspace_root).ok_or_else(|| {
         format!(
             "pas de serveur LSP pour « {lang_id} » (binaire non installé —              typescript-language-server via npm, rust-analyzer via rustup, pylsp via pip)"
         )
     })?;
-    let session = spawn_session(path, bin_args, lang_id.to_string(), app.clone()).await?;
+    crate::commands::project_trust::require_current_trusted_root(app, &workspace_root)?;
+    let session = spawn_session(
+        path,
+        bin_args,
+        lang_id.to_string(),
+        app.clone(),
+        workspace_root.clone(),
+    )
+    .await?;
+    if let Err(error) =
+        crate::commands::project_trust::require_current_trusted_root(app, &workspace_root)
+    {
+        session.force_kill();
+        return Err(error);
+    }
     let session = std::sync::Arc::new(session);
     let state = app.state::<LspServerRegistry>();
-    let mut guard = state.0.lock().map_err(|e| format!("registry lock: {e}"))?;
-    guard.insert(lang_id.to_string(), session.clone());
+    {
+        let mut guard = state.0.lock().map_err(|e| format!("registry lock: {e}"))?;
+        guard.insert(lang_id.to_string(), session.clone());
+    }
+    if let Err(error) =
+        crate::commands::project_trust::require_current_trusted_root(app, &workspace_root)
+    {
+        if let Ok(mut guard) = state.0.lock() {
+            if guard
+                .get(lang_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &session))
+            {
+                guard.remove(lang_id);
+            }
+        }
+        session.force_kill();
+        return Err(error);
+    }
     Ok(session)
-}
-
-fn workspace_root_required(app: &AppHandle) -> Result<std::path::PathBuf, String> {
-    let ws_state = app.state::<std::sync::Mutex<Option<std::path::PathBuf>>>();
-    let guard = ws_state
-        .lock()
-        .map_err(|e| format!("workspace lock: {e}"))?;
-    guard.clone().ok_or("no workspace open".to_string())
 }
 
 /// Handshake LSP une fois par session (lazy, au premier besoin agent).
@@ -990,7 +1068,7 @@ pub(crate) async fn agent_lsp_open_document(
     language: &str,
 ) -> Result<(), String> {
     let session = ensure_session(app, lang_id).await?;
-    let ws_uri = path_to_file_uri(&workspace_root_required(app)?);
+    let ws_uri = path_to_file_uri(&session.workspace_root);
     ensure_initialized(&ws_uri, &session).await?;
     agent_lsp_open_document_on_session(&session, uri, text, language).await
 }
@@ -1004,7 +1082,7 @@ pub(crate) async fn agent_lsp_request(
     timeout: std::time::Duration,
 ) -> Result<serde_json::Value, String> {
     let session = ensure_session(app, lang_id).await?;
-    let uri = path_to_file_uri(&workspace_root_required(app)?);
+    let uri = path_to_file_uri(&session.workspace_root);
     ensure_initialized(&uri, &session).await?;
     agent_lsp_request_inner(&session, method, params, timeout).await
 }
@@ -1071,7 +1149,7 @@ pub(crate) async fn agent_lsp_diagnostics(
     timeout: std::time::Duration,
 ) -> Result<Vec<serde_json::Value>, String> {
     let session = ensure_session(app, lang_id).await?;
-    let ws_uri = path_to_file_uri(&workspace_root_required(app)?);
+    let ws_uri = path_to_file_uri(&session.workspace_root);
     ensure_initialized(&ws_uri, &session).await?;
     agent_lsp_diagnostics_on_session(&session, uri, text, language, timeout).await
 }

@@ -1509,6 +1509,28 @@ async fn run_chat_tool_loop(
     // (text-only) when none is open, but a tool call reports the missing
     // workspace to the model rather than touching the filesystem.
     let root = get_workspace_root(app);
+    let allow_project_config = root
+        .as_deref()
+        .is_some_and(|path| crate::commands::project_trust::is_trusted(app, path));
+    let ensure_workspace_binding = || -> Result<(), String> {
+        if let Some(expected) = root.as_deref() {
+            if get_workspace_root(app).as_deref() != Some(expected) {
+                return Err(
+                    "Le workspace ouvert a changé pendant le chat outillé ; exécution interrompue."
+                        .to_string(),
+                );
+            }
+            if (write_enabled || allow_project_config)
+                && !crate::commands::project_trust::is_trusted(app, expected)
+            {
+                return Err(
+                    "La confiance du projet a été révoquée ; aucun nouvel outil ne sera exécuté."
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    };
 
     // Project the flat chat history into the richer AgentMessage form so we can
     // append assistant-tool-call + tool-result turns as the loop progresses.
@@ -1559,6 +1581,7 @@ async fn run_chat_tool_loop(
     }
 
     for iter in 0..CHAT_TOOL_MAX_ITERS {
+        ensure_workspace_binding()?;
         // The last allowed iteration forces a final text answer (no tools), the
         // same termination guarantee as `runner::tool_use_loop`'s last round.
         let last_iteration = iter == CHAT_TOOL_MAX_ITERS - 1;
@@ -1576,7 +1599,14 @@ async fn run_chat_tool_loop(
                 _ => chat_tools_json_openai(write_enabled),
             };
             let mgr = app.state::<crate::commands::mcp::McpManager>();
-            let mcp_tools = crate::commands::mcp::enabled_tools_json(app, &mgr, protocol).await;
+            let mcp_tools = crate::commands::mcp::enabled_tools_json_for_workspace(
+                app,
+                &mgr,
+                protocol,
+                root.as_deref(),
+                allow_project_config,
+            )
+            .await;
             if let Some(a) = arr.as_array_mut() {
                 a.extend(mcp_tools);
             }
@@ -1654,6 +1684,7 @@ async fn run_chat_tool_loop(
             }
             other => return Err(format!("chat tool loop: unsupported protocol {other}")),
         };
+        ensure_workspace_binding()?;
 
         // The turn's stream is over — flush the buffered tail BEFORE the final
         // answer / tool-activity deltas below so the streamed text always lands
@@ -1713,6 +1744,7 @@ async fn run_chat_tool_loop(
         // Execute each tool call, emitting a visibility delta first.
         let mut results: Vec<ToolResult> = Vec::new();
         for tc in &turn.tool_calls {
+            ensure_workspace_binding()?;
             let args: serde_json::Value =
                 serde_json::from_str(&tc.arguments).unwrap_or_else(|_| serde_json::json!({}));
 
@@ -1798,7 +1830,15 @@ async fn run_chat_tool_loop(
                 }
             } else if tc.name.starts_with("mcp__") {
                 let mgr = app.state::<crate::commands::mcp::McpManager>();
-                crate::commands::mcp::mcp_execute(app, &mgr, &tc.name, &args).await
+                crate::commands::mcp::mcp_execute_for_workspace(
+                    app,
+                    &mgr,
+                    &tc.name,
+                    &args,
+                    root.as_deref(),
+                    allow_project_config,
+                )
+                .await
             } else {
                 // Outils fs : exécutés contre le vrai workspace (ou erreur si aucun).
                 match &root {
@@ -2190,6 +2230,9 @@ pub async fn chat_send(
 
     let result: Result<String, String> = if use_tool_loop {
         let write_enabled = write_tools == Some(true);
+        if write_enabled {
+            crate::commands::project_trust::require_trusted_workspace(&app)?;
+        }
         let key = resolve_key(protocol_str, &api_key)?;
         run_chat_tool_loop(
             &app,

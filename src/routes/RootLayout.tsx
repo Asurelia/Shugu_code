@@ -58,6 +58,8 @@ import { queryClient } from "@/lib/queryClient";
 import { fsKeys } from "@/features/fs/keys";
 import { gitKeys } from "@/features/git/keys";
 import { projectKeys } from "@/features/projects/keys";
+import { ProjectTrustGate } from "@/features/projects/ProjectTrustGate";
+import { useProjectTrustEvents } from "@/features/projects/projectTrustQueries";
 import { useFsEvents } from "@/features/fs/useEvents";
 import { useGitEvents } from "@/features/git/useEvents";
 import { useRefreshOpenFiles } from "@/features/fs/useRefreshOpenFiles";
@@ -384,6 +386,7 @@ export function RootLayout() {
   // Plus de store Zustand custom, plus de applyEvent manuel. Le freeze
   // diagnostiqué dans Plan v2 est résolu par cette migration architecturale.
   useAgentEvents();
+  useProjectTrustEvents();
   // Chat events : invalide useMessages quand un message est appendé OU
   // quand un agent complete (le delegate flow appende sa réponse alors).
   useChatEvents();
@@ -680,6 +683,10 @@ export function RootLayout() {
   }, []);
 
   useEffect(() => {
+    // Le smoke natif valide le shell/IPC dans un profil jetable et mesure un
+    // budget mémoire de boot. Lancer fastembed sur son minuscule workspace
+    // fausserait cette mesure (l'indexeur possède ses propres tests dédiés).
+    if (import.meta.env.VITE_SHUGU_NATIVE_SMOKE === "1") return;
     const t = setTimeout(() => { void indexWorkspace(); }, 5000);
     // Ré-index quand l'utilisateur OUVRE UN AUTRE dossier sans relancer l'app
     // (Rust émet `workspace://changed` depuis fs_open_folder). L'indexeur est
@@ -1502,6 +1509,7 @@ export function RootLayout() {
           open={notifOpen}
           onClose={() => setNotifOpen(false)}
         />
+        <ProjectTrustGate />
         {/* FloatChat moved to the dedicated mascot window (src/mascot.tsx) —
             the chibi now lives in its own transparent Tauri window instead
             of being embedded in the IDE. pinnedAnno will flow to the mascot

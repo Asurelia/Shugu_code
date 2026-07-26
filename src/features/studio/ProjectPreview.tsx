@@ -20,6 +20,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "@/components/components";
+import { useProjectTrust } from "@/features/projects/projectTrustQueries";
 import type { SelectedElement } from "./studioChat";
 import {
   TWEAKS_STYLE,
@@ -96,9 +97,23 @@ export function ProjectPreview({
   const [overrides, setOverrides] = useState<Record<string, string>>({});
   const frameRef = useRef<HTMLIFrameElement>(null);
   const origin = previewOrigin();
+  const { data: projectTrust } = useProjectTrust();
+  const trusted = projectTrust?.state === "trusted";
+
+  // Révocation = déchargement immédiat du document généré. Bloquer uniquement
+  // les requêtes suivantes côté protocole ne suffit pas : un iframe déjà chargé
+  // peut encore exécuter ses timers et ses accès réseau.
+  useEffect(() => {
+    if (trusted) return;
+    setSelecting(false);
+    setTweaking(false);
+    setTokens([]);
+    setOverrides({});
+  }, [trusted]);
 
   // Live reload on any workspace write (the agent writes preview files).
   useEffect(() => {
+    if (!trusted) return;
     let unlisten: (() => void) | null = null;
     void (async () => {
       try {
@@ -109,7 +124,7 @@ export function ProjectPreview({
       }
     })();
     return () => unlisten?.();
-  }, []);
+  }, [trusted]);
 
   // Messages coming back from the injected controller (selections + tokens).
   useEffect(() => {
@@ -134,6 +149,7 @@ export function ProjectPreview({
   // Target the preview's own origin (not "*") so messages are only ever
   // delivered to the generated page, never any other embedded content.
   const post = (msg: Record<string, unknown>) => {
+    if (!trusted) return;
     frameRef.current?.contentWindow?.postMessage(msg, origin);
   };
 
@@ -181,6 +197,7 @@ export function ProjectPreview({
         <button
           className={"lgb lgb-sm" + (tweaking ? " studio-select-on" : "")}
           onClick={toggleTweaks}
+          disabled={!trusted}
           title="Ajuster les couleurs et tokens en live"
         >
           <Icon name="palette" size={12} /> Tweaks
@@ -188,6 +205,7 @@ export function ProjectPreview({
         <button
           className={"lgb lgb-sm" + (selecting ? " studio-select-on" : "")}
           onClick={toggleSelect}
+          disabled={!trusted}
           title="Sélectionner un élément à modifier"
         >
           <Icon name="sparkle" size={12} /> {selecting ? "Clique un élément…" : "Sélectionner"}
@@ -198,13 +216,14 @@ export function ProjectPreview({
               key={d}
               className={"studio-device-btn" + (device === d ? " is-active" : "")}
               onClick={() => setDevice(d)}
+              disabled={!trusted}
               title={`Aperçu ${DEVICE_LABEL[d]}${DEVICE_WIDTH[d] ? ` (${DEVICE_WIDTH[d]}px)` : ""}`}
             >
               {DEVICE_LABEL[d]}
             </button>
           ))}
         </div>
-        <button className="lgb lgb-sm" onClick={() => setNonce((n) => n + 1)} title="Recharger l'aperçu">
+        <button className="lgb lgb-sm" disabled={!trusted} onClick={() => setNonce((n) => n + 1)} title="Recharger l'aperçu">
           <Icon name="history" size={12} /> Recharger
         </button>
       </div>
@@ -286,24 +305,32 @@ export function ProjectPreview({
       )}
 
       <div className={"studio-preview-stage" + (device !== "full" ? " is-framed" : "")}>
-        <iframe
-          key={src}
-          ref={frameRef}
-          className="studio-preview-frame"
-          style={w ? { width: w, maxWidth: "100%" } : undefined}
-          src={src}
-          onLoad={() => {
-            if (selecting) sendMode(true);
-            // New document → previous inline overrides are gone; re-sync from
-            // the freshly loaded page so the panel shows the real current values.
-            if (tweaking) {
-              setOverrides({});
-              requestTokens();
-            }
-          }}
-          title="Aperçu du projet généré"
-          sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups"
-        />
+        {trusted ? (
+          <iframe
+            key={src}
+            ref={frameRef}
+            className="studio-preview-frame"
+            style={w ? { width: w, maxWidth: "100%" } : undefined}
+            src={src}
+            onLoad={() => {
+              if (selecting) sendMode(true);
+              // New document → previous inline overrides are gone; re-sync from
+              // the freshly loaded page so the panel shows the real current values.
+              if (tweaking) {
+                setOverrides({});
+                requestTokens();
+              }
+            }}
+            title="Aperçu du projet généré"
+            sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups"
+          />
+        ) : (
+          <div className="studio-preview-trust" role="status">
+            <Icon name="shield" size={18} />
+            <strong>Aperçu suspendu</strong>
+            <span>Approuve ce projet pour charger et exécuter son aperçu.</span>
+          </div>
+        )}
       </div>
     </div>
   );

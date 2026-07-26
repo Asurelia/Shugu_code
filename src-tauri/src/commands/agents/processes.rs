@@ -890,6 +890,63 @@ pub(crate) fn kill_run_all(app: &AppHandle, agent_id: &str) {
     }
 }
 
+/// Tue les processus persistants dont le cwd appartient à un workspace.
+/// Contrairement aux sessions (liées à la vie du run), `run_background` peut
+/// légitimement survivre à une fin normale ; une révocation ou un changement
+/// de projet doit toutefois l'arrêter immédiatement.
+pub(crate) fn kill_workspace_backgrounds(app: &AppHandle, workspace_root: &Path) {
+    let canonical_root =
+        std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    let rows: Vec<BackgroundRow> = super::get_conn(app)
+        .ok()
+        .and_then(|m| {
+            let conn = m.lock().ok()?;
+            let mut stmt = conn
+                .prepare(&format!("{BG_SELECT} WHERE status = 'running'"))
+                .ok()?;
+            let rows = stmt
+                .query_map([], row_to_bg)
+                .ok()?
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?;
+            Some(rows)
+        })
+        .unwrap_or_default();
+
+    let victims: Vec<(String, Arc<BackgroundProc>)> = {
+        let registry = app.state::<BackgroundRegistry>();
+        let Ok(map) = registry.0.lock() else {
+            return;
+        };
+        rows.into_iter()
+            .filter(|row| {
+                let cwd = std::path::PathBuf::from(&row.cwd);
+                let canonical_cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+                canonical_cwd.starts_with(&canonical_root)
+            })
+            .filter_map(|row| map.get(&row.id).cloned().map(|proc| (row.id, proc)))
+            .collect()
+    };
+
+    for (id, proc) in victims {
+        proc.terminate();
+        proc.exited.store(-1, Ordering::SeqCst);
+        let tail = proc
+            .buf
+            .lock()
+            .map(|buffer| buffer.tail(OUTPUT_SNAPSHOT_CAP))
+            .unwrap_or_default();
+        if let Ok(conn_mutex) = super::get_conn(app) {
+            if let Ok(conn) = conn_mutex.lock() {
+                let _ = finish_bg_on_conn(&conn, &id, "killed", Some(-1), &tail, super::now_ms());
+            }
+        }
+        if let Ok(mut map) = app.state::<BackgroundRegistry>().0.lock() {
+            map.remove(&id);
+        }
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Commandes Tauri (AgentsPanel « Terminaux »)
 // ────────────────────────────────────────────────────────────────────────

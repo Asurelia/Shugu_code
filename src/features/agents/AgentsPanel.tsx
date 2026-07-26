@@ -57,6 +57,7 @@ import { agentProcessList, agentProcessOutput, agentProcessStop, type Background
 import { processStatusLabel, processStatusTone, sessionStatusLabel, formatTail } from "./processesUtils";
 import { fileSkillSourceLabel } from "@/features/settings/pluginsUtils";
 import { buildAgentTree } from "./fanout";
+import { useProjectTrust } from "@/features/projects/projectTrustQueries";
 import "./agents-knowledge.css";
 
 // Resolve the active model → provider routing (protocol / baseUrl / key), exactly
@@ -1199,6 +1200,8 @@ function WorktreeIsolationSection({
 
 export function AgentsPanel() {
   const { data: agents = [], isLoading } = useActiveAgents();
+  const { data: projectTrust } = useProjectTrust();
+  const projectRestricted = projectTrust?.state !== "trusted";
   // selectedId est globalement géré via TanStack (queryKey ["agents","selected"])
   // pour permettre à RootLayout de set la sélection depuis le listener
   // `app://reveal-agent` (clic sur "via Orchestrateur" chip dans le chat).
@@ -1292,7 +1295,7 @@ export function AgentsPanel() {
   // Lance réellement le Grounded Run (après confirmation si nécessaire).
   const doLaunchGrounded = async () => {
     const t = groundedTask.trim();
-    if (!t || groundedLaunching || !execReady) return;
+    if (!t || groundedLaunching || !execReady || projectRestricted) return;
     setGroundedLaunching(true);
     setGroundedErr(null);
     try {
@@ -1319,7 +1322,7 @@ export function AgentsPanel() {
   // sinon on lance directement.
   const requestLaunchGrounded = () => {
     const t = groundedTask.trim();
-    if (!t || groundedLaunching || !execReady) return;
+    if (!t || groundedLaunching || !execReady || projectRestricted) return;
     if (!safetyNetOk) {
       setConfirmRiskyRun(true);
       return;
@@ -1510,9 +1513,13 @@ export function AgentsPanel() {
           <button
             type="button"
             onClick={requestLaunchGrounded}
-            disabled={groundedLaunching || !groundedTask.trim() || !execReady}
+            disabled={
+              groundedLaunching || !groundedTask.trim() || !execReady || projectRestricted
+            }
             title={
-              !execReady
+              projectRestricted
+                ? "Projet en lecture seule — approuve-le depuis le badge de confiance"
+                : !execReady
                 ? execCap?.warning ?? "Ouvre un dossier d'abord"
                 : safetyNetOk
                   ? "Lancer un Grounded Run sur le projet ouvert"
@@ -1529,8 +1536,13 @@ export function AgentsPanel() {
               color: "var(--danger, #ff6a8a)",
               border: "1px solid rgba(255, 106, 138, 0.45)",
               cursor:
-                groundedLaunching || !groundedTask.trim() || !execReady ? "default" : "pointer",
-              opacity: groundedLaunching || !groundedTask.trim() || !execReady ? 0.5 : 1,
+                groundedLaunching || !groundedTask.trim() || !execReady || projectRestricted
+                  ? "default"
+                  : "pointer",
+              opacity:
+                groundedLaunching || !groundedTask.trim() || !execReady || projectRestricted
+                  ? 0.5
+                  : 1,
               fontFamily: "inherit",
             }}
           >

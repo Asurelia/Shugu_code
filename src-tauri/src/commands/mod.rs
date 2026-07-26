@@ -30,6 +30,7 @@ pub mod models;
 pub mod music;
 pub mod pathutil;
 pub mod preview;
+pub mod project_trust;
 pub mod search;
 pub mod snapshot;
 pub mod storage;

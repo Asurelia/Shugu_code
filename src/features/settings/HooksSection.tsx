@@ -23,6 +23,7 @@ import {
   hookSourceLabel,
 } from "./hooksUtils";
 import { pushToast } from "@/components/toast";
+import { listen } from "@/lib/tauri";
 
 const TONE_COLORS: Record<string, { fg: string; bg: string; border: string }> = {
   success: { fg: "var(--success, #8aefc7)", bg: "rgba(138,239,199,0.10)", border: "rgba(138,239,199,0.32)" },
@@ -231,6 +232,21 @@ export function HooksSection() {
 
   useEffect(() => {
     void refresh();
+  }, [refresh]);
+
+  useEffect(() => {
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+    const retain = (unlisten: () => void) => {
+      if (disposed) unlisten();
+      else unlisteners.push(unlisten);
+    };
+    void listen("workspace://changed", refresh).then(retain).catch(() => {});
+    void listen("workspace://trust-changed", refresh).then(retain).catch(() => {});
+    return () => {
+      disposed = true;
+      unlisteners.forEach((unlisten) => unlisten());
+    };
   }, [refresh]);
 
   const toggle = async (id: string, disabled: boolean) => {

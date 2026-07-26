@@ -17,6 +17,7 @@ const plugin = (over: Partial<PluginSummary>): PluginSummary => ({
   author: null,
   source: "project",
   enabled: true,
+  blockedByTrust: false,
   commands: 0,
   agents: 0,
   skills: 0,

@@ -410,6 +410,14 @@ pub async fn agent_def_list(app: AppHandle, scope: String) -> Result<Vec<AgentDe
         other => return Err(format!("scope invalide: {other}")),
     };
     for s in scopes {
+        if s == "workspace" {
+            let Some(root) = workspace_root(&app) else {
+                continue;
+            };
+            if !crate::commands::project_trust::is_trusted(&app, &root) {
+                continue;
+            }
+        }
         // workspace peut ne pas exister (aucun workspace ouvert) : on saute.
         let dir = match claude_agents_dir(&app, s) {
             Ok(p) => p,
@@ -475,6 +483,13 @@ fn resolve_allowed_agent_path(
     };
 
     for scope in ["global", "workspace"] {
+        if scope == "workspace"
+            && workspace_root(app)
+                .as_deref()
+                .is_none_or(|root| !crate::commands::project_trust::is_trusted(app, root))
+        {
+            continue;
+        }
         let Ok(dir) = claude_agents_dir(app, scope) else {
             continue;
         };
@@ -505,7 +520,13 @@ fn resolve_allowed_agent_path(
         );
     }
     let ws = workspace_root(app);
-    for plugin in crate::commands::agents::plugins::discover_plugins(ws.as_deref()) {
+    let allow_project = ws
+        .as_deref()
+        .is_some_and(|root| crate::commands::project_trust::is_trusted(app, root));
+    for plugin in crate::commands::agents::plugins::filter_project_trust(
+        crate::commands::agents::plugins::discover_plugins(ws.as_deref()),
+        allow_project,
+    ) {
         let dir = plugin.root.join("agents");
         let Ok(dir) = std::fs::canonicalize(dir) else {
             continue;
@@ -530,6 +551,9 @@ pub async fn agent_def_read(app: AppHandle, path: String) -> Result<AgentDef, St
 /// laisse un fichier tronqué (Claude Code refuserait un frontmatter incomplet).
 #[tauri::command]
 pub async fn agent_def_write(app: AppHandle, def: AgentDef) -> Result<String, String> {
+    if def.scope == "workspace" {
+        crate::commands::project_trust::require_trusted_workspace(&app)?;
+    }
     ensure_dirs_and_link(&app, &def.scope)?;
     let dir = claude_agents_dir(&app, &def.scope)?;
     let safe_name: String = def

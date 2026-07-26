@@ -27,7 +27,7 @@
 //! at the SSE chunk boundary (typically 10-50 ms latency).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::params;
@@ -672,6 +672,8 @@ async fn maybe_compact<F, Fut>(
     window: usize,
     execution_profile: ExecutionProfile,
     workspace_root: Option<&std::path::Path>,
+    trust_root: Option<&std::path::Path>,
+    allow_project_config: bool,
     summarise: F,
 ) -> bool
 where
@@ -698,7 +700,18 @@ where
     // de threader hook_defs depuis la boucle).
     if super::hooks::hooks_enabled_for_profile(execution_profile) {
         if let Some(ws) = workspace_root {
-            let defs = super::hooks::load_hooks(app, Some(ws));
+            if enforce_run_workspace_binding(
+                app,
+                agent_id,
+                trust_root,
+                !execution_profile.is_read_only() || allow_project_config,
+            )
+            .is_err()
+            {
+                return false;
+            }
+            let defs =
+                super::hooks::load_hooks_with_project_trust(app, Some(ws), allow_project_config);
             if !defs.is_empty() {
                 let payload = super::hooks::build_payload(
                     super::hooks::HookEvent::PreCompact,
@@ -718,6 +731,7 @@ where
                     execution_profile,
                     agent_id,
                     None,
+                    trust_root,
                 )
                 .await;
                 for ctx in fire.contexts {
@@ -1152,6 +1166,32 @@ pub(crate) fn get_workspace_root(app: &AppHandle) -> Option<PathBuf> {
     guard.clone()
 }
 
+fn enforce_run_workspace_binding(
+    app: &AppHandle,
+    agent_id: &str,
+    trust_root: Option<&Path>,
+    requires_trust: bool,
+) -> Result<(), String> {
+    let Some(expected) = trust_root else {
+        return Ok(());
+    };
+    if get_workspace_root(app).as_deref() != Some(expected) {
+        super::processes::kill_run_all(app, agent_id);
+        return Err(
+            "Le workspace ouvert a changé pendant le run ; exécution interrompue avant tout nouvel outil."
+                .to_string(),
+        );
+    }
+    if requires_trust && !crate::commands::project_trust::is_trusted(app, expected) {
+        super::processes::kill_run_all(app, agent_id);
+        return Err(
+            "La confiance de ce projet a été révoquée pendant le run ; exécution interrompue."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Run task (top-level entry)
 // ────────────────────────────────────────────────────────────────────
@@ -1177,6 +1217,9 @@ pub(super) async fn run_agent_task(
     // Atelier : quand `Some`, l'agent travaille dans CE dossier (temp de
     // création) au lieu du workspace ouvert. `None` = workspace réel.
     workspace_override: Option<PathBuf>,
+    // Racine utilisateur canonique capturée par la commande AVANT toute
+    // transaction/setup. Empêche un clic lancé sur A de démarrer sur B.
+    expected_workspace_root: Option<PathBuf>,
     system_prompt_override: Option<String>,
     execution_profile: ExecutionProfile,
     // Mémoire de conversation : quand `Some(id)`, on recharge les tours
@@ -1209,6 +1252,25 @@ pub(super) async fn run_agent_task(
     let mut system_prompt =
         system_prompt_override.unwrap_or_else(|| super::prompts::seed_prompt(&role));
     let read_only = execution_profile.is_read_only();
+    let internal_workspace_override = workspace_override.is_some();
+    let trust_root = if internal_workspace_override {
+        None
+    } else {
+        expected_workspace_root
+    };
+    let allow_project_config = internal_workspace_override
+        || trust_root
+            .as_deref()
+            .is_some_and(|root| crate::commands::project_trust::is_trusted(&app, root));
+    if let Err(error) = enforce_run_workspace_binding(
+        &app,
+        &agent_id,
+        trust_root.as_deref(),
+        !read_only || allow_project_config,
+    ) {
+        finish_error(&app, &state, &agent_id, &error);
+        return;
+    }
     // Phase A (Design Studio) — when the Studio passes a design-system context,
     // append GENERATION MODE so the agent writes a complete styled project to
     // `.shugu-forge/preview/` (served live by the preview:// protocol). Chat
@@ -1299,11 +1361,20 @@ pub(super) async fn run_agent_task(
     // `iso_root`/`iso_entry` carry the merge-back context
     // to `finalize_isolation` after the run; they stay `None` when we didn't
     // isolate, so the finalize step is a no-op on every existing path.
+    // La confiance porte sur le workspace OUVERT, pas sur un éventuel worktree
+    // isolé créé plus bas. Les overrides internes (Atelier/Studio) sont générés
+    // par Shugu et n'activent aucune configuration d'un projet utilisateur.
     let mut workspace_override = workspace_override;
     let mut iso_root: Option<PathBuf> = None;
     let mut iso_entry: Option<crate::commands::worktree::WorktreeEntry> = None;
     if isolate && workspace_override.is_none() && !read_only {
-        if let Some(root) = get_workspace_root(&app) {
+        if let Err(error) =
+            enforce_run_workspace_binding(&app, &agent_id, trust_root.as_deref(), true)
+        {
+            finish_error(&app, &state, &agent_id, &error);
+            return;
+        }
+        if let Some(root) = trust_root.clone() {
             if root.join(".git").exists() {
                 match crate::commands::worktree::create_inner(&root, None, Some(&role)).await {
                     Ok(entry) => {
@@ -1395,7 +1466,13 @@ pub(super) async fn run_agent_task(
     // `shugu_snapshot_list`, annulable via `shugu_snapshot_revert` (turn_id =
     // agent_id).
     if workspace_override.is_none() && !read_only {
-        if let Some(root) = get_workspace_root(&app) {
+        if let Err(error) =
+            enforce_run_workspace_binding(&app, &agent_id, trust_root.as_deref(), true)
+        {
+            finish_error(&app, &state, &agent_id, &error);
+            return;
+        }
+        if let Some(root) = trust_root.clone() {
             if root.join(".git").exists() {
                 match crate::commands::snapshot::checkpoint_inner(&root, &agent_id).await {
                     Ok(snap) => eprintln!(
@@ -1412,9 +1489,7 @@ pub(super) async fn run_agent_task(
     // body (`tool_use_loop`) calls the LLM, executes tools, appends to
     // history, repeats. The abort branch wins if the user kills the
     // agent mid-flight.
-    let memory_workspace_root = workspace_override
-        .clone()
-        .or_else(|| get_workspace_root(&app));
+    let memory_workspace_root = workspace_override.clone().or_else(|| trust_root.clone());
     let memory_workspace_id = memory_workspace_root
         .as_deref()
         .map(crate::commands::vector::workspace_id);
@@ -1433,6 +1508,8 @@ pub(super) async fn run_agent_task(
             &mut history,
             &mut loop_metrics,
             workspace_override.clone(),
+            trust_root.clone(),
+            allow_project_config,
             execution_profile,
             advisor.as_ref(),
             conversation_id.as_deref(),
@@ -1899,6 +1976,9 @@ async fn run_delegated_children_parallel(
     depth: u32,
     tasks: Vec<(String, String)>, // (tool_call_id, child_task)
     execution_profile: ExecutionProfile,
+    workspace_root: Option<PathBuf>,
+    trust_root: Option<PathBuf>,
+    allow_project_config: bool,
 ) -> Vec<(String, (String, bool))> {
     let lease = match acquire_fanout_lease(app, parent_id, tasks.len()) {
         Ok(lease) => lease,
@@ -1929,6 +2009,8 @@ async fn run_delegated_children_parallel(
             );
             let kwargs_c = kwargs.clone();
             let parent_c = parent_id.clone();
+            let workspace_root_c = workspace_root.clone();
+            let trust_root_c = trust_root.clone();
             move || {
                 let tc_id = tc_id.clone();
                 async move {
@@ -1944,6 +2026,9 @@ async fn run_delegated_children_parallel(
                         depth,
                         task,
                         execution_profile,
+                        workspace_root_c,
+                        trust_root_c,
+                        allow_project_config,
                     )
                     .await;
                     let outcome = match res {
@@ -2040,6 +2125,9 @@ pub(super) async fn run_delegated_child(
     depth: u32,
     task: String,
     execution_profile: ExecutionProfile,
+    workspace_root: Option<PathBuf>,
+    trust_root: Option<PathBuf>,
+    allow_project_config: bool,
 ) -> Result<String, String> {
     let start = std::time::Instant::now();
     let child_id = uuid::Uuid::new_v4().to_string();
@@ -2107,8 +2195,8 @@ pub(super) async fn run_delegated_child(
     // (doctrine single-writer). Pour les FAITS du handoff, on capture le statut
     // git AVANT le sous-run ; le delta après coup liste les chemins réellement
     // touchés pendant le run (vérité-terrain non falsifiable par la prose).
-    let workspace_override: Option<PathBuf> = None;
-    let ws_root = get_workspace_root(app);
+    let workspace_override = workspace_root.clone();
+    let ws_root = workspace_root;
     let dirty_before: std::collections::HashSet<String> = match ws_root.as_ref() {
         Some(root) if root.join(".git").exists() => crate::commands::worktree::dirty_paths(root)
             .await
@@ -2148,6 +2236,8 @@ pub(super) async fn run_delegated_child(
             &mut history,
             &mut metrics,
             workspace_override.clone(),
+            trust_root,
+            allow_project_config,
             execution_profile,
             None, // advisor : pas de conseiller imbriqué en v1
             None, // conversation_id : contexte vierge
@@ -2399,6 +2489,12 @@ pub(super) async fn tool_use_loop(
     // open workspace (the Atelier's throwaway creation dir). `None` = the
     // real open workspace.
     workspace_override: Option<PathBuf>,
+    // Workspace utilisateur dont la décision de confiance gouverne le run.
+    // `None` désigne un workspace interne généré par Shugu.
+    trust_root: Option<PathBuf>,
+    // Décision figée pour la découverte de configuration de ce run. La
+    // révocation des MUTATIONS est, elle, revérifiée à chaque itération.
+    allow_project_config: bool,
     execution_profile: ExecutionProfile,
     // Modèle conseiller distinct pour l'outil `advisor` (v2). `None` ⇒ le
     // conseiller est le modèle de l'exécuteur (auto-consultation).
@@ -2413,9 +2509,7 @@ pub(super) async fn tool_use_loop(
     definition_tools: Option<&[String]>,
 ) -> Result<(String, String, RunUsageTotals), String> {
     let read_only = execution_profile.is_read_only();
-    let memory_workspace_root = workspace_override
-        .clone()
-        .or_else(|| get_workspace_root(app));
+    let memory_workspace_root = workspace_override.clone().or_else(|| trust_root.clone());
     let memory_workspace_id = memory_workspace_root
         .as_deref()
         .map(crate::commands::vector::workspace_id);
@@ -2459,8 +2553,11 @@ pub(super) async fn tool_use_loop(
     // fichier gagne, l'apprise reste en DB sans être double-injectée). Le
     // listing fichier (name + description SEULEMENT) est injecté ensuite : le
     // corps se charge paresseusement via l'outil `skill_load`.
-    let file_skills =
-        super::file_skills::discover_file_skills(app, memory_workspace_root.as_deref());
+    let file_skills = super::file_skills::discover_file_skills_with_project_trust(
+        app,
+        memory_workspace_root.as_deref(),
+        allow_project_config,
+    );
     let file_skill_names: std::collections::HashSet<String> =
         file_skills.iter().map(|s| s.name.clone()).collect();
     let skills_block =
@@ -2593,7 +2690,26 @@ pub(super) async fn tool_use_loop(
             super::tools::tools_json_openai()
         };
         let mgr = app.state::<crate::commands::mcp::McpManager>();
-        let mcp_tools = crate::commands::mcp::enabled_tools_json(app, &mgr, protocol).await;
+        enforce_run_workspace_binding(
+            app,
+            agent_id,
+            trust_root.as_deref(),
+            !read_only || allow_project_config,
+        )?;
+        let mcp_tools = crate::commands::mcp::enabled_tools_json_for_workspace(
+            app,
+            &mgr,
+            protocol,
+            memory_workspace_root.as_deref(),
+            allow_project_config,
+        )
+        .await;
+        enforce_run_workspace_binding(
+            app,
+            agent_id,
+            trust_root.as_deref(),
+            !read_only || allow_project_config,
+        )?;
         if let Some(a) = arr.as_array_mut() {
             a.extend(mcp_tools);
         }
@@ -2721,12 +2837,10 @@ pub(super) async fn tool_use_loop(
     // delegation depth. This prevents prompt/tool drift: the model sees the
     // exact names present in this request, plus bounded rules from the effective
     // workspace (isolated worktree when applicable).
-    let context_root = workspace_override
-        .clone()
-        .or_else(|| get_workspace_root(app));
+    let context_root = workspace_override.clone().or_else(|| trust_root.clone());
     let project_context = context_root
         .as_deref()
-        .map(|root| super::project_context::load(root, &task_text))
+        .map(|root| super::project_context::load_if_trusted(root, &task_text, allow_project_config))
         .unwrap_or_default();
     let runtime_prompt = super::prompts::compose_runtime(
         role,
@@ -2782,9 +2896,19 @@ pub(super) async fn tool_use_loop(
     // P6.4 — hooks de cycle de vie utilisateur. Chargés UNE fois par run,
     // UNIQUEMENT en profil mutant (Chat/Plan ⇒ zéro processus hook) et avec un
     // workspace ouvert (le hook a besoin d'un cwd + d'un dossier payload).
+    enforce_run_workspace_binding(
+        app,
+        agent_id,
+        trust_root.as_deref(),
+        !read_only || allow_project_config,
+    )?;
     let hook_defs: Vec<super::hooks::HookDef> =
         if super::hooks::hooks_enabled_for_profile(execution_profile) {
-            super::hooks::load_hooks(app, context_root.as_deref())
+            super::hooks::load_hooks_with_project_trust(
+                app,
+                context_root.as_deref(),
+                allow_project_config,
+            )
         } else {
             Vec::new()
         };
@@ -2794,6 +2918,12 @@ pub(super) async fn tool_use_loop(
                 super::hooks::HookEvent::SessionStart,
                 super::hooks::HookEvent::UserPromptSubmit,
             ] {
+                enforce_run_workspace_binding(
+                    app,
+                    agent_id,
+                    trust_root.as_deref(),
+                    !read_only || allow_project_config,
+                )?;
                 let payload = super::hooks::build_payload(
                     event,
                     agent_id,
@@ -2812,6 +2942,7 @@ pub(super) async fn tool_use_loop(
                     execution_profile,
                     agent_id,
                     None,
+                    trust_root.as_deref(),
                 )
                 .await;
                 for ctx in fire.contexts {
@@ -2840,6 +2971,18 @@ pub(super) async fn tool_use_loop(
 
     while iteration < budget {
         metrics.iterations = iteration + 1;
+
+        // Le run reste lié au workspace canonique capturé au départ. Une
+        // révocation, ou un switch vers un autre dossier, coupe la boucle avant
+        // le prochain appel provider. Un run read-only qui n'a chargé AUCUNE
+        // configuration projet peut continuer sans confiance, mais jamais sur
+        // une autre racine.
+        enforce_run_workspace_binding(
+            app,
+            agent_id,
+            trust_root.as_deref(),
+            !read_only || allow_project_config,
+        )?;
 
         // ── 0b. Follow-ups « steer » (P6.1) — messages de l'utilisateur envoyés
         //        PENDANT le run, drainés ICI, au point sûr entre deux tours
@@ -2911,6 +3054,8 @@ pub(super) async fn tool_use_loop(
             context_window,
             execution_profile,
             context_root.as_deref(),
+            trust_root.as_deref(),
+            allow_project_config,
             |excerpt| {
                 summarise_turns(
                     client,
@@ -2924,6 +3069,12 @@ pub(super) async fn tool_use_loop(
             },
         )
         .await;
+        enforce_run_workspace_binding(
+            app,
+            agent_id,
+            trust_root.as_deref(),
+            !read_only || allow_project_config,
+        )?;
 
         // ── 1. Call the LLM with the current history + tools manifest ──
         let forced_tool = if iteration > 0 {
@@ -2957,6 +3108,15 @@ pub(super) async fn tool_use_loop(
             forced_tool,
         )
         .await?;
+
+        // La décision peut changer PENDANT l'appel provider. Revérifier ici
+        // garantit qu'aucun PreToolUse ni outil du tour reçu ne part ensuite.
+        enforce_run_workspace_binding(
+            app,
+            agent_id,
+            trust_root.as_deref(),
+            !read_only || allow_project_config,
+        )?;
 
         // ── 2. Persist Message event for this assistant turn ───────────
         let _ = persist_and_emit(
@@ -3029,6 +3189,7 @@ pub(super) async fn tool_use_loop(
                                 execution_profile,
                                 agent_id,
                                 None,
+                                trust_root.as_deref(),
                             )
                             .await;
                             if let Some(reason) = fire.blocked_reason {
@@ -3217,7 +3378,7 @@ pub(super) async fn tool_use_loop(
             if let Some(ws) = workspace_override
                 .as_ref()
                 .cloned()
-                .or_else(|| get_workspace_root(app))
+                .or_else(|| trust_root.clone())
                 .as_deref()
             {
                 let ws = ws.to_path_buf();
@@ -3245,6 +3406,7 @@ pub(super) async fn tool_use_loop(
                         execution_profile,
                         agent_id,
                         Some(&tc.name),
+                        trust_root.as_deref(),
                     )
                     .await;
                     if let Some(reason) = fire.blocked_reason {
@@ -3258,7 +3420,7 @@ pub(super) async fn tool_use_loop(
         let workspace_root = workspace_override
             .as_ref()
             .cloned()
-            .or_else(|| get_workspace_root(app));
+            .or_else(|| trust_root.clone());
         // A prompt can request plan-first behaviour, but only the dispatcher
         // can guarantee it. Until `todo_write` has succeeded in an earlier
         // round, every mutation-capable tool is refused before touching disk or
@@ -3365,6 +3527,9 @@ Livrable attendu : {expected}"
                     depth + 1,
                     prepared,
                     execution_profile,
+                    workspace_root.clone(),
+                    trust_root.clone(),
+                    allow_project_config,
                 )
                 .await;
                 for (tc_id, outcome) in outcomes {
@@ -3377,6 +3542,20 @@ Livrable attendu : {expected}"
             let mgr = app.state::<crate::commands::mcp::McpManager>();
             let mut acc: Vec<ToolResult> = Vec::with_capacity(turn.tool_calls.len());
             for tc in &turn.tool_calls {
+                if let Err(content) = enforce_run_workspace_binding(
+                    app,
+                    agent_id,
+                    trust_root.as_deref(),
+                    !read_only || allow_project_config,
+                ) {
+                    acc.push(ToolResult {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        is_error: true,
+                        content,
+                    });
+                    continue;
+                }
                 if !definition_allows_tool(definition_tools, &tc.name) {
                     acc.push(ToolResult {
                         id: tc.id.clone(),
@@ -3663,6 +3842,9 @@ Livrable attendu : {expected}"
                                     depth + 1,
                                     child_task,
                                     execution_profile,
+                                    workspace_root.clone(),
+                                    trust_root.clone(),
+                                    allow_project_config,
                                 ))
                                 .await;
                                 drop(lease);
@@ -3739,8 +3921,15 @@ Livrable attendu : {expected}"
                     // args become `{}` so the call stays well-formed.
                     let args: serde_json::Value =
                         serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
-                    let (content, is_error) =
-                        crate::commands::mcp::mcp_execute(app, &mgr, &tc.name, &args).await;
+                    let (content, is_error) = crate::commands::mcp::mcp_execute_for_workspace(
+                        app,
+                        &mgr,
+                        &tc.name,
+                        &args,
+                        workspace_root.as_deref(),
+                        allow_project_config,
+                    )
+                    .await;
                     acc.push(ToolResult {
                         id: tc.id.clone(),
                         name: tc.name.clone(),
@@ -3773,6 +3962,7 @@ Livrable attendu : {expected}"
                             &last_exec_clone,
                             &agent_id_clone,
                             profile,
+                            allow_project_config,
                         )
                     })
                     .await
@@ -3826,7 +4016,22 @@ Livrable attendu : {expected}"
                 let last_exec_clone = last_exec_exit.clone();
                 let agent_id_clone = agent_id.to_string();
                 let profile = execution_profile;
+                let trust_root_clone = trust_root.clone();
+                let requires_project_trust = !read_only || allow_project_config;
                 async move {
+                    if let Err(content) = enforce_run_workspace_binding(
+                        &app_clone,
+                        &agent_id_clone,
+                        trust_root_clone.as_deref(),
+                        requires_project_trust,
+                    ) {
+                        return ToolResult {
+                            id: fallback_id,
+                            name: fallback_name,
+                            is_error: true,
+                            content,
+                        };
+                    }
                     if profile_blocked || definition_blocked {
                         return ToolResult {
                             id: fallback_id,
@@ -3900,6 +4105,7 @@ Livrable attendu : {expected}"
                             &last_exec_clone,
                             &agent_id_clone,
                             profile,
+                            allow_project_config,
                         )
                     })
                     .await
@@ -3988,6 +4194,7 @@ Livrable attendu : {expected}"
                         execution_profile,
                         agent_id,
                         Some(&tc.name),
+                        trust_root.as_deref(),
                     )
                     .await;
                     for ctx in fire.contexts {

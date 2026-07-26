@@ -509,11 +509,26 @@ fn apply_workspace_root(
     let display = super::pathutil::strip_extended_prefix(canonical.clone())
         .to_string_lossy()
         .to_string();
-    {
+    let previous_root = {
         let mut guard = root_state
             .lock()
             .map_err(|e| format!("workspace state lock: {e}"))?;
+        let previous = guard.clone();
         *guard = Some(canonical.clone());
+        previous
+    };
+
+    // Les processus dont la configuration appartenait à l'ancien projet ne
+    // doivent jamais survivre au changement de racine. L'état est remplacé
+    // AVANT l'invalidation : toute connexion concurrente voit déjà la nouvelle
+    // racine, et la génération MCP empêche une insertion tardive.
+    let lsp = app.state::<crate::commands::lsp::LspServerRegistry>();
+    crate::commands::lsp::kill_all(&lsp);
+    crate::commands::mcp::invalidate_connections(app);
+    if previous_root.as_deref() != Some(canonical.as_path()) {
+        if let Some(previous_root) = previous_root.as_deref() {
+            crate::commands::agents::processes::kill_workspace_backgrounds(app, previous_root);
+        }
     }
 
     // Persist to settings table (best-effort — don't fail the command on DB error).

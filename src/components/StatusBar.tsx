@@ -19,6 +19,7 @@ import { useAgentsRailDisplay } from "@/features/agents/queries";
 import { useChatBusy } from "@/features/chat/chatBusy";
 import { useIndexingState } from "@/features/fs/indexingStore";
 import { useUnreadNotificationCount } from "@/components/notifications";
+import { ProjectTrustBadge } from "@/features/projects/ProjectTrustGate";
 
 function basename(p: string | null | undefined): string | null {
   if (!p) return null;
@@ -40,6 +41,7 @@ export function ShellStatusExtras() {
 
   return (
     <>
+      <ProjectTrustBadge />
       {running > 0 && (
         <button
           type="button"

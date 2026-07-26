@@ -1,6 +1,6 @@
 # Shugu — plan de viabilisation complet
 
-État de référence : 25 juillet 2026. Ce document décrit le produit local Tauri,
+État de référence : 26 juillet 2026. Ce document décrit le produit local Tauri,
 pas la branche distante. SQLite reste la source de vérité et aucun écran ne doit
 annoncer une capacité que le backend n'applique pas.
 
@@ -54,17 +54,18 @@ annoncer une capacité que le backend n'applique pas.
 | P6.11 | Sub-agents en fan-out parallèle | Validé | Délégations multiples du même tour exécutées après gates permission/hook, en parallèle borné avec réservations atomiques multi-parents (cap global 4, délégation imbriquée sans deadlock), wall-time ≈ max(latences) prouvé, résultats dans l'ordre, erreurs honnêtes, cascade kill BFS sans zombie, arbre parent↔enfants dans AgentsPanel ; 5 tests Rust + 4 Vitest verts. |
 | P6.12 | Outils LSP pour agents | Validé | `lsp_diagnostics`/`definition`/`references` au manifest en effet `shared_read`, confinement workspace et résultats bornés ; session unique par langue, IDs agent négatifs sans collision éditeur, handshake partagé/serialisé, `didOpen` puis `didChange` versionné, diagnostics diffusés à tous les waiters ; mock LSP strict + fixture TS, 13 tests Rust verts. |
 | P6.13 | Auto-update | À faire | Vérification au boot + dialog natif ; sans certificat, mode notifier + télécharger seulement. |
-| P6.14 | Refonte UX/UI (analyse Claude/OpenCode/Cursor) | À faire | **Tranche 1 : confiance projet** avant activation des règles/hooks/plugins projet, avec choix lecture seule/faire confiance et état visible ; puis système de motion, tokens hairline/ring/opacités, sidebar groupée + non-lus, palette Ctrl+K, cartes d'outils + divider checkpoint, virtualisation, anti-flash ; périmètre : `docs/competitor-ux-2026-07-24.md`. |
+| P6.14 | Refonte UX/UI (analyse Claude/OpenCode/Cursor) | Partiel | **Tranche 1 validée : confiance projet** persistée par chemin canonique, décision obligatoire lecture seule/faire confiance, badges visibles et révocation. La racine affichée, approuvée et exécutée est liée de bout en bout ; backend fail-closed pour règles, hooks, skills, plugins, MCP, LSP, formatage, preview, chat historique et agents projet. Switch/révocation coupent outils, hooks, connexions, LSP, iframes et processus persistants avant réutilisation. Restent : système de motion, tokens hairline/ring/opacités, sidebar groupée + non-lus, palette Ctrl+K, cartes d'outils + divider checkpoint, virtualisation, anti-flash ; périmètre : `docs/competitor-ux-2026-07-24.md`. |
 
 > Analyse comparative source : `docs/competitor-parity-2026-07-24.md`
 > (dissection Codex desktop 26.721 / Claude Code 2.1.193, réimplémentation
 > sans reprise de code propriétaire).
 
-> Limite de sûreté encore ouverte : jusqu'à la tranche « confiance projet » de
-> P6.14, l'ouverture volontaire d'un workspace vaut confiance implicite pour ses
-> règles, hooks, skills et plugins. Auto les confine, mais Full Access rend cette
-> hypothèse trop forte ; le gate explicite est donc prioritaire avant la finition
-> visuelle.
+> La confiance projet n'est plus implicite : un workspace inconnu reste en
+> lecture seule et ses règles, hooks, skills, plugins et agents sont neutralisés
+> côté Rust jusqu'à décision explicite. Les configurations MCP, processus LSP,
+> formatteurs et aperçus générés suivent la même frontière. Une révocation ou un
+> changement de racine invalide les ressources déjà ouvertes et interrompt les
+> mutations avant le prochain outil.
 
 ## Contrat produit non négociable
 
@@ -186,23 +187,37 @@ audité ne repose sur une donnée de démonstration ou un contrôle sans effet.
 L'accessibilité critique, le runtime release isolé, la charge
 indexation/streaming et les installateurs sont également prouvés.
 
-## Dernière preuve locale — 25 juillet 2026
+## Dernière preuve locale — 26 juillet 2026
 
 - Reprise du plan Kimi interrompu en P6.12 sur la branche
   `codex/resume-kimi-parity-plan`, sans écraser le worktree existant.
-- Rust : `cargo check` vert et 548 tests `--lib` verts, dont les contrats
+- Rust : `cargo check` vert et 558 tests verts, dont les contrats
   permissions/plugins/hooks/fan-out/LSP/rewind ajoutés pendant la revue
   adversariale. Le loader Windows du harness de test porte désormais le
   manifeste Common Controls v6 requis par Tauri.
-- Frontend : 63 fichiers / 632 tests Vitest, typecheck, ESLint, build Vite et
+- Frontend : 64 fichiers / 634 tests Vitest, typecheck, ESLint, build Vite,
+  Playwright et
   `ui:tour` verts. Le tour headless conserve les captures dans
   `dev-logs/ui-tour/`.
 - Revue sécurité/logic : permissions fail-closed et single-use réellement
   atomiques, fan-out après gates avec réservation globale, approbation MCP liée
   à toute la configuration, background sans orphelin, rewind sans mutation si
   son checkpoint de secours échoue, session LSP partagée sans collision d'ID.
-- Restent à prouver nativement : le toast Windows P6.5, l'auto-update P6.13 et
-  le gate de confiance projet priorisé en première tranche P6.14.
+- Tranche confiance P6.14 : migration V30, décision locale liée au chemin
+  canonique, modale non contournable, badges et révocation ; règles
+  AGENTS/CLAUDE/Cursor/OpenCode, hooks, skills, plugins, MCP, définitions
+  d'agents, LSP, formatage et preview projet neutralisés avant confiance ;
+  Auto/Full Access refusés en lecture seule. Les runs épinglent la racine dès
+  l'IPC, revérifient après chaque attente asynchrone et tuent processus/connexions
+  persistants au switch ou à la révocation.
+- Preuve native isolée :
+  `dev-logs/native-smoke/20260726-032918/` — vraie base SQLite fraîche en
+  schéma 30, décision unknown → lecture seule → approuvée, focus-trap, badges,
+  captures, 12 audits accessibilité/contraste sans violation, aucune erreur
+  page/requête, backup/restauration sur deux boots et budget mémoire WebView2 +
+  Tauri respecté (1 053 569 024 octets).
+- Restent à prouver nativement : le toast Windows P6.5 et l'auto-update P6.13 ;
+  la finition visuelle et les grands parcours de navigation de P6.14 continuent.
 
 ## Preuve locale historique — 23 juillet 2026
 

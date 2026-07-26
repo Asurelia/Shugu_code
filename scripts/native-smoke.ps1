@@ -48,6 +48,7 @@ $saved = @{
   WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
   SHUGU_CDP_URL = $env:SHUGU_CDP_URL
   SHUGU_NATIVE_OUT = $env:SHUGU_NATIVE_OUT
+  VITE_SHUGU_NATIVE_SMOKE = $env:VITE_SHUGU_NATIVE_SMOKE
 }
 $launcher = $null
 $exitCode = 1
@@ -66,6 +67,7 @@ try {
   $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=$cdpPort"
   $env:SHUGU_CDP_URL = "http://127.0.0.1:$cdpPort"
   $env:SHUGU_NATIVE_OUT = $out
+  $env:VITE_SHUGU_NATIVE_SMOKE = "1"
 
   $firstLaunchStarted = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
   $launcher = Start-Process `

@@ -973,20 +973,6 @@ pub(crate) fn get_conn(app: &tauri::AppHandle) -> Result<&'static Mutex<Connecti
         eprintln!("[agents] purged {purged_shots} screenshot row(s) older than 7 days");
     }
 
-    // Phase 2 — table des règles de commande apprises. Auto-migrante côté
-    // backend (CREATE TABLE IF NOT EXISTS) : pas de migration TS à ajouter, la
-    // table existe dès le premier accès agent. PK = pattern (INSERT OR REPLACE
-    // raffine une règle existante).
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS agent_command_rules (
-            pattern    TEXT PRIMARY KEY,
-            verdict    TEXT NOT NULL,
-            detail     TEXT,
-            created_at INTEGER NOT NULL
-        );",
-    )
-    .map_err(|e| format!("create agent_command_rules: {e}"))?;
-
     let _ = AGENTS_CONN.set(Mutex::new(conn));
     AGENTS_CONN
         .get()
@@ -1275,6 +1261,9 @@ pub async fn agent_spawn(
     full_access: State<'_, FullAccessGrant>,
     mut args: SpawnArgs,
 ) -> Result<String, String> {
+    // Épingle la racine dès l'entrée IPC, avant même de charger une définition
+    // d'agent projet. Toute bascule pendant le preflight annule le spawn.
+    let requested_workspace_root = runner::get_workspace_root(&app);
     // Agent custom (`.md` format Claude Code) ? Charge la définition et écrase
     // role/model par ses valeurs. Le body devient le `system_prompt_override`
     // — le runner accepte déjà ce levier ([runner.rs] system_prompt_override).
@@ -1313,6 +1302,24 @@ pub async fn agent_spawn(
         resolve_execution_profile(args.mode.as_deref(), args.execution_profile)?,
         full_access.enabled(),
     )?;
+    let expected_workspace_root = if !execution_profile.is_read_only() {
+        let trusted_root = crate::commands::project_trust::require_trusted_workspace(&app)?;
+        if requested_workspace_root.as_deref() != Some(trusted_root.as_path()) {
+            return Err(
+                "Le workspace ouvert a changé pendant la préparation du run ; relance la tâche."
+                    .to_string(),
+            );
+        }
+        Some(trusted_root)
+    } else {
+        if runner::get_workspace_root(&app) != requested_workspace_root {
+            return Err(
+                "Le workspace ouvert a changé pendant la préparation du run ; relance la tâche."
+                    .to_string(),
+            );
+        }
+        requested_workspace_root
+    };
     require_agent_loop_capability(
         execution_profile,
         args.protocol.as_deref().unwrap_or("openai"),
@@ -1392,7 +1399,7 @@ pub async fn agent_spawn(
                     .conversation_id
                     .as_deref()
                     .ok_or_else(|| "le mode Goal exige une conversation".to_string())?;
-                let workspace_id = runner::get_workspace_root(&app)
+                let workspace_id = expected_workspace_root
                     .as_deref()
                     .map(crate::commands::vector::workspace_id);
                 Some(goals::attach_run_on_conn(
@@ -1513,6 +1520,7 @@ pub async fn agent_spawn(
     let design_context_for_task = args.design_context.clone();
     let system_prompt_override_for_task = system_prompt_override;
     let definition_tools_for_task = definition_tools;
+    let expected_workspace_root_for_task = expected_workspace_root.clone();
     // Exécution DIRECTE par défaut (décision utilisateur 2026-07-02, retour au
     // pivot 2026-06-10 « exec directe + filet git ») : l'agent travaille sur le
     // VRAI checkout, comme Claude Code. L'isolation worktree (Phase 7 #4) reste
@@ -1567,6 +1575,7 @@ pub async fn agent_spawn(
             design_context_for_task,
             abort_token,
             None, // workspace_override — chat works on the real open workspace
+            expected_workspace_root_for_task,
             // Exec directe pour TOUT agent (pivot 2026-06-10) : run_command tourne
             // sur la machine, le filet de sécurité est git (onglet Git de l'app).
             system_prompt_override_for_task, // None ⇒ seed_prompt ; Some ⇒ .md custom
@@ -1930,6 +1939,7 @@ pub async fn agent_atelier_run(
             None, // design_context
             abort_token,
             Some(ws_for_task), // workspace_override — the throwaway creation dir
+            None,              // expected_workspace_root — workspace interne
             Some(prompts::ATELIER_PROMPT.to_string()),
             policy::ExecutionProfile::Auto,
             None,  // conversation_id — l'Atelier n'est pas lié à une conversation
@@ -1993,6 +2003,8 @@ pub async fn agent_grounded_run(
     if crate::commands::fs::restore_workspace_root(&app).is_none() {
         return Err("aucun projet ouvert : ouvre un dossier avant un Grounded Run".to_string());
     }
+    let expected_workspace_root =
+        crate::commands::project_trust::require_trusted_workspace(&app)?;
 
     // Capacity check + handle insertion (same cap as agent_spawn / Atelier).
     let agent_id = Uuid::new_v4().to_string();
@@ -2072,6 +2084,7 @@ pub async fn agent_grounded_run(
     let app_for_task = app.clone();
     let agent_state = state.0.clone();
     let agent_id_for_task = agent_id.clone();
+    let expected_workspace_root_for_task = expected_workspace_root.clone();
     tauri::async_runtime::spawn(async move {
         runner::run_agent_task(
             app_for_task,
@@ -2087,6 +2100,7 @@ pub async fn agent_grounded_run(
             None, // design_context
             abort_token,
             None, // workspace_override — the REAL open workspace
+            Some(expected_workspace_root_for_task),
             Some(system_prompt),
             policy::ExecutionProfile::Auto,
             None, // conversation_id — Grounded Run n'est pas lié à une conversation

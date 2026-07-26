@@ -149,10 +149,20 @@ pub(crate) fn discover_file_skills_in(
 /// Toutes les skills fichiers (découverte complète — projet, utilisateur,
 /// claude, plugins actifs). Ordre = priorité de `skill_load`.
 pub(crate) fn discover_file_skills(app: &AppHandle, workspace: Option<&Path>) -> Vec<FileSkill> {
+    let allow_project =
+        workspace.is_some_and(|root| crate::commands::project_trust::is_trusted(app, root));
+    discover_file_skills_with_project_trust(app, workspace, allow_project)
+}
+
+pub(crate) fn discover_file_skills_with_project_trust(
+    app: &AppHandle,
+    workspace: Option<&Path>,
+    allow_project: bool,
+) -> Vec<FileSkill> {
     discover_file_skills_in(
-        workspace,
+        workspace.filter(|_| allow_project),
         home_dir().as_deref(),
-        &plugins::enabled_plugins(app, workspace),
+        &plugins::enabled_plugins_with_project_trust(app, workspace, allow_project),
     )
 }
 
@@ -231,6 +241,18 @@ pub(crate) fn load_body(
     name: &str,
 ) -> Result<String, String> {
     load_body_from(&discover_file_skills(app, workspace), name)
+}
+
+pub(crate) fn load_body_with_project_trust(
+    app: &AppHandle,
+    workspace: Option<&Path>,
+    name: &str,
+    allow_project: bool,
+) -> Result<String, String> {
+    load_body_from(
+        &discover_file_skills_with_project_trust(app, workspace, allow_project),
+        name,
+    )
 }
 
 // ────────────────────────────────────────────────────────────────────────

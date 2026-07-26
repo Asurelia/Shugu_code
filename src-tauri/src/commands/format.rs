@@ -155,14 +155,19 @@ pub async fn format_code(
     code: String,
     file_path: Option<String>,
 ) -> Result<String, String> {
-    // Resolve workspace root (clone before .await to release the lock)
-    let workspace_root: PathBuf = {
+    let current_workspace = {
         let ws_state = app.state::<Mutex<Option<PathBuf>>>();
-        let guard = ws_state
+        let root = ws_state
             .lock()
-            .map_err(|e| format!("workspace lock: {e}"))?;
-        // Fall back to temp dir if no workspace is open (e.g. scratch file)
-        guard.clone().unwrap_or_else(|| std::env::temp_dir())
+            .map_err(|e| format!("workspace lock: {e}"))?
+            .clone();
+        root
+    };
+    // Resolve workspace root (clone before .await to release the lock)
+    let workspace_root = if current_workspace.is_some() {
+        crate::commands::project_trust::require_trusted_workspace(&app)?
+    } else {
+        std::env::temp_dir()
     };
 
     // Find formatter for this language
@@ -192,6 +197,9 @@ pub async fn format_code(
     };
 
     // Spawn the formatter child process
+    if current_workspace.is_some() {
+        crate::commands::project_trust::require_current_trusted_root(&app, &workspace_root)?;
+    }
     let mut child = Command::new(&binary_path)
         .args(&args)
         .current_dir(&workspace_root)

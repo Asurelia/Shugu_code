@@ -11,6 +11,7 @@ import { useCallback, useEffect, useState } from "react";
 import { pluginsList, pluginsSetEnabled, type PluginSummary } from "@/lib/plugins";
 import { pluginContributionsSummary, pluginSourceLabel } from "./pluginsUtils";
 import { pushToast } from "@/components/toast";
+import { listen } from "@/lib/tauri";
 
 function PluginRow({
   plugin,
@@ -32,7 +33,7 @@ function PluginRow({
         borderRadius: 8,
         background: "var(--surface-container, #16162a)",
         border: "1px solid rgba(150,150,150,0.16)",
-        opacity: plugin.enabled ? 1 : 0.55,
+        opacity: plugin.enabled ? 1 : 0.62,
       }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
@@ -71,8 +72,9 @@ function PluginRow({
         </button>
         <button
           type="button"
-          disabled={busy}
+          disabled={busy || plugin.blockedByTrust}
           onClick={() => onToggle(plugin.id, !plugin.enabled)}
+          title={plugin.blockedByTrust ? "Approuve d'abord le projet depuis le badge de confiance." : undefined}
           style={{
             fontSize: 11,
             padding: "3px 10px",
@@ -83,14 +85,16 @@ function PluginRow({
             border: "1px solid rgba(150,150,150,0.3)",
           }}
         >
-          {plugin.enabled ? "Désactiver" : "Activer"}
+          {plugin.blockedByTrust ? "Projet non approuvé" : plugin.enabled ? "Désactiver" : "Activer"}
         </button>
       </div>
       {plugin.description && (
         <span style={{ fontSize: 11.5, color: "var(--on-surface-muted)" }}>{plugin.description}</span>
       )}
       <span style={{ fontSize: 11, color: "var(--on-surface-muted)" }}>
-        {pluginContributionsSummary(plugin)}
+        {plugin.blockedByTrust
+          ? "Contributions neutralisées tant que le projet reste en lecture seule."
+          : pluginContributionsSummary(plugin)}
       </span>
       {open && (
         <div
@@ -141,6 +145,21 @@ export function PluginsSection() {
 
   useEffect(() => {
     void refresh();
+  }, [refresh]);
+
+  useEffect(() => {
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+    const retain = (unlisten: () => void) => {
+      if (disposed) unlisten();
+      else unlisteners.push(unlisten);
+    };
+    void listen("workspace://changed", refresh).then(retain).catch(() => {});
+    void listen("workspace://trust-changed", refresh).then(retain).catch(() => {});
+    return () => {
+      disposed = true;
+      unlisteners.forEach((unlisten) => unlisten());
+    };
   }, [refresh]);
 
   const toggle = async (id: string, enabled: boolean) => {

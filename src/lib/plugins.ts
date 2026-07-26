@@ -14,6 +14,8 @@ export interface PluginSummary {
   /** "user" | "project" | "claude-cache". */
   source: string;
   enabled: boolean;
+  /** Contribution projet détectée mais neutralisée par le gate de confiance. */
+  blockedByTrust: boolean;
   commands: number;
   agents: number;
   skills: number;

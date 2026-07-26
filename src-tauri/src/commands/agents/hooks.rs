@@ -43,6 +43,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tauri::AppHandle;
 
 use super::exec;
@@ -263,16 +265,31 @@ fn user_hooks_path() -> Option<PathBuf> {
 /// Charge les deux fichiers + les hooks des PLUGINS actifs (P6.7, source
 /// "plugin:<name>") et les merge — SANS filtrer les disabled (le Settings a
 /// besoin de la liste complète annotée). Ordre : user → projet → plugins.
-fn load_all_hooks(app: &AppHandle, workspace: Option<&Path>) -> Vec<HookDef> {
+fn load_all_hooks_with_project_trust(
+    app: &AppHandle,
+    workspace: Option<&Path>,
+    allow_project: bool,
+) -> Vec<HookDef> {
     let user = user_hooks_path()
         .map(|p| parse_hooks_file(&p, HookSource::User))
         .unwrap_or_default();
     let project = workspace
+        .filter(|_| allow_project)
         .map(|ws| parse_hooks_file(&ws.join(".shugu").join("hooks.json"), HookSource::Project))
         .unwrap_or_default();
     let mut merged = merge_hooks(user, project);
-    merged.extend(super::plugins::enabled_plugins_hooks(app, workspace));
+    merged.extend(super::plugins::enabled_plugins_hooks_with_project_trust(
+        app,
+        workspace,
+        allow_project,
+    ));
     merged
+}
+
+fn load_all_hooks(app: &AppHandle, workspace: Option<&Path>) -> Vec<HookDef> {
+    let allow_project =
+        workspace.is_some_and(|root| crate::commands::project_trust::is_trusted(app, root));
+    load_all_hooks_with_project_trust(app, workspace, allow_project)
 }
 
 /// Ids des hooks désactivés (table `settings`, clé `hooks.disabled` = JSON
@@ -283,10 +300,13 @@ pub(crate) fn disabled_hook_ids(app: &AppHandle) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Charge les hooks ACTIFS pour un run (merge + retrait des disabled).
-pub(crate) fn load_hooks(app: &AppHandle, workspace: Option<&Path>) -> Vec<HookDef> {
+pub(crate) fn load_hooks_with_project_trust(
+    app: &AppHandle,
+    workspace: Option<&Path>,
+    allow_project: bool,
+) -> Vec<HookDef> {
     let disabled = disabled_hook_ids(app);
-    load_all_hooks(app, workspace)
+    load_all_hooks_with_project_trust(app, workspace, allow_project)
         .into_iter()
         .filter(|d| !disabled.contains(&d.id))
         .collect()
@@ -396,6 +416,16 @@ pub(crate) fn run_hook(
     ws: &Path,
     profile: ExecutionProfile,
 ) -> HookOutcome {
+    run_hook_cancellable(def, payload, ws, profile, None)
+}
+
+fn run_hook_cancellable(
+    def: &HookDef,
+    payload: &serde_json::Value,
+    ws: &Path,
+    profile: ExecutionProfile,
+    cancelled: Option<&AtomicBool>,
+) -> HookOutcome {
     let started = std::time::Instant::now();
     let hooks_dir = ws.join(".shugu").join("agent-runtime").join("hooks");
     let payload_file = hooks_dir.join(format!("input-{}.json", uuid::Uuid::new_v4()));
@@ -414,12 +444,13 @@ pub(crate) fn run_hook(
         } else {
             format!("cat {file_display} | {}", def.command)
         };
-        let res = exec::run_command_direct(
+        let res = exec::run_command_governed(
             ws,
             &wrapped,
             def.timeout_secs,
             profile.policy(),
             &[], // les hooks sont de la config utilisateur de confiance — pas de classification
+            cancelled,
         );
         exit_code = res.exit_code;
         timed_out = res.timed_out;
@@ -519,6 +550,70 @@ pub(crate) fn run_hook(
     }
 }
 
+fn trust_revoked_outcome() -> HookOutcome {
+    HookOutcome {
+        outcome: "error",
+        exit_code: 130,
+        reason: Some("hook interrompu : workspace changé ou confiance révoquée".to_string()),
+        additional_context: None,
+        duration_ms: 0,
+        stdout: String::new(),
+        stderr: String::new(),
+    }
+}
+
+/// Exécute un hook sous surveillance de la racine approuvée. Le poll est
+/// volontairement court : `run_command_governed` tue tout l'arbre au prochain
+/// check de son token, y compris pour un hook `async` détaché.
+fn run_hook_guarded(
+    app: &AppHandle,
+    def: &HookDef,
+    payload: &serde_json::Value,
+    ws: &Path,
+    profile: ExecutionProfile,
+    trust_root: Option<&Path>,
+) -> HookOutcome {
+    let Some(trust_root) = trust_root else {
+        return run_hook(def, payload, ws, profile);
+    };
+    if crate::commands::project_trust::require_current_trusted_root(app, trust_root).is_err() {
+        return trust_revoked_outcome();
+    }
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let app_for_monitor = app.clone();
+    let root_for_monitor = trust_root.to_path_buf();
+    let cancelled_for_monitor = cancelled.clone();
+    let done_for_monitor = done.clone();
+    let monitor = std::thread::spawn(move || {
+        while !done_for_monitor.load(Ordering::Acquire) {
+            if crate::commands::project_trust::require_current_trusted_root(
+                &app_for_monitor,
+                &root_for_monitor,
+            )
+            .is_err()
+            {
+                cancelled_for_monitor.store(true, Ordering::Release);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    });
+    let mut outcome =
+        run_hook_cancellable(def, payload, ws, profile, Some(cancelled.as_ref()));
+    done.store(true, Ordering::Release);
+    let _ = monitor.join();
+    if cancelled.load(Ordering::Acquire) {
+        outcome.outcome = "error";
+        outcome.exit_code = 130;
+        outcome.reason =
+            Some("hook interrompu : workspace changé ou confiance révoquée".to_string());
+        outcome.additional_context = None;
+    }
+    outcome
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // Orchestration pour le runner — fire + trace `hookFired`
 // ────────────────────────────────────────────────────────────────────────
@@ -583,6 +678,7 @@ fn emit_hook_fired(
 /// EXÉCUTÉS de façon synchrone ici (le détachement est l'affaire de `fire` —
 /// voir ci-dessous) : NON — par construction `fire_core` ne traite que les
 /// hooks sync ; les async sont filtrés par l'appelant.
+#[cfg(test)]
 pub(crate) async fn fire_core(
     defs: &[HookDef],
     event: HookEvent,
@@ -642,6 +738,7 @@ pub(crate) async fn fire(
     profile: ExecutionProfile,
     agent_id: &str,
     tool: Option<&str>,
+    trust_root: Option<&Path>,
 ) -> FireResult {
     // Hooks async : détachés, trace à la fin.
     for def in defs.iter().filter(|d| d.event == event && d.async_) {
@@ -650,18 +747,82 @@ pub(crate) async fn fire(
                 continue;
             }
         }
+        if trust_root.is_some_and(|root| {
+            crate::commands::project_trust::require_current_trusted_root(app, root).is_err()
+        }) {
+            break;
+        }
         let app2 = app.clone();
         let def2 = def.clone();
         let payload2 = payload.clone();
         let ws2 = ws.to_path_buf();
         let agent2 = agent_id.to_string();
         let tool2 = tool.map(str::to_string);
+        let trust_root2 = trust_root.map(Path::to_path_buf);
         std::thread::spawn(move || {
-            let outcome = run_hook(&def2, &payload2, &ws2, profile);
+            let outcome = run_hook_guarded(
+                &app2,
+                &def2,
+                &payload2,
+                &ws2,
+                profile,
+                trust_root2.as_deref(),
+            );
             emit_hook_fired(&app2, &agent2, &def2, &outcome, tool2.as_deref());
         });
     }
-    let report = fire_core(defs, event, payload, ws, profile, tool).await;
+    let mut report = FireReport::default();
+    for def in defs.iter().filter(|d| d.event == event && !d.async_) {
+        if let (Some(matcher_tool), Some(re)) = (tool, def.matcher_re.as_ref()) {
+            if !re.is_match(matcher_tool) {
+                continue;
+            }
+        }
+        if trust_root.is_some_and(|root| {
+            crate::commands::project_trust::require_current_trusted_root(app, root).is_err()
+        }) {
+            break;
+        }
+        let app2 = app.clone();
+        let def2 = def.clone();
+        let payload2 = payload.clone();
+        let ws2 = ws.to_path_buf();
+        let trust_root2 = trust_root.map(Path::to_path_buf);
+        let outcome = tokio::task::spawn_blocking(move || {
+            run_hook_guarded(
+                &app2,
+                &def2,
+                &payload2,
+                &ws2,
+                profile,
+                trust_root2.as_deref(),
+            )
+        })
+        .await
+        .unwrap_or_else(|error| HookOutcome {
+            outcome: "error",
+            exit_code: -1,
+            reason: Some(format!("hook join error: {error}")),
+            additional_context: None,
+            duration_ms: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        });
+        let is_block = outcome.outcome == "block";
+        if is_block {
+            report.result.blocked_reason = outcome
+                .reason
+                .clone()
+                .or_else(|| Some("bloqué par un hook".to_string()));
+        }
+        if let Some(context) = outcome.additional_context.clone() {
+            report.result.contexts.push(context);
+        }
+        report.fired.push((def.clone(), outcome));
+        if is_block {
+            break;
+        }
+    }
     for (def, outcome) in &report.fired {
         emit_hook_fired(app, agent_id, def, outcome, tool);
     }

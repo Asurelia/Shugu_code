@@ -48,6 +48,7 @@ import { loadProviderConfig } from "@/lib/credentials";
 import { useGitBranches } from "@/features/git/queries";
 import { fsGetWorkspaceRoot } from "@/lib/fs";
 import { fsKeys } from "@/features/fs/keys";
+import { ProjectTrustBadge } from "@/features/projects/ProjectTrustGate";
 import { CommentTray } from "@/features/cockpit/CommentTray";
 import { GoalCard } from "@/features/goals/GoalCard";
 import { getComments, clearComments } from "@/features/cockpit/commentStore";
@@ -679,6 +680,7 @@ export function ChatView({
         >
           {cwd}
         </button>
+        <ProjectTrustBadge compact />
         {branch && (
           <>
             <span className="cx-quiet-sep" aria-hidden="true">·</span>

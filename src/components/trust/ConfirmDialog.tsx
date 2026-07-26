@@ -27,6 +27,7 @@ export function ConfirmDialog({
   onConfirm,
   onCancel,
   initialFocusRef,
+  busy = false,
 }: {
   open: boolean;
   title: string;
@@ -37,6 +38,8 @@ export function ConfirmDialog({
   tone?: "default" | "danger";
   onConfirm: () => void;
   onCancel: () => void;
+  /** Bloque fermeture et double soumission pendant une mutation asynchrone. */
+  busy?: boolean;
   /** Élément à focus à l'ouverture À LA PLACE du bouton Confirmer. À utiliser
    *  quand le `body` contient un champ éditable (ex. un motif à corriger) — sans
    *  ça, focus sur Confirmer = un Entrée immédiat valide la valeur non éditée. */
@@ -51,7 +54,7 @@ export function ConfirmDialog({
     open,
     containerRef: dialogRef,
     initialFocusRef: initialFocusRef ?? confirmRef,
-    onEscape: onCancel,
+    onEscape: busy ? undefined : onCancel,
   });
 
   if (!open) return null;
@@ -65,7 +68,7 @@ export function ConfirmDialog({
   return createPortal(
     <div
       className="trust-confirm-overlay"
-      onClick={onCancel}
+      onClick={busy ? undefined : onCancel}
       style={{
         position: "fixed",
         inset: 0,
@@ -83,6 +86,7 @@ export function ConfirmDialog({
         aria-modal="true"
         aria-labelledby={titleId}
         aria-describedby={body ? bodyId : undefined}
+        aria-busy={busy}
         className={`trust-confirm-modal trust-confirm-${tone}`}
         tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
@@ -134,6 +138,7 @@ export function ConfirmDialog({
           <button
             type="button"
             onClick={onCancel}
+            disabled={busy}
             style={{
               fontSize: 12,
               fontWeight: 600,
@@ -143,6 +148,7 @@ export function ConfirmDialog({
               color: "var(--on-surface-variant, #a5a0bf)",
               border: "1px solid rgba(150,150,150,0.28)",
               cursor: "pointer",
+              opacity: busy ? 0.55 : 1,
               fontFamily: "inherit",
             }}
           >
@@ -152,6 +158,7 @@ export function ConfirmDialog({
             type="button"
             ref={confirmRef}
             onClick={onConfirm}
+            disabled={busy}
             style={{
               fontSize: 12,
               fontWeight: 700,
@@ -161,6 +168,7 @@ export function ConfirmDialog({
               color: accent,
               border: `1px solid ${confirmBorder}`,
               cursor: "pointer",
+              opacity: busy ? 0.7 : 1,
               fontFamily: "inherit",
             }}
           >
