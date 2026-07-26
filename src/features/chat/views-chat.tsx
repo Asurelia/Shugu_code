@@ -741,7 +741,7 @@ export function ChatView({
   );
 
   const chatMain = (
-    <div className="cx">
+    <div className={"cx" + (typing || chatStream.streaming ? " running" : "")}>
       {!isEmpty && (
         <div className="cx-head">
           <span className="dot" />

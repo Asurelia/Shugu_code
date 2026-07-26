@@ -19,6 +19,7 @@ import "./styles/shell-extras.css";
 import "./styles/typography.css";
 import "./components/provider-mark.css";
 import "./styles/density.css";
+import "./styles/celestial-foundations.css";
 
 import { RouterProvider } from "@tanstack/react-router";
 import { ThemeBootstrap } from "./lib/ThemeBootstrap";

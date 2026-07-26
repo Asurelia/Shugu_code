@@ -1,0 +1,245 @@
+/* ============================================================
+   Celestial Veil — interaction foundations
+
+   A compact motion + surface vocabulary shared by the shell,
+   transcript and overlays. Imported after the prototype CSS so
+   established layouts stay intact while interaction states converge.
+   ============================================================ */
+
+:root {
+  --cv-dur-100: 100ms;
+  --cv-dur-150: 150ms;
+  --cv-dur-220: 220ms;
+  --cv-dur-300: 300ms;
+  --cv-ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --cv-ease-out-quart: cubic-bezier(0.165, 0.84, 0.44, 1);
+  --cv-ease-spring: cubic-bezier(0.16, 1, 0.3, 1);
+
+  --cv-hairline: rgba(255, 255, 255, 0.085);
+  --cv-hairline-strong: rgba(255, 255, 255, 0.14);
+  --cv-ring-primary: rgba(224, 142, 254, 0.2);
+  --cv-shadow-element:
+    inset 0 0 0 0.5px rgba(255, 255, 255, 0.035), 0 1px 1px rgba(0, 0, 0, 0.22),
+    0 8px 24px rgba(0, 0, 0, 0.12);
+  --cv-shadow-overlay:
+    inset 0 0 0 0.5px rgba(255, 255, 255, 0.055), 0 1px 1px rgba(0, 0, 0, 0.3),
+    0 22px 64px rgba(0, 0, 0, 0.46);
+}
+
+/* Tactile controls: immediate hover, slightly slower state settlement. */
+:where(
+  .palette-item,
+  .chat-row,
+  .cx-tool,
+  .cx-send,
+  .cx-chip,
+  .cx-quiet,
+  .cx-agent-activity > summary,
+  .cx-agent-plan > summary,
+  .setting-row,
+  .toast
+) {
+  transition:
+    color var(--cv-dur-100) var(--cv-ease-standard),
+    background-color var(--cv-dur-150) var(--cv-ease-standard),
+    border-color var(--cv-dur-150) var(--cv-ease-standard),
+    box-shadow var(--cv-dur-150) var(--cv-ease-standard),
+    opacity var(--cv-dur-150) var(--cv-ease-standard),
+    transform var(--cv-dur-150) var(--cv-ease-out-quart);
+}
+
+:where(.palette-item, .chat-row, .cx-tool, .cx-send, .cx-chip):active {
+  transform: translateY(0.5px) scale(0.985);
+}
+
+/* Fine, layered surfaces — dense enough for an IDE without feeling boxed in. */
+:where(.cx-agent-activity, .cx-agent-plan, .cx-code-block) {
+  box-shadow: var(--cv-shadow-element);
+  contain: paint;
+}
+
+:where(.palette, .trust-confirm-modal, .cx-preview-modal) {
+  box-shadow: var(--cv-shadow-overlay);
+}
+
+:where(.cx-agent-activity, .cx-agent-plan, .palette, .toast) {
+  border-color: var(--cv-hairline-strong);
+}
+
+:where(
+  .cx-meta .ts,
+  .cx-agent-activity .el,
+  .cx-agent-activity .ct,
+  .cx-agent-activity .foot,
+  .chat-row-count,
+  .statusbar
+) {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Dialogs and palettes enter once, without bouncy "AI magic" theatre. */
+@keyframes cv-scrim-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes cv-surface-in {
+  from {
+    opacity: 0;
+    transform: translateY(7px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes cv-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+:where(.palette-scrim, .trust-confirm-overlay, .cx-preview-scrim) {
+  animation: cv-scrim-in var(--cv-dur-150) var(--cv-ease-standard) both;
+}
+
+:where(.palette, .trust-confirm-modal, .cx-preview-modal) {
+  animation: cv-surface-in var(--cv-dur-220) var(--cv-ease-spring) both;
+  transform-origin: 50% 24%;
+}
+
+.toast {
+  animation: cv-toast-in var(--cv-dur-220) var(--cv-ease-out-quart) both;
+}
+
+@keyframes cv-transcript-in {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.cx-msg {
+  animation: cv-transcript-in var(--cv-dur-220) var(--cv-ease-out-quart) both;
+}
+
+/* A 2px run indicator answers "is it still working?" without stealing space. */
+.cx.running::before {
+  content: "";
+  position: absolute;
+  z-index: 20;
+  top: 0;
+  left: 0;
+  width: 38%;
+  height: 2px;
+  pointer-events: none;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(224, 142, 254, 0.42) 28%,
+    var(--primary) 64%,
+    rgba(138, 239, 199, 0.86) 82%,
+    transparent
+  );
+  filter: drop-shadow(0 0 5px rgba(224, 142, 254, 0.42));
+  animation: cv-run-whip 1.35s linear infinite;
+}
+
+@keyframes cv-run-whip {
+  from {
+    transform: translateX(-110%);
+  }
+  to {
+    transform: translateX(365%);
+  }
+}
+
+@keyframes cv-stream-shimmer {
+  from {
+    background-position: 180% 0;
+  }
+  to {
+    background-position: -80% 0;
+  }
+}
+
+.cx-agent-activity.running > summary .hl,
+.cx-msg.ai:last-child .cx-meta .ts {
+  background: linear-gradient(
+    90deg,
+    var(--on-surface-muted) 15%,
+    var(--on-surface) 42%,
+    var(--on-surface-muted) 68%
+  );
+  background-size: 260% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  animation: cv-stream-shimmer 2s linear infinite;
+}
+
+@keyframes cv-stop-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(224, 82, 82, 0);
+  }
+  50% {
+    box-shadow: 0 0 0 3px rgba(224, 82, 82, 0.11);
+  }
+}
+
+:where(.cx-send.stop, .cx-agent-activity.running > summary .stop) {
+  animation: cv-stop-pulse 1.8s ease-in-out infinite;
+}
+
+/* Reusable loading primitive for future data-bound cards. */
+.cv-skeleton {
+  min-height: 0.7em;
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.035) 20%,
+    rgba(255, 255, 255, 0.09) 45%,
+    rgba(255, 255, 255, 0.035) 70%
+  );
+  background-size: 240% 100%;
+  animation: cv-stream-shimmer 1.8s linear infinite;
+}
+
+/* Both the OS preference and Shugu's explicit setting are authoritative. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+:root[data-animations="off"] *,
+:root[data-animations="off"] *::before,
+:root[data-animations="off"] *::after,
+:root[data-reducedmotion="on"] *,
+:root[data-reducedmotion="on"] *::before,
+:root[data-reducedmotion="on"] *::after {
+  scroll-behavior: auto !important;
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+}

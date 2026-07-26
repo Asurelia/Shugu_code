@@ -28,6 +28,7 @@ import "./styles/forge-integrations.css";
 // EN DERNIER — même surcharge typographique que la fenêtre principale
 // (chrome en sans, code en mono), pour un rendu cohérent entre fenêtres.
 import "./styles/typography.css";
+import "./styles/celestial-foundations.css";
 
 // Debug instrumentation — mirror of main.tsx. See the comment there.
 // Both windows wire this so we can tell from which window an error
