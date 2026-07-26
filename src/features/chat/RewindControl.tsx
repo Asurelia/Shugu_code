@@ -36,7 +36,10 @@ import {
 } from "./rewind";
 import { useActiveConv } from "./chat-sync";
 
-const CHOICE_LABELS: Record<RewindChoice, { icon: string; label: string; hint: string }> = {
+const CHOICE_LABELS: Record<
+  RewindChoice,
+  { icon: string; label: string; hint: string }
+> = {
   files: {
     icon: "📁",
     label: "Fichiers seuls",
@@ -63,7 +66,15 @@ async function emitWorkspaceChanged(): Promise<void> {
   }
 }
 
-export function RewindControl({ m, convId }: { m: Message; convId: string }) {
+export function RewindControl({
+  m,
+  convId,
+  variant = "compact",
+}: {
+  m: Message;
+  convId: string;
+  variant?: "compact" | "checkpoint";
+}) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [pending, setPending] = useState<{
     choice: RewindChoice;
@@ -115,7 +126,11 @@ export function RewindControl({ m, convId }: { m: Message; convId: string }) {
           const result = await snapshotRewind(agentId, "files");
           await emitWorkspaceChanged();
           pushToast(
-            rewindResultSummary(result.restored.length, result.removed.length, result.safetyRef),
+            rewindResultSummary(
+              result.restored.length,
+              result.removed.length,
+              result.safetyRef,
+            ),
             result.safetyRef ? "success" : "info",
             7000,
           );
@@ -123,7 +138,11 @@ export function RewindControl({ m, convId }: { m: Message; convId: string }) {
           // Fork D'ABORD (l'id de branche voyage dans l'event rewind du run),
           // puis rewind fichiers.
           const fork = await forkConversationAt(convId, String(m.id));
-          const result = await snapshotRewind(agentId, "both", fork.conversationId);
+          const result = await snapshotRewind(
+            agentId,
+            "both",
+            fork.conversationId,
+          );
           await emitWorkspaceChanged();
           setActiveConv(fork.conversationId);
           pushToast(
@@ -141,12 +160,23 @@ export function RewindControl({ m, convId }: { m: Message; convId: string }) {
     })();
   };
 
-  const confirmContent = pending ? rewindConfirmContent(pending.choice, pending.preview) : null;
+  const confirmContent = pending
+    ? rewindConfirmContent(pending.choice, pending.preview)
+    : null;
 
   return (
     <>
-      <span style={{ position: "relative", display: "inline-block" }}>
+      <span
+        className={
+          "cx-rewind" +
+          (variant === "checkpoint" ? " cx-rewind-checkpoint" : "")
+        }
+        style={{ position: "relative", display: "inline-block" }}
+      >
         <button
+          className={
+            variant === "checkpoint" ? "cx-checkpoint-action" : undefined
+          }
           title="Revenir ici (fichiers et/ou conversation)"
           disabled={busy}
           onClick={(e) => {
@@ -155,6 +185,7 @@ export function RewindControl({ m, convId }: { m: Message; convId: string }) {
           }}
         >
           <Icon name="revert" size={12} />
+          {variant === "checkpoint" && <span>Revenir à ce point</span>}
         </button>
         {menuOpen && (
           <span
@@ -224,8 +255,12 @@ export function RewindControl({ m, convId }: { m: Message; convId: string }) {
                   key={i}
                   style={{
                     fontSize: 12,
-                    fontFamily: line.startsWith("  ") ? "var(--font-mono)" : undefined,
-                    color: line.startsWith("  ") ? "var(--on-surface-muted)" : undefined,
+                    fontFamily: line.startsWith("  ")
+                      ? "var(--font-mono)"
+                      : undefined,
+                    color: line.startsWith("  ")
+                      ? "var(--on-surface-muted)"
+                      : undefined,
                     whiteSpace: "pre-wrap",
                   }}
                 >

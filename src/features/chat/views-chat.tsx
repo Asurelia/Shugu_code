@@ -80,6 +80,28 @@ import { pushToast } from "@/components/toast";
 import { togglePinnedAsset, useStudioBrandBoard } from "@/features/studio/brandBoard";
 import { isMediaCancellation, useMediaJob } from "./useMediaJob";
 import { clearMediaRetry, peekMediaRetry } from "@/features/image/mediaRetry";
+import { createTranscriptPreview } from "./transcriptPresentation";
+
+const EMPTY_QUICKSTARTS = [
+  {
+    icon: "⌁",
+    label: "Comprendre le projet",
+    prompt:
+      "Analyse ce projet en lecture seule. Résume son architecture, ses points d’entrée et les commandes utiles pour le développer.",
+  },
+  {
+    icon: "◇",
+    label: "Repérer les risques",
+    prompt:
+      "Inspecte le projet en lecture seule et identifie les bugs probables, risques de sécurité et dettes techniques prioritaires. Donne des preuves précises.",
+  },
+  {
+    icon: "↗",
+    label: "Planifier une fonctionnalité",
+    prompt:
+      "Aide-moi à cadrer une nouvelle fonctionnalité. Commence par analyser l’existant, puis propose un plan testable sans modifier les fichiers.",
+  },
+] as const;
 
 type ImageResult = {
   id: number | string;
@@ -223,6 +245,14 @@ export function ChatView({
   useEffect(() => {
     inputRef.current?.focus();
   }, []);
+
+  const applyQuickstart = (prompt: string) => {
+    setInput(prompt);
+    requestAnimationFrame(() => {
+      inputRef.current?.focus();
+      inputRef.current?.setSelectionRange(prompt.length, prompt.length);
+    });
+  };
 
   // Auto-grow du composer : la hauteur suit le contenu (borne CSS max-height,
   // scroll interne au-delà) — comme dans tous les harness de référence. Sans
@@ -762,6 +792,21 @@ export function ChatView({
           <h1 className="cx-empty-title">
             Que devrions-nous construire dans <span className="acc">{cwd}</span> ?
           </h1>
+          <div className="cx-quickstarts" aria-label="Suggestions de départ">
+            {EMPTY_QUICKSTARTS.map((quickstart) => (
+              <button
+                key={quickstart.label}
+                type="button"
+                className="cx-quickstart"
+                onClick={() => applyQuickstart(quickstart.prompt)}
+              >
+                <span className="ico" aria-hidden="true">
+                  {quickstart.icon}
+                </span>
+                <span>{quickstart.label}</span>
+              </button>
+            ))}
+          </div>
           <div className="cx-empty-composer">{composer}</div>
         </div>
       ) : (
@@ -1335,6 +1380,15 @@ function CxMessage({
     worktree,
     followUps,
   } = useMessageDisplay(m);
+  const [bodyExpanded, setBodyExpanded] = useState(false);
+  const collapsedBody = useMemo(
+    () => createTranscriptPreview(displayBody),
+    [displayBody],
+  );
+  const renderedBody =
+    collapsedBody.truncated && !bodyExpanded
+      ? collapsedBody.text
+      : displayBody;
 
   // Le journal d'activité ne s'affiche que pour le travail de l'ORCHESTRATEUR,
   // pas pour les messages de plan / revue (préfixés 📋 / 🔎) que l'advisor
@@ -1397,7 +1451,11 @@ function CxMessage({
             // sémantique d'action cliquable (plus de span onClick).
             style={{ appearance: "none", margin: 0 }}
           >
-            via orchestrator
+            <span>Trace</span>
+            <span aria-hidden="true">›</span>
+            <span>
+              {agentRole === "advisor" ? "Conseiller" : "Orchestrateur"}
+            </span>
           </button>
         )}
       </div>
@@ -1482,7 +1540,32 @@ function CxMessage({
           <img src={imageDataUrl} alt="image générée" />
         ) : (
           <>
-            {displayBody && <Markdown text={displayBody} />}
+            {displayBody && (
+              <>
+                <div
+                  className={
+                    "cx-response-shell" +
+                    (collapsedBody.truncated && !bodyExpanded
+                      ? " collapsed"
+                      : "")
+                  }
+                >
+                  <Markdown text={renderedBody} />
+                </div>
+                {collapsedBody.truncated && (
+                  <button
+                    type="button"
+                    className="cx-response-toggle"
+                    aria-expanded={bodyExpanded}
+                    onClick={() => setBodyExpanded((expanded) => !expanded)}
+                  >
+                    {bodyExpanded
+                      ? "Réduire la réponse"
+                      : `Afficher la suite · ${collapsedBody.hiddenLines > 0 ? `${collapsedBody.hiddenLines} lignes` : `${collapsedBody.hiddenCharacters} caractères`}`}
+                  </button>
+                )}
+              </>
+            )}
             {m.code && (
               <CodeBlock
                 lang={m.code.lang}
@@ -1508,7 +1591,9 @@ function CxMessage({
         <div className="cx-react">
           {/* P6.3 — « Revenir ici » : rewind fichiers (checkpoint du tour) et/ou
               branche de conversation à partir de ce message. */}
-          <RewindControl m={m} convId={convId} />
+          {(!m.viaAgent || !m.agentId) && (
+            <RewindControl m={m} convId={convId} />
+          )}
           <button title="Copier" onClick={() => copyText(displayBody || m.body || m.text || "")}>
             <Icon name="copy" size={12} />
           </button>
@@ -1517,6 +1602,18 @@ function CxMessage({
           <ReviewFeedback reviewerId={m.agentId} />
         )}
       </div>
+      {m.viaAgent && m.agentId && (
+        <div className="cx-checkpoint-divider">
+          <span className="line" aria-hidden="true" />
+          <span className="label">Point de retour du tour</span>
+          <RewindControl
+            m={m}
+            convId={convId}
+            variant="checkpoint"
+          />
+          <span className="line" aria-hidden="true" />
+        </div>
+      )}
     </div>
   );
 }

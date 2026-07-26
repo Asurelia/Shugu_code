@@ -178,12 +178,25 @@ await need("nav.rail", "rail");
 await need(".rail-group-label", "labels de groupes du rail");
 await need(".tb-bell", "cloche notifications");
 await need('nav.rail button[aria-label="Connections"]', "bouton Connections");
+await need(".cx-quickstarts .cx-quickstart", "suggestions de départ du chat");
 if ((await page.locator(".shell-statusbar").count()) > 0) {
   missing.push("statusbar globale visible dans le chat (doublon du composer)");
 }
 
 if (!FOCUSED) {
   await screenshot(`${OUT}/01-chat-shell.png`);
+
+  // Les suggestions remplissent le composer sans envoyer automatiquement.
+  const firstQuickstart = page.locator(".cx-quickstart").first();
+  if (await firstQuickstart.count()) {
+    await fastClick(firstQuickstart);
+    await page.waitForTimeout(100);
+    const quickstartValue = await page.locator(".cx-composer-input").inputValue();
+    if (!quickstartValue.trim()) {
+      missing.push("suggestion de départ n’alimente pas le composer");
+    }
+    await page.locator(".cx-composer-input").fill("");
+  }
 
   // ── Palette unifiée : commandes + fichiers + conversations ─────────────
   await fastClick(page.locator(".tb-search"));
