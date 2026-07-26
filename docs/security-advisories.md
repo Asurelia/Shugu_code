@@ -1,6 +1,6 @@
 # Security advisories
 
-Dernière revue locale : 23 juillet 2026.
+Dernière revue locale : 26 juillet 2026.
 
 `pnpm audit` doit terminer sans advisory JavaScript connu. `cargo audit` garde
 trois exceptions explicites et vérifiables ; aucune ne correspond à du code
@@ -16,3 +16,10 @@ Les exceptions sont passées individuellement à `cargo audit`; tout nouvel avis
 reste bloquant. Les avertissements RustSec `unmaintained`/`unsound` non classés
 comme vulnérabilités restent visibles dans la sortie et doivent être revus lors
 de chaque mise à niveau Tauri, `xcap`, `fastembed` ou ripgrep.
+
+Revue du 26 juillet : `pnpm audit` est revenu à zéro après retrait de
+`@convex-dev/react-query` (dépendance inutilisée de la synchro Convex dormante)
+et verrouillage de `brace-expansion` 5.0.8. Les avis RustSec atteignables
+`anyhow` et `memmap2` ont été corrigés respectivement en 1.0.104 et 0.9.11 ;
+la commande bornée ci-dessus reste verte avec uniquement les trois exceptions
+du tableau.

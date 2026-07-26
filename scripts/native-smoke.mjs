@@ -513,6 +513,28 @@ if (
   );
 }
 
+// Exercise the product notification helper through the real Tauri plugin.
+// A successful receipt proves permission + native dispatch; the smoke profile
+// is isolated and its notification is explicitly labelled as a test.
+const nativeNotification = await page.evaluate(async () => {
+  const { notifyNative } = await import("/src/lib/nativeNotifications.ts");
+  const permissionBefore = globalThis.Notification?.permission ?? "unavailable";
+  const result = await notifyNative(
+    "Shugu — test natif réussi",
+    "Notification de vérification automatique. Aucune action requise.",
+  );
+  return {
+    result,
+    permissionBefore,
+    permissionAfter: globalThis.Notification?.permission ?? "unavailable",
+  };
+});
+if (nativeNotification.result !== "sent") {
+  throw new Error(
+    `native notification dispatch failed: ${JSON.stringify(nativeNotification)}`,
+  );
+}
+
 // Project trust gate: a fresh canonical workspace must fail closed, force an
 // explicit decision, expose the restricted state, then allow a revocable grant.
 const initialProjectTrust = await page.evaluate(async (path) => {
@@ -909,6 +931,7 @@ const summary = {
   cdpUrl,
   mainUrl: page.url(),
   ipc,
+  nativeNotification,
   backupRestore,
   accessibility: {
     mediaTabsKeyboard: true,

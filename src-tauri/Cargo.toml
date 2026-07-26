@@ -25,6 +25,10 @@ serde_json = "1"
 base64 = "0.22"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
+# rmcp 1.7 uses reqwest 0.13 for its streamable HTTP transport. Keep a named
+# direct handle to that exact client type so Shugu can disable redirects and
+# bound connection setup instead of accepting rmcp's default client policy.
+reqwest_mcp = { package = "reqwest", version = "0.13" }
 futures-util = "0.3"
 semver = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }

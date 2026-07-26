@@ -59,7 +59,6 @@
     "@codemirror/search": "^6.7.0",
     "@codemirror/state": "^6.4.1",
     "@codemirror/view": "^6.26.3",
-    "@convex-dev/react-query": "^0.0.0-alpha.8",
     "@lezer/highlight": "^1.2.0",
     "@replit/codemirror-lang-svelte": "^6.0.0",
     "@replit/codemirror-minimap": "^0.5.2",
@@ -104,7 +103,7 @@
   "pnpm": {
     "overrides": {
       "@babel/core@<=7.29.0": "7.29.6",
-      "brace-expansion@>=3.0.0 <5.0.7": "5.0.7",
+      "brace-expansion@>=3.0.0 <5.0.8": "5.0.8",
       "ws@>=8.0.0 <8.21.0": "8.21.1"
     }
   }

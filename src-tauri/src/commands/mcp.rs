@@ -10,9 +10,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
+
+use crate::commands::agents::policy::ExternalToolEffect;
 
 /// Un serveur MCP tel que déclaré dans `.mcp.json`. `command`(+args/env) ⇒
 /// transport stdio ; `url` ⇒ transport HTTP/SSE. Les deux sont mutuellement
@@ -39,6 +42,73 @@ impl McpServerConfig {
         } else {
             "invalid"
         }
+    }
+}
+
+fn validate_server_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("le nom du serveur MCP est vide".to_string());
+    }
+    if name.contains("__") {
+        return Err(format!(
+            "Nom de serveur invalide « {name} » : il ne doit pas contenir « __ » \
+             (réservé au délimiteur des noms d'outils MCP)."
+        ));
+    }
+    Ok(())
+}
+
+/// MCP HTTP is an explicit user connection, but it still must not silently
+/// downgrade or follow a redirect to a different origin. Cleartext HTTP is
+/// accepted only for a literal loopback endpoint used by local servers.
+pub(crate) fn validate_mcp_http_url(raw: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(raw.trim()).map_err(|e| format!("URL MCP invalide : {e}"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("URL MCP refusée : identifiants intégrés interdits".to_string());
+    }
+    if url.fragment().is_some() {
+        return Err("URL MCP refusée : fragment interdit".to_string());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "URL MCP refusée : hôte manquant".to_string())?;
+    let host_ip = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse::<IpAddr>()
+        .ok();
+    if host_ip.is_some_and(|ip| ip.is_unspecified() || ip.is_multicast()) {
+        return Err("URL MCP refusée : adresse non routable".to_string());
+    }
+    match url.scheme() {
+        "https" => {}
+        "http"
+            if host.eq_ignore_ascii_case("localhost")
+                || host_ip.is_some_and(|ip| ip.is_loopback()) => {}
+        "http" => {
+            return Err(
+                "URL MCP refusée : HTTP clair autorisé uniquement sur localhost".to_string(),
+            )
+        }
+        scheme => {
+            return Err(format!(
+                "URL MCP refusée : schéma `{scheme}` non pris en charge (HTTPS requis)"
+            ))
+        }
+    }
+    Ok(url)
+}
+
+fn validate_server_config(cfg: &McpServerConfig) -> Result<(), String> {
+    match (&cfg.command, &cfg.url) {
+        (Some(command), None) if !command.trim().is_empty() => Ok(()),
+        (None, Some(url)) => validate_mcp_http_url(url).map(|_| ()),
+        (Some(_), Some(_)) => {
+            Err("config MCP invalide : `command` et `url` sont mutuellement exclusifs".to_string())
+        }
+        (Some(_), None) => Err("config MCP invalide : `command` est vide".to_string()),
+        (None, None) => Err("config MCP invalide : `command` ou `url` requis".to_string()),
     }
 }
 
@@ -150,6 +220,8 @@ pub fn write_server(
     cfg: &McpServerConfig,
     global: bool,
 ) -> Result<(), String> {
+    validate_server_name(name)?;
+    validate_server_config(cfg)?;
     let trusted_root = if global {
         None
     } else {
@@ -298,6 +370,7 @@ pub fn set_enabled_setting(app: &AppHandle, name: &str, enabled: bool) -> Result
 //     feature rmcp `transport-streamable-http-client-reqwest` (voir Cargo.toml).
 // ---------------------------------------------------------------------------
 
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use rmcp::ServiceExt;
 use std::collections::HashMap;
@@ -370,13 +443,16 @@ pub(crate) async fn connect_for_workspace(
         .mcp_servers
         .remove(name)
         .ok_or_else(|| format!("serveur MCP inconnu : {name}"))?;
+    validate_server_name(name)?;
+    validate_server_config(&cfg)?;
     let generation = mgr.generation.load(Ordering::SeqCst);
 
     {
         let mut map = mgr.connections.lock().await;
-        if let Some(c) = map.get(name).filter(|conn| {
-            conn.config == cfg && conn.workspace_root.as_deref() == workspace
-        }) {
+        if let Some(c) = map
+            .get(name)
+            .filter(|conn| conn.config == cfg && conn.workspace_root.as_deref() == workspace)
+        {
             return Ok(c.clone());
         }
         map.remove(name);
@@ -420,11 +496,26 @@ pub(crate) async fn connect_for_workspace(
                     .map_err(|e| format!("handshake MCP {name} : {e}"))?
             }
             "http" => {
-                let url = cfg
+                let raw_url = cfg
                     .url
                     .clone()
                     .ok_or_else(|| format!("config MCP {name} : `url` manquant"))?;
-                let transport = StreamableHttpClientTransport::from_uri(url.as_str());
+                let url = validate_mcp_http_url(&raw_url)?;
+                // No redirects: a configured HTTPS/loopback origin cannot
+                // silently move the MCP session to another host. The connect
+                // timeout bounds dead endpoints without terminating a healthy
+                // long-lived SSE stream.
+                let http_client = reqwest_mcp::Client::builder()
+                    .pool_max_idle_per_host(0)
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .redirect(reqwest_mcp::redirect::Policy::none())
+                    .user_agent("Shugu-MCP/0.1")
+                    .build()
+                    .map_err(|e| format!("client HTTP MCP {name} : {e}"))?;
+                let transport = StreamableHttpClientTransport::with_client(
+                    http_client,
+                    StreamableHttpClientTransportConfig::with_uri(url.to_string()),
+                );
                 ().serve(transport)
                     .await
                     .map_err(|e| format!("connexion MCP {name} : {e}"))?
@@ -754,18 +845,47 @@ fn keychain_set(account: &str, secret: &str) -> Result<(), String> {
         .map_err(|e| format!("keychain {account}: {e}"))
 }
 
+/// Converts MCP's standard annotations into Shugu's effect vocabulary.
+/// Missing `readOnlyHint` stays Unknown instead of applying the MCP default
+/// (`false`): unknown declarations must never gain Auto privileges.
+pub(crate) fn classify_tool_effect(tool: &rmcp::model::Tool) -> ExternalToolEffect {
+    let Some(annotations) = tool.annotations.as_ref() else {
+        return ExternalToolEffect::Unknown;
+    };
+    match annotations.read_only_hint {
+        Some(true) => {
+            if annotations.open_world_hint == Some(false) {
+                ExternalToolEffect::SharedRead
+            } else {
+                ExternalToolEffect::ExternalRead
+            }
+        }
+        Some(false) if annotations.destructive_hint == Some(false) => {
+            ExternalToolEffect::AdditiveWrite
+        }
+        Some(false) => ExternalToolEffect::DestructiveWrite,
+        None => ExternalToolEffect::Unknown,
+    }
+}
+
+pub(crate) struct EnabledMcpTools {
+    pub provider_tools: Vec<serde_json::Value>,
+    pub effects: HashMap<String, ExternalToolEffect>,
+}
+
 /// Rend les outils MCP de TOUS les serveurs ACTIVÉS au format `tools` du
 /// provider. `protocol == "anthropic"` → `{name, description, input_schema}` ;
 /// sinon (OpenAI/compatibles) → `{type:"function", function:{name, description,
 /// parameters}}`. Un serveur en erreur de connexion est IGNORÉ (pas de crash).
-pub(crate) async fn enabled_tools_json_for_workspace(
+pub(crate) async fn enabled_tools_for_workspace(
     app: &AppHandle,
     mgr: &McpManager,
     protocol: &str,
     workspace: Option<&Path>,
     allow_project: bool,
-) -> Vec<serde_json::Value> {
+) -> EnabledMcpTools {
     let mut out = Vec::new();
+    let mut effects = HashMap::new();
     let cfg = load_merged_config_for_workspace(app, workspace, allow_project);
     for server in cfg.mcp_servers.keys() {
         if !is_enabled(app, server) {
@@ -790,6 +910,7 @@ pub(crate) async fn enabled_tools_json_for_workspace(
         };
         for t in &conn.tools {
             let full = namespaced(server, &t.name);
+            effects.insert(full.clone(), classify_tool_effect(t));
             // `input_schema` est un `Arc<JsonObject>` → sérialisable tel quel.
             let schema = serde_json::to_value(&t.input_schema)
                 .unwrap_or_else(|_| serde_json::json!({ "type": "object" }));
@@ -821,7 +942,10 @@ pub(crate) async fn enabled_tools_json_for_workspace(
             }
         }
     }
-    out
+    EnabledMcpTools {
+        provider_tools: out,
+        effects,
+    }
 }
 
 /// Exécute `mcp__server__tool` avec `args` JSON. NE retourne JAMAIS d'erreur
@@ -844,6 +968,7 @@ pub async fn mcp_execute(
         args,
         workspace.as_deref(),
         allow_project,
+        None,
     )
     .await
 }
@@ -855,6 +980,7 @@ pub(crate) async fn mcp_execute_for_workspace(
     args: &serde_json::Value,
     workspace: Option<&Path>,
     allow_project: bool,
+    execution_profile: Option<crate::commands::agents::policy::ExecutionProfile>,
 ) -> (String, bool) {
     let Some((server, tool)) = split_namespaced(full_name) else {
         return (format!("nom d'outil MCP invalide : {full_name}"), true);
@@ -866,6 +992,24 @@ pub(crate) async fn mcp_execute_for_workspace(
         Ok(c) => c,
         Err(e) => return (e, true),
     };
+    if let Some(profile) = execution_profile {
+        let effect = conn
+            .tools
+            .iter()
+            .find(|candidate| candidate.name.as_ref() == tool)
+            .map(classify_tool_effect)
+            .unwrap_or(ExternalToolEffect::Unknown);
+        if !profile.allows_external_tool(effect) {
+            return (
+                format!(
+                    "outil `{full_name}` refusé par le profil {} : effet MCP {:?}",
+                    profile.as_str(),
+                    effect
+                ),
+                true,
+            );
+        }
+    }
     // `CallToolRequestParams` est `#[non_exhaustive]` → construction via
     // `::new(name)` puis pose de `arguments` (un `Option<JsonObject>` =
     // `Option<Map<String, Value>>`).
@@ -972,6 +1116,7 @@ pub struct McpServerStatus {
 pub struct McpToolInfo {
     pub name: String,
     pub description: String,
+    pub effect: ExternalToolEffect,
 }
 
 /// Liste les serveurs de la config fusionnée + leur état (activé / connecté /
@@ -999,7 +1144,9 @@ pub async fn mcp_list_servers(
             enabled,
             connected,
             tool_count,
-            error: None,
+            error: validate_server_name(name)
+                .and_then(|_| validate_server_config(c))
+                .err(),
         });
     }
     Ok(out)
@@ -1024,6 +1171,7 @@ pub async fn mcp_test_server(
                 .as_ref()
                 .map(|d| d.to_string())
                 .unwrap_or_default(),
+            effect: classify_tool_effect(t),
         })
         .collect())
 }
@@ -1038,6 +1186,14 @@ pub async fn mcp_set_enabled(
     name: String,
     enabled: bool,
 ) -> Result<(), String> {
+    if enabled {
+        let cfg = load_merged_config(&app)
+            .mcp_servers
+            .remove(&name)
+            .ok_or_else(|| format!("serveur MCP inconnu : {name}"))?;
+        validate_server_name(&name)?;
+        validate_server_config(&cfg)?;
+    }
     set_enabled_setting(&app, &name, enabled)?;
     if !enabled {
         mgr.connections.lock().await.remove(&name);
@@ -1054,16 +1210,6 @@ pub async fn mcp_add_server(
     config: McpServerConfig,
     global: bool,
 ) -> Result<(), String> {
-    // Les noms d'outils MCP sont `mcp__<server>__<tool>`, reparsés en splittant au
-    // PREMIER `__` après le préfixe (`split_namespaced`). Un nom de serveur contenant
-    // `__` casse ce round-trip (l'outil serait routé vers un mauvais serveur, tout
-    // appel échouerait comme « serveur inconnu »). On refuse à l'ajout.
-    if name.contains("__") {
-        return Err(format!(
-            "Nom de serveur invalide « {name} » : il ne doit pas contenir « __ » \
-             (réservé au délimiteur des noms d'outils MCP)."
-        ));
-    }
     write_server(&app, &name, &config, global)
 }
 
@@ -1181,6 +1327,53 @@ mod tests {
         assert_eq!(c.mcp_servers["fs"].transport(), "stdio");
         assert_eq!(c.mcp_servers["fs"].command.as_deref(), Some("npx"));
         assert_eq!(c.mcp_servers["remote"].transport(), "http");
+    }
+
+    #[test]
+    fn http_transport_requires_https_or_literal_loopback() {
+        assert!(validate_mcp_http_url("https://example.com/mcp").is_ok());
+        assert!(validate_mcp_http_url("http://localhost:8080/mcp").is_ok());
+        assert!(validate_mcp_http_url("http://127.0.0.1:8080/mcp").is_ok());
+        assert!(validate_mcp_http_url("http://[::1]:8080/mcp").is_ok());
+        assert!(validate_mcp_http_url("http://example.com/mcp").is_err());
+        assert!(validate_mcp_http_url("https://user:secret@example.com/mcp").is_err());
+        assert!(validate_mcp_http_url("file:///tmp/mcp").is_err());
+        assert!(validate_mcp_http_url("https://example.com/mcp#other").is_err());
+        assert!(validate_mcp_http_url("https://0.0.0.0/mcp").is_err());
+    }
+
+    #[test]
+    fn tool_effects_are_explicit_and_fail_closed() {
+        use rmcp::model::{Tool, ToolAnnotations};
+        let schema = serde_json::Map::new();
+
+        let unknown = Tool::new("unknown", "", schema.clone());
+        let shared_read = Tool::new("memory_get", "", schema.clone())
+            .with_annotations(ToolAnnotations::new().read_only(true).open_world(false));
+        let external_read = Tool::new("search", "", schema.clone())
+            .with_annotations(ToolAnnotations::new().read_only(true).open_world(true));
+        let additive = Tool::new("create_issue", "", schema.clone())
+            .with_annotations(ToolAnnotations::new().read_only(false).destructive(false));
+        let destructive = Tool::new("delete_issue", "", schema)
+            .with_annotations(ToolAnnotations::new().read_only(false));
+
+        assert_eq!(classify_tool_effect(&unknown), ExternalToolEffect::Unknown);
+        assert_eq!(
+            classify_tool_effect(&shared_read),
+            ExternalToolEffect::SharedRead
+        );
+        assert_eq!(
+            classify_tool_effect(&external_read),
+            ExternalToolEffect::ExternalRead
+        );
+        assert_eq!(
+            classify_tool_effect(&additive),
+            ExternalToolEffect::AdditiveWrite
+        );
+        assert_eq!(
+            classify_tool_effect(&destructive),
+            ExternalToolEffect::DestructiveWrite
+        );
     }
 
     #[test]

@@ -1593,13 +1593,14 @@ async fn run_chat_tool_loop(
         // BLOCKER 1 — on fusionne les outils des serveurs MCP ACTIVÉS au tableau
         // de base. Sans serveur MCP activé, `enabled_tools_json` renvoie `[]` →
         // comportement chat strictement identique à avant (non-régression).
+        let mut mcp_effects = std::collections::HashMap::new();
         let tools_json: Option<serde_json::Value> = if with_tools {
             let mut arr = match protocol {
                 "anthropic" => chat_tools_json_anthropic(write_enabled),
                 _ => chat_tools_json_openai(write_enabled),
             };
             let mgr = app.state::<crate::commands::mcp::McpManager>();
-            let mcp_tools = crate::commands::mcp::enabled_tools_json_for_workspace(
+            let discovered_mcp = crate::commands::mcp::enabled_tools_for_workspace(
                 app,
                 &mgr,
                 protocol,
@@ -1607,8 +1608,30 @@ async fn run_chat_tool_loop(
                 allow_project_config,
             )
             .await;
+            mcp_effects = discovered_mcp.effects;
             if let Some(a) = arr.as_array_mut() {
-                a.extend(mcp_tools);
+                a.extend(discovered_mcp.provider_tools);
+                // The chat loop has no Full Access grant. It may use only MCP
+                // tools that explicitly declare a read-only effect; unknown or
+                // mutating external actions belong to the agent lifecycle.
+                a.retain(|tool| {
+                    let name = tool["name"]
+                        .as_str()
+                        .or_else(|| tool["function"]["name"].as_str());
+                    let Some(name) = name else {
+                        return false;
+                    };
+                    if !name.starts_with("mcp__") {
+                        return true;
+                    }
+                    matches!(
+                        mcp_effects.get(name),
+                        Some(
+                            crate::commands::agents::policy::ExternalToolEffect::SharedRead
+                                | crate::commands::agents::policy::ExternalToolEffect::ExternalRead
+                        )
+                    )
+                });
             }
             // Recherche NATIVE (miroir du runner) : sur Claude récent + réglage ON,
             // remplace notre `web_search` client par l'outil serveur Anthropic
@@ -1829,16 +1852,35 @@ async fn run_chat_tool_loop(
                     )
                 }
             } else if tc.name.starts_with("mcp__") {
-                let mgr = app.state::<crate::commands::mcp::McpManager>();
-                crate::commands::mcp::mcp_execute_for_workspace(
-                    app,
-                    &mgr,
-                    &tc.name,
-                    &args,
-                    root.as_deref(),
-                    allow_project_config,
-                )
-                .await
+                let effect = mcp_effects
+                    .get(&tc.name)
+                    .copied()
+                    .unwrap_or(crate::commands::agents::policy::ExternalToolEffect::Unknown);
+                if !matches!(
+                    effect,
+                    crate::commands::agents::policy::ExternalToolEffect::SharedRead
+                        | crate::commands::agents::policy::ExternalToolEffect::ExternalRead
+                ) {
+                    (
+                        format!(
+                            "outil `{}` refusé dans Chat : effet MCP inconnu ou mutatif",
+                            tc.name
+                        ),
+                        true,
+                    )
+                } else {
+                    let mgr = app.state::<crate::commands::mcp::McpManager>();
+                    crate::commands::mcp::mcp_execute_for_workspace(
+                        app,
+                        &mgr,
+                        &tc.name,
+                        &args,
+                        root.as_deref(),
+                        allow_project_config,
+                        Some(crate::commands::agents::policy::ExecutionProfile::Chat),
+                    )
+                    .await
+                }
             } else {
                 // Outils fs : exécutés contre le vrai workspace (ou erreur si aucun).
                 match &root {

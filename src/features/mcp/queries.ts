@@ -2,12 +2,17 @@
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { invoke } from "@/lib/tauri";
 import { queryClient } from "@/lib/queryClient";
+import type { McpToolEffect } from "./mcpToolEffects";
 
 export interface McpServerStatus {
   name: string; transport: string; enabled: boolean;
   connected: boolean; toolCount: number; error?: string;
 }
-export interface McpToolInfo { name: string; description: string }
+export interface McpToolInfo {
+  name: string;
+  description: string;
+  effect: McpToolEffect;
+}
 export interface McpServerConfig {
   command?: string; args?: string[]; env?: Record<string,string>; url?: string;
 }

@@ -2411,6 +2411,22 @@ fn definition_allows_tool(selectors: Option<&[String]>, tool: &str) -> bool {
         }))
 }
 
+fn profile_allows_tool(
+    profile: super::policy::ExecutionProfile,
+    tool: &str,
+    mcp_effects: &std::collections::HashMap<String, super::policy::ExternalToolEffect>,
+) -> bool {
+    if tool.starts_with("mcp__") {
+        return profile.allows_external_tool(
+            mcp_effects
+                .get(tool)
+                .copied()
+                .unwrap_or(super::policy::ExternalToolEffect::Unknown),
+        );
+    }
+    profile.allows_tool(tool)
+}
+
 fn permission_allows_hooks(decision: Option<&super::permission::ToolPermission>) -> bool {
     matches!(decision, Some(super::permission::ToolPermission::Proceed))
 }
@@ -2681,6 +2697,8 @@ pub(super) async fn tool_use_loop(
     // locaux). Additif : un modèle fort n'est jamais affecté.
     let caps = crate::commands::model_capabilities::capabilities(protocol, model);
 
+    let mut mcp_effects: std::collections::HashMap<String, super::policy::ExternalToolEffect> =
+        std::collections::HashMap::new();
     let agent_tools: Option<serde_json::Value> = if !caps.supports_tools {
         None
     } else {
@@ -2696,7 +2714,7 @@ pub(super) async fn tool_use_loop(
             trust_root.as_deref(),
             !read_only || allow_project_config,
         )?;
-        let mcp_tools = crate::commands::mcp::enabled_tools_json_for_workspace(
+        let discovered_mcp = crate::commands::mcp::enabled_tools_for_workspace(
             app,
             &mgr,
             protocol,
@@ -2704,6 +2722,7 @@ pub(super) async fn tool_use_loop(
             allow_project_config,
         )
         .await;
+        mcp_effects = discovered_mcp.effects;
         enforce_run_workspace_binding(
             app,
             agent_id,
@@ -2711,7 +2730,7 @@ pub(super) async fn tool_use_loop(
             !read_only || allow_project_config,
         )?;
         if let Some(a) = arr.as_array_mut() {
-            a.extend(mcp_tools);
+            a.extend(discovered_mcp.provider_tools);
         }
         // Same central profile gate as the dispatcher. Unknown MCP effects fail
         // closed in Chat/Plan instead of bypassing the native write list.
@@ -2722,7 +2741,7 @@ pub(super) async fn tool_use_loop(
                     .or_else(|| t["function"]["name"].as_str());
                 name.is_some_and(|name| {
                     super::execution_profile_authorized(app, execution_profile)
-                        && execution_profile.allows_tool(name)
+                        && profile_allows_tool(execution_profile, name, &mcp_effects)
                 })
             });
         }
@@ -3339,7 +3358,7 @@ pub(super) async fn tool_use_loop(
         for tc in &turn.tool_calls {
             if !definition_allows_tool(definition_tools, &tc.name)
                 || !super::execution_profile_authorized(app, execution_profile)
-                || !execution_profile.allows_tool(&tc.name)
+                || !profile_allows_tool(execution_profile, &tc.name, &mcp_effects)
                 || super::lifecycle::reject_unplanned_tool(tc, enforce_plan_first).is_some()
             {
                 continue;
@@ -3478,7 +3497,7 @@ pub(super) async fn tool_use_loop(
                 // partir avant qu'une règle ask/deny ou un hook le bloque.
                 if !definition_allows_tool(definition_tools, &tc.name)
                     || !super::execution_profile_authorized(app, execution_profile)
-                    || !execution_profile.allows_tool(&tc.name)
+                    || !profile_allows_tool(execution_profile, &tc.name, &mcp_effects)
                     || super::lifecycle::reject_unplanned_tool(tc, enforce_plan_first).is_some()
                     || !permission_allows_hooks(permission_preflight.get(&tc.id))
                     || pre_tool_blocked.contains_key(&tc.id)
@@ -3578,7 +3597,7 @@ Livrable attendu : {expected}"
                     });
                     continue;
                 }
-                if !execution_profile.allows_tool(&tc.name) {
+                if !profile_allows_tool(execution_profile, &tc.name, &mcp_effects) {
                     acc.push(ToolResult {
                         id: tc.id.clone(),
                         name: tc.name.clone(),
@@ -3928,6 +3947,7 @@ Livrable attendu : {expected}"
                         &args,
                         workspace_root.as_deref(),
                         allow_project_config,
+                        Some(execution_profile),
                     )
                     .await;
                     acc.push(ToolResult {

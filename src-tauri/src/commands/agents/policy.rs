@@ -57,6 +57,25 @@ pub enum ExecutionProfile {
     FullAccess,
 }
 
+/// Declared effect of an external (MCP) tool. Unlike native Shugu tools, an
+/// MCP server executes outside the workspace sandbox, so its effect must be
+/// explicit before a read-only or Auto profile can expose it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExternalToolEffect {
+    /// Reads a bounded/closed data set (for example a project memory store).
+    SharedRead,
+    /// Reads an open external world (for example search, docs or SaaS data).
+    ExternalRead,
+    /// Performs an additive or otherwise non-destructive mutation.
+    AdditiveWrite,
+    /// May overwrite, delete, publish or otherwise perform destructive work.
+    DestructiveWrite,
+    /// No trustworthy declaration was supplied. Always fail closed outside an
+    /// explicitly confirmed Full Access session.
+    Unknown,
+}
+
 impl ExecutionProfile {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -129,6 +148,20 @@ impl ExecutionProfile {
                 | "lsp_references"
         );
         shared_read || (matches!(self, Self::Plan) && matches!(name, "todo_write" | "submit_plan"))
+    }
+
+    /// Profile gate for an MCP tool after discovery classified its declared
+    /// effect. Chat, Plan and Auto may consume explicit reads; mutations and
+    /// unknown tools remain Full-Access-only because an MCP process is not
+    /// confined by Shugu's workspace sandbox.
+    pub fn allows_external_tool(self, effect: ExternalToolEffect) -> bool {
+        if matches!(self, Self::FullAccess) {
+            return true;
+        }
+        matches!(
+            effect,
+            ExternalToolEffect::SharedRead | ExternalToolEffect::ExternalRead
+        )
     }
 }
 
@@ -991,12 +1024,16 @@ mod tests {
     }
 
     #[test]
-    fn read_only_profiles_fail_closed_for_mutations_and_mcp() {
+    fn profiles_fail_closed_for_untyped_mcp_and_allow_declared_reads() {
         for profile in [ExecutionProfile::Chat, ExecutionProfile::Plan] {
             assert!(profile.allows_tool("fs_read_file"));
             assert!(!profile.allows_tool("fs_write_file"));
             assert!(!profile.allows_tool("run_command"));
             assert!(!profile.allows_tool("mcp__github__create_issue"));
+            assert!(profile.allows_external_tool(ExternalToolEffect::SharedRead));
+            assert!(profile.allows_external_tool(ExternalToolEffect::ExternalRead));
+            assert!(!profile.allows_external_tool(ExternalToolEffect::Unknown));
+            assert!(!profile.allows_external_tool(ExternalToolEffect::AdditiveWrite));
         }
         assert!(!ExecutionProfile::Chat.allows_tool("submit_plan"));
         assert!(ExecutionProfile::Plan.allows_tool("submit_plan"));
@@ -1005,6 +1042,9 @@ mod tests {
         assert!(ExecutionProfile::Auto.allows_tool("todo_write"));
         assert!(ExecutionProfile::FullAccess.allows_tool("todo_write"));
         assert!(!ExecutionProfile::Auto.allows_tool("mcp__github__create_issue"));
+        assert!(ExecutionProfile::Auto.allows_external_tool(ExternalToolEffect::ExternalRead));
+        assert!(!ExecutionProfile::Auto.allows_external_tool(ExternalToolEffect::DestructiveWrite));
+        assert!(ExecutionProfile::FullAccess.allows_external_tool(ExternalToolEffect::Unknown));
         assert!(!ExecutionProfile::Plan.allows_tool("browser_test"));
         assert!(ExecutionProfile::Auto.allows_tool("browser_test"));
         assert!(ExecutionProfile::FullAccess.allows_tool("run_command"));

@@ -30,6 +30,10 @@ import {
   type InventoryEntry,
   type McpRisk,
 } from "./queries";
+import {
+  getMcpToolEffectMeta,
+  type McpToolEffect,
+} from "./mcpToolEffects";
 
 // Per-row outcome of a "Tester" probe: either the discovered tools or an error
 // string. Kept in local state keyed by server name because a single
@@ -294,6 +298,11 @@ export function McpServersSection() {
         Chaque serveur est défini dans un fichier <code>.mcp.json</code> (à la
         racine du projet, ou dans ton dossier personnel pour le global). Active
         un serveur pour que ses outils soient proposés au chat et aux agents.
+      </p>
+      <p className="sub" style={{ marginTop: 6 }}>
+        « Tester » affiche l’effet déclaré de chaque outil. Chat, Plan et Auto
+        n’acceptent que les lectures explicites ; les écritures, actions
+        destructives et effets inconnus restent réservés à Full Access.
       </p>
 
       <div className="conn-actions" style={{ marginTop: 12 }}>
@@ -725,6 +734,51 @@ function Td({ children, title }: { children: ReactNode; title?: string }) {
 
 // ─── A single MCP server card ────────────────────────────────────────────────
 
+function ToolEffectBadge({ effect }: { effect: McpToolEffect }) {
+  const meta = getMcpToolEffectMeta(effect);
+  const palette = {
+    read: {
+      background: "rgba(93, 212, 168, 0.1)",
+      border: "rgba(93, 212, 168, 0.22)",
+      color: "var(--success, #5dd4a8)",
+    },
+    write: {
+      background: "rgba(224, 142, 254, 0.1)",
+      border: "rgba(224, 142, 254, 0.22)",
+      color: "var(--primary)",
+    },
+    danger: {
+      background: "rgba(255, 107, 107, 0.1)",
+      border: "rgba(255, 107, 107, 0.24)",
+      color: "var(--error, #ff6b6b)",
+    },
+    unknown: {
+      background: "rgba(255, 255, 255, 0.04)",
+      border: "rgba(255, 255, 255, 0.1)",
+      color: "var(--on-surface-muted)",
+    },
+  }[meta.tone];
+
+  return (
+    <span
+      title={`${meta.description} Les annotations viennent du serveur activé.`}
+      style={{
+        flex: "none",
+        padding: "1px 5px",
+        borderRadius: 999,
+        border: `1px solid ${palette.border}`,
+        background: palette.background,
+        color: palette.color,
+        fontFamily: "var(--font-mono)",
+        fontSize: 8.5,
+        letterSpacing: 0.2,
+      }}
+    >
+      {meta.label}
+    </span>
+  );
+}
+
 function McpServerCard({
   server,
   busy,
@@ -806,10 +860,14 @@ function McpServerCard({
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                 {result.tools.map((t) => (
-                  <div key={t.name}>
+                  <div
+                    key={t.name}
+                    style={{ display: "flex", alignItems: "baseline", gap: 6 }}
+                  >
                     <code style={{ background: "rgba(0,0,0,0.3)", padding: "1px 5px", borderRadius: 3, color: "var(--on-surface)" }}>{t.name}</code>
+                    <ToolEffectBadge effect={t.effect} />
                     {t.description && (
-                      <span style={{ marginLeft: 6, opacity: 0.8 }}>{t.description}</span>
+                      <span style={{ opacity: 0.8 }}>{t.description}</span>
                     )}
                   </div>
                 ))}

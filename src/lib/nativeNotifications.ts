@@ -19,6 +19,7 @@
 import { db } from "@/lib/db";
 
 export type NotificationKind = "runComplete" | "runError" | "hitlWaiting";
+export type NativeNotificationResult = "sent" | "denied" | "failed";
 
 export interface NotificationSettings {
   runComplete: boolean;
@@ -96,19 +97,24 @@ function isMascotWindow(): boolean {
 }
 
 /** Envoie la notification native (demande la permission si nécessaire).
- *  Résout silencieusement en cas d'échec — une notification ne doit jamais
+ *  Retourne un reçu sans lever d'erreur — une notification ne doit jamais
  *  casser le flux d'events du chat. */
-export async function notifyNative(title: string, body: string): Promise<void> {
+export async function notifyNative(
+  title: string,
+  body: string,
+): Promise<NativeNotificationResult> {
   try {
     const notif = await import("@tauri-apps/plugin-notification");
     let granted = await notif.isPermissionGranted();
     if (!granted) {
       granted = (await notif.requestPermission()) === "granted";
     }
-    if (!granted) return;
+    if (!granted) return "denied";
     notif.sendNotification({ title, body });
+    return "sent";
   } catch (err) {
     console.warn("[notifications] native notify failed:", err);
+    return "failed";
   }
 }
 

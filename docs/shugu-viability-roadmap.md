@@ -27,7 +27,7 @@ annoncer une capacité que le backend n'applique pas.
 | P1.3 | Ollama agentique natif | Fonctionnel sans binaire local | NDJSON et tool calls testés par serveur local factice ; test live requis dès qu'Ollama est installé. |
 | P1.4 | Interop Codex CLI/app-server (chat/probe) | Validé | Chat et probe Codex réels prouvés en live. Un bridge agentique CLI n'est pas un objectif produit : l'exécution agentique reste sous le lifecycle natif Shugu. |
 | P1.5 | Interop OpenCode / autres CLI compatibles | Fonctionnel | Endpoint compatible utilisable et présenté honnêtement en Chat-only ; Shugu reprend leurs bonnes conventions sans déléguer son lifecycle agentique à un CLI opaque. |
-| P1.6 | MCP avec effets typés | Partiel | MCP fonctionne ; Auto refuse les effets inconnus. Reste à typer chaque outil et durcir le transport HTTP. |
+| P1.6 | MCP avec effets typés | Validé | Les annotations standard deviennent `sharedRead`/`externalRead`/`additiveWrite`/`destructiveWrite`/`unknown`, visibles dans Connections. Chat/Plan/Auto n'exposent que les lectures explicites et l'effet est revérifié sur la connexion exacte avant l'appel ; Full Access reste requis sinon. HTTP distant exige HTTPS, HTTP clair est loopback-only, identifiants/fragments/redirections sont refusés et le connect est borné. |
 | P2.1 | Settings réels | Fonctionnel | Valeurs effectives, persistance SQLite/local cache, diagnostics About réels, aucun switch sans consommateur. |
 | P2.2 | Connections réelles | Fonctionnel | « Connecté » uniquement après probe ; intégrations absentes marquées indisponibles. |
 | P2.3 | Conversations et dock | Fonctionnel | Aucun transcript seedé, agent dock relié à SQLite, Output/Problems alimentés par données réelles. |
@@ -39,13 +39,13 @@ annoncer une capacité que le backend n'applique pas.
 | P4.1 | E2E navigateur de la couche UI | Validé | Build, `ui:tour` et Playwright verts, avec erreurs Tauri absentes explicitement tolérées. |
 | P4.2 | E2E Tauri/WebView2 automatisé | Validé | Harness CDP reproductible, identifiant/base/profil isolés, deux boots, captures, IPC natif et teardown exact. |
 | P4.3 | Évaluations agents live multi-provider | Validé | Codex réel validé en chat/probe ; Qwen3 8B et Llama 3.1 8B validés séparément sur le même cycle Agent complet sous llama.cpp. |
-| P5.1 | Accessibilité clavier/ARIA | Validé | 584 contrôles visibles nommés et 950 échantillons de contraste sans violation sur 12 états au dernier passage ; navigation clavier et focus-trap/restauration des dialogs prouvés dans WebView2. |
+| P5.1 | Accessibilité clavier/ARIA | Validé | 594 contrôles visibles nommés et 941 échantillons de contraste sans violation sur 12 états au dernier passage ; navigation clavier et focus-trap/restauration des dialogs prouvés dans WebView2. |
 | P5.2 | Dépendances, lint et performances | Validé | Audit JS propre, exceptions Rust bornées, lint à 0/0, budgets dev/release/charge mesurés, indexation batchée et installateurs Windows produits. |
 | P6.1 | File de suivi run (queue/steer/interrupt) | Validé | Migration V25 `queued_followups` ; steer injecté entre deux tours (preuve provider scripté), queue drainée par le pipeline d'envoi normal sur succès seulement, interrupt = kill CAS + nouvelle instruction ; kill conserve la file ; 6 tests Rust + 8 Vitest verts. |
 | P6.2 | Comptabilité tokens + indicateur contexte | Validé | `usage` parsé sur Anthropic/OpenAI-compatible/Ollama sans zéro fabriqué, `tokenUsage` par tour et `tokens_used` du run persistés, jauge de contexte sourcée (provider/estimate) avec alerte 75 %, événement `memoryCompacted` enfin consommé dans l'UI ; 8 tests Rust + 9 Vitest verts. |
 | P6.3 | Rewind/checkpoints par tour | Validé | Migration V26 (provenance fork) ; rewind fichiers avec preview (restaurés/supprimés), checkpoint de secours `pre-revert-*` obligatoire avant mutation, double rewind idempotent, fork de conversation non-destructif, event `rewindApplied` persisté ; menu 3 choix (fichiers/conversation/les deux) ; 10 tests Rust + 8 Vitest verts. |
 | P6.4 | Hooks lifecycle utilisateur | Validé | hooks.json user+projet (merge concaténé, désactivation persistée hors JSON), 6 événements, permissions évaluées avant PreToolUse, PreToolUse fail-closed (refus = ToolResult), chemins stdin échappés par shell, PostToolUse/Stop avec contexte tracé (`hookFired` persisté), Stop borné à 3 blocs, exécution confinée (LOW en Auto, zéro hook en Chat/Plan) ; 12 tests Rust + 8 Vitest verts. |
-| P6.5 | Notifications OS natives | Fonctionnel | tauri-plugin-notification câblé (capability fenêtre principale seule), toasts natifs fin/erreur/HITL avec 4 toggles persistés à consommateurs réels, garde focus et anti-double-window ; 7 tests Vitest verts ; preuve native du toast Windows à confirmer au prochain `native:smoke` (étapes documentées). |
+| P6.5 | Notifications OS natives | Validé | tauri-plugin-notification câblé (capability fenêtre principale seule), toasts natifs fin/erreur/HITL avec 4 toggles persistés à consommateurs réels, garde focus et anti-double-window ; 7 tests Vitest verts. Le `native:smoke` appelle le helper produit dans le vrai WebView2, obtient la permission Windows et enregistre un reçu `sent`. |
 | P6.6 | Modes de détail de conversation | Validé | Récit/Étapes/Exécution = 3 présentations des mêmes events persistés (filtré ≠ supprimé), bascule en direct sans reload sur chat + AgentsPanel, actions HITL/fichiers conservées en Récit ; 9 tests Vitest verts. |
 | P6.7 | Plugins par convention de répertoires | Validé | Découverte user/projet/cache Claude (lecture seule, dernière version semver, formats actuels `installed_plugins`/`enabledPlugins` + hérités), 5 contributions (commands namespacées, agents via le parseur existant, skills, hooks scopés plugin, `.mcp.json` en approbation explicite avec empreinte complète commande+arguments+env+URL revérifiée), enable/disable sans réécriture ; 9 tests Rust + 7 Vitest verts (couvrant aussi P6.8). |
 | P6.8 | Skills fichiers SKILL.md sémantiques | Validé | Découverte projet > shugu > claude > plugins, listing name+description seul injecté (borné, préambule anti-injection), outil `skill_load` paresseux Auto-safe tracé en ToolCall, dedup fichier-gagne sans suppression de l'apprise ; preuve loopback corps absent du prompt initial. |
@@ -99,11 +99,14 @@ annoncer une capacité que le backend n'applique pas.
   `WindowsApps`, `submit_plan` strictement réservé au mode Plan, `todo_write`
   conservé dans le toolset des petits modèles, mutation impossible avant plan
   et réponse brute impossible en mode Agent sans action.
-- **À terminer** — MCP fonctionne et Auto refuse aujourd'hui tout effet inconnu ;
-  il reste à traduire les annotations d'outils en effets Shugu fiables et à
-  durcir le transport HTTP avant d'autoriser les lectures déclarées.
-- **Garde-fou maintenu** — Codex et OpenCode restent Chat-only jusqu'à ce qu'un bridge fournisse chaque
-  ToolCall/ToolResult au lifecycle Shugu et respecte kill/profil/isolation.
+- **Livré** — effets MCP typés dès la découverte, badges explicites dans
+  Connections, double gate manifeste/exécution et blocage fail-closed de toute
+  mutation ou capacité inconnue hors Full Access ; transport HTTPS/loopback sans
+  redirection et avec timeout de connexion.
+- **Garde-fou maintenu** — Codex et OpenCode restent volontairement Chat-only :
+  aucun bridge agentique opaque n'est planifié. Shugu reprend leurs bonnes
+  pratiques, mais garde ToolCall/ToolResult, kill, profils et isolation dans son
+  propre lifecycle observable.
 
 ### R2 — jobs média et stockage — livré
 
@@ -192,11 +195,11 @@ indexation/streaming et les installateurs sont également prouvés.
 
 - Reprise du plan Kimi interrompu en P6.12 sur la branche
   `codex/resume-kimi-parity-plan`, sans écraser le worktree existant.
-- Rust : `cargo check` vert et 562 tests verts, dont les contrats
+- Rust : `cargo check` vert et 564 tests verts, dont les contrats
   permissions/plugins/hooks/fan-out/LSP/rewind ajoutés pendant la revue
   adversariale. Le loader Windows du harness de test porte désormais le
   manifeste Common Controls v6 requis par Tauri.
-- Frontend : 70 fichiers / 653 tests Vitest, typecheck, ESLint, build Vite,
+- Frontend : 71 fichiers / 655 tests Vitest, typecheck, ESLint, build Vite,
   Playwright et
   `ui:tour` verts. Le tour headless conserve les captures dans
   `dev-logs/ui-tour/`.
@@ -225,17 +228,31 @@ indexation/streaming et les installateurs sont également prouvés.
   commit hors `main` ou des versions incohérentes, teste puis publie NSIS/MSI
   et `SHA256SUMS.txt`. La preuve de téléchargement live attend la première
   Release ; aucun faux succès n'est affiché jusque-là.
+- MCP P1.6 : effets standard convertis en cinq classes affichées dans
+  Connections ; seules les lectures explicites passent en Chat/Plan/Auto,
+  avec revérification sur la connexion immédiatement avant l'appel. Les
+  endpoints distants exigent HTTPS, le HTTP clair est limité au loopback et le
+  client ne suit aucune redirection. Les audits JS/Rust sont verts après retrait
+  du bridge Convex React Query inutilisé, correction de `brace-expansion` et
+  mises à jour `anyhow`/`memmap2`.
 - Preuve native isolée :
-  `dev-logs/native-smoke/20260726-050411/` — vraie base SQLite fraîche en
+  `dev-logs/native-smoke/20260726-053823/` — vraie base SQLite fraîche en
   schéma 30, décision unknown → lecture seule → approuvée, focus-trap, badges,
-  captures, 12 audits accessibilité/contraste sans violation, aucune erreur
-  page/requête, backup/restauration sur deux boots et budget mémoire WebView2 +
-  Tauri respecté (956 071 936 octets). Le harness force la collecte des
+  captures, 594 contrôles et 941 échantillons de contraste sans violation,
+  aucune erreur page/requête, notification Windows réellement envoyée
+  (`permissionAfter: granted`, `result: sent`), backup/restauration sur deux
+  boots et budget mémoire WebView2 + Tauri respecté (927 203 328 octets). Le
+  harness force la collecte des
   allocations temporaires du tour avant mesure, conserve le seuil 1 Gio et
   distingue les lenteurs Vite dev du budget release. Les deux fenêtres ne
   chargent plus de police distante au boot.
-- Restent à prouver nativement : le toast Windows P6.5 et le téléchargement
-  P6.13 contre une première Release publiée. Les expériences quick entry,
+- Preuve release isolée :
+  `dev-logs/release-smoke/20260726-054347/` — binaire optimisé de 80 625 664
+  octets, shell utilisable en 682 ms, DOMContentLoaded en 137 ms, heap JS de
+  26 412 882 octets et empreinte Tauri + WebView2 de 676 823 040 octets, sans
+  erreur page/console/requête.
+- Reste à prouver en environnement publié : le téléchargement P6.13 contre une
+  première Release GitHub. Les expériences quick entry,
   onglets typés, « Open in… » et tiling multi-agents sont un futur arbitrage
   produit, pas une dette de P6.14.
 
