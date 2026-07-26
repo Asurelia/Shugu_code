@@ -15,6 +15,14 @@ import {
 import { ProjectSwitcher, type ProjectViewMode } from "@/features/projects/ProjectSwitcher";
 import { projectKeys } from "@/features/projects/keys";
 import { useModalFocusTrap } from "@/lib/modalFocus";
+import {
+  findConversation,
+  flattenConversations,
+  groupConversationsByActivity,
+  nextUnreadConversationId,
+  patchConversationTree,
+  removeConversationTree,
+} from "./chatSidebarModel";
 
 export const DEFAULT_GROUPS = [
   { id: "pinned", label: "Épinglées", pinnedSection: true },
@@ -85,7 +93,7 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
     project: "all",
     env: "all",
     activity: "all",
-    groupBy: "custom",
+    groupBy: "activity",
     sortBy: "recency",
   });
   const [ctx, setCtx]         = useState<any>({ open: false, x: 0, y: 0, convo: null, submenu: null });
@@ -94,12 +102,47 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
   const [dropTarget, setDropTarget] = useState<any>(null);
   const [newGroupOpen, setNewGroupOpen] = useState(false);
 
+  const patch = useCallback(
+    (id: string, values: any) =>
+      setConvos((current) =>
+        patchConversationTree(current, id, {
+          ...values,
+          updated:
+            values.updated ??
+            findConversation(current, id)?.updated ??
+            Date.now(),
+        }),
+      ),
+    [],
+  );
+
+  const activateConversation = useCallback(
+    (id: string) => {
+      const conversation = findConversation(convos, id);
+      if (conversation?.unread) {
+        patch(id, { unread: false });
+        void db.conversations.setUnread(id, false);
+      }
+      setActiveId(id);
+    },
+    [convos, patch, setActiveId],
+  );
+
   useEffect(() => {
     if (!onActiveTitle) return;
-    const c = convos.find((c: any) => c.id === activeId)
-      || convos.flatMap((c: any) => c.children || []).find((c: any) => c.id === activeId);
+    const c = findConversation(convos, activeId);
     onActiveTitle(c?.title || null);
   }, [activeId, convos, onActiveTitle]);
+
+  // Active conversation changes can originate from the unified palette or
+  // from the mascot window. Opening is authoritative: it clears unread in the
+  // sidebar and SQLite even when the click did not originate here.
+  useEffect(() => {
+    const active = findConversation(convos, activeId);
+    if (!active?.unread) return;
+    patch(activeId, { unread: false });
+    void db.conversations.setUnread(activeId, false);
+  }, [activeId, convos, patch]);
 
   // Keep the module cache in sync with the live state so the next remount
   // (panel reopen) starts from the real data, not a stale snapshot.
@@ -197,6 +240,26 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
     );
   }, [visible, searchOpen, trimmedQuery, semanticConvIds]);
 
+  const unreadCount = useMemo(
+    () =>
+      flattenConversations(searchedSource).filter(
+        (conversation: any) => conversation.unread,
+      ).length,
+    [searchedSource],
+  );
+
+  const navigateUnread = useCallback(
+    (direction: 1 | -1) => {
+      const id = nextUnreadConversationId(
+        searchedSource,
+        activeId,
+        direction,
+      );
+      if (id) activateConversation(id);
+    },
+    [activateConversation, activeId, searchedSource],
+  );
+
   const groupsForRender = useMemo(() => {
     // searchedSource already applied the active search (or is `visible` when
     // the search bar is closed / empty).
@@ -213,16 +276,7 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
       return [...m.entries()].map(([k, items]) => ({ id: k, label: k.toUpperCase(), items }));
     }
     if (filters.groupBy === "activity") {
-      const buckets = [
-        { id: "today", label: "Today",     test: (c: any) => Date.now() - c.updated < 86400*1000 },
-        { id: "week",  label: "This week", test: (c: any) => Date.now() - c.updated < 7*86400*1000 },
-        { id: "older", label: "Older",     test: () => true },
-      ];
-      const used = new Set<string>();
-      return buckets.map(b => ({
-        id: b.id, label: b.label,
-        items: source.filter((c: any) => !used.has(c.id) && b.test(c) && used.add(c.id))
-      })).filter(g => g.items.length);
+      return groupConversationsByActivity(source);
     }
     return groups.map((g: any) => ({
       id: g.id, label: g.label, pinnedSection: g.pinnedSection,
@@ -230,13 +284,12 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
     })).filter((g: any) => g.items.length || !g.pinnedSection);
   }, [searchedSource, filters.groupBy, groups]);
 
-  const patch = useCallback((id: string, p: any) => setConvos(cs => cs.map((c: any) => c.id === id ? { ...c, ...p, updated: p.updated ?? c.updated } : c)), []);
   const remove = (id: string) => {
-    setConvos(cs => cs.filter((c: any) => c.id !== id));
+    setConvos((current) => removeConversationTree(current, id));
     void db.conversations.remove(id);
   };
   const togglePin = useCallback((id: string) => {
-    const cur = convos.find((c: any) => c.id === id);
+    const cur = findConversation(convos, id);
     const next = !cur?.pinned;
     patch(id, { pinned: next });
     void db.conversations.setPinned(id, next);
@@ -250,7 +303,7 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
     void db.conversations.setArchived(id, false);
   };
   const duplicate = useCallback((id: string) => {
-    const c = convos.find((c: any) => c.id === id);
+    const c = findConversation(convos, id);
     if (!c) return;
     const newConvoData = { ...c, id: c.id + "-copy-" + Date.now(), title: c.title + " (copy)", updated: Date.now() };
     setConvos(cs => [newConvoData, ...cs]);
@@ -310,6 +363,25 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
     setConvos(cs => cs.map((c: any) => c.group === id ? { ...c, group: "ungrouped" } : c));
     setGroups(gs => gs.filter((g: any) => g.id !== id));
   };
+  const markGroupRead = (groupId: string) => {
+    const ids = flattenConversations(
+      convos.filter((conversation: any) => conversation.group === groupId),
+    )
+      .filter((conversation: any) => conversation.unread)
+      .map((conversation: any) => conversation.id);
+    if (ids.length === 0) {
+      closeGroupCtx();
+      return;
+    }
+    setConvos((current) =>
+      ids.reduce(
+        (next, id) => patchConversationTree(next, id, { unread: false }),
+        current,
+      ),
+    );
+    ids.forEach((id) => void db.conversations.setUnread(id, false));
+    closeGroupCtx();
+  };
   const moveGroup = (id: string, beforeId: string) => {
     setGroups(gs => {
       const item = gs.find((g: any) => g.id === id);
@@ -329,13 +401,30 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
   const [hoverId, setHoverId] = useState<string | null>(null);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName;
+      if (
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        target?.isContentEditable ||
+        target?.getAttribute("role") === "textbox"
+      ) {
+        return;
+      }
+      if (
+        e.altKey &&
+        e.shiftKey &&
+        (e.key === "ArrowDown" || e.key === "ArrowUp")
+      ) {
+        e.preventDefault();
+        navigateUnread(e.key === "ArrowDown" ? 1 : -1);
+        return;
+      }
       const targetId = ctx.open ? ctx.convo?.id : hoverId;
       if (!targetId) return;
-      const tag = (e.target as HTMLElement)?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA") return;
       const k = e.key.toLowerCase();
       if (k === "p") { togglePin(targetId); closeCtx(); }
-      else if (k === "u") { const cur2 = convos.find((c: any) => c.id === targetId); const nu = !cur2?.unread; patch(targetId, { unread: nu }); void db.conversations.setUnread(targetId, nu); closeCtx(); }
+      else if (k === "u") { const cur2 = findConversation(convos, targetId); const nu = !cur2?.unread; patch(targetId, { unread: nu }); void db.conversations.setUnread(targetId, nu); closeCtx(); }
       else if (k === "r") { setRenaming(targetId); closeCtx(); }
       else if (k === "f") { duplicate(targetId); closeCtx(); }
       else if (k === "a") { archive(targetId); closeCtx(); }
@@ -343,7 +432,7 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [ctx.open, ctx.convo?.id, hoverId, convos, patch, togglePin, duplicate, archive]);
+  }, [ctx.open, ctx.convo?.id, hoverId, convos, patch, togglePin, duplicate, archive, navigateUnread]);
 
   const newConvo = () => {
     const id = "c-" + Date.now();
@@ -360,10 +449,23 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
     setRenaming(id);
   };
 
+  const customGrouping = filters.groupBy === "custom";
+
   return (
     <aside className="side chat-side">
       <div className="side-head">
         <div className="side-title">Conversations</div>
+        {unreadCount > 0 && (
+          <button
+            className="side-unread-nav"
+            onClick={() => navigateUnread(1)}
+            title="Conversation non lue suivante (Alt+Shift+↓ · précédente ↑)"
+            aria-label={`${unreadCount} conversation${unreadCount > 1 ? "s" : ""} non lue${unreadCount > 1 ? "s" : ""}. Ouvrir la suivante`}
+          >
+            <span className="dot" aria-hidden="true" />
+            <span>{unreadCount}</span>
+          </button>
+        )}
         <button
           className={"side-filter-btn" + (searchOpen ? " on" : "")}
           onClick={() => { setSearchOpen(o => !o); setTimeout(() => searchInputRef.current?.focus(), 60); }}
@@ -448,8 +550,11 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
           const isCustom = !g.pinnedSection && g.id !== "ungrouped" && groups.some((gg: any) => gg.id === g.id);
           return (
           <div key={g.id} className={"chat-group" + (g.pinnedSection ? " pinned" : "")}
-            onDragOver={(e) => onDragOverGroup(e, g.id)}
+            onDragOver={(e) => {
+              if (customGrouping) onDragOverGroup(e, g.id);
+            }}
             onDrop={(e) => {
+              if (!customGrouping) return;
               const groupDrag = e.dataTransfer.getData("text/group");
               if (groupDrag) {
                 e.preventDefault();
@@ -484,6 +589,11 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
                 >
                   <span>{g.pinnedSection && <Icon name="up" size={10}/>} {g.label}</span>
                   {isCustom && <span className="chat-group-count">{g.items.length}</span>}
+                  {!isCustom && g.unreadCount > 0 && (
+                    <span className="chat-group-unread" title={`${g.unreadCount} non lue${g.unreadCount > 1 ? "s" : ""}`}>
+                      {g.unreadCount}
+                    </span>
+                  )}
                 </div>
               )
             )}
@@ -497,22 +607,29 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
               <ChatRow
                 key={c.id}
                 convo={c}
-                active={c.id === activeId}
-                renaming={renaming === c.id}
-                onPick={() => setActiveId(c.id)}
-                onCtx={(e: any) => openCtx(e, c)}
-                onRename={(title: string) => { patch(c.id, { title, updated: Date.now() }); void db.conversations.rename(c.id, title); setRenaming(null); }}
+                activeId={activeId}
+                renamingId={renaming}
+                onPick={activateConversation}
+                onCtx={openCtx}
+                onRename={(id: string, title: string) => { patch(id, { title, updated: Date.now() }); void db.conversations.rename(id, title); setRenaming(null); }}
                 onCancelRename={() => setRenaming(null)}
                 onDragStart={(e: any) => onDragStart(e, c.id)}
                 onDragEnd={onDragEnd}
                 dragging={draggingId === c.id}
-                onHover={(v: boolean) => setHoverId(v ? c.id : (hoverId === c.id ? null : hoverId))}
+                dragEnabled={customGrouping}
+                onHover={setHoverId}
               />
             ))}
           </div>
           );
         })}
-        <button className="chat-new-group" onClick={() => setNewGroupOpen(true)}>
+        <button
+          className="chat-new-group"
+          onClick={() => {
+            setFilters((current: any) => ({ ...current, groupBy: "custom" }));
+            setNewGroupOpen(true);
+          }}
+        >
           <Icon name="plus" size={11}/> New group
         </button>
       </div>
@@ -525,12 +642,13 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
           convo={ctx.convo}
           groups={groups}
           onClose={closeCtx}
-          onActivate={(id: string) => { setActiveId(id); closeCtx(); }}
+          onActivate={(id: string) => { activateConversation(id); closeCtx(); }}
           onPin={() => { togglePin(ctx.convo.id); closeCtx(); }}
           onUnread={() => { const nu = !ctx.convo.unread; patch(ctx.convo.id, { unread: nu }); void db.conversations.setUnread(ctx.convo.id, nu); closeCtx(); }}
           onRename={() => { setRenaming(ctx.convo.id); closeCtx(); }}
           onDuplicate={() => { duplicate(ctx.convo.id); closeCtx(); }}
           onMove={(gid: string) => {
+            setFilters((current: any) => ({ ...current, groupBy: "custom" }));
             if (gid === "__new") setNewGroupOpen(true);
             else moveTo(ctx.convo.id, gid);
             closeCtx();
@@ -549,7 +667,7 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
             <button className="chat-ctx-item" onClick={() => { setRenamingGroup(groupCtx.group.id); closeGroupCtx(); }}>
               <span className="label">Renommer le groupe</span><span className="kbd">R</span>
             </button>
-            <button className="chat-ctx-item" onClick={closeGroupCtx}>
+            <button className="chat-ctx-item" onClick={() => markGroupRead(groupCtx.group.id)}>
               <span className="label">Tout marquer comme lu</span>
             </button>
             <button className="chat-ctx-item" onClick={() => { setConvos(cs => cs.map((c: any) => { if (c.group === groupCtx.group.id) { void db.conversations.setArchived(c.id, true); return { ...c, status: "archived" }; } return c; })); closeGroupCtx(); }}>
@@ -578,23 +696,40 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
   );
 }
 
-export function ChatRow({ convo, active, renaming, onPick, onCtx, onRename, onCancelRename, onDragStart, onDragEnd, dragging, onHover }: any) {
+export function ChatRow({
+  convo,
+  activeId,
+  renamingId,
+  onPick,
+  onCtx,
+  onRename,
+  onCancelRename,
+  onDragStart,
+  onDragEnd,
+  dragging,
+  dragEnabled = true,
+  onHover,
+  child = false,
+}: any) {
   const [val, setVal] = useState(convo.title);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const active = convo.id === activeId;
+  const renaming = convo.id === renamingId;
   useEffect(() => { if (renaming) { setVal(convo.title); inputRef.current?.select(); } }, [renaming, convo.title]);
 
   return (
     <>
       <div
-        className={"chat-row" + (active ? " active" : "") + (dragging ? " dragging" : "") + (convo.pinned ? " pinned" : "") + (convo.unread ? " unread" : "")}
-        onClick={() => !renaming && onPick()}
-        onContextMenu={onCtx}
-        onMouseEnter={() => onHover(true)}
-        onMouseLeave={() => onHover(false)}
-        draggable={!renaming}
+        className={"chat-row" + (child ? " child" : "") + (active ? " active" : "") + (dragging ? " dragging" : "") + (convo.pinned ? " pinned" : "") + (convo.unread ? " unread" : "")}
+        onClick={() => !renaming && onPick(convo.id)}
+        onContextMenu={(event) => onCtx(event, convo)}
+        onMouseEnter={() => onHover(convo.id)}
+        onMouseLeave={() => onHover(null)}
+        draggable={!child && dragEnabled && !renaming}
         onDragStart={onDragStart}
         onDragEnd={onDragEnd}
       >
+        {child && <span className="chat-row-line"></span>}
         <span className="chat-row-dot"></span>
         {renaming ? (
           <input
@@ -603,27 +738,35 @@ export function ChatRow({ convo, active, renaming, onPick, onCtx, onRename, onCa
             value={val}
             onChange={e => setVal(e.target.value)}
             onKeyDown={e => {
-              if (e.key === "Enter") onRename(val);
+              if (e.key === "Enter") onRename(convo.id, val);
               else if (e.key === "Escape") onCancelRename();
             }}
-            onBlur={() => onRename(val)}
+            onBlur={() => onRename(convo.id, val)}
             autoFocus
           />
         ) : (
           <span className="chat-row-label">{convo.title}</span>
         )}
         {convo.pinned && !renaming && <Icon name="up" size={10} className="chat-row-pin"/>}
-        {convo.children && <span className="chat-row-count">{convo.children.length}</span>}
+        {convo.children?.length > 0 && <span className="chat-row-count">{convo.children.length}</span>}
       </div>
-      {convo.children && convo.children.map((child: any) => (
-        <div key={child.id} className={"chat-row child" + (child.id === active ? " active" : "")}
-          onClick={onPick}
-          onContextMenu={(e) => onCtx(e, child)}
-        >
-          <span className="chat-row-line"></span>
-          <span className="chat-row-dot"></span>
-          <span className="chat-row-label">{child.title}</span>
-        </div>
+      {convo.children?.map((nested: any) => (
+        <ChatRow
+          key={nested.id}
+          convo={nested}
+          activeId={activeId}
+          renamingId={renamingId}
+          onPick={onPick}
+          onCtx={onCtx}
+          onRename={onRename}
+          onCancelRename={onCancelRename}
+          onDragStart={onDragStart}
+          onDragEnd={onDragEnd}
+          dragging={false}
+          dragEnabled={false}
+          onHover={onHover}
+          child
+        />
       ))}
     </>
   );
