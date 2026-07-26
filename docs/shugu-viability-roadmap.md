@@ -53,7 +53,7 @@ annoncer une capacité que le backend n'applique pas.
 | P6.10 | Permissions allow/ask/deny par motifs | Validé | Migrations V28/V29 ; décision fail-closed calculée une fois avant hooks, deny = ToolResult de refus, ask = pause HITL durable par signature et continuation, `allow once` consommé atomiquement une seule fois, réponse inconnue refusée ; chemins normalisés avant matching ; précédence deny > ask > allow puis spécificité puis projet > global ; UI 3 listes + testeur live ; 6 tests Rust + 14 Vitest verts. |
 | P6.11 | Sub-agents en fan-out parallèle | Validé | Délégations multiples du même tour exécutées après gates permission/hook, en parallèle borné avec réservations atomiques multi-parents (cap global 4, délégation imbriquée sans deadlock), wall-time ≈ max(latences) prouvé, résultats dans l'ordre, erreurs honnêtes, cascade kill BFS sans zombie, arbre parent↔enfants dans AgentsPanel ; 5 tests Rust + 4 Vitest verts. |
 | P6.12 | Outils LSP pour agents | Validé | `lsp_diagnostics`/`definition`/`references` au manifest en effet `shared_read`, confinement workspace et résultats bornés ; session unique par langue, IDs agent négatifs sans collision éditeur, handshake partagé/serialisé, `didOpen` puis `didChange` versionné, diagnostics diffusés à tous les waiters ; mock LSP strict + fixture TS, 13 tests Rust verts. |
-| P6.13 | Auto-update | À faire | Vérification au boot + dialog natif ; sans certificat, mode notifier + télécharger seulement. |
+| P6.13 | Auto-update | Fonctionnel | Vérification stable GitHub Releases au boot + réglage manuel, dialogue accessible, sélection d’installeur native, téléchargement borné dans le cache et SHA-256 GitHub vérifié lorsqu’il est publié. Sans certificat, Shugu révèle le fichier mais ne l’exécute jamais ; workflow tag `v*` prêt. Validation live à faire avec la première Release publiée. |
 | P6.14 | Refonte UX/UI (analyse Claude/OpenCode/Cursor) | Partiel | **Tranche 1 validée : confiance projet** persistée par chemin canonique, décision obligatoire lecture seule/faire confiance, badges visibles et révocation. La racine affichée, approuvée et exécutée est liée de bout en bout ; backend fail-closed pour règles, hooks, skills, plugins, MCP, LSP, formatage, preview, chat historique et agents projet. Switch/révocation coupent outils, hooks, connexions, LSP, iframes et processus persistants avant réutilisation. Restent : système de motion, tokens hairline/ring/opacités, sidebar groupée + non-lus, palette Ctrl+K, cartes d'outils + divider checkpoint, virtualisation, anti-flash ; périmètre : `docs/competitor-ux-2026-07-24.md`. |
 
 > Analyse comparative source : `docs/competitor-parity-2026-07-24.md`
@@ -191,11 +191,11 @@ indexation/streaming et les installateurs sont également prouvés.
 
 - Reprise du plan Kimi interrompu en P6.12 sur la branche
   `codex/resume-kimi-parity-plan`, sans écraser le worktree existant.
-- Rust : `cargo check` vert et 558 tests verts, dont les contrats
+- Rust : `cargo check` vert et 562 tests verts, dont les contrats
   permissions/plugins/hooks/fan-out/LSP/rewind ajoutés pendant la revue
   adversariale. Le loader Windows du harness de test porte désormais le
   manifeste Common Controls v6 requis par Tauri.
-- Frontend : 64 fichiers / 634 tests Vitest, typecheck, ESLint, build Vite,
+- Frontend : 65 fichiers / 635 tests Vitest, typecheck, ESLint, build Vite,
   Playwright et
   `ui:tour` verts. Le tour headless conserve les captures dans
   `dev-logs/ui-tour/`.
@@ -210,14 +210,25 @@ indexation/streaming et les installateurs sont également prouvés.
   Auto/Full Access refusés en lecture seule. Les runs épinglent la racine dès
   l'IPC, revérifient après chaque attente asynchrone et tuent processus/connexions
   persistants au switch ou à la révocation.
+- Auto-update P6.13 : vérification GitHub Releases stable au boot ou à la
+  demande, préférence et report de version persistés, sélection d'installeur
+  native, URL/redirections/nom/taille revérifiés côté Rust, flux SHA-256 vers
+  un cache géré et révélation manuelle seulement. Le workflow `v*` refuse un
+  commit hors `main` ou des versions incohérentes, teste puis publie NSIS/MSI
+  et `SHA256SUMS.txt`. La preuve de téléchargement live attend la première
+  Release ; aucun faux succès n'est affiché jusque-là.
 - Preuve native isolée :
-  `dev-logs/native-smoke/20260726-032918/` — vraie base SQLite fraîche en
+  `dev-logs/native-smoke/20260726-041218/` — vraie base SQLite fraîche en
   schéma 30, décision unknown → lecture seule → approuvée, focus-trap, badges,
   captures, 12 audits accessibilité/contraste sans violation, aucune erreur
   page/requête, backup/restauration sur deux boots et budget mémoire WebView2 +
-  Tauri respecté (1 053 569 024 octets).
-- Restent à prouver nativement : le toast Windows P6.5 et l'auto-update P6.13 ;
-  la finition visuelle et les grands parcours de navigation de P6.14 continuent.
+  Tauri respecté (926 289 920 octets). Le harness force la collecte des
+  allocations temporaires du tour avant mesure, conserve le seuil 1 Gio et
+  distingue les lenteurs Vite dev du budget release. Les deux fenêtres ne
+  chargent plus de police distante au boot.
+- Restent à prouver nativement : le toast Windows P6.5 et le téléchargement
+  P6.13 contre une première Release publiée ; la finition visuelle et les
+  grands parcours de navigation de P6.14 continuent.
 
 ## Preuve locale historique — 23 juillet 2026
 

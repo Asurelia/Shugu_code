@@ -8,7 +8,7 @@
    différence visuelle flagrante ressentie (« rendu maquette terminal »).
 
    Levier systémique plutôt que 200 retouches : --font-mono est de fait la
-   variable du chrome → on la re-pointe vers la sans (Inter, déjà chargée),
+   variable du chrome → on la re-pointe vers la pile sans locale/système,
    et on ré-épingle les VRAIES surfaces de code sur la nouvelle --font-code.
    styles.css (Celestial Veil) reste intact — ce fichier est chargé en
    dernier et ne fait que surcharger. Supprimer cet import restaure

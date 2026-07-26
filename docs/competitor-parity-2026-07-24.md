@@ -103,7 +103,7 @@ Config `~/.claude/settings.json` (+ `.local`, projet, policy admin).
 | Permissions allow/ask/deny par motifs d'arguments | Claude (3 listes × motifs) | **Partiel** — allow/deny par pattern de commande (`command_rules.rs`), pas de ask ni motifs d'arguments | P6.10 |
 | Sub-agents parallèles | Codex (thread_spawn_edges), Claude (teams) | **Partiel** — `delegate` séquentiel (`runner.rs:2941`) ; 4 runs concurrents max | P6.11 |
 | Outils LSP pour agents | Claude (plugins *-lsp) | **Partiel** — LSP éditeur seulement (`lsp.rs`), aucun outil agent | P6.12 |
-| Auto-update | Les deux | **Absent** | P6.13 |
+| Auto-update | Les deux | **Fonctionnel** : canal GitHub Releases stable, notification + téléchargement vérifié ; installation volontairement manuelle tant que les binaires ne sont pas signés | P6.13 |
 | Fork/resume de conversation | Les deux (parentUuid, thread/fork) | **Partiel** — conversations persistées, pas de fork ; runs en vol non repris (honnête) | P6.3 |
 | Approbations graduées / sandbox | Les deux | **Présent** — profils Chat/Plan/Auto/Full Access, sandbox LOW Windows (P0.x validés) | — |
 | Worktrees isolation | Les deux | **Présent** — P3.1 validé | — |

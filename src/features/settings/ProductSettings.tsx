@@ -8,6 +8,13 @@ import { IMAGE_MODEL_PRESETS } from "@/lib/imageProviders";
 import { db } from "@/lib/db";
 import { invoke } from "@/lib/tauri";
 import { queryClient } from "@/lib/queryClient";
+import { useQuery } from "@tanstack/react-query";
+import {
+  UPDATE_AUTO_CHECK_KEY,
+  UPDATE_OPEN_EVENT,
+  UPDATE_QUERY_KEY,
+  checkForUpdate,
+} from "@/lib/updates";
 
 function Row({ label, desc, children }: { label: string; desc?: string; children: React.ReactNode }) {
   return (
@@ -214,6 +221,13 @@ interface DiagBundle { facts: DiagFact[]; generatedAt: number }
 export function AboutSettings() {
   const [facts, setFacts] = useState<DiagFact[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [autoCheck, setAutoCheck] = useState(true);
+  const update = useQuery({
+    queryKey: UPDATE_QUERY_KEY,
+    queryFn: checkForUpdate,
+    enabled: false,
+    staleTime: 0,
+  });
   const load = async () => {
     setError(null);
     try {
@@ -223,7 +237,37 @@ export function AboutSettings() {
       setError(String(err));
     }
   };
-  useEffect(() => { void load(); }, []);
+  useEffect(() => {
+    void load();
+    let alive = true;
+    void db.settings.get(UPDATE_AUTO_CHECK_KEY).then((value) => {
+      if (alive) setAutoCheck(value !== "false");
+    });
+    return () => { alive = false; };
+  }, []);
+  const setAutomaticCheck = (on: boolean) => {
+    setAutoCheck(on);
+    void db.settings.set(UPDATE_AUTO_CHECK_KEY, on ? "true" : "false");
+  };
+  const checkUpdateNow = async () => {
+    const result = await update.refetch();
+    if (result.data?.state === "available") {
+      window.dispatchEvent(new Event(UPDATE_OPEN_EVENT));
+    }
+  };
+  const updateLabel = update.isFetching
+    ? "vérification…"
+    : update.isError
+      ? "indisponible"
+      : update.data?.state === "available"
+        ? `v${update.data.latestVersion} disponible`
+        : update.data?.state === "upToDate"
+          ? "à jour"
+          : update.data?.state === "channelUnavailable"
+            ? update.data.latestVersion
+              ? "aucun installeur compatible"
+              : "aucune Release publiée"
+            : "non vérifié";
   return (
     <div className="settings-shell scroll">
       <div className="settings-inner">
@@ -235,6 +279,35 @@ export function AboutSettings() {
           ))}
           {error && <div role="alert" style={{ color: "var(--error)", fontSize: 11 }}>{error}</div>}
           <button className="lgb lgb-sm" onClick={() => void load()}>Actualiser</button>
+        </div>
+        <div className="setting-section">
+          <h3>Mises à jour</h3>
+          <p className="sub">Canal stable GitHub Releases. L’installeur est téléchargé dans le cache Shugu, puis son lancement reste toujours manuel.</p>
+          <Row label="Recherche automatique" desc="Vérifie discrètement le canal stable après le démarrage.">
+            <Toggle on={autoCheck} onChange={setAutomaticCheck} label="Rechercher automatiquement les mises à jour" />
+          </Row>
+          <Row label="État du canal" desc={update.data?.asset?.name ?? "Aucun installeur sélectionné pour cette plateforme."}>
+            <span className={`chip ${update.data?.state === "available" ? "primary" : update.data?.state === "upToDate" ? "success" : ""}`}>
+              {updateLabel}
+            </span>
+          </Row>
+          {update.isError && (
+            <div role="alert" style={{ color: "var(--error)", fontSize: 11, marginBottom: 10 }}>
+              {String(update.error)}
+            </div>
+          )}
+          <button
+            className="lgb lgb-sm"
+            disabled={update.isFetching}
+            onClick={() => void checkUpdateNow()}
+          >
+            {update.isFetching ? "Vérification…" : "Rechercher une mise à jour"}
+          </button>
+          {update.data?.state === "available" && (
+            <p className="sub" style={{ marginTop: 10 }}>
+              La fenêtre de téléchargement sécurisée est ouverte. Tu peux aussi choisir « Plus tard » pour ignorer cette version.
+            </p>
+          )}
         </div>
       </div>
     </div>

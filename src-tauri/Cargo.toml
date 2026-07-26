@@ -26,6 +26,7 @@ base64 = "0.22"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures-util = "0.3"
+semver = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 # UUID v4 for agent identifiers — agents.rs uses Uuid::new_v4() to mint
 # stable IDs that the frontend can dedupe events against. v4 is random

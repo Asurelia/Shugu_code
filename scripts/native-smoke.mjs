@@ -42,13 +42,29 @@ if (!page) {
 
 page.setDefaultTimeout(20_000);
 const pageErrors = [];
+const runtimeExceptions = [];
 const consoleMessages = [];
 const failedRequests = [];
 const httpErrors = [];
 const accessibilityAudits = [];
 const contrastAudits = [];
+const devtools = await page.context().newCDPSession(page);
+await Promise.all([
+  devtools.send("Runtime.enable"),
+  devtools.send("Debugger.enable"),
+]);
+devtools.on("Runtime.exceptionThrown", ({ exceptionDetails }) => {
+  runtimeExceptions.push({
+    text: exceptionDetails.text,
+    url: exceptionDetails.url,
+    lineNumber: exceptionDetails.lineNumber,
+    columnNumber: exceptionDetails.columnNumber,
+    description: exceptionDetails.exception?.description,
+    frames: exceptionDetails.stackTrace?.callFrames,
+  });
+});
 page.on("pageerror", (error) =>
-  pageErrors.push(`${error.name}: ${error.message}`),
+  pageErrors.push(error.stack || `${error.name}: ${error.message}`),
 );
 page.on("console", (message) => {
   const location = message.location();
@@ -449,7 +465,9 @@ for (const [selector, label] of [
     });
 }
 if ((await page.locator(".shell-statusbar").count()) > 0) {
-  throw new Error("chat statusbar should be hidden because the composer already exposes the same controls");
+  throw new Error(
+    "chat statusbar should be hidden because the composer already exposes the same controls",
+  );
 }
 
 // Native IPC proof: these calls cannot succeed in a Vite-only browser.
@@ -526,9 +544,7 @@ await auditVisibleControls("project-trust-unknown");
 await auditTextContrast("project-trust-unknown");
 await page.screenshot({ path: `${outDir}/00a-project-trust-unknown.png` });
 
-await page
-  .getByRole("button", { name: /Ouvrir en lecture seule/i })
-  .click();
+await page.getByRole("button", { name: /Ouvrir en lecture seule/i }).click();
 await trustDialog.waitFor({ state: "detached" });
 const readOnlyProjectTrust = await page.evaluate(() =>
   globalThis.__TAURI_INTERNALS__.invoke("project_trust_status"),
@@ -543,7 +559,9 @@ if (
   );
 }
 
-const readOnlyBadge = page.getByRole("button", { name: /Lecture seule/i }).first();
+const readOnlyBadge = page
+  .getByRole("button", { name: /Lecture seule/i })
+  .first();
 await readOnlyBadge.waitFor({ state: "visible" });
 await readOnlyBadge.click();
 await page
@@ -592,7 +610,9 @@ await page
   .first()
   .waitFor({ state: "visible", timeout: 10_000 })
   .catch(() => {
-    throw new Error("global statusbar should remain visible outside chat/code/git");
+    throw new Error(
+      "global statusbar should remain visible outside chat/code/git",
+    );
   });
 await navigateRailAndAudit("Studio", "studio", "01d-studio.png");
 
@@ -634,11 +654,23 @@ const navigationTiming = await page.evaluate(() => {
     decodedBytes: navigation.decodedBodySize,
     jsHeapUsedBytes: performance.memory?.usedJSHeapSize ?? null,
     jsHeapLimitBytes: performance.memory?.jsHeapSizeLimit ?? null,
+    slowResources: performance
+      .getEntriesByType("resource")
+      .map((entry) => ({
+        name: entry.name,
+        durationMs: Math.round(entry.duration),
+        startMs: Math.round(entry.startTime),
+      }))
+      .sort((a, b) => b.durationMs - a.durationMs)
+      .slice(0, 12),
   };
 });
 if (
   !navigationTiming ||
-  navigationTiming.domContentLoadedMs > 30_000 ||
+  // This profile intentionally runs through Vite's development module graph.
+  // Keep its DOM budget aligned with the 45 s usable-shell budget above;
+  // scripts/release-smoke.mjs retains the stricter 30 s product-runtime gate.
+  navigationTiming.domContentLoadedMs > 45_000 ||
   (navigationTiming.jsHeapUsedBytes !== null &&
     navigationTiming.jsHeapUsedBytes > 256 * 1024 * 1024)
 ) {
@@ -830,15 +862,48 @@ if (
   failedRequests.length ||
   httpErrors.length
 ) {
+  const exceptionSources = [];
+  for (const detail of runtimeExceptions) {
+    const scriptIds = [
+      ...new Set((detail.frames ?? []).map((frame) => frame.scriptId)),
+    ];
+    for (const scriptId of scriptIds) {
+      try {
+        const source = await devtools.send("Debugger.getScriptSource", {
+          scriptId,
+        });
+        exceptionSources.push({
+          scriptId,
+          source: source.scriptSource.slice(0, 2_000),
+        });
+      } catch {
+        // A document reload can invalidate an older script id.
+      }
+    }
+  }
   throw new Error(
     [
       ...pageErrors.map((message) => `page: ${message}`),
       ...fatalConsoleMessages.map((message) => `console: ${message}`),
       ...failedRequests.map((message) => `request: ${message}`),
       ...httpErrors.map((message) => `http: ${message}`),
+      runtimeExceptions.length
+        ? `runtime: ${JSON.stringify(runtimeExceptions)}`
+        : "",
+      exceptionSources.length
+        ? `sources: ${JSON.stringify(exceptionSources)}`
+        : "",
     ].join("\n"),
   );
 }
+
+// The tour above allocates large transient pixel buffers for screenshots and
+// hundreds of computed-style objects for the accessibility/contrast audits.
+// Measure the retained application footprint, not garbage whose collection
+// timing depends on WebView2 scheduling. Keep the 1 GiB PowerShell budget
+// unchanged; this only makes repeated runs comparable.
+await page.requestGC();
+await page.waitForTimeout(250);
 
 const summary = {
   cdpUrl,

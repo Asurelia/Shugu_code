@@ -59,6 +59,7 @@ import { fsKeys } from "@/features/fs/keys";
 import { gitKeys } from "@/features/git/keys";
 import { projectKeys } from "@/features/projects/keys";
 import { ProjectTrustGate } from "@/features/projects/ProjectTrustGate";
+import { AppUpdateGate } from "@/features/updates/AppUpdateGate";
 import { useProjectTrustEvents } from "@/features/projects/projectTrustQueries";
 import { useFsEvents } from "@/features/fs/useEvents";
 import { useGitEvents } from "@/features/git/useEvents";
@@ -1510,6 +1511,7 @@ export function RootLayout() {
           onClose={() => setNotifOpen(false)}
         />
         <ProjectTrustGate />
+        <AppUpdateGate />
         {/* FloatChat moved to the dedicated mascot window (src/mascot.tsx) —
             the chibi now lives in its own transparent Tauri window instead
             of being embedded in the IDE. pinnedAnno will flow to the mascot

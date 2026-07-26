@@ -944,6 +944,9 @@ pub fn run() {
         .manage(commands::worktree::MergeLock(tokio::sync::Mutex::new(())))
         // LOT 3 — LSP server registry (un LspSession par langId).
         .manage(commands::lsp::LspServerRegistry::default())
+        // P6.13 — téléchargement d'une Release à la fois + chemin de l'artefact
+        // géré que l'UI peut révéler (aucun chemin arbitraire depuis IPC).
+        .manage(commands::updates::UpdateDownloadState::default())
         .setup(|app| {
             // Lane OPÉRABILITÉ — backup AUTOMATIQUE pré-migration.
             //
@@ -1194,6 +1197,11 @@ pub fn run() {
             commands::model_bundle::model_bundle_delete,
             commands::model_bundle::model_bundle_path,
             commands::model_bundle::model_bundle_installed_ids,
+            // P6.13 — canal GitHub Releases sûr (notification + téléchargement,
+            // jamais d'exécution silencieuse d'un installeur non signé).
+            commands::updates::update_check,
+            commands::updates::update_download,
+            commands::updates::update_reveal_download,
             commands::agents::agent_spawn,
             commands::agents::agent_continue,
             commands::agents::agent_enable_full_access,

@@ -1,0 +1,108 @@
+# Stable Windows release channel consumed by Shugu's in-app update checker.
+#
+# A `vX.Y.Z` tag is accepted only when package.json, tauri.conf.json and
+# Cargo.toml carry the same version. The current channel intentionally
+# publishes unsigned installers: the app downloads and reveals them, but never
+# launches them silently. When a code-signing certificate and Tauri updater key
+# are provisioned, this workflow can graduate to signed in-place updates.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Build and publish Windows installers
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag and version manifests
+        shell: pwsh
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor HEAD origin/main
+          if ($LASTEXITCODE -ne 0) {
+            throw "Une Release stable doit pointer vers un commit déjà présent sur main."
+          }
+          $tagVersion = "${{ github.ref_name }}".TrimStart("v")
+          $packageVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tauriVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargoVersion = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version = "([^"]+)"' |
+            Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($tagVersion -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Le tag ${{ github.ref_name }} doit être une version stable X.Y.Z."
+          }
+          if (@($packageVersion, $tauriVersion, $cargoVersion) |
+              Where-Object { $_ -ne $tagVersion }) {
+            throw "Versions incohérentes: tag=$tagVersion package=$packageVersion tauri=$tauriVersion cargo=$cargoVersion"
+          }
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.7.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Frontend tests
+        run: pnpm test
+
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test --no-fail-fast
+
+      - name: Build NSIS and MSI installers
+        run: pnpm tauri build --bundles nsis,msi
+
+      - name: Generate SHA-256 manifest
+        shell: pwsh
+        run: |
+          $files = @(
+            Get-ChildItem src-tauri/target/release/bundle/nsis -Filter *.exe -File
+            Get-ChildItem src-tauri/target/release/bundle/msi -Filter *.msi -File
+          )
+          if ($files.Count -lt 1) { throw "Aucun installeur Windows produit." }
+          $manifest = Join-Path $PWD "src-tauri/target/release/bundle/SHA256SUMS.txt"
+          $files | ForEach-Object {
+            $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content -LiteralPath $manifest -Encoding utf8
+
+      - name: Publish stable GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $paths = @(
+            Get-ChildItem src-tauri/target/release/bundle/nsis -Filter *.exe -File |
+              Select-Object -ExpandProperty FullName
+            Get-ChildItem src-tauri/target/release/bundle/msi -Filter *.msi -File |
+              Select-Object -ExpandProperty FullName
+            (Resolve-Path src-tauri/target/release/bundle/SHA256SUMS.txt).Path
+          )
+          gh release create "${{ github.ref_name }}" @paths --verify-tag --generate-notes --title "Shugu Forge ${{ github.ref_name }}"

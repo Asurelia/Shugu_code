@@ -36,6 +36,7 @@ pub mod snapshot;
 pub mod storage;
 pub mod studio;
 pub mod terminal;
+pub mod updates;
 pub mod vector;
 pub mod video;
 pub mod voice;
