@@ -83,11 +83,12 @@ import { NotificationCenter } from "@/components/NotificationCenter";
 import { useUnreadNotificationCount } from "@/components/notifications";
 import { ReviewDialog } from "@/features/git/components/ReviewDialog";
 import { useLlamaLifecycle } from "@/features/llama/useLlamaLifecycle";
-import { COMMANDS, getCommandById, fmtKbd, type CommandContext } from "@/lib/commands";
+import { getCommandById, type CommandContext } from "@/lib/commands";
 import { useCommandKeybindings } from "@/lib/keybindings";
 import { FindPanel } from "@/features/code/FindPanel";
 import { invalidateGitHead } from "@/features/git/queries";
 import { SideGit } from "@/features/git/SideGit";
+import { UnifiedPalette } from "@/features/palette/UnifiedPalette";
 
 // Context + hook live in ./shell-context to keep this file Fast-Refresh
 // friendly (a module exporting both a hook and a component forces a full
@@ -99,7 +100,6 @@ import { loadJSON, saveJSON } from "@/features/settings/settings-extras";
 import { useProfileFields, initialsOf } from "@/features/profile/profileQueries";
 import { formatCurrentDocumentCli, formatCodeDirect } from "@/features/code/format";
 import { invoke } from "@/lib/tauri";
-import { useModalFocusTrap } from "@/lib/modalFocus";
 
 // ─── Path → view string (derived navigation) ─────────────────
 
@@ -153,111 +153,6 @@ const TWEAK_DEFAULTS = {
   density: "comfortable",
   auroraIntensity: 55,
 };
-
-// ─── CommandPalette (moved from App.tsx) ─────────────────────
-
-function CommandPalette({ open, onClose, ctx }: { open: boolean; onClose: () => void; ctx: CommandContext }) {
-  const [q, setQ] = useState("");
-  const [idx, setIdx] = useState(0);
-  const inputRef = useRef<HTMLInputElement | null>(null);
-  const dialogRef = useRef<HTMLDivElement | null>(null);
-  useModalFocusTrap({ open, containerRef: dialogRef, initialFocusRef: inputRef, onEscape: onClose });
-
-  // Build the active command list from COMMANDS, filtered by when() and search query.
-  // Commands with when()===false are hidden (Pass 1 behaviour: filter rather than grey-out).
-  // Input-local commands and commands without icons are excluded from palette display.
-  const activeCmds = useMemo(() => {
-    return COMMANDS.filter(c => {
-      if (c.scope === "input") return false;
-      if (c.when && !c.when(ctx)) return false;
-      return true;
-    });
-  }, [ctx]);
-
-  const filtered = useMemo(() => {
-    const qq = q.trim().toLowerCase();
-    if (!qq) return activeCmds;
-    return activeCmds.filter(c =>
-      (c.title + " " + (c.description || "")).toLowerCase().includes(qq)
-    );
-  }, [q, activeCmds]);
-
-  useEffect(() => { setIdx(0); }, [q]);
-  // Group by category (replaces old group field).
-  const grouped = useMemo(() => {
-    const m = new Map<string, typeof filtered>();
-    filtered.forEach(c => {
-      if (!m.has(c.category)) m.set(c.category, []);
-      m.get(c.category)!.push(c);
-    });
-    return [...m.entries()];
-  }, [filtered]);
-
-  const onKey = (e: React.KeyboardEvent) => {
-    if (e.key === "Escape") { e.preventDefault(); onClose(); return; }
-    if (e.key === "ArrowDown") { e.preventDefault(); setIdx(i => Math.min(i + 1, filtered.length - 1)); }
-    if (e.key === "ArrowUp")   { e.preventDefault(); setIdx(i => Math.max(i - 1, 0)); }
-    if (e.key === "Enter") {
-      e.preventDefault();
-      const c = filtered[idx];
-      if (c) { void c.run(ctx); onClose(); }
-    }
-  };
-
-  if (!open) return null;
-
-  let cursor = 0;
-  return (
-    <div className="palette-scrim" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <div ref={dialogRef} className="palette" role="dialog" aria-modal="true" aria-label="Command palette" tabIndex={-1}>
-        <div className="palette-search">
-          <Icon name="search" size={16}/>
-          <input ref={inputRef} name="command-query" autoComplete="off" aria-label="Search commands" value={q} onChange={e => setQ(e.target.value)} onKeyDown={onKey} placeholder="Type a command, file, or jump to a view…"/>
-          <span className="kbd">esc</span>
-        </div>
-        <div className="palette-list scroll">
-          {grouped.map(([group, items]) => (
-            <div key={group}>
-              <div className="palette-section-label">{group}</div>
-              {items.map(c => {
-                const me = cursor++;
-                const kbd = fmtKbd(c.keybinding);
-                return (
-                  <button
-                    type="button"
-                    key={c.id}
-                    className={"palette-item" + (me === idx ? " active" : "")}
-                    style={{ width: "100%", border: 0, font: "inherit", textAlign: "left" }}
-                    onMouseEnter={() => setIdx(me)}
-                    onClick={() => { void c.run(ctx); onClose(); }}
-                  >
-                    <div className="ico"><Icon name={c.icon ?? "search"} size={13}/></div>
-                    <div className="body">
-                      <div className="name">{c.title}</div>
-                      {c.description && <div className="hint">{c.description}</div>}
-                    </div>
-                    {kbd && <span className="kbd">{kbd}</span>}
-                  </button>
-                );
-              })}
-            </div>
-          ))}
-          {filtered.length === 0 && (
-            <div style={{padding:"30px 16px", textAlign:"center", color:"var(--on-surface-muted)", fontFamily:"var(--font-mono)", fontSize:12}}>
-              No match for "{q}"
-            </div>
-          )}
-        </div>
-        <div className="palette-foot">
-          <span><span className="kbd">↑</span><span className="kbd" style={{marginLeft:2}}>↓</span> navigate</span>
-          <span><span className="kbd">↵</span> run</span>
-          <span className="spacer"></span>
-          <span style={{color:"var(--primary)"}}>shugu-forge ⌘K</span>
-        </div>
-      </div>
-    </div>
-  );
-}
 
 // ─── DockToggleButton (moved from App.tsx) ───────────────────
 
@@ -1517,10 +1412,20 @@ export function RootLayout() {
             of being embedded in the IDE. pinnedAnno will flow to the mascot
             window via Tauri events at M4 (chat://pin). */}
 
-        <CommandPalette
+        <UnifiedPalette
           open={paletteOpen}
           onClose={() => setPaletteOpen(false)}
           ctx={cmdCtx}
+          activeConversationId={activeConvo}
+          onOpenFile={(path) => {
+            void openFileSafe(path);
+            navigate({ to: "/code" });
+          }}
+          onOpenConversation={(id) => {
+            setActiveConvo(id);
+            navigate({ to: "/chat" });
+            void db.conversations.setUnread(id, false);
+          }}
         />
 
         {/* Lot stubs-palette — Quick Open (Cmd+P) : fuzzy picker sur le
@@ -1530,7 +1435,7 @@ export function RootLayout() {
           open={quickOpenOpen}
           onClose={() => setQuickOpenOpen(false)}
           onOpen={(path) => {
-            void openFile(path);
+            void openFileSafe(path);
             navigate({ to: "/code" });
           }}
         />

@@ -185,6 +185,23 @@ if ((await page.locator(".shell-statusbar").count()) > 0) {
 if (!FOCUSED) {
   await screenshot(`${OUT}/01-chat-shell.png`);
 
+  // ── Palette unifiée : commandes + fichiers + conversations ─────────────
+  await fastClick(page.locator(".tb-search"));
+  await page.waitForTimeout(250);
+  await need(".palette-unified", "palette de recherche unifiée");
+  await need(".palette-unified .palette-item", "résultats de la palette unifiée");
+  const unifiedInput = page.locator('input[name="unified-palette-query"]');
+  if (await unifiedInput.count()) {
+    await unifiedInput.fill("> settings");
+    await page.waitForTimeout(150);
+    if ((await page.locator(".palette-unified .palette-item").count()) === 0) {
+      missing.push("palette unifiée sans résultat pour « > settings »");
+    }
+    await screenshot(`${OUT}/13-unified-palette.png`);
+  }
+  await page.keyboard.press("Escape");
+  await page.waitForTimeout(150);
+
   // ── Centre de notifications ─────────────────────────────────────────────
   await fastClick(page.locator(".tb-bell"));
   await page.waitForTimeout(400);

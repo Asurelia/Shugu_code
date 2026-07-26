@@ -160,9 +160,9 @@ export function Titlebar({ project = "shugu-forge", onSearch, onAvatar, sideColl
       </div>
       {menu}
       <div className="tb-spacer"></div>
-      <button type="button" className="tb-search" onClick={onSearch} aria-label="Search files, commands, generations">
+      <button type="button" className="tb-search" onClick={onSearch} aria-label="Search commands, files, conversations">
         <Icon name="search" size={13}/>
-        <span>Search files, commands, generations…</span>
+        <span>Search commands, files, conversations…</span>
         <span className="kbd">⌘K</span>
       </button>
       <div className="tb-spacer"></div>
