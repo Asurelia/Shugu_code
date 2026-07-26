@@ -201,6 +201,22 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.chat-row-time {
+  position: absolute;
+  right: 10px;
+  z-index: 1;
+  opacity: 0;
+  color: var(--on-surface-muted);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+.chat-row:hover .chat-row-label { padding-right: 48px; }
+.chat-row:hover .chat-row-time { opacity: 1; }
+.chat-row:hover .chat-row-pin,
+.chat-row:hover .chat-row-count { opacity: 0; }
 .chat-row.child {
   padding-left: 26px;
   font-size: 12px;

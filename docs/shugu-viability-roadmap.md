@@ -25,8 +25,8 @@ annoncer une capacité que le backend n'applique pas.
 | P1.1 | Matrice provider/modèle unique | Fonctionnel | Sélection Agent bloquée pour un adaptateur Chat-only ; découverte réelle et badges cohérents. |
 | P1.2 | Anthropic / OpenAI-compatible | Fonctionnel | Boucle structurée native, streaming, outils et tests d'intégration fake-provider. |
 | P1.3 | Ollama agentique natif | Fonctionnel sans binaire local | NDJSON et tool calls testés par serveur local factice ; test live requis dès qu'Ollama est installé. |
-| P1.4 | Codex CLI/app-server comme moteur Shugu | Partiel | Chat/probe réels ; bridge agentique Shugu non livré, donc état Chat-only obligatoire. |
-| P1.5 | OpenCode / autres CLI | Partiel | Endpoint compatible utilisable ; bridge autonome non prétendu tant que lifecycle/preuves ne sont pas conservés. |
+| P1.4 | Interop Codex CLI/app-server (chat/probe) | Validé | Chat et probe Codex réels prouvés en live. Un bridge agentique CLI n'est pas un objectif produit : l'exécution agentique reste sous le lifecycle natif Shugu. |
+| P1.5 | Interop OpenCode / autres CLI compatibles | Fonctionnel | Endpoint compatible utilisable et présenté honnêtement en Chat-only ; Shugu reprend leurs bonnes conventions sans déléguer son lifecycle agentique à un CLI opaque. |
 | P1.6 | MCP avec effets typés | Partiel | MCP fonctionne ; Auto refuse les effets inconnus. Reste à typer chaque outil et durcir le transport HTTP. |
 | P2.1 | Settings réels | Fonctionnel | Valeurs effectives, persistance SQLite/local cache, diagnostics About réels, aucun switch sans consommateur. |
 | P2.2 | Connections réelles | Fonctionnel | « Connecté » uniquement après probe ; intégrations absentes marquées indisponibles. |
@@ -39,7 +39,7 @@ annoncer une capacité que le backend n'applique pas.
 | P4.1 | E2E navigateur de la couche UI | Validé | Build, `ui:tour` et Playwright verts, avec erreurs Tauri absentes explicitement tolérées. |
 | P4.2 | E2E Tauri/WebView2 automatisé | Validé | Harness CDP reproductible, identifiant/base/profil isolés, deux boots, captures, IPC natif et teardown exact. |
 | P4.3 | Évaluations agents live multi-provider | Validé | Codex réel validé en chat/probe ; Qwen3 8B et Llama 3.1 8B validés séparément sur le même cycle Agent complet sous llama.cpp. |
-| P5.1 | Accessibilité clavier/ARIA | Validé | 534 contrôles visibles nommés et 827 échantillons de contraste sans violation sur 11 états au dernier passage ; navigation clavier et focus-trap/restauration des dialogs prouvés dans WebView2. |
+| P5.1 | Accessibilité clavier/ARIA | Validé | 584 contrôles visibles nommés et 950 échantillons de contraste sans violation sur 12 états au dernier passage ; navigation clavier et focus-trap/restauration des dialogs prouvés dans WebView2. |
 | P5.2 | Dépendances, lint et performances | Validé | Audit JS propre, exceptions Rust bornées, lint à 0/0, budgets dev/release/charge mesurés, indexation batchée et installateurs Windows produits. |
 | P6.1 | File de suivi run (queue/steer/interrupt) | Validé | Migration V25 `queued_followups` ; steer injecté entre deux tours (preuve provider scripté), queue drainée par le pipeline d'envoi normal sur succès seulement, interrupt = kill CAS + nouvelle instruction ; kill conserve la file ; 6 tests Rust + 8 Vitest verts. |
 | P6.2 | Comptabilité tokens + indicateur contexte | Validé | `usage` parsé sur Anthropic/OpenAI-compatible/Ollama sans zéro fabriqué, `tokenUsage` par tour et `tokens_used` du run persistés, jauge de contexte sourcée (provider/estimate) avec alerte 75 %, événement `memoryCompacted` enfin consommé dans l'UI ; 8 tests Rust + 9 Vitest verts. |
@@ -54,7 +54,7 @@ annoncer une capacité que le backend n'applique pas.
 | P6.11 | Sub-agents en fan-out parallèle | Validé | Délégations multiples du même tour exécutées après gates permission/hook, en parallèle borné avec réservations atomiques multi-parents (cap global 4, délégation imbriquée sans deadlock), wall-time ≈ max(latences) prouvé, résultats dans l'ordre, erreurs honnêtes, cascade kill BFS sans zombie, arbre parent↔enfants dans AgentsPanel ; 5 tests Rust + 4 Vitest verts. |
 | P6.12 | Outils LSP pour agents | Validé | `lsp_diagnostics`/`definition`/`references` au manifest en effet `shared_read`, confinement workspace et résultats bornés ; session unique par langue, IDs agent négatifs sans collision éditeur, handshake partagé/serialisé, `didOpen` puis `didChange` versionné, diagnostics diffusés à tous les waiters ; mock LSP strict + fixture TS, 13 tests Rust verts. |
 | P6.13 | Auto-update | Fonctionnel | Vérification stable GitHub Releases au boot + réglage manuel, dialogue accessible, sélection d’installeur native, téléchargement borné dans le cache et SHA-256 GitHub vérifié lorsqu’il est publié. Sans certificat, Shugu révèle le fichier mais ne l’exécute jamais ; workflow tag `v*` prêt. Validation live à faire avec la première Release publiée. |
-| P6.14 | Refonte UX/UI (analyse Claude/OpenCode/Cursor) | Partiel | **Tranche 1 validée : confiance projet** persistée par chemin canonique, décision obligatoire lecture seule/faire confiance, badges visibles et révocation. La racine affichée, approuvée et exécutée est liée de bout en bout ; backend fail-closed pour règles, hooks, skills, plugins, MCP, LSP, formatage, preview, chat historique et agents projet. Switch/révocation coupent outils, hooks, connexions, LSP, iframes et processus persistants avant réutilisation. Restent : système de motion, tokens hairline/ring/opacités, sidebar groupée + non-lus, palette Ctrl+K, cartes d'outils + divider checkpoint, virtualisation, anti-flash ; périmètre : `docs/competitor-ux-2026-07-24.md`. |
+| P6.14 | Refonte UX/UI (analyse Claude/OpenCode/Cursor) | Validé | Confiance projet fail-closed ; motion/surfaces Celestial Veil et anti-flash natif ; palette Ctrl+K commandes/fichiers/conversations ; sidebar calendaire, non-lus, raccourcis et timestamps ; transcript avec cartes d'outils normalisées, checkpoint/rewind, réponses longues, breadcrumbs et quickstarts ; flux virtualisé dès 80 messages avec défilement épinglé respectueux. Les expériences du point 8 restent volontairement hors périmètre et seront évaluées séparément. |
 
 > Analyse comparative source : `docs/competitor-parity-2026-07-24.md`
 > (dissection Codex desktop 26.721 / Claude Code 2.1.193, réimplémentation
@@ -99,8 +99,9 @@ annoncer une capacité que le backend n'applique pas.
   `WindowsApps`, `submit_plan` strictement réservé au mode Plan, `todo_write`
   conservé dans le toolset des petits modèles, mutation impossible avant plan
   et réponse brute impossible en mode Agent sans action.
-- **Livré** — effets MCP typés à la découverte et blocage Auto de toute
-  capacité externe/destructive non déclarée.
+- **À terminer** — MCP fonctionne et Auto refuse aujourd'hui tout effet inconnu ;
+  il reste à traduire les annotations d'outils en effets Shugu fiables et à
+  durcir le transport HTTP avant d'autoriser les lectures déclarées.
 - **Garde-fou maintenu** — Codex et OpenCode restent Chat-only jusqu'à ce qu'un bridge fournisse chaque
   ToolCall/ToolResult au lifecycle Shugu et respecte kill/profil/isolation.
 
@@ -195,7 +196,7 @@ indexation/streaming et les installateurs sont également prouvés.
   permissions/plugins/hooks/fan-out/LSP/rewind ajoutés pendant la revue
   adversariale. Le loader Windows du harness de test porte désormais le
   manifeste Common Controls v6 requis par Tauri.
-- Frontend : 65 fichiers / 635 tests Vitest, typecheck, ESLint, build Vite,
+- Frontend : 70 fichiers / 653 tests Vitest, typecheck, ESLint, build Vite,
   Playwright et
   `ui:tour` verts. Le tour headless conserve les captures dans
   `dev-logs/ui-tour/`.
@@ -210,6 +211,13 @@ indexation/streaming et les installateurs sont également prouvés.
   Auto/Full Access refusés en lecture seule. Les runs épinglent la racine dès
   l'IPC, revérifient après chaque attente asynchrone et tuent processus/connexions
   persistants au switch ou à la révocation.
+- Finition P6.14 : tokens motion/surface partagés, thème préchargé avant React
+  et fond natif synchronisé ; palette unifiée commandes/fichiers/conversations ;
+  sidebar Aujourd'hui/Hier/Plus ancien avec non-lus, navigation clavier et
+  timestamps ; quickstarts, breadcrumb de trace, réponses longues repliables et
+  checkpoint visible dans le transcript. Les conversations de 80 messages et
+  plus utilisent une virtualisation à hauteur variable ; le streaming ne force
+  plus le retour en bas quand l'utilisateur relit l'historique.
 - Auto-update P6.13 : vérification GitHub Releases stable au boot ou à la
   demande, préférence et report de version persistés, sélection d'installeur
   native, URL/redirections/nom/taille revérifiés côté Rust, flux SHA-256 vers
@@ -218,17 +226,18 @@ indexation/streaming et les installateurs sont également prouvés.
   et `SHA256SUMS.txt`. La preuve de téléchargement live attend la première
   Release ; aucun faux succès n'est affiché jusque-là.
 - Preuve native isolée :
-  `dev-logs/native-smoke/20260726-041218/` — vraie base SQLite fraîche en
+  `dev-logs/native-smoke/20260726-050411/` — vraie base SQLite fraîche en
   schéma 30, décision unknown → lecture seule → approuvée, focus-trap, badges,
   captures, 12 audits accessibilité/contraste sans violation, aucune erreur
   page/requête, backup/restauration sur deux boots et budget mémoire WebView2 +
-  Tauri respecté (926 289 920 octets). Le harness force la collecte des
+  Tauri respecté (956 071 936 octets). Le harness force la collecte des
   allocations temporaires du tour avant mesure, conserve le seuil 1 Gio et
   distingue les lenteurs Vite dev du budget release. Les deux fenêtres ne
   chargent plus de police distante au boot.
 - Restent à prouver nativement : le toast Windows P6.5 et le téléchargement
-  P6.13 contre une première Release publiée ; la finition visuelle et les
-  grands parcours de navigation de P6.14 continuent.
+  P6.13 contre une première Release publiée. Les expériences quick entry,
+  onglets typés, « Open in… » et tiling multi-agents sont un futur arbitrage
+  produit, pas une dette de P6.14.
 
 ## Preuve locale historique — 23 juillet 2026
 

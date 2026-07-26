@@ -630,7 +630,7 @@ export function ChatSidebar({ activeId, setActiveId, onActiveTitle }: any) {
             setNewGroupOpen(true);
           }}
         >
-          <Icon name="plus" size={11}/> New group
+          <Icon name="plus" size={11}/> Nouveau groupe
         </button>
       </div>
 
@@ -715,6 +715,9 @@ export function ChatRow({
   const inputRef = useRef<HTMLInputElement | null>(null);
   const active = convo.id === activeId;
   const renaming = convo.id === renamingId;
+  const updatedAt = Number.isFinite(convo.updated)
+    ? new Date(convo.updated)
+    : null;
   useEffect(() => { if (renaming) { setVal(convo.title); inputRef.current?.select(); } }, [renaming, convo.title]);
 
   return (
@@ -746,6 +749,15 @@ export function ChatRow({
           />
         ) : (
           <span className="chat-row-label">{convo.title}</span>
+        )}
+        {updatedAt && !renaming && (
+          <time
+            className="chat-row-time"
+            dateTime={updatedAt.toISOString()}
+            title={updatedAt.toLocaleString("fr-FR")}
+          >
+            {FMT_RELATIVE(convo.updated)}
+          </time>
         )}
         {convo.pinned && !renaming && <Icon name="up" size={10} className="chat-row-pin"/>}
         {convo.children?.length > 0 && <span className="chat-row-count">{convo.children.length}</span>}
@@ -964,13 +976,13 @@ export function NewGroupDialog({ onClose, onAdd }: any) {
         className="palette"
         role="dialog"
         aria-modal="true"
-        aria-label="Create a conversation group"
+        aria-label="Créer un groupe de conversations"
         tabIndex={-1}
         style={{width: 380, padding: 0}}
       >
         <div style={{padding:"14px 16px", borderBottom:"1px solid rgba(255,255,255,0.05)"}}>
-          <div style={{fontFamily:"var(--font-display)", fontWeight:700, fontSize:14}}>New group</div>
-          <div style={{fontSize:12, color:"var(--on-surface-variant)", marginTop:2}}>Organize conversations by project, topic, or context.</div>
+          <div style={{fontFamily:"var(--font-display)", fontWeight:700, fontSize:14}}>Nouveau groupe</div>
+          <div style={{fontSize:12, color:"var(--on-surface-variant)", marginTop:2}}>Organise les conversations par projet, sujet ou contexte.</div>
         </div>
         <div style={{padding:16}}>
           <input
@@ -978,17 +990,17 @@ export function NewGroupDialog({ onClose, onAdd }: any) {
             className="lgi"
             name="group-name"
             autoComplete="off"
-            aria-label="Group name"
+            aria-label="Nom du groupe"
             value={val}
             onChange={e => setVal(e.target.value)}
             onKeyDown={e => { if (e.key === "Enter" && val.trim()) onAdd(val.trim()); }}
-            placeholder="e.g. Client Acme · Tauri build · Veil v2…"
+            placeholder="Ex. Client Acme · Build Tauri · Veil v2…"
           />
         </div>
         <div style={{padding:"10px 16px", borderTop:"1px solid rgba(255,255,255,0.05)", display:"flex", gap:8}}>
-          <button className="lgb" onClick={onClose}>Cancel</button>
+          <button className="lgb" onClick={onClose}>Annuler</button>
           <span style={{flex:1}}></span>
-          <button className="lgb lgb-primary" disabled={!val.trim()} onClick={() => onAdd(val.trim())}>Create</button>
+          <button className="lgb lgb-primary" disabled={!val.trim()} onClick={() => onAdd(val.trim())}>Créer</button>
         </div>
       </div>
     </div>

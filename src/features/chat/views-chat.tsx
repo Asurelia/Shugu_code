@@ -81,6 +81,7 @@ import { togglePinnedAsset, useStudioBrandBoard } from "@/features/studio/brandB
 import { isMediaCancellation, useMediaJob } from "./useMediaJob";
 import { clearMediaRetry, peekMediaRetry } from "@/features/image/mediaRetry";
 import { createTranscriptPreview } from "./transcriptPresentation";
+import { TranscriptMessageList } from "./TranscriptMessageList";
 
 const EMPTY_QUICKSTARTS = [
   {
@@ -154,6 +155,8 @@ export function ChatView({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const feedRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const stickToBottomRef = useRef(true);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
 
   const chatStream = useChatStream(activeConv);
   const { data: messages } = useMessages(activeConv);
@@ -238,9 +241,58 @@ export function ChatView({
     latestAgentTranscript != null &&
     isWorktreeRunActive(extractWorktreeStatus(latestAgentTranscript.events));
 
+  const scrollFeedToLatest = useCallback(() => {
+    requestAnimationFrame(() => {
+      const feed = feedRef.current;
+      if (!feed) return;
+      feed.scrollTop = feed.scrollHeight;
+      // A second frame catches variable-height rows measured by ResizeObserver
+      // after the first virtual pass.
+      requestAnimationFrame(() => {
+        if (stickToBottomRef.current && feedRef.current) {
+          feedRef.current.scrollTop = feedRef.current.scrollHeight;
+        }
+      });
+    });
+  }, []);
+
+  const jumpToLatest = useCallback(() => {
+    stickToBottomRef.current = true;
+    setShowJumpToLatest(false);
+    scrollFeedToLatest();
+  }, [scrollFeedToLatest]);
+
+  const onFeedScroll = useCallback(() => {
+    const feed = feedRef.current;
+    if (!feed) return;
+    const distanceFromBottom =
+      feed.scrollHeight - feed.scrollTop - feed.clientHeight;
+    const pinned = distanceFromBottom < 120;
+    stickToBottomRef.current = pinned;
+    setShowJumpToLatest(!pinned);
+  }, []);
+
   useEffect(() => {
-    if (feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
-  }, [messages, typing, chatStream.streaming, chatStream.partial, chatStream.partialReasoning]);
+    stickToBottomRef.current = true;
+    setShowJumpToLatest(false);
+  }, [activeConv]);
+
+  useEffect(() => {
+    if (!stickToBottomRef.current) return;
+    const frame = requestAnimationFrame(() => {
+      // The user may have scrolled up after this effect was scheduled.
+      if (stickToBottomRef.current) scrollFeedToLatest();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [
+    messages.length,
+    activeConv,
+    typing,
+    chatStream.streaming,
+    chatStream.partial,
+    chatStream.partialReasoning,
+    scrollFeedToLatest,
+  ]);
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -407,6 +459,8 @@ export function ChatView({
     const pendingComments = getComments();
     const commentsArg = pendingComments.length > 0 ? pendingComments : undefined;
 
+    stickToBottomRef.current = true;
+    setShowJumpToLatest(false);
     setInput("");
     const imageToSend = pendingImage;
     setPendingImage(null);
@@ -811,21 +865,31 @@ export function ChatView({
         </div>
       ) : (
         <>
-          <div className="cx-feed scroll" ref={feedRef}>
-            <div className="cx-feed-inner">
-              {messages.map((m) => (
-                <CxMessage
-                  key={String(m.id)}
-                  m={m}
-                  convId={activeConv}
-                  model={model}
-                  detailMode={detailMode}
-                  onOpenFile={handleOpenFile}
-                  onOpenSnippet={onOpenSnippet}
-                  activeFile={activeFile}
-                  onApply={(code, lang, target) => void applyCodeToFile(code, lang, target)}
+          <div className="cx-feed-shell">
+            <div
+              className="cx-feed scroll"
+              ref={feedRef}
+              onScroll={onFeedScroll}
+            >
+              <div className="cx-feed-inner">
+                <TranscriptMessageList
+                  messages={messages}
+                  scrollRef={feedRef}
+                  renderMessage={(m) => (
+                    <CxMessage
+                      m={m}
+                      convId={activeConv}
+                      model={model}
+                      detailMode={detailMode}
+                      onOpenFile={handleOpenFile}
+                      onOpenSnippet={onOpenSnippet}
+                      activeFile={activeFile}
+                      onApply={(code, lang, target) =>
+                        void applyCodeToFile(code, lang, target)
+                      }
+                    />
+                  )}
                 />
-              ))}
               {/* Bulle « en train de travailler » : visible quand CETTE fenêtre
                   envoie (typing local) OU quand un stream est en cours POUR la
                   conversation active, quelle que soit la fenêtre émettrice
@@ -874,7 +938,18 @@ export function ChatView({
                   )}
                 </div>
               )}
+              </div>
             </div>
+            {showJumpToLatest && (
+              <button
+                type="button"
+                className="cx-jump-latest"
+                onClick={jumpToLatest}
+              >
+                <span aria-hidden="true">↓</span>
+                Dernier message
+              </button>
+            )}
           </div>
           <div className="cx-composer-wrap">{composer}</div>
         </>

@@ -69,4 +69,31 @@ describe("ChatRow conversation tree", () => {
     });
     expect(onCtx.mock.calls[0]?.[1]?.id).toBe("child");
   });
+
+  it("exposes the last update time without shifting the row on hover", () => {
+    const updated = new Date("2026-07-25T18:42:00.000Z").getTime();
+
+    act(() => {
+      root.render(
+        <ChatRow
+          convo={{ id: "timed", title: "Timed conversation", updated }}
+          activeId={null}
+          renamingId={null}
+          onPick={() => {}}
+          onCtx={() => {}}
+          onRename={() => {}}
+          onCancelRename={() => {}}
+          onDragStart={() => {}}
+          onDragEnd={() => {}}
+          dragging={false}
+          dragEnabled={false}
+          onHover={() => {}}
+        />,
+      );
+    });
+
+    const time = host.querySelector<HTMLTimeElement>(".chat-row-time");
+    expect(time?.dateTime).toBe("2026-07-25T18:42:00.000Z");
+    expect(time?.title).toBeTruthy();
+  });
 });

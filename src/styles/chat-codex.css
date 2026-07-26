@@ -11,8 +11,50 @@
 /* overflow-x hidden : avec seulement overflow-y:auto, le overflow-x calculé
    devient "auto" → toute fuite horizontale (long mot, code large) crée une
    scrollbar horizontale parasite sur TOUT le feed. */
+.cx-feed-shell {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
+}
 .cx-feed { flex: 1; overflow-y: auto; overflow-x: hidden; padding: var(--layout-pad-y) var(--layout-pad-x) 12px; min-height: 0; }
 .cx-feed-inner { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 22px; }
+.cx-virtual-list {
+  position: relative;
+  width: 100%;
+  contain: layout style;
+}
+.cx-virtual-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  contain: layout style;
+}
+.cx-jump-latest {
+  position: absolute;
+  left: 50%;
+  bottom: 12px;
+  z-index: 8;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  transform: translateX(-50%);
+  border: 1px solid rgba(224,142,254,0.26);
+  border-radius: 999px;
+  background: rgba(18,14,30,0.92);
+  color: var(--on-surface-variant);
+  box-shadow: var(--cv-shadow-element, 0 8px 24px rgba(0,0,0,0.25));
+  backdrop-filter: blur(var(--lg-blur, 12px));
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+.cx-jump-latest:hover {
+  border-color: rgba(224,142,254,0.44);
+  color: var(--on-surface);
+}
 
 /* ── Empty state (no messages) ────────────────────────────── */
 .cx-empty {
