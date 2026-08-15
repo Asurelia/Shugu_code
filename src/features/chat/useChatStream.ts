@@ -52,10 +52,6 @@ export function useChatStreamListener(): void {
     let cancelled = false;
     let unlisten: (() => void) | null = null;
 
-    diag(
-      "chat-stream",
-      `HOOK MOUNTED window=${typeof window !== "undefined" ? window.location.pathname : "?"}`,
-    );
     void (async () => {
       try {
         unlisten = await listen<ChatDelta>("chat://delta", (delta) => {

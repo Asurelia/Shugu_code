@@ -19,9 +19,13 @@
 //   import { diag } from "@/lib/diag";
 //   diag("agent-events", `event=${event.kind} agent=${id}`);
 //
-// Activation :
-//   Auto-activé en mode dev (import.meta.env.DEV).
-//   Catégories filtrables via DIAG_CATEGORIES — passer à `null` pour ALL.
+// Activation (opt-in) :
+//   En DEV, silencieux par défaut — le terminal tauri-dev doit rester un
+//   journal d'événements / d'échecs, pas un flux de breadcrumbs
+//   (« HOOK MOUNTED », « LISTEN ATTACHED ») laissés pendant le debug Plan v4.
+//   Pour réactiver le miroir JS→CMD : dans la DevTools console,
+//     localStorage.setItem("shugu.diag", "1")  puis recharger.
+//   Catégories filtrables via DIAG_CATEGORIES — `null` = toutes (si activé).
 //
 // Capture du trace dans un fichier (HORS workspace pour éviter feedback
 // loop avec le watcher fs) :
@@ -35,9 +39,15 @@
 
 import { invoke } from "@/lib/tauri";
 
-/** Active en dev seulement. Toggle à `false` ici pour silencer même
- *  en dev (utile quand on debug autre chose et que le bruit gêne). */
-const DIAG_ENABLED = import.meta.env.DEV;
+/** Opt-in même en DEV — évite de noyer la CMD de traces internes. */
+function diagOptIn(): boolean {
+  if (!import.meta.env.DEV) return false;
+  try {
+    return typeof localStorage !== "undefined" && localStorage.getItem("shugu.diag") === "1";
+  } catch {
+    return false;
+  }
+}
 
 /** Catégories acceptées. `null` = toutes. Sinon Set de strings. Permet
  *  de tracer juste une feature sans noyer le terminal. */
@@ -52,7 +62,7 @@ const DIAG_CATEGORIES: Set<string> | null = null;
  * @param msg      — message libre, déjà formatté côté caller
  */
 export function diag(category: string, msg: string): void {
-  if (!DIAG_ENABLED) return;
+  if (!diagOptIn()) return;
   if (DIAG_CATEGORIES && !DIAG_CATEGORIES.has(category)) return;
   const line = `[${category}] ${msg}`;
   console.log(line);

@@ -210,7 +210,9 @@ function useMascotClickThrough() {
       const pollHandle = window.setInterval(tick, 50);
 
       // Boot ignored, so the moment the mascot window appears it doesn't
-      // swallow whatever the user was clicking on.
+      // swallow whatever the user was clicking on. (Rust setup also arms
+      // ignore + show before any long boot work — this keeps the toggle
+      // correct after HMR / remount.)
       await setIgnore(true);
 
       cleanup = () => {

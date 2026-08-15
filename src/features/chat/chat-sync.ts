@@ -778,7 +778,7 @@ export async function sendChatMessage(
 /**
  * Resolve the configured orchestrator's model + provider config. Shared by
  * the chat delegate path (handleDelegate) and the Design Studio "Generate"
- * (StudioView) so both spawn agents through the SAME provider resolution.
+ * (StudioWorkspace) so both spawn agents through the SAME provider resolution.
  * Returns a discriminated result; callers map the failure reasons to their
  * own UX (chat message vs Studio banner).
  */

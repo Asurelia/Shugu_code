@@ -1,20 +1,7 @@
-// Shugu Forge — Design view data layer (open-design catalogue).
+// Shugu Forge — design data layer.
 //
-// Reads the vendored open-design catalogue served from public/ :
-//   /design-systems/index.json   — manifest (id, name, has{Tokens,Components,Spec})
-//   /design-systems/<id>/{DESIGN.md,tokens.css,components.html}
-//   /design-skills/index.json    — manifest (id, name, description, category)
-// NB: seuls les manifests sont vendorés. Les corps SKILL.md (jamais fetchés —
-// « Phase K » du plan) ont été retirés de public/ ; scripts/vendor-open-design.mjs
-// les re-vendorera depuis l'upstream si la Phase K se concrétise.
-//
-// In dev Vite serves public/ at the web root; in a packaged Tauri build the
-// same files are bundled into dist and served from the app origin. Either way
-// a plain relative fetch("/design-systems/…") works (same pattern as the
-// PreviewCard iframe in features/context-cards/cards.tsx).
-//
-// TanStack Query by default (project policy). The catalogue is immutable at
-// runtime (vendored static assets) → staleTime: Infinity, never refetch.
+// Design-systems catalogue (open-design demos) was removed from the product.
+// Skills catalogue remains for generationContext (agent self-selects approaches).
 
 import { useQuery } from "@tanstack/react-query";
 
@@ -34,9 +21,7 @@ export interface DesignSkillMeta {
 }
 
 export interface DesignSystemFiles {
-  /** Raw DESIGN.md (empty string if the system has no spec). */
   designMd: string;
-  /** Raw tokens.css (empty string if the system has no tokens). */
   tokensCss: string;
 }
 
@@ -46,22 +31,16 @@ async function fetchJson<T>(url: string): Promise<T> {
   return (await res.json()) as T;
 }
 
-async function fetchText(url: string): Promise<string> {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`fetch ${url} → ${res.status}`);
-  return res.text();
-}
-
-/** Catalogue of design systems (≈150 entries). */
+/** @deprecated Catalogue removed — always empty. */
 export function useDesignSystems() {
   return useQuery<DesignSystemMeta[]>({
     queryKey: ["design", "systems-index"],
-    queryFn: () => fetchJson<DesignSystemMeta[]>("/design-systems/index.json"),
+    queryFn: async () => [],
     staleTime: Infinity,
   });
 }
 
-/** Catalogue of skills (≈132 entries). */
+/** Skill stubs for generationContext (agent picks approaches by description). */
 export function useDesignSkills() {
   return useQuery<DesignSkillMeta[]>({
     queryKey: ["design", "skills-index"],
@@ -70,26 +49,12 @@ export function useDesignSkills() {
   });
 }
 
-/**
- * Lazily fetch DESIGN.md + tokens.css for one system (the preview pane needs
- * them; "Utiliser dans le chat" reuses the cached result). A missing file
- * (system without spec/tokens) resolves to "" rather than throwing, so the
- * preview degrades to an empty state instead of an error.
- */
+/** @deprecated Catalogue removed — always empty files. */
 export function useDesignSystemFiles(id: string | null) {
   return useQuery<DesignSystemFiles>({
     queryKey: ["design", "system-files", id],
     enabled: !!id,
     staleTime: Infinity,
-    queryFn: async () => {
-      const [designMd, tokensCss] = await Promise.all([
-        fetchText(`/design-systems/${id}/DESIGN.md`).catch(() => ""),
-        fetchText(`/design-systems/${id}/tokens.css`).catch(() => ""),
-      ]);
-      return { designMd, tokensCss };
-    },
+    queryFn: async () => ({ designMd: "", tokensCss: "" }),
   });
 }
-
-// (useDesignSkillDoc supprimé — hook jamais consommé ; les SKILL.md ne sont
-//  plus vendorés dans public/. À réintroduire avec la Phase K si besoin.)

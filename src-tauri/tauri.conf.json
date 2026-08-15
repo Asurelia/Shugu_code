@@ -38,7 +38,7 @@
         "resizable": false,
         "focus": false,
         "focusable": false,
-        "visible": true
+        "visible": false
       }
     ],
     "security": {

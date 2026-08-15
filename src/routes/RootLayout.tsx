@@ -1180,7 +1180,7 @@ export function RootLayout() {
       case "code":     return { title: "Editor",        sub: activeFile };
       case "git":      return { title: "Source Control", sub: activeFile || "" };
       case "image":    return { title: <span><span className="acc">Image Studio</span></span>, sub: "flux.1 · sdxl · lcm-fast" };
-      case "studio":   return { title: <span><span className="acc">Studio</span></span>, sub: "inspiration · génération · aperçu live" };
+      case "studio":   return { title: <span><span className="acc">Studio</span></span>, sub: "canvas · jumeau produit · chat" };
       case "agents":   return { title: "Agents",        sub: `${agents.filter((a: any) => a.status === "running").length} running · ${agents.length} total` };
       case "gallery":  return { title: "Gallery",       sub: `${generations.length} generations` };
       case "settings": return { title: "Settings",      sub: settingsSection };

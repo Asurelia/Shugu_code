@@ -14,6 +14,7 @@ import "./styles/chat-codex.css";
 import "./styles/forge-integrations.css";
 import "./styles/design.css";
 import "./styles/studio.css";
+import "./styles/studio-canvas.css";
 import "./styles/shell-extras.css";
 // EN DERNIER — surcharges typographie puis densité/hiérarchie.
 import "./styles/typography.css";

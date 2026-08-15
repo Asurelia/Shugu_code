@@ -17,7 +17,6 @@
 
 import { useEffect } from "react";
 import { listen } from "@/lib/tauri";
-import { diag } from "@/lib/diag";
 import { invalidateAllGit } from "./queries";
 
 export function useGitEvents(): void {
@@ -25,18 +24,14 @@ export function useGitEvents(): void {
     let cancelled = false;
     let unlisten: (() => void) | null = null;
 
-    diag("git-events", "HOOK MOUNTED");
-
     void (async () => {
       try {
         unlisten = await listen<void>("git://changed", () => {
           if (cancelled) return;
-          diag("git-events", "git://changed → invalidateAllGit");
           invalidateAllGit();
         });
-        diag("git-events", "LISTEN ATTACHED");
       } catch (err) {
-        diag("git-events", `LISTEN ATTACH FAILED: ${String(err)}`);
+        console.warn("[git-events] listen attach failed:", err);
       }
       if (cancelled) {
         unlisten?.();

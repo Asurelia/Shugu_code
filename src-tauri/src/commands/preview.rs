@@ -189,7 +189,17 @@ pub fn serve(app: &AppHandle, raw_path: &str) -> Response<Cow<'static, [u8]>> {
         return serve_atelier(rest);
     }
 
-    // Workspace preview (Design Studio): <workspace>/.shugu-forge/preview/<path>.
+    // Open-workspace files: `__ws__/<path>` serves from the trusted workspace
+    // root (any project the user opened) — Studio atlas pages/assets, not the
+    // forge generation silo.
+    if let Some(rest) = rel.strip_prefix("__ws__/") {
+        return serve_workspace_root(app, rest, is_index_request);
+    }
+    if rel == "__ws__" || rel == "__ws__/" {
+        return serve_workspace_root(app, "index.html", true);
+    }
+
+    // Legacy Studio generation silo: <workspace>/.shugu-forge/preview/<path>.
     // Live workspace root from managed state (seeded on startup from the
     // settings table, updated by fs_open_folder). On Windows this is the
     // canonical `\\?\`-prefixed path — std::fs::read handles it fine.
@@ -243,6 +253,64 @@ pub fn serve(app: &AppHandle, raw_path: &str) -> Response<Cow<'static, [u8]>> {
     };
     if !canonical_target.starts_with(&canonical_base) || !canonical_target.is_file() {
         return not_found();
+    }
+    read_and_respond(&canonical_target)
+}
+
+/// Serve a file from the open workspace root (`__ws__/<rel>`). Same trust +
+/// path-safety rules as the forge silo, but the base is the project folder
+/// itself so Studio can render real pages/assets of whatever is open.
+fn serve_workspace_root(
+    app: &AppHandle,
+    rest: &str,
+    is_index_request: bool,
+) -> Response<Cow<'static, [u8]>> {
+    let root: PathBuf = {
+        let state = app.state::<Mutex<Option<PathBuf>>>();
+        let guard = match state.lock() {
+            Ok(g) => g,
+            Err(_) => return not_found(),
+        };
+        match guard.clone() {
+            Some(r) => r,
+            None if is_index_request => return empty_preview(),
+            None => return not_found(),
+        }
+    };
+    if !crate::commands::project_trust::is_trusted(app, &root) {
+        return if is_index_request {
+            empty_preview()
+        } else {
+            not_found()
+        };
+    }
+
+    let rel = if rest.is_empty() { "index.html" } else { rest };
+    let mut target = root.clone();
+    for comp in std::path::Path::new(rel).components() {
+        match comp {
+            Component::Normal(c) => target.push(c),
+            Component::CurDir => {}
+            _ => return not_found(),
+        }
+    }
+
+    let canonical_base = match std::fs::canonicalize(&root) {
+        Ok(path) => path,
+        Err(_) if is_index_request => return empty_preview(),
+        Err(_) => return not_found(),
+    };
+    let canonical_target = match std::fs::canonicalize(&target) {
+        Ok(path) => path,
+        Err(_) if is_index_request => return empty_preview(),
+        Err(_) => return not_found(),
+    };
+    if !canonical_target.starts_with(&canonical_base) || !canonical_target.is_file() {
+        return if is_index_request {
+            empty_preview()
+        } else {
+            not_found()
+        };
     }
     read_and_respond(&canonical_target)
 }

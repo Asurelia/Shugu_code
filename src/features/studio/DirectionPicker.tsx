@@ -33,7 +33,7 @@ export function DirectionPicker({
   // event-driven convention (spawnAgent + awaitAgentComplete over the
   // `agent://lifecycle` Tauri bus + manual state), NOT useMutation. This is a
   // one-shot generation feeding local UI state, not a server cache — and it
-  // stays consistent with chat delegation (chat-sync) and StudioView.generate.
+  // stays consistent with chat delegation (chat-sync) and StudioWorkspace.
   const [directions, setDirections] = useState<Direction[]>(CURATED_DIRECTIONS);
   const [loading, setLoading] = useState(false);
   const [note, setNote] = useState<string | null>(null);

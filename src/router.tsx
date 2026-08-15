@@ -19,11 +19,7 @@ const LazyChatRoute        = lazy(() => import("./routes/chat"));
 const LazyCodeRoute        = lazy(() => import("./routes/code"));
 const LazyGitRoute         = lazy(() => import("./routes/git"));
 const LazyImageRoute       = lazy(() => import("./routes/image"));
-const LazyInspirationRoute = lazy(() => import("./routes/design"));        // catalogue (systems-only) → /studio/inspiration
-const LazyStudioShell      = lazy(() => import("./routes/studio"));        // unified Studio shell (sub-tabs + Outlet)
-const LazyStudioCreate     = lazy(() => import("./routes/studio.create")); // /studio index → the assistant
-const LazyStudioProjects   = lazy(() => import("./routes/studio.projects")); // /studio/projects → saved-projects grid
-const LazyStudioBrand      = lazy(() => import("./routes/studio.brand")); // /studio/brand → brand workspace
+const LazyStudioShell      = lazy(() => import("./routes/studio"));        // canvas-first Studio workspace
 const LazyAgentsRoute      = lazy(() => import("./routes/agents"));
 const LazyGalleryRoute     = lazy(() => import("./routes/gallery"));
 const LazySettingsRoute    = lazy(() => import("./routes/settings"));
@@ -71,43 +67,29 @@ const imageRoute = createRoute({
   component: () => <LazyImageRoute />,
 });
 
-// ─── /design → redirect to the unified Studio inspiration sub-page ─
+// ─── /design and legacy Studio sub-tabs → canvas Studio ─
 const designRedirectRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/design",
-  beforeLoad: () => { throw redirect({ to: "/studio/inspiration" }); },
+  beforeLoad: () => { throw redirect({ to: "/studio" }); },
   component: () => null,
 });
+const studioLegacyRedirect = (path: string) =>
+  createRoute({
+    getParentRoute: () => rootRoute,
+    path,
+    beforeLoad: () => { throw redirect({ to: "/studio" }); },
+    component: () => null,
+  });
+const studioProjectsRedirectRoute = studioLegacyRedirect("/studio/projects");
+const studioBrandRedirectRoute = studioLegacyRedirect("/studio/brand");
+const studioInspirationRedirectRoute = studioLegacyRedirect("/studio/inspiration");
 
-// ─── /studio (unified Design Studio — shell with nested sub-routes) ─
+// ─── /studio (canvas-first workspace — no nested sub-tabs) ─
 const studioRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/studio",
   component: () => <LazyStudioShell />,
-});
-// index → "Créer" (the 3-step assistant)
-const studioCreateRoute = createRoute({
-  getParentRoute: () => studioRoute,
-  path: "/",
-  component: () => <LazyStudioCreate />,
-});
-// /studio/projects → the saved-projects grid (Projets tab)
-const studioProjectsRoute = createRoute({
-  getParentRoute: () => studioRoute,
-  path: "projects",
-  component: () => <LazyStudioProjects />,
-});
-// /studio/brand → brand workspace (design base + notes + image refs)
-const studioBrandRoute = createRoute({
-  getParentRoute: () => studioRoute,
-  path: "brand",
-  component: () => <LazyStudioBrand />,
-});
-// /studio/inspiration → the catalogue (systems as a starting base)
-const studioInspirationRoute = createRoute({
-  getParentRoute: () => studioRoute,
-  path: "inspiration",
-  component: () => <LazyInspirationRoute />,
 });
 
 // ─── /agents ─────────────────────────────────────────────────
@@ -160,7 +142,10 @@ const routeTree = rootRoute.addChildren([
   gitRoute,
   imageRoute,
   designRedirectRoute,
-  studioRoute.addChildren([studioCreateRoute, studioProjectsRoute, studioBrandRoute, studioInspirationRoute]),
+  studioRoute,
+  studioProjectsRedirectRoute,
+  studioBrandRedirectRoute,
+  studioInspirationRedirectRoute,
   agentsRoute,
   galleryRoute,
   settingsIndexRoute,

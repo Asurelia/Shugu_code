@@ -948,6 +948,30 @@ pub fn run() {
         // géré que l'UI peut révéler (aucun chemin arbitraire depuis IPC).
         .manage(commands::updates::UpdateDownloadState::default())
         .setup(|app| {
+            // Mascotte always-on-top : click-through AVANT tout travail long du
+            // setup (backup VACUUM ~36 Mo, restore, …), puis show. Config
+            // `visible: false` : zéro fenêtre opaque aux clics entre la
+            // création native et ce point. alwaysOnTop reste ; seuls les
+            // curseurs passent pendant (et après) le boot. Le hook JS
+            // (useMascotClickThrough) reprend ensuite le toggle dynamique.
+            if let Some(mascot) = app.get_webview_window("mascot") {
+                if let Err(e) = mascot.set_ignore_cursor_events(true) {
+                    eprintln!("[mascot] boot click-through failed: {e}");
+                }
+                if let Err(e) = mascot.show() {
+                    eprintln!("[mascot] boot show failed: {e}");
+                }
+            }
+
+            // V28 a été amendée après déploiement (CREATE TABLE IF NOT EXISTS
+            // pour les DB fraîches). sqlx bloque alors V29/V30 tant que le
+            // checksum stocké ne matche pas — réparation best-effort ici.
+            commands::backup::repair_amended_migration_checksum(
+                app.handle(),
+                28,
+                MIGRATION_V28,
+            );
+
             // Lane OPÉRABILITÉ — backup AUTOMATIQUE pré-migration.
             //
             // tauri-plugin-sql applique ses migrations LAZILY (au premier

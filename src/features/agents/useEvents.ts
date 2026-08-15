@@ -36,11 +36,6 @@ export function useAgentEvents(): void {
     let cancelled = false;
     let unlisten: (() => void) | null = null;
 
-    diag(
-      "agent-events",
-      `HOOK MOUNTED window=${typeof window !== "undefined" ? window.location.pathname : "?"}`,
-    );
-
     void (async () => {
       try {
         unlisten = await listen<AgentEvent>("agent://lifecycle", (event) => {
@@ -291,9 +286,8 @@ export function useAgentEvents(): void {
             void qc.invalidateQueries({ queryKey: followupKeys.all });
           }
         });
-        diag("agent-events", `LISTEN ATTACHED cancelled=${cancelled}`);
       } catch (err) {
-        diag("agent-events", `LISTEN ATTACH FAILED: ${String(err)}`);
+        console.warn("[agent-events] listen attach failed:", err);
       }
       if (cancelled) {
         unlisten?.();

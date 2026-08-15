@@ -1,20 +1,13 @@
 // Shugu Forge — Design Studio draft (the assistant's in-progress inputs).
 //
-// Why this exists: the Studio is now a parent route with nested sub-routes
-// (/studio = Créer, /studio/inspiration = catalogue). Switching to Inspiration
-// UNMOUNTS the Créer view, so any wizard input held in StudioView's useState
-// would be lost — breaking the core "type a brief → go pick a base → Partir de
-// cette base → back to Créer" loop. The brief, discovery answers, chosen
-// direction and step must survive that round-trip.
+// Why this exists: Studio draft (brief, direction, convId) must survive dock
+// remounts and project switches. Synthetic query as global state — same pattern
+// as brandBoard / canvas doc.
 //
 // Pattern: TanStack "synthetic query as global state" — identical to
-// activeDesignSystem.ts. The value lives in the query cache (not a component),
-// so it persists across the route transition; readable reactively in
-// StudioView and writable from anywhere via setStudioDraft.
-//
-// Only the INPUTS live here. Generation-runtime state (status, reloadKey) stays
-// local to StudioView, and the rendered preview is disk-backed (preview://), so
-// it survives on its own.
+// brandBoard / canvas store. Readable from StudioWorkspace; writable via
+// setStudioDraft. Generation-runtime state (reloadKey) stays local; preview
+// files are disk-backed.
 
 import { useQuery } from "@tanstack/react-query";
 import { queryClient } from "@/lib/queryClient";
@@ -55,7 +48,7 @@ const INITIAL: StudioDraft = {
   convId: null,
 };
 
-/** Reactive read — StudioView re-renders when any draft field changes. */
+/** Reactive read — StudioWorkspace re-renders when any draft field changes. */
 export function useStudioDraft(): StudioDraft {
   return (
     useQuery<StudioDraft>({

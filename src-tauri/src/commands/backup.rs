@@ -2,8 +2,8 @@
 //!
 //! Ce module est **autonome** : il n'altère aucune logique existante. Il
 //! n'expose que des commandes nouvelles (enregistrées en APPEND dans `lib.rs`)
-//! plus un point d'entrée runtime `auto_backup_before_migration` appelé depuis
-//! le `setup` de `lib.rs`.
+//! plus des points d'entrée runtime (`auto_backup_before_migration`,
+//! `repair_amended_migration_checksum`) appelés depuis le `setup` de `lib.rs`.
 //!
 //! ## Ce qui est sauvegardé
 //!
@@ -388,6 +388,95 @@ fn write_bundle(app: &AppHandle, bundle_dir: &Path) -> Result<BackupManifest, St
         .map_err(|e| format!("write manifest.json : {e}"))?;
 
     Ok(manifest)
+}
+
+// ---------------------------------------------------------------------------
+// Réparation checksum migrations amendées (appelé depuis lib.rs::setup)
+// ---------------------------------------------------------------------------
+
+/// sqlx (via tauri-plugin-sql) refuse d'appliquer toute migration suivante si
+/// une migration DÉJÀ appliquée a un checksum différent du SQL actuel
+/// (`Sha384` des octets SQL — erreur « previously applied but has been
+/// modified »). Quand on amende volontairement une migration déjà déployée
+/// (ex. V28 : `CREATE TABLE IF NOT EXISTS agent_command_rules` pour les DB
+/// fraîches), on réécrit le BLOB `checksum` stocké AVANT le premier
+/// `db.load()` du front. Best-effort : n'altère rien si la ligne n'existe
+/// pas, si le checksum est déjà à jour, ou si la base est absente.
+pub fn repair_amended_migration_checksum(app: &AppHandle, version: i64, sql: &str) {
+    let src = match live_db_path(app) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[backup] repair checksum v{version}: chemin base indisponible: {e}");
+            return;
+        }
+    };
+    match repair_amended_migration_checksum_at(&src, version, sql) {
+        Ok(RepairChecksumOutcome::Updated) => {
+            eprintln!(
+                "[backup] checksum migration v{version} réparé (amendement volontaire du SQL)"
+            );
+        }
+        Ok(RepairChecksumOutcome::Unchanged) => {}
+        Ok(RepairChecksumOutcome::Skipped) => {}
+        Err(e) => eprintln!("[backup] repair checksum v{version} échoué (boot continue): {e}"),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RepairChecksumOutcome {
+    /// Ligne absente / table absente / base absente — rien à faire.
+    Skipped,
+    /// Checksum déjà aligné sur le SQL courant.
+    Unchanged,
+    /// Checksum réécrit pour débloquer les migrations suivantes.
+    Updated,
+}
+
+fn repair_amended_migration_checksum_at(
+    db: &Path,
+    version: i64,
+    sql: &str,
+) -> Result<RepairChecksumOutcome, String> {
+    use sha2::{Digest, Sha384};
+
+    if !db.exists() {
+        return Ok(RepairChecksumOutcome::Skipped);
+    }
+    let conn = Connection::open(db).map_err(|e| format!("open: {e}"))?;
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='_sqlx_migrations'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if exists == 0 {
+        return Ok(RepairChecksumOutcome::Skipped);
+    }
+
+    let expected: Vec<u8> = Sha384::digest(sql.as_bytes()).to_vec();
+    let current: Option<Vec<u8>> = match conn.query_row(
+        "SELECT checksum FROM _sqlx_migrations WHERE version = ?1",
+        [version],
+        |r| r.get(0),
+    ) {
+        Ok(blob) => Some(blob),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(format!("select checksum: {e}")),
+    };
+
+    match current {
+        None => Ok(RepairChecksumOutcome::Skipped),
+        Some(c) if c == expected => Ok(RepairChecksumOutcome::Unchanged),
+        Some(_) => {
+            conn.execute(
+                "UPDATE _sqlx_migrations SET checksum = ?1 WHERE version = ?2",
+                rusqlite::params![expected, version],
+            )
+            .map_err(|e| format!("update checksum: {e}"))?;
+            Ok(RepairChecksumOutcome::Updated)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -855,6 +944,52 @@ mod tests {
             params![schema_version],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn repair_checksum_updates_stale_blob_and_is_idempotent() {
+        use sha2::{Digest, Sha384};
+
+        let dir = temp_dir("checksum");
+        let db = dir.join("shugu.db");
+        make_db(&db, 28);
+        let sql = "CREATE TABLE IF NOT EXISTS agent_permission_rules (x TEXT);";
+        let expected: Vec<u8> = Sha384::digest(sql.as_bytes()).to_vec();
+
+        // Seed an OLD checksum so the repair has something to overwrite.
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute(
+                "UPDATE _sqlx_migrations SET checksum = ?1 WHERE version = 28",
+                params![vec![0u8; 48]],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            repair_amended_migration_checksum_at(&db, 28, sql).unwrap(),
+            RepairChecksumOutcome::Updated
+        );
+        let stored: Vec<u8> = {
+            let conn = Connection::open(&db).unwrap();
+            conn.query_row(
+                "SELECT checksum FROM _sqlx_migrations WHERE version = 28",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(stored, expected);
+
+        assert_eq!(
+            repair_amended_migration_checksum_at(&db, 28, sql).unwrap(),
+            RepairChecksumOutcome::Unchanged
+        );
+        assert_eq!(
+            repair_amended_migration_checksum_at(&db, 99, sql).unwrap(),
+            RepairChecksumOutcome::Skipped
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

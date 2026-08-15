@@ -443,6 +443,34 @@ fn agent_tools() -> &'static [ToolDef] {
                 }),
             },
             ToolDef {
+                name: "studio_deposit_exploration",
+                description: "Deposit an Exploration UI frame on the Studio infinite canvas \
+                              (a VARIANT, not the live product). Writes a self-contained HTML \
+                              document to `.shugu-forge/canvas/explorations/<slug>.html`. \
+                              The live product twin stays in `.shugu-forge/preview/` — never \
+                              overwrite preview files for exploratory variants. Prefer this \
+                              tool when the user asks for alternates, A/B layouts, or mood \
+                              explorations beside the product frame.",
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Short human label shown on the canvas frame, e.g. \"Hero sombre\"."
+                        },
+                        "html": {
+                            "type": "string",
+                            "description": "Full self-contained HTML document (inline CSS/JS OK)."
+                        },
+                        "slug": {
+                            "type": "string",
+                            "description": "Optional kebab-case id (a-z0-9-). Derived from name when omitted."
+                        }
+                    },
+                    "required": ["name", "html"]
+                }),
+            },
+            ToolDef {
                 name: "fs_search",
                 description: "Search the whole workspace for a pattern (ripgrep-style) and return \
                               matching lines as `path:line: preview`. Use this FIRST to LOCATE where \
@@ -1326,6 +1354,46 @@ fn dispatch_inner(
             );
             Ok(format!("wrote {bytes} bytes to {path}"))
         }
+        "studio_deposit_exploration" => {
+            let name = args["name"]
+                .as_str()
+                .ok_or_else(|| "missing required field: name".to_string())?
+                .trim();
+            if name.is_empty() {
+                return Err("name must not be empty".to_string());
+            }
+            let html = args["html"]
+                .as_str()
+                .ok_or_else(|| "missing required field: html".to_string())?;
+            if html.trim().is_empty() {
+                return Err("html must not be empty".to_string());
+            }
+            if html.len() > 1_500_000 {
+                return Err("html too large (max ~1.5MB)".to_string());
+            }
+            let slug_raw = args["slug"].as_str().unwrap_or("").trim();
+            let slug = if slug_raw.is_empty() {
+                slugify_exploration_name(name)
+            } else {
+                slugify_exploration_name(slug_raw)
+            };
+            let path = format!(".shugu-forge/canvas/explorations/{slug}.html");
+            // Inject <title> when missing so the canvas label stays meaningful.
+            let body = ensure_html_title(html, name);
+            let before = crate::commands::fs::read_file_inner(root, &path, None).ok();
+            let bytes = crate::commands::fs::write_file_inner(root, &path, &body)?;
+            let _ = super::persist_and_emit(
+                app,
+                &super::AgentEvent::Write {
+                    agent_id: agent_id.to_string(),
+                    path: path.clone(),
+                    before,
+                },
+            );
+            Ok(format!(
+                "deposited exploration « {name} » at {path} ({bytes} bytes) — visible as a canvas frame beside the live product"
+            ))
+        }
         "fs_list_dir" => {
             let path = args["path"].as_str().unwrap_or(".");
             crate::commands::fs::list_dir_inner(root, path)
@@ -1727,6 +1795,64 @@ fn dispatch_inner(
     }
 }
 
+/// Kebab-case slug for Studio exploration frames (a-z0-9-, max 48).
+fn slugify_exploration_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut prev_dash = false;
+    for ch in raw.chars() {
+        let c = ch.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        return format!("variant-{}", chrono_like_slug());
+    }
+    out.truncate(48);
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+fn chrono_like_slug() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("{ms:x}")
+}
+
+/// Ensure the deposited HTML has a <title> so the canvas label is meaningful.
+fn ensure_html_title(html: &str, name: &str) -> String {
+    if html.to_ascii_lowercase().contains("<title") {
+        return html.to_string();
+    }
+    let escaped = name
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    if let Some(idx) = html.to_ascii_lowercase().find("<head") {
+        if let Some(end) = html[idx..].find('>') {
+            let insert_at = idx + end + 1;
+            let mut s = String::with_capacity(html.len() + escaped.len() + 20);
+            s.push_str(&html[..insert_at]);
+            s.push_str(&format!("\n<title>{escaped}</title>"));
+            s.push_str(&html[insert_at..]);
+            return s;
+        }
+    }
+    format!("<!DOCTYPE html><html><head><title>{escaped}</title></head><body>{html}</body></html>")
+}
+
 // ────────────────────────────────────────────────────────────────────
 // AM-3 — tests for the untrusted-content fence
 // ────────────────────────────────────────────────────────────────────
@@ -1836,5 +1962,23 @@ mod injection_defense_tests {
         let out = wrap_untrusted("file", "");
         assert!(out.starts_with(UNTRUSTED_OPEN_PREFIX));
         assert!(out.trim_end().ends_with(UNTRUSTED_CLOSE));
+    }
+
+    #[test]
+    fn slugify_exploration_name_is_kebab_safe() {
+        assert_eq!(slugify_exploration_name("Hero Dark!!"), "hero-dark");
+        assert_eq!(slugify_exploration_name("  A/B Test  "), "a-b-test");
+        assert!(!slugify_exploration_name("@@@").is_empty());
+    }
+
+    #[test]
+    fn ensure_html_title_injects_when_missing() {
+        let out = ensure_html_title("<html><head></head><body>hi</body></html>", "Alt");
+        assert!(out.contains("<title>Alt</title>"));
+        let kept = ensure_html_title(
+            "<html><head><title>Keep</title></head><body/></html>",
+            "Alt",
+        );
+        assert!(kept.contains("<title>Keep</title>"));
     }
 }

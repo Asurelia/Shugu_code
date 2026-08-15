@@ -2393,7 +2393,10 @@ fn definition_allows_tool(selectors: Option<&[String]>, tool: &str) -> bool {
                 tool,
                 "fs_read_file" | "fs_list_dir" | "fs_search" | "code_search"
             ),
-            "write" => matches!(tool, "fs_write_file" | "fs_delete" | "fs_move"),
+            "write" => matches!(
+                tool,
+                "fs_write_file" | "fs_delete" | "fs_move" | "studio_deposit_exploration"
+            ),
             "edit" => tool == "fs_edit",
             "bash" | "shell" => tool == "run_command",
             "web" => matches!(tool, "web_search" | "web_fetch"),

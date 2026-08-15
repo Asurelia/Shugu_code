@@ -82,15 +82,46 @@ export function ProjectPreview({
   reloadKey = 0,
   onSelectElement,
   onBakeTokens,
+  /** Path under preview/ (forge silo) — ignored when externalUrl is set. */
+  route = "index.html",
+  /**
+   * Live URL of the OPEN workspace project (e.g. http://localhost:5173).
+   * When set, Studio shows THAT app — never `.shugu-forge/preview/`.
+   */
+  externalUrl,
+  /** Canvas-embedded: fill parent, hide the floating tool bar (tools live in the dock). */
+  embedded = false,
+  /** External control for select mode when embedded in the canvas. */
+  selecting: selectingProp,
+  onSelectingChange,
+  tweaking: tweakingProp,
+  onTweakingChange,
 }: {
   reloadKey?: number;
   onSelectElement?: (el: SelectedElement) => void;
   onBakeTokens?: (overrides: Record<string, string>) => void;
+  route?: string;
+  externalUrl?: string | null;
+  embedded?: boolean;
+  selecting?: boolean;
+  onSelectingChange?: (on: boolean) => void;
+  tweaking?: boolean;
+  onTweakingChange?: (on: boolean) => void;
 }) {
   const [nonce, setNonce] = useState(0);
   const [device, setDevice] = useState<Device>("full");
-  const [selecting, setSelecting] = useState(false);
-  const [tweaking, setTweaking] = useState(false);
+  const [selectingLocal, setSelectingLocal] = useState(false);
+  const [tweakingLocal, setTweakingLocal] = useState(false);
+  const selecting = selectingProp ?? selectingLocal;
+  const tweaking = tweakingProp ?? tweakingLocal;
+  const setSelecting = (on: boolean) => {
+    setSelectingLocal(on);
+    onSelectingChange?.(on);
+  };
+  const setTweaking = (on: boolean) => {
+    setTweakingLocal(on);
+    onTweakingChange?.(on);
+  };
   // `tokens` is the snapshot read from the page (the originals, for Reset);
   // `overrides` holds only what the user changed (name → new value).
   const [tokens, setTokens] = useState<Token[]>([]);
@@ -153,6 +184,12 @@ export function ProjectPreview({
     frameRef.current?.contentWindow?.postMessage(msg, origin);
   };
 
+  // Keep injected select-mode in sync when the dock drives `selecting` externally.
+  useEffect(() => {
+    if (!trusted || selectingProp === undefined) return;
+    post({ type: "shugu:setSelectMode", on: selectingProp });
+  }, [selectingProp, trusted, origin]);
+
   const sendMode = (on: boolean) => post({ type: "shugu:setSelectMode", on });
   const toggleSelect = () => {
     const next = !selecting;
@@ -179,8 +216,15 @@ export function ProjectPreview({
     setOverrides({});
   };
 
-  const src = `${origin}/index.html?_=${reloadKey}_${nonce}`;
-  const w = DEVICE_WIDTH[device];
+  const isExternal = Boolean(externalUrl);
+  const safeRoute = (route || "index.html").replace(/^\/+/, "");
+  // Prefer the open project's live URL; forge preview:// only as legacy fallback.
+  const src = isExternal
+    ? `${externalUrl!.replace(/\/$/, "")}${externalUrl!.includes("?") ? "&" : "?"}_=${reloadKey}_${nonce}`
+    : `${origin}/${safeRoute}?_=${reloadKey}_${nonce}`;
+  const w = embedded ? undefined : DEVICE_WIDTH[device];
+  // Cross-origin localhost apps can't receive select/tweaks postMessage.
+  const toolsEnabled = trusted && !isExternal;
   // Token groups for the Tweaks panel (classified by value → control type).
   const colorTokens = tokens.filter((t) => tokenKind(t.value) === "color");
   const sizeTokens = tokens.filter((t) => {
@@ -190,45 +234,49 @@ export function ProjectPreview({
   const textTokens = tokens.filter((t) => tokenKind(t.value) === "text");
 
   return (
-    <div className="studio-preview">
-      <div className="studio-preview-bar">
-        <span className="studio-preview-origin"><Icon name="image" size={12} /> Aperçu live</span>
-        <span style={{ flex: 1 }} />
-        <button
-          className={"lgb lgb-sm" + (tweaking ? " studio-select-on" : "")}
-          onClick={toggleTweaks}
-          disabled={!trusted}
-          title="Ajuster les couleurs et tokens en live"
-        >
-          <Icon name="palette" size={12} /> Tweaks
-        </button>
-        <button
-          className={"lgb lgb-sm" + (selecting ? " studio-select-on" : "")}
-          onClick={toggleSelect}
-          disabled={!trusted}
-          title="Sélectionner un élément à modifier"
-        >
-          <Icon name="sparkle" size={12} /> {selecting ? "Clique un élément…" : "Sélectionner"}
-        </button>
-        <div className="studio-device">
-          {(["full", "tablet", "mobile"] as Device[]).map((d) => (
-            <button
-              key={d}
-              className={"studio-device-btn" + (device === d ? " is-active" : "")}
-              onClick={() => setDevice(d)}
-              disabled={!trusted}
-              title={`Aperçu ${DEVICE_LABEL[d]}${DEVICE_WIDTH[d] ? ` (${DEVICE_WIDTH[d]}px)` : ""}`}
-            >
-              {DEVICE_LABEL[d]}
-            </button>
-          ))}
+    <div className={"studio-preview" + (embedded ? " is-embedded" : "")}>
+      {!embedded && (
+        <div className="studio-preview-bar">
+          <span className="studio-preview-origin">
+            <Icon name="image" size={12} /> {isExternal ? "Projet live" : "Aperçu live"}
+          </span>
+          <span style={{ flex: 1 }} />
+          <button
+            className={"lgb lgb-sm" + (tweaking ? " studio-select-on" : "")}
+            onClick={toggleTweaks}
+            disabled={!toolsEnabled}
+            title={isExternal ? "Tweaks : disponible sur le silo forge uniquement" : "Ajuster les couleurs et tokens en live"}
+          >
+            <Icon name="palette" size={12} /> Tweaks
+          </button>
+          <button
+            className={"lgb lgb-sm" + (selecting ? " studio-select-on" : "")}
+            onClick={toggleSelect}
+            disabled={!toolsEnabled}
+            title={isExternal ? "Sélection : disponible sur le silo forge uniquement" : "Sélectionner un élément à modifier"}
+          >
+            <Icon name="sparkle" size={12} /> {selecting ? "Clique un élément…" : "Sélectionner"}
+          </button>
+          <div className="studio-device">
+            {(["full", "tablet", "mobile"] as Device[]).map((d) => (
+              <button
+                key={d}
+                className={"studio-device-btn" + (device === d ? " is-active" : "")}
+                onClick={() => setDevice(d)}
+                disabled={!trusted && !isExternal}
+                title={`Aperçu ${DEVICE_LABEL[d]}${DEVICE_WIDTH[d] ? ` (${DEVICE_WIDTH[d]}px)` : ""}`}
+              >
+                {DEVICE_LABEL[d]}
+              </button>
+            ))}
+          </div>
+          <button className="lgb lgb-sm" disabled={!trusted && !isExternal} onClick={() => setNonce((n) => n + 1)} title="Recharger l'aperçu">
+            <Icon name="history" size={12} /> Recharger
+          </button>
         </div>
-        <button className="lgb lgb-sm" disabled={!trusted} onClick={() => setNonce((n) => n + 1)} title="Recharger l'aperçu">
-          <Icon name="history" size={12} /> Recharger
-        </button>
-      </div>
+      )}
 
-      {tweaking && (
+      {tweaking && !embedded && (
         <div className="studio-tweaks">
           <style>{TWEAKS_STYLE}</style>
           <div className="studio-tweaks-hd">

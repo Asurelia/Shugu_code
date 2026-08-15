@@ -9,7 +9,6 @@
 
 import { useEffect } from "react";
 import { listen } from "@/lib/tauri";
-import { diag } from "@/lib/diag";
 import { invalidateDirChildren } from "./queries";
 import { invalidateGrep } from "@/features/code/grep/queries";
 import { invalidateAllGit } from "@/features/git/queries";
@@ -29,12 +28,9 @@ export function useFsEvents(): void {
     let unlisten: (() => void) | null = null;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
-    diag("fs-events", "HOOK MOUNTED");
-
     const invalidateAll = () => {
       timer = null;
       if (cancelled) return;
-      diag("fs-events", "fs://changed (debounced) → invalidate dir + scoped + grep + git");
       // Niveaux lazy de l'explorateur (`fsKeys.dir`) + sous-arbres scoped
       // Studio (`fsKeys.scoped`) — refetch des dossiers/preview ouverts
       // seulement ; l'état d'expansion vit dans SideFiles. (L'ancien
@@ -57,9 +53,8 @@ export function useFsEvents(): void {
           if (timer !== null) clearTimeout(timer);
           timer = setTimeout(invalidateAll, INVALIDATE_DEBOUNCE_MS);
         });
-        diag("fs-events", "LISTEN ATTACHED");
       } catch (err) {
-        diag("fs-events", `LISTEN ATTACH FAILED: ${String(err)}`);
+        console.warn("[fs-events] listen attach failed:", err);
       }
       if (cancelled) {
         unlisten?.();

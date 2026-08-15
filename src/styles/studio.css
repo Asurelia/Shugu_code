@@ -881,6 +881,7 @@ button.studio-file-row:hover { background: rgba(224, 142, 254, 0.1); color: var(
 
 /* ── Right: live preview ──────────────────────────────────── */
 .studio-preview {
+  /* Embedded canvas frames set position/size via .is-embedded in studio-canvas.css */
   flex: 1;
   min-width: 0;
   min-height: 0;
