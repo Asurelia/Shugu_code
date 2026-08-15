@@ -689,3 +689,7 @@
   font-size: 11px;
   color: var(--on-surface-variant);
 }
+
+/* Compose hint: plain paragraph with inline <b> — .studio-hint-sm is flex,
+   which would scatter each inline element into its own narrow column. */
+.studio-compose > .studio-hint-sm { display: block; }

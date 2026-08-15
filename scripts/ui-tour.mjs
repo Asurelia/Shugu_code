@@ -267,6 +267,62 @@ if (!FOCUSED) {
     await page.waitForTimeout(1000);
     await screenshot(`${OUT}/${shot}.png`);
   }
+
+  // ── Studio : workspace canvas-first, modes d'interaction, compose ──────
+  await fastClick(page.locator('nav.rail button[aria-label="Studio"]'));
+  await page.waitForTimeout(1200);
+  await need(".studio-workspace", "workspace Studio");
+  await need(".studio-toolbar", "toolbar Studio");
+  await need(".studio-toolbar-toggles .studio-panel-toggle", "toggles layers/dock");
+  await need(".studio-workspace-body", "corps du workspace Studio");
+  await need(".studio-layers", "panneau layers");
+  // Les trois modes d'interaction directe (sélection / édition / commentaire).
+  for (const mode of ["Sélectionner", "Éditer", "Commenter"]) {
+    await need(`.studio-toolbar button:has-text("${mode}")`, `bouton mode « ${mode} »`);
+  }
+  await screenshot(`${OUT}/14-studio.png`);
+
+  // Dock compose : quiz brief + génération + exploration 3 directions.
+  await need(".studio-compose", "panneau compose");
+  await need(".studio-brief", "champ brief");
+  await need(".studio-quiz-chips .studio-chip", "puces du quiz brief");
+  await need(".studio-generate", "bouton Générer");
+  await need(".studio-generate-alt", "bouton Explorer 3 directions");
+  const chipCount = await page.locator(".studio-quiz-chips .studio-chip").count();
+  if (chipCount > 0) {
+    await fastClick(page.locator(".studio-quiz-chips .studio-chip").first());
+    await page.waitForTimeout(150);
+    if ((await page.locator(".studio-quiz-chips .studio-chip.is-active").count()) === 0) {
+      missing.push("puce quiz ne s'active pas au clic");
+    }
+  }
+  await screenshot(`${OUT}/15-studio-compose.png`);
+
+  // Onglet Inspector du dock.
+  const inspectorTab = page.locator('.studio-dock-tab:has-text("Inspector")');
+  if (await inspectorTab.count()) {
+    await fastClick(inspectorTab);
+    await page.waitForTimeout(300);
+    await need(".studio-inspector", "panneau inspector");
+    await screenshot(`${OUT}/16-studio-inspector.png`);
+    await fastClick(page.locator('.studio-dock-tab:has-text("Chat")'));
+    await page.waitForTimeout(200);
+  }
+
+  // Repli/dépli des layers.
+  const layersToggle = page.locator('.studio-panel-toggle[title*="layers" i]').first();
+  if (await layersToggle.count()) {
+    await fastClick(layersToggle);
+    await page.waitForTimeout(250);
+    await need(".studio-workspace-body.layers-collapsed", "repli des layers");
+    await fastClick(page.locator(".studio-rail-expand.is-left"));
+    await page.waitForTimeout(250);
+    await need(".studio-layers", "dépli des layers");
+  }
+
+  // Retour au chat pour la suite du tour.
+  await fastClick(page.locator('nav.rail button[aria-label="Chat"]'));
+  await page.waitForTimeout(400);
 }
 
 // ── Connexions : cartes compactes, identité provider, expansion ────────────
