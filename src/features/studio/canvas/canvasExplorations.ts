@@ -78,22 +78,23 @@ export function mergeExplorationsIntoDoc(
   const bySlug = new Map(files.map((f) => [f.slug, f]));
   const keepIds = new Set([...bySlug.keys()].map(explorationNodeId));
 
-  let nodes: CanvasNode[] = doc.nodes.filter(
+  const nodes: CanvasNode[] = doc.nodes.filter(
     (n) => !(n.kind === "exploration" && isExplorationNodeId(n.id) && !keepIds.has(n.id)),
   );
 
   let next: StudioCanvasDoc = { ...doc, nodes };
-  let selectedId = doc.selectedId;
+  const selectedId = doc.selectedId;
 
   for (const file of files) {
     const id = explorationNodeId(file.slug);
+    const route = explorationRelPath(file.slug);
     const existing = next.nodes.find((n) => n.id === id);
     if (existing) {
       next = {
         ...next,
         nodes: next.nodes.map((n) =>
           n.id === id
-            ? { ...n, kind: "exploration", name: file.name, html: file.html }
+            ? { ...n, kind: "exploration", name: file.name, html: file.html, route }
             : n,
         ),
       };
@@ -102,6 +103,7 @@ export function mergeExplorationsIntoDoc(
         id,
         name: file.name,
         html: file.html,
+        route,
       });
       // addExplorationFrame selects the new node — restore prior selection
       // unless nothing was selected (first deposit should focus the variant).

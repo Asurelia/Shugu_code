@@ -105,7 +105,7 @@ export function extractComponentsFromHtml(html: string, pageRoute: string): Atla
     const text = (el.textContent || "").trim();
     if (text.length < 2 && !el.querySelector("img,svg,video,canvas")) return;
     used.add(el);
-    let slug = slugify(name);
+    const slug = slugify(name);
     let id = `comp-${pageSlug}-${slug}`;
     let n = 2;
     while (out.some((c) => c.id === id)) {

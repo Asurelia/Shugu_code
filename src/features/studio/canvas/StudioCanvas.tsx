@@ -1,5 +1,8 @@
-// Shugu Forge — infinite canvas surface (pan / zoom / node chrome).
-// Live frames reuse ProjectPreview (embedded). Exploration frames use srcDoc.
+// Shugu Forge — infinite canvas surface (pan / zoom / node chrome / resize).
+// Live frames reuse ProjectPreview (embedded). Exploration frames are served
+// through the SAME preview:// bridge when disk-backed (route), so direct
+// manipulation (edit / styles / pins / DOM layers) works on every frame —
+// srcDoc remains the fallback for in-memory-only variants.
 // Brand node is a compact board card — edits live in the dock inspector.
 
 import {
@@ -9,26 +12,49 @@ import {
   useState,
   type PointerEvent as ReactPointerEvent,
   type WheelEvent as ReactWheelEvent,
+  type MutableRefObject,
 } from "react";
 import { Icon } from "@/components/components";
-import { ProjectPreview } from "../ProjectPreview";
+import {
+  ProjectPreview,
+  type ProjectPreviewHandle,
+  type PinPlacedPayload,
+  type TextEditedPayload,
+} from "../ProjectPreview";
 import type { SelectedElement } from "../studioChat";
+import type { ElStyle } from "../directEdit";
+import type { DomTreeItem } from "../domLayers";
 import { useStudioBrandBoard } from "../brandBoard";
 import {
   bringToFront,
   moveNode,
+  resizeNode,
   selectNode,
   zoomAt,
   type CanvasNode,
   type StudioCanvasDoc,
 } from "./studioCanvasDoc";
+import { pinsOfNode } from "./canvasPins";
 import { setStudioCanvasDoc } from "./studioCanvasStore";
 import { isWorkspaceHtmlRoute, workspacePreviewPath } from "./workspaceUiAtlas";
 import { LazyFrame } from "./LazyFrame";
 
 type Drag =
   | { kind: "pan"; px: number; py: number; camX: number; camY: number }
-  | { kind: "node"; id: string; px: number; py: number; ox: number; oy: number };
+  | { kind: "node"; id: string; px: number; py: number; ox: number; oy: number }
+  | { kind: "resize"; id: string; px: number; py: number; ow: number; oh: number };
+
+/** Bridge callbacks the workspace wants from the SELECTED frame's preview. */
+export interface CanvasBridge {
+  editing?: boolean;
+  pinning?: boolean;
+  onSelectElement?: (el: SelectedElement) => void;
+  onTextEdited?: (nodeId: string, p: TextEditedPayload) => void;
+  onElStyles?: (styles: ElStyle[]) => void;
+  onPinPlaced?: (nodeId: string, p: PinPlacedPayload) => void;
+  onDomTree?: (nodes: DomTreeItem[]) => void;
+  onBakeTokens?: (overrides: Record<string, string>) => void;
+}
 
 export function StudioCanvas({
   doc,
@@ -40,6 +66,8 @@ export function StudioCanvas({
   onSelectElement,
   onSelectingChange,
   onBakeTokens,
+  bridge,
+  selectedPreviewRef,
 }: {
   doc: StudioCanvasDoc;
   reloadKey: number;
@@ -50,6 +78,10 @@ export function StudioCanvas({
   onSelectElement?: (el: SelectedElement) => void;
   onSelectingChange?: (on: boolean) => void;
   onBakeTokens?: (overrides: Record<string, string>) => void;
+  /** Lot A/B/E bridge state + callbacks, applied to the selected frame. */
+  bridge?: CanvasBridge;
+  /** Receives the preview handle of the currently selected frame. */
+  selectedPreviewRef?: MutableRefObject<ProjectPreviewHandle | null>;
 }) {
   const brand = useStudioBrandBoard();
   const stageRef = useRef<HTMLDivElement>(null);
@@ -105,6 +137,13 @@ export function StudioCanvas({
     setDrag({ kind: "node", id: node.id, px: e.clientX, py: e.clientY, ox: node.x, oy: node.y });
   };
 
+  const onPointerDownResize = (e: ReactPointerEvent, node: CanvasNode) => {
+    if (e.button !== 0 || spacePan) return;
+    e.stopPropagation();
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    setDrag({ kind: "resize", id: node.id, px: e.clientX, py: e.clientY, ow: node.width, oh: node.height });
+  };
+
   const onPointerMove = (e: ReactPointerEvent) => {
     if (!drag) return;
     if (drag.kind === "pan") {
@@ -119,6 +158,12 @@ export function StudioCanvas({
       return;
     }
     const z = doc.camera.zoom || 1;
+    if (drag.kind === "resize") {
+      setStudioCanvasDoc(
+        resizeNode(doc, drag.id, drag.ow + (e.clientX - drag.px) / z, drag.oh + (e.clientY - drag.py) / z),
+      );
+      return;
+    }
     setStudioCanvasDoc(
       moveNode(doc, drag.id, drag.ox + (e.clientX - drag.px) / z, drag.oy + (e.clientY - drag.py) / z),
     );
@@ -126,6 +171,26 @@ export function StudioCanvas({
 
   const onPointerUp = () => setDrag(null);
   const sorted = [...doc.nodes].sort((a, b) => a.zIndex - b.zIndex);
+
+  // The selected frame's preview owns the bridge callbacks + the imperative ref.
+  const bridgeFor = (node: CanvasNode, isSelected: boolean) => {
+    if (!isSelected || !bridge) {
+      return {
+        onSelectElement,
+        onBakeTokens,
+      };
+    }
+    return {
+      onSelectElement: bridge.onSelectElement ?? onSelectElement,
+      onBakeTokens: bridge.onBakeTokens ?? onBakeTokens,
+      editing: bridge.editing,
+      pinning: bridge.pinning,
+      onTextEdited: (p: TextEditedPayload) => bridge.onTextEdited?.(node.id, p),
+      onElStyles: bridge.onElStyles,
+      onPinPlaced: (p: PinPlacedPayload) => bridge.onPinPlaced?.(node.id, p),
+      onDomTree: bridge.onDomTree,
+    };
+  };
 
   return (
     <div
@@ -145,6 +210,8 @@ export function StudioCanvas({
       >
         {sorted.map((node) => {
           const selected = doc.selectedId === node.id;
+          const pins = pinsOfNode(node);
+          const bp = bridgeFor(node, selected);
           return (
             <div
               key={node.id}
@@ -177,6 +244,11 @@ export function StudioCanvas({
                   </span>
                 )}
                 {node.kind === "component" && <span className="studio-cnode-tag is-comp">composant</span>}
+                {pins.length > 0 && (
+                  <span className="studio-cnode-tag is-pins" title={`${pins.length} commentaire(s) épinglé(s)`}>
+                    {pins.length} 📌
+                  </span>
+                )}
               </div>
               <div
                 className="studio-cnode-body"
@@ -197,17 +269,17 @@ export function StudioCanvas({
                       if (liveUrl && node.id === "live-home" && !node.html && !isWorkspaceHtmlRoute(node.route)) {
                         return (
                           <ProjectPreview
+                            ref={selected ? selectedPreviewRef : undefined}
                             embedded
                             externalUrl={liveUrl}
                             reloadKey={reloadKey}
-                            onSelectElement={onSelectElement}
                             selecting={selected ? selecting : false}
                             onSelectingChange={onSelectingChange}
-                            onBakeTokens={onBakeTokens}
+                            {...bp}
                           />
                         );
                       }
-                      if (node.html) {
+                      if (node.html && !node.route) {
                         return (
                           <iframe
                             className="studio-cnode-iframe"
@@ -220,13 +292,13 @@ export function StudioCanvas({
                       if (isWorkspaceHtmlRoute(node.route)) {
                         return (
                           <ProjectPreview
+                            ref={selected ? selectedPreviewRef : undefined}
                             embedded
                             route={workspacePreviewPath(node.route!)}
                             reloadKey={reloadKey}
-                            onSelectElement={onSelectElement}
                             selecting={selected ? selecting : false}
                             onSelectingChange={onSelectingChange}
-                            onBakeTokens={onBakeTokens}
+                            {...bp}
                           />
                         );
                       }
@@ -265,7 +337,19 @@ export function StudioCanvas({
                     </div>
                   ))}
                 {node.kind === "exploration" &&
-                  (node.html ? (
+                  (node.route ? (
+                    <LazyFrame active={selected} title={node.name} placeholder={node.name}>
+                      <ProjectPreview
+                        ref={selected ? selectedPreviewRef : undefined}
+                        embedded
+                        route={workspacePreviewPath(node.route)}
+                        reloadKey={reloadKey}
+                        selecting={selected ? selecting : false}
+                        onSelectingChange={onSelectingChange}
+                        {...bp}
+                      />
+                    </LazyFrame>
+                  ) : node.html ? (
                     <LazyFrame active={selected} title={node.name} placeholder={node.name}>
                       <iframe
                         className="studio-cnode-iframe"
@@ -298,13 +382,43 @@ export function StudioCanvas({
                     </div>
                   </div>
                 )}
+
+                {/* Pin badges (Lot B) — position relative to the frame body. */}
+                {pins.map((p, i) => (
+                  <button
+                    key={p.id}
+                    type="button"
+                    className={"studio-cpin" + (p.comment.trim() ? " has-comment" : "")}
+                    style={{ left: `${p.relX * 100}%`, top: `${p.relY * 100}%` }}
+                    title={p.comment.trim() || `Élément ${p.selector} — annote dans l'inspector`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (!selected) {
+                        let next = selectNode(doc, node.id);
+                        next = bringToFront(next, node.id);
+                        setStudioCanvasDoc(next);
+                      }
+                    }}
+                  >
+                    {i + 1}
+                  </button>
+                ))}
               </div>
+
+              {/* Resize handle (Lot A) — bottom-right corner of the selected frame. */}
+              {selected && (
+                <div
+                  className="studio-cnode-resize"
+                  title="Glisser pour redimensionner la frame"
+                  onPointerDown={(e) => onPointerDownResize(e, node)}
+                />
+              )}
             </div>
           );
         })}
       </div>
       <div className="studio-canvas-hint">
-        molette = zoom · espace / milieu = pan · glisser l’en-tête = déplacer
+        molette = zoom · espace / milieu = pan · glisser l’en-tête = déplacer · coin = redimensionner
       </div>
     </div>
   );

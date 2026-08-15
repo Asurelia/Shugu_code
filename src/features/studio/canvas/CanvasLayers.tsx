@@ -2,6 +2,12 @@ import { useMemo, useState } from "react";
 import { Icon } from "@/components/components";
 import { selectNode, type CanvasNode, type StudioCanvasDoc } from "./studioCanvasDoc";
 import { setStudioCanvasDoc } from "./studioCanvasStore";
+import {
+  DOM_LAYERS_RENDER_CAP,
+  domItemLabel,
+  filterDomItems,
+  type DomTreeItem,
+} from "../domLayers";
 
 type FolderId = "pages" | "components" | "icons" | "explorations" | "brand";
 
@@ -35,9 +41,24 @@ function readOpen(): Record<string, boolean> {
   return { pages: true, components: true, icons: false, explorations: true, brand: true };
 }
 
-export function CanvasLayers({ doc }: { doc: StudioCanvasDoc }) {
+export function CanvasLayers({
+  doc,
+  domTree,
+  onRefreshDomTree,
+  onDomHover,
+  onDomPick,
+}: {
+  doc: StudioCanvasDoc;
+  /** Lot E — flat DOM walk of the selected frame (empty when unavailable). */
+  domTree?: DomTreeItem[];
+  onRefreshDomTree?: () => void;
+  onDomHover?: (i: number | null) => void;
+  onDomPick?: (i: number) => void;
+}) {
   const [open, setOpen] = useState<Record<string, boolean>>(readOpen);
   const [filter, setFilter] = useState<FolderId | "all">("all");
+  const [domOpen, setDomOpen] = useState(true);
+  const [domQuery, setDomQuery] = useState("");
 
   const groups = useMemo(() => {
     const sorted = [...doc.nodes].sort((a, b) => b.zIndex - a.zIndex);
@@ -46,6 +67,16 @@ export function CanvasLayers({ doc }: { doc: StudioCanvasDoc }) {
       nodes: sorted.filter(f.match),
     })).filter((g) => g.nodes.length > 0);
   }, [doc.nodes]);
+
+  const selectedNode = doc.nodes.find((n) => n.id === doc.selectedId) ?? null;
+  const showDom =
+    !!selectedNode &&
+    (selectedNode.kind === "live" || selectedNode.kind === "exploration") &&
+    !!onRefreshDomTree;
+  const domItems = useMemo(
+    () => filterDomItems(domTree ?? [], domQuery).slice(0, DOM_LAYERS_RENDER_CAP),
+    [domTree, domQuery],
+  );
 
   const toggle = (id: string) => {
     setOpen((prev) => {
@@ -91,6 +122,75 @@ export function CanvasLayers({ doc }: { doc: StudioCanvasDoc }) {
       </div>
 
       <ul className="studio-layers-list scroll">
+        {showDom && (
+          <li className="studio-layers-folder studio-layers-dom">
+            <button
+              type="button"
+              className="studio-layers-folder-hd"
+              onClick={() => setDomOpen((v) => !v)}
+              aria-expanded={domOpen}
+            >
+              <Icon name={domOpen ? "down" : "chevron-right"} size={11} />
+              <span>DOM — {selectedNode!.name}</span>
+              <span
+                role="button"
+                tabIndex={0}
+                className="studio-layers-refresh"
+                title="Relire le DOM de la frame"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onRefreshDomTree();
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.stopPropagation();
+                    onRefreshDomTree();
+                  }
+                }}
+              >
+                <Icon name="history" size={11} />
+              </span>
+            </button>
+            {domOpen && (
+              <>
+                {(domTree?.length ?? 0) > 20 && (
+                  <input
+                    className="studio-layers-domfilter"
+                    value={domQuery}
+                    onChange={(e) => setDomQuery(e.target.value)}
+                    placeholder="Filtrer (tag, classe, texte)…"
+                    aria-label="Filtrer le DOM"
+                  />
+                )}
+                {domItems.length === 0 ? (
+                  <p className="studio-layers-domempty">
+                    {domTree && domTree.length > 0
+                      ? "Aucun élément ne correspond au filtre."
+                      : "DOM non chargé — clique ↻ après avoir ouvert la frame."}
+                  </p>
+                ) : (
+                  <ul className="studio-layers-folder-list">
+                    {domItems.map((it) => (
+                      <li key={it.i}>
+                        <button
+                          type="button"
+                          className="studio-layers-item studio-layers-domitem"
+                          style={{ paddingLeft: 8 + it.depth * 10 }}
+                          onMouseEnter={() => onDomHover?.(it.i)}
+                          onMouseLeave={() => onDomHover?.(null)}
+                          onClick={() => onDomPick?.(it.i)}
+                          title={`${it.tag}${it.suffix}`}
+                        >
+                          <span className="studio-layers-name">{domItemLabel(it)}</span>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </>
+            )}
+          </li>
+        )}
         {groups
           .filter((g) => filter === "all" || filter === g.id)
           .map((g) => {

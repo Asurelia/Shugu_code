@@ -90,27 +90,41 @@ fn empty_preview() -> Response<Cow<'static, [u8]>> {
 }
 
 /// A tiny controller injected into every served HTML page so the Studio can
-/// reach into the cross-origin iframe. Two jobs, both inert until the parent
-/// asks via `postMessage`:
+/// reach into the cross-origin iframe. Inert until the parent asks via
+/// `postMessage`. Capabilities:
 ///   1. Element selection — on `shugu:setSelectMode`, a click reports the
 ///      chosen element's descriptor back; only a temporary hover outline is
-///      drawn, never a markup/style change.
+///      drawn, never a markup/style change. The picked element is remembered
+///      for the style probe below.
 ///   2. Live Tweaks — on `shugu:getTokens` it reports the `:root` custom
 ///      properties (`--*`) it discovers; on `shugu:setToken` it applies one via
-///      `style.setProperty` on the root for instant preview. These inline
-///      overrides are runtime-only (gone on reload) until the user bakes them.
+///      `style.setProperty` on the root for instant preview.
+///   3. Direct text edit (Lot A) — on `shugu:setEditMode`, a double-click on an
+///      element with its own text turns it `contentEditable`; commit
+///      (blur / Enter) posts `shugu:textEdited` with old/new text, Escape
+///      reverts. The parent then patches the source file.
+///   4. Element styles (Lot A) — `shugu:probeStyles` reports a fixed list of
+///      computed styles of the picked element; `shugu:setElStyle` applies one
+///      inline at runtime (runtime-only until baked).
+///   5. Pins (Lot B) — on `shugu:setPinMode`, clicks post `shugu:pinPlaced`
+///      with the element descriptor + click position relative to the viewport.
+///   6. DOM layers (Lot E) — `shugu:getDomTree` posts a flat capped walk of
+///      the document; `shugu:highlight` / `shugu:unhighlight` outline an item,
+///      `shugu:pickIndex` selects it.
 ///
 /// Security note: the controller posts back to the parent with
 /// `targetOrigin: "*"` because an injected script cannot know the host app's
-/// origin. This is acceptable here — payloads are non-sensitive (an element
-/// descriptor or `--*` design tokens, both from the user's own generated page)
-/// and the parent verifies `event.origin` before acting. Inbound `setToken`
-/// only writes `--*` custom properties on `:root`, so it cannot escalate beyond
-/// restyling the preview.
+/// origin. This is acceptable here — payloads are non-sensitive (element
+/// descriptors, `--*` design tokens, computed styles — all from the user's own
+/// generated page) and the parent verifies `event.origin` before acting.
+/// Inbound writes only touch `--*` custom properties on `:root`, inline styles
+/// of the picked element, or its own text — none can escalate beyond restyling
+/// or rewording the preview.
 const CONTROLLER_SCRIPT: &str = r##"<script>
 (function(){
   if(window.__shuguStudio)return;window.__shuguStudio=true;
-  var sel=false,hov=null;
+  var sel=false,hov=null,picked=null,editOn=false,pinOn=false,editing=null,oldText="",domCache=[];
+  var PROBED=["color","background-color","font-size","font-weight","line-height","letter-spacing","padding","margin","border-radius","gap"];
   function out(el,v){try{el.style.outline=v;}catch(e){}}
   function setHov(el){if(hov===el)return;if(hov)out(hov,hov.__o||"");hov=el;if(el&&el.style){el.__o=el.style.outline;out(el,"2px solid #e08efe");}}
   function desc(el){
@@ -139,17 +153,87 @@ const CONTROLLER_SCRIPT: &str = r##"<script>
     out.sort(function(a,b){return a.name<b.name?-1:(a.name>b.name?1:0);});
     return out;
   }
+  function ownText(el){
+    for(var i=0;i<el.childNodes.length;i++){var n=el.childNodes[i];if(n.nodeType===3&&(n.textContent||"").trim())return true;}
+    return false;
+  }
+  function commitEdit(cancel){
+    if(!editing)return;var el=editing;editing=null;
+    try{el.removeAttribute("contenteditable");}catch(e){}
+    var nt=(el.textContent||"").trim().replace(/\s+/g," ");
+    if(!cancel&&nt&&nt!==oldText){
+      try{parent.postMessage({type:"shugu:textEdited",el:desc(el),oldText:oldText,newText:nt},"*");}catch(e2){}
+    }else if(cancel){try{el.textContent=oldText;}catch(e3){}}
+  }
+  function probe(){
+    if(!picked)return;
+    var cs=getComputedStyle(picked),arr=[];
+    for(var i=0;i<PROBED.length;i++){arr.push({prop:PROBED[i],value:(cs.getPropertyValue(PROBED[i])||"").trim()});}
+    try{parent.postMessage({type:"shugu:elStyles",styles:arr},"*");}catch(e){}
+  }
+  function domTree(){
+    domCache=[];var list=[];var MAX=250;
+    function walk(el,depth){
+      if(domCache.length>=MAX||depth>6)return;
+      var tag=(el.tagName||"").toLowerCase();
+      if(tag==="script"||tag==="style"||tag==="noscript"||tag==="link"||tag==="meta")return;
+      var id=el.id?("#"+el.id):"";
+      var cls=(el.className&&typeof el.className==="string")?("."+el.className.trim().split(/\s+/).filter(Boolean).slice(0,3).join(".")):"";
+      var t="";
+      for(var i=0;i<el.childNodes.length;i++){var n=el.childNodes[i];if(n.nodeType===3){t=(n.textContent||"").trim().replace(/\s+/g," ");if(t)break;}}
+      domCache.push(el);
+      list.push({i:domCache.length-1,depth:depth,tag:tag,suffix:(id+cls).slice(0,80),text:t.slice(0,40)});
+      var kids=el.children;
+      for(var k=0;k<kids.length;k++)walk(kids[k],depth+1);
+    }
+    try{if(document.body)walk(document.body,0);}catch(e){}
+    try{parent.postMessage({type:"shugu:domTree",nodes:list},"*");}catch(e2){}
+  }
   window.addEventListener("message",function(e){
     var d=e.data||{};
     if(d.type==="shugu:setSelectMode"){sel=!!d.on;try{document.body.style.cursor=sel?"crosshair":"";}catch(e2){}if(!sel)setHov(null);}
+    else if(d.type==="shugu:setEditMode"){editOn=!!d.on;if(!editOn)commitEdit(true);}
+    else if(d.type==="shugu:setPinMode"){pinOn=!!d.on;try{document.body.style.cursor=pinOn?"copy":(sel?"crosshair":"");}catch(e6){}}
     else if(d.type==="shugu:getTokens"){try{parent.postMessage({type:"shugu:tokens",tokens:tok()},"*");}catch(e4){}}
     else if(d.type==="shugu:setToken"&&d.name&&d.name.indexOf("--")===0){try{document.documentElement.style.setProperty(d.name,d.value);}catch(e5){}}
+    else if(d.type==="shugu:probeStyles"){probe();}
+    else if(d.type==="shugu:setElStyle"&&d.prop){try{if(picked)picked.style.setProperty(d.prop,d.value);}catch(e7){}}
+    else if(d.type==="shugu:getDomTree"){domTree();}
+    else if(d.type==="shugu:highlight"){var el=domCache[d.i];if(el)setHov(el);}
+    else if(d.type==="shugu:unhighlight"){setHov(null);}
+    else if(d.type==="shugu:pickIndex"){var el2=domCache[d.i];if(el2){picked=el2;try{parent.postMessage({type:"shugu:selected",el:desc(el2)},"*");}catch(e8){}}}
   });
   document.addEventListener("mouseover",function(e){if(sel)setHov(e.target);},true);
   document.addEventListener("click",function(e){
+    if(pinOn){
+      e.preventDefault();e.stopPropagation();
+      picked=e.target;
+      try{parent.postMessage({type:"shugu:pinPlaced",el:desc(e.target),relX:e.clientX/Math.max(1,window.innerWidth),relY:e.clientY/Math.max(1,window.innerHeight)},"*");}catch(err){}
+      return;
+    }
     if(!sel)return;e.preventDefault();e.stopPropagation();
-    var el=e.target;setHov(null);sel=false;try{document.body.style.cursor="";}catch(e3){}
+    var el=e.target;picked=el;setHov(null);sel=false;try{document.body.style.cursor="";}catch(e3){}
     try{parent.postMessage({type:"shugu:selected",el:desc(el)},"*");}catch(err){}
+  },true);
+  document.addEventListener("dblclick",function(e){
+    if(!editOn)return;
+    var el=e.target;
+    if(!el||!el.tagName)return;
+    if(!ownText(el)){
+      var p=el.parentElement,n=0;
+      while(p&&n<3&&!ownText(p)){p=p.parentElement;n++;}
+      if(p&&ownText(p))el=p;else return;
+    }
+    e.preventDefault();e.stopPropagation();
+    commitEdit(false);
+    editing=el;oldText=(el.textContent||"").trim().replace(/\s+/g," ");
+    try{el.contentEditable="true";el.focus();}catch(e2){}
+  },true);
+  document.addEventListener("blur",function(e){if(editing&&e.target===editing)commitEdit(false);},true);
+  document.addEventListener("keydown",function(e){
+    if(!editing)return;
+    if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();commitEdit(false);}
+    else if(e.key==="Escape"){commitEdit(true);}
   },true);
 })();
 </script>"##;

@@ -529,3 +529,163 @@
     grid-template-columns: 160px minmax(0, 1fr) minmax(260px, 320px);
   }
 }
+
+
+/* ── Lot A/B/D/E — direct manipulation, pins, quiz, DOM layers ─────────── */
+
+/* Resize handle — bottom-right corner of the selected frame (inside, the
+   node has overflow:hidden). */
+.studio-cnode-resize {
+  position: absolute;
+  right: 2px;
+  bottom: 2px;
+  width: 18px;
+  height: 18px;
+  cursor: nwse-resize;
+  border-radius: 4px;
+  background:
+    linear-gradient(135deg, transparent 50%, rgba(224, 142, 254, 0.75) 50%);
+  opacity: 0.85;
+  z-index: 5;
+}
+.studio-cnode-resize:hover { opacity: 1; }
+
+/* Pin badges overlaid on the frame body (position = click point). */
+.studio-cpin {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  border: 1.5px solid rgba(224, 142, 254, 0.9);
+  background: rgba(24, 16, 34, 0.92);
+  color: rgb(224, 142, 254);
+  font-size: 10px;
+  font-weight: 700;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  z-index: 6;
+  padding: 0;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+}
+.studio-cpin.has-comment {
+  background: rgba(224, 142, 254, 0.92);
+  color: #1a1020;
+}
+.studio-cnode-tag.is-pins {
+  background: rgba(224, 142, 254, 0.16);
+  color: rgb(224, 142, 254);
+}
+
+/* Contextual element sliders (inspector). */
+.studio-elstyles { margin-top: 4px; }
+.studio-elslider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+  font-size: 11px;
+}
+.studio-elslider .studio-tweak-cname {
+  flex: 0 0 92px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.studio-elslider input[type="range"] {
+  flex: 1;
+  min-width: 0;
+  accent-color: rgb(224, 142, 254);
+}
+.studio-elslider-val {
+  flex: 0 0 52px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--on-surface-variant);
+}
+
+/* Pins list (inspector). */
+.studio-pins-list {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.studio-pin-item {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 8px;
+  background: rgba(255, 255, 255, 0.03);
+}
+.studio-pin-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.studio-pin-num {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  font-size: 10px;
+  font-weight: 700;
+  background: rgba(224, 142, 254, 0.2);
+  color: rgb(224, 142, 254);
+}
+.studio-pin-sel {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
+  color: var(--on-surface-variant);
+}
+
+/* Guided-brief quiz chips (compose panel). */
+.studio-quiz-row { margin-top: 10px; }
+.studio-quiz-label {
+  display: block;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--on-surface-variant);
+  margin-bottom: 5px;
+}
+.studio-quiz-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.studio-generate-alt { margin-top: 8px; }
+
+/* DOM layers section. */
+.studio-layers-dom .studio-layers-folder-hd { display: flex; align-items: center; gap: 6px; }
+.studio-layers-refresh {
+  margin-left: auto;
+  display: inline-flex;
+  padding: 2px;
+  border-radius: 5px;
+  color: var(--on-surface-variant);
+  cursor: pointer;
+}
+.studio-layers-refresh:hover { color: var(--on-surface); background: rgba(255, 255, 255, 0.07); }
+.studio-layers-domfilter {
+  width: calc(100% - 12px);
+  margin: 4px 6px;
+  padding: 4px 8px;
+  font-size: 11px;
+  border-radius: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--on-surface);
+}
+.studio-layers-domitem { font-family: var(--font-mono, monospace); font-size: 10.5px; }
+.studio-layers-domempty {
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--on-surface-variant);
+}

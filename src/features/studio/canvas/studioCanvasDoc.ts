@@ -4,6 +4,8 @@
 // exploration frames (variants), and a brand node. No React / Tauri here —
 // mutations are pure so camera/node logic stays honest under vitest.
 
+import { parsePins } from "./canvasPins";
+
 export type CanvasNodeKind = "live" | "component" | "exploration" | "brand";
 
 export interface CanvasCamera {
@@ -25,6 +27,8 @@ export interface CanvasNode {
   /** live: path under preview/ (e.g. "index.html"). exploration: inline HTML. */
   route?: string;
   html?: string;
+  /** Persistent element-anchored comments (Lot B). See canvasPins.ts. */
+  pins?: import("./canvasPins").CanvasPin[];
 }
 
 export interface StudioCanvasDoc {
@@ -108,6 +112,7 @@ export function parseCanvasDoc(raw: unknown): StudioCanvasDoc | null {
       zIndex: typeof n.zIndex === "number" ? n.zIndex : 0,
       route: typeof n.route === "string" ? n.route : undefined,
       html: typeof n.html === "string" ? n.html : undefined,
+      pins: parsePins(n.pins),
     });
   }
   if (nodes.length === 0) return null;
@@ -203,7 +208,7 @@ export function zoomAt(
 
 export function addExplorationFrame(
   doc: StudioCanvasDoc,
-  input: { id: string; name: string; html: string; x?: number; y?: number },
+  input: { id: string; name: string; html: string; route?: string; x?: number; y?: number },
 ): StudioCanvasDoc {
   const maxZ = doc.nodes.reduce((m, n) => Math.max(m, n.zIndex), 0);
   const live = doc.nodes.find((n) => n.kind === "live");
@@ -217,6 +222,7 @@ export function addExplorationFrame(
     height: 640,
     zIndex: maxZ + 1,
     html: input.html,
+    route: input.route,
   };
   return { ...doc, nodes: [...doc.nodes, node], selectedId: node.id };
 }

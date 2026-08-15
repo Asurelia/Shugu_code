@@ -18,10 +18,12 @@
 // them live, then "Appliquer au projet" bakes the values into the CSS via an
 // agent turn (onBakeTokens, handled by the parent).
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useImperativeHandle, useRef, useState, forwardRef } from "react";
 import { Icon } from "@/components/components";
 import { useProjectTrust } from "@/features/projects/projectTrustQueries";
 import type { SelectedElement } from "./studioChat";
+import type { ElStyle } from "./directEdit";
+import type { DomTreeItem } from "./domLayers";
 import {
   TWEAKS_STYLE,
   TweakSection,
@@ -29,6 +31,23 @@ import {
   TweakText,
   TweakButton,
 } from "@/features/tweaks/tweaks-panel";
+
+/** Imperative one-shot bridge into the preview document (Lot A/B/E). */
+export interface ProjectPreviewHandle {
+  post: (msg: Record<string, unknown>) => void;
+}
+
+/** Payloads the injected controller can post back (beyond selection/tokens). */
+export interface TextEditedPayload {
+  el: SelectedElement;
+  oldText: string;
+  newText: string;
+}
+export interface PinPlacedPayload {
+  el: SelectedElement;
+  relX: number;
+  relY: number;
+}
 
 // wry serves a custom `foo://` scheme as `http://foo.localhost/` on
 // Windows/Android and `foo://localhost/` elsewhere.
@@ -78,7 +97,7 @@ function lenRange(unit: string, n: number): { min: number; max: number; step: nu
   return { min: 0, max: Math.max(64, Math.ceil(n * 2)), step: 1 };
 }
 
-export function ProjectPreview({
+export const ProjectPreview = forwardRef(function ProjectPreview({
   reloadKey = 0,
   onSelectElement,
   onBakeTokens,
@@ -96,6 +115,14 @@ export function ProjectPreview({
   onSelectingChange,
   tweaking: tweakingProp,
   onTweakingChange,
+  /** Lot A — double-click text editing in the preview document. */
+  editing,
+  /** Lot B — pin placement mode (click drops a comment pin). */
+  pinning,
+  onTextEdited,
+  onElStyles,
+  onPinPlaced,
+  onDomTree,
 }: {
   reloadKey?: number;
   onSelectElement?: (el: SelectedElement) => void;
@@ -107,7 +134,13 @@ export function ProjectPreview({
   onSelectingChange?: (on: boolean) => void;
   tweaking?: boolean;
   onTweakingChange?: (on: boolean) => void;
-}) {
+  editing?: boolean;
+  pinning?: boolean;
+  onTextEdited?: (p: TextEditedPayload) => void;
+  onElStyles?: (styles: ElStyle[]) => void;
+  onPinPlaced?: (p: PinPlacedPayload) => void;
+  onDomTree?: (nodes: DomTreeItem[]) => void;
+}, handleRef: React.Ref<ProjectPreviewHandle>) {
   const [nonce, setNonce] = useState(0);
   const [device, setDevice] = useState<Device>("full");
   const [selectingLocal, setSelectingLocal] = useState(false);
@@ -164,31 +197,78 @@ export function ProjectPreview({
       // (on Windows, http://preview.localhost === previewOrigin()). This assumes
       // the platform's preview origin; revisit if Shugu ships beyond Windows.
       if (e.origin !== previewOrigin()) return;
-      const d = e.data as { type?: string; el?: SelectedElement; tokens?: Token[] } | null;
+      const d = e.data as {
+        type?: string;
+        el?: SelectedElement;
+        tokens?: Token[];
+        oldText?: string;
+        newText?: string;
+        styles?: ElStyle[];
+        relX?: number;
+        relY?: number;
+        nodes?: DomTreeItem[];
+      } | null;
       if (!d) return;
       if (d.type === "shugu:selected" && d.el) {
         onSelectElement?.(d.el);
         setSelecting(false);
       } else if (d.type === "shugu:tokens" && Array.isArray(d.tokens)) {
         setTokens(d.tokens);
+      } else if (
+        d.type === "shugu:textEdited" &&
+        d.el &&
+        typeof d.oldText === "string" &&
+        typeof d.newText === "string"
+      ) {
+        onTextEdited?.({ el: d.el, oldText: d.oldText, newText: d.newText });
+      } else if (d.type === "shugu:elStyles" && Array.isArray(d.styles)) {
+        onElStyles?.(d.styles);
+      } else if (
+        d.type === "shugu:pinPlaced" &&
+        d.el &&
+        typeof d.relX === "number" &&
+        typeof d.relY === "number"
+      ) {
+        onPinPlaced?.({ el: d.el, relX: d.relX, relY: d.relY });
+      } else if (d.type === "shugu:domTree" && Array.isArray(d.nodes)) {
+        onDomTree?.(d.nodes);
       }
     }
     window.addEventListener("message", onMsg);
     return () => window.removeEventListener("message", onMsg);
-  }, [onSelectElement]);
+  }, [onSelectElement, onTextEdited, onElStyles, onPinPlaced, onDomTree]);
 
   // Target the preview's own origin (not "*") so messages are only ever
   // delivered to the generated page, never any other embedded content.
-  const post = (msg: Record<string, unknown>) => {
-    if (!trusted) return;
-    frameRef.current?.contentWindow?.postMessage(msg, origin);
-  };
+  const post = useCallback(
+    (msg: Record<string, unknown>) => {
+      if (!trusted) return;
+      frameRef.current?.contentWindow?.postMessage(msg, origin);
+    },
+    [trusted, origin],
+  );
+
+  // Lot A/B/E — one-shot imperative bridge (probeStyles, setElStyle,
+  // getDomTree, highlight, pickIndex…). Inert until trusted.
+  useImperativeHandle(handleRef, () => ({ post }), [post]);
+
+  // Lot A — direct text editing toggle.
+  useEffect(() => {
+    if (!trusted || editing === undefined) return;
+    post({ type: "shugu:setEditMode", on: editing });
+  }, [editing, trusted, post]);
+
+  // Lot B — pin placement toggle.
+  useEffect(() => {
+    if (!trusted || pinning === undefined) return;
+    post({ type: "shugu:setPinMode", on: pinning });
+  }, [pinning, trusted, post]);
 
   // Keep injected select-mode in sync when the dock drives `selecting` externally.
   useEffect(() => {
     if (!trusted || selectingProp === undefined) return;
     post({ type: "shugu:setSelectMode", on: selectingProp });
-  }, [selectingProp, trusted, origin]);
+  }, [selectingProp, trusted, post]);
 
   const sendMode = (on: boolean) => post({ type: "shugu:setSelectMode", on });
   const toggleSelect = () => {
@@ -362,6 +442,9 @@ export function ProjectPreview({
             src={src}
             onLoad={() => {
               if (selecting) sendMode(true);
+              // Reload wipes the injected modes — re-arm them on the new document.
+              if (editing) post({ type: "shugu:setEditMode", on: true });
+              if (pinning) post({ type: "shugu:setPinMode", on: true });
               // New document → previous inline overrides are gone; re-sync from
               // the freshly loaded page so the panel shows the real current values.
               if (tweaking) {
@@ -382,4 +465,4 @@ export function ProjectPreview({
       </div>
     </div>
   );
-}
+});
